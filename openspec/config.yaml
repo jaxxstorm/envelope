@@ -1,0 +1,79 @@
+schema: spec-driven
+
+context: |
+  Project: Envelope
+  Purpose: A lightweight shim that integrates AWS Gateway Load Balancer (GWLB) with Tailscale by terminating/originating
+  GENEVE (UDP/6081), decapsulating encapsulated IP packets, and forwarding them to a Tailscale-managed TUN device.
+  Return traffic is re-encapsulated into GENEVE and sent back to GWLB to preserve symmetric flow behavior.
+
+  Tech stack:
+  - Language: Go (preferred) with no cgo/c bindings.
+  - OS: Linux only (initially).
+  - Tailscale integration:
+    - Preferred mode: Envelope creates/owns a TUN device (envelope0) and runs tailscaled with --tun=envelope0.
+  - AWS: Targeted for deployment behind GWLB as a transparent appliance endpoint.
+
+  Networking conventions & assumptions:
+  - GENEVE runs over UDP/6081.
+  - Inner payload is treated as L3 IP packets (no L2 bridging in v1).
+  - Avoid conntrack/NAT in v1 unless strictly required for AWS return-path correctness.
+  - Handle MTU carefully due to encapsulation overhead; prefer PMTU-safe defaults and clear operator guidance.
+
+  Performance goals:
+  - Keep datapath minimal: UDP recv -> GENEVE decap -> write to TUN; read from TUN -> GENEVE encap -> UDP send.
+  - Prefer batching and buffer pooling (sync.Pool) to reduce allocations and GC pressure.
+  - Instrument for pps/bytes/latency to enable tuning.
+
+  Observability:
+  - Structured logs (zap-style or slog), no noisy debug by default.
+  - Prometheus metrics on :9090/metrics and health endpoint :9090/healthz.
+  - Include per-stage counters: geneve_rx/tx, decap/encap_errors, tun_rx/tx, drops, latency histograms.
+
+  Repo expectations:
+  - Specs are the source of truth; code and tests must trace back to specs and acceptance criteria.
+  - Prefer small, incremental changes with explicit non-goals and failure-mode analysis.
+
+rules:
+  specs:
+    - Use clear headings: Goals, Non-goals, Architecture, Interfaces, Data plane, Control plane, Failure modes, Testing.
+    - Include an explicit "Return path & symmetry" section (GWLB expectations).
+    - State MTU strategy and fragmentation behavior explicitly.
+    - Keep each spec focused; split when it exceeds ~2-3 pages.
+
+  proposal:
+    - Keep proposals under 800 words.
+    - Must include: Motivation, Proposed design, Alternatives considered, Risks, Rollout plan.
+    - Must call out whether the change impacts datapath (hot path) and expected perf impact.
+
+  tasks:
+    - Break work into chunks <= 2 hours where possible.
+    - Each task must include: acceptance check, test plan, and a link/reference to the governing spec section.
+    - Include at least one task for observability/metrics for any dataplane feature.
+
+  code:
+    - No cgo by default; if required, justify in the proposal and provide a fallback.
+    - Avoid global allocations on the hot path; use buffer pools.
+    - Prefer x/sys/unix for performance-critical socket options and (optional) recvmmsg/sendmmsg.
+    - Include integration tests using pcap fixtures and/or a dockerized replay harness.
+    - keep the main.go relatively simple, delegating to well-structured packages.
+
+  tests:
+    - Must include:
+      - Unit tests for GENEVE header parsing/serialization (with fuzz targets if practical).
+      - End-to-end test: UDP/6081 in -> decap -> tun write; tun read -> encap -> UDP/6081 out.
+    - Provide pcap fixtures for at least:
+      - minimal GENEVE packet
+      - packet with options (GWLB relevant TLVs if used)
+      - oversize packet to validate MTU handling behavior
+
+  libraries:
+    - Use alecthomas/kong for CLI and env var parsing.
+    - use zap for structured logging
+
+  docs:
+    - README must include:
+      - What Envelope is / is not
+      - Deployment modes (v1 single TUN; v2 policy routing optional)
+      - Required Linux capabilities and sysctls
+      - MTU guidance and troubleshooting steps
+    - Avoid marketing language; keep it operational and precise.

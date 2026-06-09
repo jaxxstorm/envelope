@@ -1,0 +1,18 @@
+# Local/editor noise
+.DS_Store
+
+# Build/test outputs
+bin/
+coverage.out
+*.test
+
+# Terraform local state and secrets
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+.terraform/
+.terraform.lock.hcl
+
+# Runtime logs
+*.log
