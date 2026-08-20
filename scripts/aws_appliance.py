@@ -2158,7 +2158,11 @@ OWNED_RESOURCE_ABSENT_MARKERS = {
     "instance": ("InvalidInstanceID.NotFound",),
     "volume": ("InvalidVolume.NotFound",),
     "vpc-endpoint": ("InvalidVpcEndpointId.NotFound",),
-    "vpc-endpoint-service": ("InvalidServiceId.NotFound", "InvalidVpcEndpointService.NotFound"),
+    "vpc-endpoint-service": (
+        "InvalidServiceId.NotFound",
+        "InvalidVpcEndpointService.NotFound",
+        "InvalidVpcEndpointServiceId.NotFound",
+    ),
     "natgateway": ("NatGatewayNotFound",),
     "elastic-ip": ("InvalidAllocationID.NotFound",),
     "internet-gateway": ("InvalidInternetGatewayID.NotFound",),

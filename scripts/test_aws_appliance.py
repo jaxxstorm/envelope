@@ -1088,7 +1088,9 @@ class SecurityAndBackendTest(unittest.TestCase):
                         return {"VpcEndpoints": []}
                     raise appliance.CommandError(args, 255, "InvalidVpcEndpointId.NotFound: fixture tombstone")
                 if operation == "describe-vpc-endpoint-service-configurations":
-                    return {"ServiceConfigurations": []}
+                    raise appliance.CommandError(
+                        args, 255, "InvalidVpcEndpointServiceId.NotFound: fixture tombstone"
+                    )
                 if operation.startswith(("delete", "terminate", "release")):
                     self.delete_calls.append(operation)
                     return {}
