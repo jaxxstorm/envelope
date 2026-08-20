@@ -26,7 +26,7 @@ func Open(name string, mtu int) (*Device, error) {
 	}
 	ifr := ifreq{}
 	copy(ifr.Name[:], name)
-	ifr.Flags = unix.IFF_TUN | unix.IFF_NO_PI
+	ifr.Flags = unix.IFF_TUN | unix.IFF_NO_PI | unix.IFF_TUN_EXCL
 	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(unix.TUNSETIFF), uintptr(unsafe.Pointer(&ifr)))
 	if errno != 0 {
 		unix.Close(fd)
@@ -42,6 +42,10 @@ func Open(name string, mtu int) (*Device, error) {
 	if err := setUp(actualName); err != nil {
 		unix.Close(fd)
 		return nil, err
+	}
+	if err := unix.SetNonblock(fd, true); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("set TUN nonblocking: %w", err)
 	}
 	file := os.NewFile(uintptr(fd), actualName)
 	return &Device{File: file, Name: actualName, MTU: mtu}, nil

@@ -3,8 +3,11 @@
 
 # Build/test outputs
 bin/
+dist/
 coverage.out
 *.test
+__pycache__/
+*.pyc
 
 # Terraform local state and secrets
 *.tfstate
@@ -13,6 +16,12 @@ coverage.out
 *.tfvars.json
 .terraform/
 .terraform.lock.hcl
+!example/terraform/.terraform.lock.hcl
+
+# Protected deployment-run material
+.run/
+*.tfplan
+*.tfplan.json
 
 # Runtime logs
 *.log

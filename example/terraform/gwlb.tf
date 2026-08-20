@@ -1,32 +1,30 @@
 resource "aws_lb" "west" {
-  name               = substr("${var.name}-west-gwlb", 0, 32)
-  load_balancer_type = "gateway"
-  subnets            = module.vpc_west.private_subnets
+  name                             = "${var.name}-west-gwlb"
+  load_balancer_type               = "gateway"
+  subnets                          = [for key in sort(keys(var.west_azs)) : aws_subnet.gwlb_west[key].id]
+  enable_cross_zone_load_balancing = true
 
-  tags = merge(var.tags, {
-    Name = substr("${var.name}-west-gwlb", 0, 32)
-    Site = "west"
-  })
+  tags = { Name = "${var.name}-west-gwlb", Site = "west" }
 }
 
 resource "aws_lb" "east" {
-  provider           = aws.east
-  name               = substr("${var.name}-east-gwlb", 0, 32)
-  load_balancer_type = "gateway"
-  subnets            = module.vpc_east.private_subnets
+  provider = aws.east
 
-  tags = merge(var.tags, {
-    Name = substr("${var.name}-east-gwlb", 0, 32)
-    Site = "east"
-  })
+  name                             = "${var.name}-east-gwlb"
+  load_balancer_type               = "gateway"
+  subnets                          = [for key in sort(keys(var.east_azs)) : aws_subnet.gwlb_east[key].id]
+  enable_cross_zone_load_balancing = true
+
+  tags = { Name = "${var.name}-east-gwlb", Site = "east" }
 }
 
 resource "aws_lb_target_group" "west" {
-  name        = substr("${var.name}-west-gwlb-tg", 0, 32)
-  port        = 6081
-  protocol    = "GENEVE"
-  target_type = "instance"
-  vpc_id      = module.vpc_west.vpc_id
+  name                 = "${var.name}-west-gwlb-tg"
+  port                 = 6081
+  protocol             = "GENEVE"
+  target_type          = "instance"
+  vpc_id               = aws_vpc.west.id
+  deregistration_delay = 0
 
   health_check {
     enabled             = true
@@ -34,24 +32,23 @@ resource "aws_lb_target_group" "west" {
     path                = "/healthz"
     port                = "9090"
     healthy_threshold   = 3
-    unhealthy_threshold = 3
+    unhealthy_threshold = 2
     interval            = 10
     timeout             = 5
   }
 
-  tags = merge(var.tags, {
-    Name = substr("${var.name}-west-gwlb-tg", 0, 32)
-    Site = "west"
-  })
+  tags = { Name = "${var.name}-west-gwlb-tg", Site = "west" }
 }
 
 resource "aws_lb_target_group" "east" {
-  provider    = aws.east
-  name        = substr("${var.name}-east-gwlb-tg", 0, 32)
-  port        = 6081
-  protocol    = "GENEVE"
-  target_type = "instance"
-  vpc_id      = module.vpc_east.vpc_id
+  provider = aws.east
+
+  name                 = "${var.name}-east-gwlb-tg"
+  port                 = 6081
+  protocol             = "GENEVE"
+  target_type          = "instance"
+  vpc_id               = aws_vpc.east.id
+  deregistration_delay = 0
 
   health_check {
     enabled             = true
@@ -59,20 +56,16 @@ resource "aws_lb_target_group" "east" {
     path                = "/healthz"
     port                = "9090"
     healthy_threshold   = 3
-    unhealthy_threshold = 3
+    unhealthy_threshold = 2
     interval            = 10
     timeout             = 5
   }
 
-  tags = merge(var.tags, {
-    Name = substr("${var.name}-east-gwlb-tg", 0, 32)
-    Site = "east"
-  })
+  tags = { Name = "${var.name}-east-gwlb-tg", Site = "east" }
 }
 
 resource "aws_lb_listener" "west" {
   load_balancer_arn = aws_lb.west.arn
-
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.west.arn
@@ -82,7 +75,6 @@ resource "aws_lb_listener" "west" {
 resource "aws_lb_listener" "east" {
   provider          = aws.east
   load_balancer_arn = aws_lb.east.arn
-
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.east.arn
@@ -103,117 +95,80 @@ resource "aws_lb_target_group_attachment" "east" {
 resource "aws_vpc_endpoint_service" "west" {
   acceptance_required        = false
   gateway_load_balancer_arns = [aws_lb.west.arn]
-
-  tags = merge(var.tags, {
-    Name = substr("${var.name}-west-gwlb-svc", 0, 32)
-    Site = "west"
-  })
+  tags                       = { Name = "${var.name}-west-gwlb-svc", Site = "west" }
 }
 
 resource "aws_vpc_endpoint_service" "east" {
-  provider                   = aws.east
+  provider = aws.east
+
   acceptance_required        = false
   gateway_load_balancer_arns = [aws_lb.east.arn]
-
-  tags = merge(var.tags, {
-    Name = substr("${var.name}-east-gwlb-svc", 0, 32)
-    Site = "east"
-  })
-}
-
-locals {
-  west_private_subnet_index = { for idx, subnet_id in module.vpc_west.private_subnets : subnet_id => idx }
-  east_private_subnet_index = { for idx, subnet_id in module.vpc_east.private_subnets : subnet_id => idx }
+  tags                       = { Name = "${var.name}-east-gwlb-svc", Site = "east" }
 }
 
 resource "aws_vpc_endpoint" "west" {
-  for_each = local.west_private_subnet_index
+  for_each = var.west_azs
 
-  vpc_id            = module.vpc_west.vpc_id
+  vpc_id            = aws_vpc.west.id
   service_name      = aws_vpc_endpoint_service.west.service_name
   vpc_endpoint_type = "GatewayLoadBalancer"
-  subnet_ids        = [each.key]
-
-  tags = merge(var.tags, {
-    Name = substr("${var.name}-west-gwlb-endpoint-${each.value}", 0, 32)
-    Site = "west"
-  })
+  subnet_ids        = [aws_subnet.gwlbe_west[each.key].id]
+  tags              = { Name = "${var.name}-west-gwlbe-${each.key}", Site = "west", ZoneKey = each.key }
 }
 
 resource "aws_vpc_endpoint" "east" {
   provider = aws.east
-  for_each = local.east_private_subnet_index
+  for_each = var.east_azs
 
-  vpc_id            = module.vpc_east.vpc_id
+  vpc_id            = aws_vpc.east.id
   service_name      = aws_vpc_endpoint_service.east.service_name
   vpc_endpoint_type = "GatewayLoadBalancer"
-  subnet_ids        = [each.key]
-
-  tags = merge(var.tags, {
-    Name = substr("${var.name}-east-gwlb-endpoint-${each.value}", 0, 32)
-    Site = "east"
-  })
+  subnet_ids        = [aws_subnet.gwlbe_east[each.key].id]
+  tags              = { Name = "${var.name}-east-gwlbe-${each.key}", Site = "east", ZoneKey = each.key }
 }
 
-data "aws_route_table" "west_private" {
-  for_each  = local.west_private_subnet_index
-  subnet_id = each.key
+resource "aws_route" "workload_to_remote_west" {
+  for_each = local.west_remote_workload_routes
+
+  route_table_id         = aws_route_table.workload_west[each.value.az_key].id
+  destination_cidr_block = each.value.cidr
+  vpc_endpoint_id        = aws_vpc_endpoint.west[each.value.az_key].id
 }
 
-data "aws_route_table" "east_private" {
-  provider  = aws.east
-  for_each  = local.east_private_subnet_index
-  subnet_id = each.key
-}
-
-resource "aws_route" "private_to_remote_via_gwlbe_west" {
-  for_each = data.aws_route_table.west_private
-
-  route_table_id         = each.value.id
-  destination_cidr_block = var.east_vpc_cidr
-  vpc_endpoint_id        = aws_vpc_endpoint.west[each.key].id
-}
-
-resource "aws_route" "private_to_remote_via_gwlbe_east" {
+resource "aws_route" "workload_to_remote_east" {
   provider = aws.east
-  for_each = data.aws_route_table.east_private
+  for_each = local.east_remote_workload_routes
 
-  route_table_id         = each.value.id
-  destination_cidr_block = var.west_vpc_cidr
-  vpc_endpoint_id        = aws_vpc_endpoint.east[each.key].id
+  route_table_id         = aws_route_table.workload_east[each.value.az_key].id
+  destination_cidr_block = each.value.cidr
+  vpc_endpoint_id        = aws_vpc_endpoint.east[each.value.az_key].id
 }
 
 output "gwlb_arns" {
-  value = {
-    west = aws_lb.west.arn
-    east = aws_lb.east.arn
-  }
-}
-
-output "gwlb_dns_names" {
-  value = {
-    west = aws_lb.west.dns_name
-    east = aws_lb.east.dns_name
-  }
+  value = { west = aws_lb.west.arn, east = aws_lb.east.arn }
 }
 
 output "gwlb_target_group_arns" {
-  value = {
-    west = aws_lb_target_group.west.arn
-    east = aws_lb_target_group.east.arn
-  }
-}
-
-output "gwlb_endpoint_service_names" {
-  value = {
-    west = aws_vpc_endpoint_service.west.service_name
-    east = aws_vpc_endpoint_service.east.service_name
-  }
+  value = { west = aws_lb_target_group.west.arn, east = aws_lb_target_group.east.arn }
 }
 
 output "gwlb_endpoint_ids" {
   value = {
-    west = { for subnet_id, ep in aws_vpc_endpoint.west : subnet_id => ep.id }
-    east = { for subnet_id, ep in aws_vpc_endpoint.east : subnet_id => ep.id }
+    west = { for key, endpoint in aws_vpc_endpoint.west : key => endpoint.id }
+    east = { for key, endpoint in aws_vpc_endpoint.east : key => endpoint.id }
   }
+}
+locals {
+  west_remote_workload_routes = merge([
+    for az_key in sort(keys(var.west_azs)) : {
+      for cidr in var.envelope_remote_tailnet_cidrs["west"] :
+      "${az_key}:${cidr}" => { az_key = az_key, cidr = cidr }
+    }
+  ]...)
+  east_remote_workload_routes = merge([
+    for az_key in sort(keys(var.east_azs)) : {
+      for cidr in var.envelope_remote_tailnet_cidrs["east"] :
+      "${az_key}:${cidr}" => { az_key = az_key, cidr = cidr }
+    }
+  ]...)
 }

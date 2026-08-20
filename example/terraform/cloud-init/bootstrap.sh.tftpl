@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2016 # Terraform replaces these single-quoted template expressions.
+set -euo pipefail
+umask 077
+
+readonly site='${site}'
+readonly expected_sha256='${artifact_sha256}'
+
+systemctl disable --now envelope.service >/dev/null 2>&1 || true
+
+dnf install -y jq nftables iptables-legacy iptables-services
+systemctl disable --now firewalld.service nftables.service >/dev/null 2>&1 || true
+
+if command -v alternatives >/dev/null 2>&1; then
+  alternatives --set iptables /usr/sbin/iptables-legacy >/dev/null 2>&1 || true
+  alternatives --set ip6tables /usr/sbin/ip6tables-legacy >/dev/null 2>&1 || true
+fi
+
+if ! /usr/sbin/iptables --version | grep -Fq '(legacy)' || ! /usr/sbin/ip6tables --version | grep -Fq '(legacy)'; then
+  printf '%s\n' 'legacy iptables and ip6tables are required' >&2
+  exit 1
+fi
+for binary in /usr/sbin/iptables-save /usr/sbin/ip6tables-save /usr/sbin/nft; do
+  test -x "$binary"
+done
+
+/usr/bin/tailscale version | grep -Eq '^${tailscale_version}([[:space:]]|$)'
+/usr/bin/rpm -q 'tailscale-${tailscale_version}-1'
+
+test -x /usr/local/bin/envelope
+install -d -m 0755 /etc/envelope /usr/local/sbin
+
+cat >/etc/sysctl.d/90-envelope.conf <<'SYSCTL'
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
+SYSCTL
+
+cat >/usr/local/sbin/envelope-host-network <<'HOST_NETWORK'
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly underlay='${underlay_iface}'
+readonly tailscale='${tailscale_iface}'
+readonly envelope='${tun_name}'
+readonly configured_mtu=1280
+
+/usr/sbin/sysctl -p /etc/sysctl.d/90-envelope.conf >/dev/null
+for iface in "$underlay" "$tailscale"; do
+  test -e "/sys/class/net/$iface/mtu"
+  /usr/sbin/sysctl -q -w "net.ipv4.conf.$iface.rp_filter=0"
+done
+if [[ -e "/sys/class/net/$envelope/mtu" ]]; then
+  /usr/sbin/sysctl -q -w "net.ipv4.conf.$envelope.rp_filter=0"
+fi
+
+/usr/sbin/nft flush ruleset
+
+interface_mtu() {
+  local iface=$1
+  if [[ "$iface" == "$envelope" && ! -e "/sys/class/net/$iface/mtu" ]]; then
+    printf '%s\n' "$configured_mtu"
+    return
+  fi
+  cat "/sys/class/net/$iface/mtu"
+}
+
+path_mss() {
+  local family=$1 input=$2 output=$3 mtu=$configured_mtu candidate allowance
+  for candidate in "$(interface_mtu "$input")" "$(interface_mtu "$output")"; do
+    if (( candidate < mtu )); then mtu=$candidate; fi
+  done
+  allowance=40
+  if [[ "$family" == 6 ]]; then allowance=60; fi
+  if (( mtu <= allowance )); then return 1; fi
+  printf '%s\n' "$((mtu - allowance))"
+}
+
+directions=(
+  "$underlay $tailscale"
+  "$tailscale $underlay"
+  "$envelope $tailscale"
+  "$tailscale $envelope"
+)
+
+for family in 4 6; do
+  binary=/usr/sbin/iptables
+  if [[ "$family" == 6 ]]; then binary=/usr/sbin/ip6tables; fi
+  "$binary" --version | grep -Fq '(legacy)'
+
+  for table in raw mangle nat filter security; do
+    if "$binary" -t "$table" -L -n >/dev/null 2>&1; then
+      "$binary" -t "$table" -F
+      "$binary" -t "$table" -X
+      for chain in PREROUTING INPUT FORWARD OUTPUT POSTROUTING; do
+        "$binary" -t "$table" -P "$chain" ACCEPT >/dev/null 2>&1 || true
+      done
+    fi
+  done
+
+  "$binary" -P INPUT ACCEPT
+  "$binary" -P FORWARD ACCEPT
+  "$binary" -P OUTPUT ACCEPT
+  "$binary" -N ENVELOPE-FORWARD
+  "$binary" -A FORWARD -j ENVELOPE-FORWARD
+  "$binary" -t mangle -N ENVELOPE-MSS
+  "$binary" -t mangle -A FORWARD -j ENVELOPE-MSS
+
+  for direction in "$${directions[@]}"; do
+    read -r input output <<<"$direction"
+    "$binary" -A ENVELOPE-FORWARD -i "$input" -o "$output" -j ACCEPT
+    mss=$(path_mss "$family" "$input" "$output")
+    "$binary" -t mangle -A ENVELOPE-MSS -i "$input" -o "$output" -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss"
+  done
+  "$binary" -t mangle -A ENVELOPE-MSS -j RETURN
+done
+
+/usr/sbin/nft -j list ruleset | /usr/bin/jq -e '.nftables | length == 1 and .[0].metainfo != null' >/dev/null
+HOST_NETWORK
+chmod 0755 /usr/local/sbin/envelope-host-network
+
+cat >/etc/systemd/system/envelope-host-network.service <<'HOST_UNIT'
+[Unit]
+Description=Envelope persistent host-network contract
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+Before=envelope.service
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/envelope-host-network
+RemainAfterExit=yes
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target
+HOST_UNIT
+
+cat >/etc/envelope/site.env <<'SITE_ENV'
+ENVELOPE_UDP_BIND=0.0.0.0:6081
+ENVELOPE_VNI=0
+ENVELOPE_TUN_NAME=${tun_name}
+ENVELOPE_TUN_MTU=1280
+ENVELOPE_TAILSCALE_IFACE=${tailscale_iface}
+ENVELOPE_UNDERLAY_INTERFACE=${underlay_iface}
+ENVELOPE_ROUTING_MODE=${routing_mode}
+ENVELOPE_GWLB_RETURN_CIDRS=${gwlb_return_cidrs}
+ENVELOPE_LOCAL_DELIVERY_CIDRS=${local_delivery_cidrs}
+ENVELOPE_REMOTE_TAILNET_CIDRS=${remote_tailnet_cidrs}
+ENVELOPE_ROUTING_TABLE_ID=${routing_table_id}
+ENVELOPE_ROUTING_RULE_PRIORITY=${routing_rule_priority}
+ENVELOPE_METRICS_ADDR=0.0.0.0:9090
+ENVELOPE_LOG_LEVEL=info
+ENVELOPE_TCP_FLOW_TIMEOUT=350s
+ENVELOPE_UDP_FLOW_TIMEOUT=120s
+ENVELOPE_OTHER_FLOW_TIMEOUT=120s
+SITE_ENV
+chmod 0644 /etc/envelope/site.env
+
+cat >/usr/local/sbin/envelope-preflight <<'PREFLIGHT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly expected_version='${tailscale_version}'
+readonly remote_cidrs='${remote_tailnet_cidrs}'
+readonly local_cidrs='${gwlb_return_cidrs},${local_delivery_cidrs}'
+readonly tailscale_bin="$${TAILSCALE_BIN:-/usr/bin/tailscale}"
+readonly timeout_bin="$${TIMEOUT_BIN:-/usr/bin/timeout}"
+readonly jq_bin="$${JQ_BIN:-/usr/bin/jq}"
+readonly ip_bin="$${IP_BIN:-/usr/sbin/ip}"
+readonly systemctl_bin="$${SYSTEMCTL_BIN:-/usr/bin/systemctl}"
+readonly sysctl_bin="$${SYSCTL_BIN:-/usr/sbin/sysctl}"
+readonly iptables_save_bin="$${IPTABLES_SAVE_BIN:-/usr/sbin/iptables-save}"
+readonly ip6tables_save_bin="$${IP6TABLES_SAVE_BIN:-/usr/sbin/ip6tables-save}"
+readonly nft_bin="$${NFT_BIN:-/usr/sbin/nft}"
+readonly sha256_bin="$${SHA256_BIN:-/usr/bin/sha256sum}"
+readonly envelope_bin="$${ENVELOPE_BIN:-/usr/local/bin/envelope}"
+readonly sleep_bin="$${SLEEP_BIN:-/usr/bin/sleep}"
+readonly max_attempts="$${PREFLIGHT_MAX_ATTEMPTS:-36}"
+readonly retry_seconds="$${PREFLIGHT_RETRY_SECONDS:-5}"
+
+host_contract_is_read_only_ready() {
+  "$systemctl_bin" is-active --quiet envelope-host-network.service || return 1
+  [[ $("$sysctl_bin" -n net.ipv4.ip_forward) == 1 ]] || return 1
+  [[ $("$sysctl_bin" -n net.ipv6.conf.all.forwarding) == 1 ]] || return 1
+  for iface in '${underlay_iface}' '${tailscale_iface}'; do
+    [[ $("$sysctl_bin" -n "net.ipv4.conf.$iface.rp_filter") == 0 ]] || return 1
+  done
+  "$nft_bin" -j list ruleset |
+    "$jq_bin" -e '.nftables | length == 1 and .[0].metainfo != null' >/dev/null || return 1
+  for save_bin in "$iptables_save_bin" "$ip6tables_save_bin"; do
+    rules=$("$save_bin") || return 1
+    [[ $(grep -Ec -- '^-A FORWARD -j ENVELOPE-FORWARD$' <<<"$rules") == 1 ]] || return 1
+    [[ $(grep -Ec -- '^-A FORWARD -j ENVELOPE-MSS$' <<<"$rules") == 1 ]] || return 1
+    for direction in \
+      '${underlay_iface} ${tailscale_iface}' \
+      '${tailscale_iface} ${underlay_iface}' \
+      '${tun_name} ${tailscale_iface}' \
+      '${tailscale_iface} ${tun_name}'; do
+      read -r input output <<<"$direction"
+      grep -Fqx -- "-A ENVELOPE-FORWARD -i $input -o $output -j ACCEPT" <<<"$rules" || return 1
+      grep -F -- "-A ENVELOPE-MSS -i $input -o $output -p tcp" <<<"$rules" >/dev/null || return 1
+    done
+  done
+}
+
+for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+  if "$systemctl_bin" is-active --quiet tailscaled.service &&
+    host_contract_is_read_only_ready &&
+    "$tailscale_bin" version | grep -Eq "^$expected_version([[:space:]]|$)" &&
+    "$timeout_bin" 5 "$tailscale_bin" status --json |
+      "$jq_bin" -e '(.Version | startswith("1.80.")) and (.TUN == true) and (.BackendState == "Running") and ((.Health | length) == 0)' >/dev/null; then
+    ready=true
+    IFS=',' read -ra advertised <<<"$local_cidrs"
+    for cidr in "$${advertised[@]}"; do
+      [[ -z "$cidr" ]] && continue
+      if ! "$timeout_bin" 5 "$tailscale_bin" status --json |
+        "$jq_bin" -e --arg cidr "$cidr" '(.Self.AllowedIPs // []) | index($cidr) != null' >/dev/null; then
+        ready=false
+      fi
+    done
+    IFS=',' read -ra remotes <<<"$remote_cidrs"
+    for cidr in "$${remotes[@]}"; do
+      [[ -z "$cidr" ]] && continue
+      if ! "$ip_bin" -j route show table 52 "$cidr" |
+        "$jq_bin" -e --arg cidr "$cidr" 'any(.[]; .dst == $cidr and .dev == "${tailscale_iface}" and ((.type // "unicast") == "unicast"))' >/dev/null; then
+        ready=false
+      fi
+      if ! "$timeout_bin" 5 "$tailscale_bin" status --json |
+        "$jq_bin" -e --arg cidr "$cidr" '[.Peer[]? | (.PrimaryRoutes // [])[]] | index($cidr) != null' >/dev/null; then
+        ready=false
+      fi
+    done
+    if [[ "$ready" == true ]]; then
+      printf '%s  %s\n' '${artifact_sha256}' "$envelope_bin" | "$sha256_bin" -c - >/dev/null
+      exit 0
+    fi
+  fi
+  "$sleep_bin" "$retry_seconds"
+done
+printf '%s\n' 'bounded Envelope preflight timed out; inspect envelope-diagnostics' >&2
+exit 1
+PREFLIGHT
+chmod 0755 /usr/local/sbin/envelope-preflight
+
+cat >/usr/local/sbin/envelope-redact <<'REDACT'
+#!/usr/bin/env bash
+set -euo pipefail
+sed -E \
+  -e 's/tskey-[A-Za-z0-9_-]+/[REDACTED_TAILSCALE_KEY]/g' \
+  -e 's/(access[_-]?key|secret|token|auth[_-]?key)(["= :]+)[^ ,"}]+/\1\2[REDACTED]/Ig'
+REDACT
+chmod 0755 /usr/local/sbin/envelope-redact
+
+cat >/usr/local/sbin/envelope-diagnostics <<'DIAGNOSTICS'
+#!/usr/bin/env bash
+set -euo pipefail
+{
+printf 'site=%s run=%s\n' '${site}' '${run_name}'
+cloud-init status --long 2>&1 || true
+systemctl --no-pager --full status tailscaled.service envelope-host-network.service envelope.service 2>&1 || true
+journalctl --no-pager -n 100 -u cloud-init.service -u cloud-config.service -u cloud-final.service 2>&1 || true
+journalctl --no-pager -n 100 -u tailscaled.service -u envelope-host-network.service -u envelope.service 2>&1 || true
+/usr/bin/timeout 5 /usr/bin/tailscale status --json 2>/dev/null |
+  /usr/bin/jq '{Version,TUN,BackendState,Health,Self:(.Self|{Online,AllowedIPs,PrimaryRoutes}),Peer:[.Peer[]?|{Online,AllowedIPs,PrimaryRoutes,InNetworkMap,InMagicSock,InEngine}]}' || true
+/usr/sbin/ip -j link show '${underlay_iface}' '${tailscale_iface}' '${tun_name}' 2>&1 || true
+/usr/sbin/ip -j rule show 2>&1 || true
+/usr/sbin/ip -j route show table all 2>&1 || true
+/usr/sbin/iptables-save 2>&1 || true
+/usr/sbin/ip6tables-save 2>&1 || true
+/usr/sbin/nft -j list ruleset 2>&1 || true
+curl --fail --silent --show-error --max-time 5 http://127.0.0.1:9090/healthz 2>&1 || true
+} | /usr/local/sbin/envelope-redact
+DIAGNOSTICS
+chmod 0755 /usr/local/sbin/envelope-diagnostics
+
+if ! getent group envelope >/dev/null; then groupadd --system envelope; fi
+if ! getent passwd envelope >/dev/null; then
+  useradd --system --gid envelope --home-dir /nonexistent --shell /sbin/nologin envelope
+fi
+cat >/etc/tmpfiles.d/envelope.conf <<'TMPFILES'
+f /run/envelope-routing.lock 0600 envelope envelope -
+TMPFILES
+systemd-tmpfiles --create /etc/tmpfiles.d/envelope.conf
+
+cat >/etc/systemd/system/envelope.service <<'ENVELOPE_UNIT'
+[Unit]
+Description=Envelope AWS GWLB appliance
+After=cloud-final.service network-online.target tailscaled.service envelope-host-network.service
+Wants=network-online.target tailscaled.service
+Requires=envelope-host-network.service
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=envelope
+Group=envelope
+EnvironmentFile=/etc/envelope/site.env
+EnvironmentFile=/etc/envelope/artifact.env
+ExecStartPre=/usr/local/sbin/envelope-preflight
+ExecStart=/usr/local/bin/envelope
+Restart=on-failure
+RestartSec=3s
+TimeoutStartSec=210s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=yes
+PrivateDevices=no
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/run
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+ENVELOPE_UNIT
+
+systemctl daemon-reload
+systemctl enable envelope-host-network.service envelope.service
+systemctl start --no-block envelope.service
+
+printf 'Envelope bootstrap staged for site=%s artifact=%s revision=%s\n' "$site" "$expected_sha256" '${artifact_revision}'

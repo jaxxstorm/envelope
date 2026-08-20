@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2016 # Terraform replaces these single-quoted template expressions.
+set -euo pipefail
+umask 077
+
+readonly root="$${ENVELOPE_INSTALL_ROOT:-}"
+readonly aws_bin="$${AWS_BIN:-/usr/bin/aws}"
+readonly systemctl_bin="$${SYSTEMCTL_BIN:-/usr/bin/systemctl}"
+readonly sha256_bin="$${SHA256_BIN:-/usr/bin/sha256sum}"
+readonly install_bin="$${INSTALL_BIN:-/usr/bin/install}"
+readonly mv_bin="$${MV_BIN:-/usr/bin/mv}"
+readonly expected_sha256='${artifact_sha256}'
+readonly artifact_uri='s3://${artifact_bucket}/${artifact_key}'
+readonly artifact_region='${artifact_region}'
+readonly target="$root/usr/local/bin/envelope"
+readonly library_dir="$root/usr/local/lib/envelope"
+readonly config_dir="$root/etc/envelope"
+
+"$systemctl_bin" disable --now envelope.service >/dev/null 2>&1 || true
+"$install_bin" -d -m 0755 "$root/usr/local/bin" "$library_dir" "$config_dir"
+download_path=$(mktemp "$library_dir/download.XXXXXX")
+staged_path=$(mktemp "$library_dir/install.XXXXXX")
+cleanup_download() {
+  rm -f "$download_path" "$staged_path"
+}
+trap cleanup_download EXIT
+
+AWS_PAGER='' AWS_MAX_ATTEMPTS=5 "$aws_bin" s3 cp --only-show-errors --region "$artifact_region" "$artifact_uri" "$download_path"
+actual_sha256=$("$sha256_bin" "$download_path" | cut -d ' ' -f 1)
+if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+  printf 'artifact checksum mismatch for %s\n' "$artifact_uri" >&2
+  exit 1
+fi
+"$install_bin" -m 0755 "$download_path" "$staged_path"
+"$mv_bin" -f "$staged_path" "$target"
+
+cat >"$config_dir/artifact.env" <<'ARTIFACT'
+ENVELOPE_DEPLOYED_ARTIFACT_SHA256=${artifact_sha256}
+ENVELOPE_DEPLOYED_ARTIFACT_REVISION=${artifact_revision}
+ENVELOPE_DEPLOYED_ARTIFACT_VERSION=${artifact_version}
+ENVELOPE_DEPLOYED_ARTIFACT_ARCHITECTURE=${artifact_architecture}
+ARTIFACT
+chmod 0644 "$config_dir/artifact.env"
+printf 'installed checksum-verified Envelope artifact %s\n' "$expected_sha256"

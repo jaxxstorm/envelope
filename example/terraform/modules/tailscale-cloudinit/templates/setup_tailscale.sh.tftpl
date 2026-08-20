@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+readonly resolver='${auth_key}'
+readonly expected_version='${package_version}'
+readonly max_retries='${max_retries}'
+readonly retry_delay='${retry_delay}'
+
+resolve_auth_key() {
+  case "$resolver" in
+    command:*) /bin/sh -c "$${resolver#command:}" | /usr/bin/tr -d '\n' ;;
+    *) printf '%s\n' 'protected auth-key resolver must use command:' >&2; return 1 ;;
+  esac
+}
+
+/usr/bin/tailscale version | /usr/bin/grep -Eq "^$expected_version([[:space:]]|$)"
+/usr/bin/systemctl enable --now tailscaled.service
+
+for ((attempt = 1; attempt <= max_retries; attempt++)); do
+  auth_key=$(resolve_auth_key)
+  if [[ -z "$auth_key" ]]; then
+    printf '%s\n' 'runtime auth-key resolver returned no material' >&2
+    exit 1
+  fi
+  if /usr/bin/tailscale up \
+      --auth-key="$auth_key" \
+      --hostname='${hostname}' \
+      --advertise-tags='${advertise_tags}' \
+      --advertise-routes='${advertise_routes}' \
+      --accept-routes='${accept_routes}' \
+      --snat-subnet-routes='${snat_subnet_routes}' \
+      --netfilter-mode='${netfilter_mode}' \
+      --timeout='${timeout}'; then
+    unset auth_key
+    exit 0
+  fi
+  unset auth_key
+  /usr/bin/sleep "$retry_delay"
+done
+
+printf '%s\n' 'Tailscale authentication exhausted retries' >&2
+exit 1

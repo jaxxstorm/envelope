@@ -6,44 +6,40 @@ import (
 	"time"
 
 	"github.com/jaxxstorm/envelope/internal/config"
-	"github.com/jaxxstorm/envelope/internal/metrics"
-	"github.com/prometheus/client_golang/prometheus"
-	"go.uber.org/zap"
 )
 
 func BenchmarkEnsureManagedIdempotent(b *testing.B) {
-	cfg, err := config.Parse([]string{
-		"--udp-bind=:6081",
-		"--metrics-addr=:9090",
-		"--routing-mode=manage",
-		"--protected-cidrs=172.16.0.0/16",
-	})
-	if err != nil {
-		b.Fatalf("parse config: %v", err)
+	cfg := routingConfig(b, config.RoutingModeManage)
+	ops := readyFakeOps(cfg)
+	ops.recordQueries = false
+	mgr, _ := newTestManager(b, cfg, ops, time.Hour)
+	if err := mgr.Initialize(context.Background()); err != nil || !mgr.Ready() {
+		b.Fatalf("initialize: %v (%s)", err, mgr.HealthReason())
 	}
-
-	ops := newFakeOps()
-	ops.ifaces[cfg.TunName] = true
-	ops.ifaces[cfg.TailscaleIface] = true
-	ops.sysctls[ipv4ForwardingPath] = true
-	for _, rt := range buildTargets(cfg.EffectiveProtectedCIDRs()) {
-		ops.rules[ruleKey(rt.family, cfg.RoutingRulePriority, cfg.TailscaleIface, rt.cidr, cfg.RoutingTableID)] = struct{}{}
-		ops.routes[routeKey(rt.family, cfg.RoutingTableID, rt.cidr, cfg.TunName)] = struct{}{}
-	}
-
-	reg := prometheus.NewRegistry()
-	m := metrics.New(reg)
-	rm, err := newManager(cfg, zap.NewNop(), m, ops, time.Millisecond)
-	if err != nil {
-		b.Fatalf("new manager: %v", err)
-	}
-	mgr := rm.(*manager)
 
 	ctx := context.Background()
+	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		if _, err := mgr.ensureManaged(ctx, false); err != nil {
 			b.Fatalf("ensure managed: %v", err)
+		}
+	}
+}
+
+func BenchmarkEffectiveRouteValidation(b *testing.B) {
+	cfg := routingConfig(b, config.RoutingModeVerify)
+	ops := readyFakeOps(cfg)
+	ops.recordQueries = false
+	addEquivalentReturnState(cfg, ops)
+	mgr, _ := newTestManager(b, cfg, ops, time.Hour)
+
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if err := mgr.verify(ctx); err != nil {
+			b.Fatalf("verify: %v", err)
 		}
 	}
 }

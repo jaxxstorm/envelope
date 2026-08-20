@@ -12,6 +12,8 @@ UDP_ADDR = (
     os.environ.get("E2E_UDP_HOST", "127.0.0.1"),
     int(os.environ.get("E2E_UDP_PORT", "6081")),
 )
+GWLB_PEER_IP = os.environ.get("E2E_GWLB_PEER_IP", "127.0.0.2")
+GWLB_FLOW_PORT = int(os.environ.get("E2E_GWLB_FLOW_PORT", "40000"))
 PCAP_OUT = "/tmp/envelope_ingress.pcap"
 
 
@@ -72,7 +74,14 @@ def decode_geneve(pkt):
     hdr_len = 8 + opt_len
     if len(pkt) < hdr_len:
         raise ValueError("geneve header too short")
-    return pkt[hdr_len:]
+    vni = int.from_bytes(pkt[4:7], "big")
+    return vni, pkt[8:hdr_len], pkt[hdr_len:]
+
+
+def geneve_tlv(option_class, option_type, data):
+    if len(data) % 4:
+        raise ValueError("option data must be word aligned")
+    return struct.pack("!HBB", option_class, option_type, len(data) // 4) + data
 
 
 def setup_tun():
@@ -85,7 +94,6 @@ def main():
     require_root()
     require_cmd("ip")
     require_cmd("tcpdump")
-    require_cmd("ping")
 
     setup_tun()
 
@@ -93,16 +101,31 @@ def main():
         os.unlink(PCAP_OUT)
 
     tcpdump = subprocess.Popen(["tcpdump", "-i", TUN_NAME, "-c", "1", "-w", PCAP_OUT])
+    time.sleep(0.2)
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("127.0.0.1", 0))
-    sock.settimeout(3)
+    ingress = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ingress.bind((GWLB_PEER_IP, GWLB_FLOW_PORT))
+    ingress.settimeout(0.1)
+    returned = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    returned.bind((GWLB_PEER_IP, 6081))
+    returned.settimeout(3)
 
-    # Seed flow mapping using ICMP so the ping flow matches.
-    icmp_payload = b"\x08\x00\x00\x00\x00\x00\x00\x00"
-    inner = ipv4_header(20 + len(icmp_payload), proto=1) + icmp_payload
-    pkt = geneve_packet(1, inner)
-    sock.sendto(pkt, UDP_ADDR)
+    # Inject an echo request toward the local TUN address. The kernel emits the
+    # reverse echo reply into TUN, which must return on the original GWLB port
+    # orientation rather than to this ingress socket.
+    icmp = struct.pack("!BBHHH", 8, 0, 0, 1, 1)
+    icmp = icmp[:2] + struct.pack("!H", checksum(icmp)) + icmp[4:]
+    inner = ipv4_header(
+        20 + len(icmp),
+        proto=1,
+        src=b"\x0a\x00\x00\x02",
+        dst=b"\x0a\x00\x00\x01",
+    ) + icmp
+    options = (
+        geneve_tlv(0x0108, 1, bytes.fromhex("1122334455667788"))
+        + geneve_tlv(0x0108, 3, bytes.fromhex("deadbeef"))
+    )
+    ingress.sendto(geneve_packet(0, inner, options), UDP_ADDR)
 
     try:
         tcpdump.wait(timeout=3)
@@ -113,23 +136,34 @@ def main():
     if not os.path.exists(PCAP_OUT) or os.path.getsize(PCAP_OUT) == 0:
         sys.exit("no packet captured on tun")
 
-    # Trigger egress by sending a routed packet to the TUN interface.
-    run(["ping", "-c", "1", "-W", "1", "10.0.0.2"], check=False)
-
     try:
-        data, _ = sock.recvfrom(4096)
+        data, peer = returned.recvfrom(4096)
     except socket.timeout:
-        sys.exit("timeout waiting for geneve response")
+        sys.exit("timeout waiting for GWLB-oriented return packet on peer UDP/6081")
+
+    if peer != ("127.0.0.1", GWLB_FLOW_PORT):
+        sys.exit(f"wrong return source {peer!r}, want ('127.0.0.1', {GWLB_FLOW_PORT})")
 
     try:
-        payload = decode_geneve(data)
+        ingress.recvfrom(4096)
+    except socket.timeout:
+        pass
+    else:
+        sys.exit("received ordinary UDP reply on ingress flow port; GWLB orientation is wrong")
+
+    try:
+        vni, returned_options, payload = decode_geneve(data)
     except ValueError as e:
         sys.exit(f"invalid geneve response: {e}")
 
-    if len(payload) == 0:
-        sys.exit("empty geneve payload")
+    if vni != 0 or returned_options != options:
+        sys.exit("return packet changed VNI or ordered AWS options")
+    if len(payload) < 28 or payload[12:16] != b"\x0a\x00\x00\x01" or payload[16:20] != b"\x0a\x00\x00\x02":
+        sys.exit("return inner packet is not the reverse flow")
+    if payload[20] != 0:
+        sys.exit("return inner packet is not an ICMP echo reply")
 
-    print("e2e ok")
+    print("e2e ok: 127.0.0.1:%d -> %s:6081" % (GWLB_FLOW_PORT, GWLB_PEER_IP))
 
 
 if __name__ == "__main__":

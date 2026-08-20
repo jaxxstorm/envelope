@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+readonly expected_version='${package_version}'
+readonly package_url='${package_url}'
+readonly expected_sha256='${package_sha256}'
+readonly max_retries='${max_retries}'
+readonly retry_delay='${retry_delay}'
+readonly package_path=/var/tmp/tailscale-reviewed.rpm
+readonly key_path=/var/tmp/tailscale-repo.gpg
+
+# shellcheck disable=SC2317 # Invoked indirectly by the EXIT trap.
+cleanup() {
+  rm -f "$package_path" "$key_path"
+}
+trap cleanup EXIT
+
+printf '%s' '${signing_key}' | /usr/bin/base64 --decode >"$key_path"
+/usr/bin/rpm --import "$key_path"
+
+for ((attempt = 1; attempt <= max_retries; attempt++)); do
+  if /usr/bin/curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+      --output "$package_path" "$package_url"; then
+    actual_sha256=$(/usr/bin/sha256sum "$package_path" | /usr/bin/cut -d ' ' -f 1)
+    if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+      printf '%s\n' 'reviewed Tailscale package checksum mismatch' >&2
+      exit 1
+    fi
+    signature_output=$(/usr/bin/rpm --checksig --verbose "$package_path")
+    printf '%s\n' "$signature_output"
+    [[ $(/usr/bin/grep -c 'V4 RSA/SHA256 Signature, key ID 957f5868: OK' <<<"$signature_output") -eq 2 ]]
+    /usr/bin/dnf install -y "$package_path"
+    /usr/bin/tailscale version | /usr/bin/grep -Eq "^$expected_version([[:space:]]|$)"
+    exit 0
+  fi
+  /usr/bin/sleep "$retry_delay"
+done
+
+printf '%s\n' 'reviewed Tailscale package download exhausted retries' >&2
+exit 1

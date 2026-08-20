@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -22,6 +23,7 @@ type Runner interface {
 	Run(context.Context) error
 	HealthHandler(http.ResponseWriter, *http.Request)
 	Ready() bool
+	HealthReason() string
 	Close()
 }
 
@@ -33,19 +35,7 @@ func Run(ctx context.Context, cfg *config.Config, log *zap.Logger) error {
 }
 
 func run(ctx context.Context, cfg *config.Config, log *zap.Logger, factory runnerFactory, newRouting routingFactory) error {
-	log.Info("starting envelope",
-		zap.String("udp_bind", cfg.UDPBind),
-		zap.String("tun_name", cfg.TunName),
-		zap.Int("tun_mtu", cfg.TunMTU),
-		zap.String("tailscale_iface", cfg.TailscaleIface),
-		zap.String("routing_mode", string(cfg.RoutingMode)),
-		zap.Strings("protected_cidrs", cfg.EffectiveProtectedCIDRs()),
-		zap.Int("routing_table_id", cfg.RoutingTableID),
-		zap.Int("routing_rule_priority", cfg.RoutingRulePriority),
-		zap.String("metrics_addr", cfg.MetricsAddr),
-		zap.Any("vni", cfg.VNI),
-		zap.Duration("flow_timeout", cfg.FlowTimeout),
-	)
+	logStartup(cfg, log)
 
 	reg := prometheus.NewRegistry()
 	m := metrics.New(reg)
@@ -72,6 +62,7 @@ func run(ctx context.Context, cfg *config.Config, log *zap.Logger, factory runne
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/healthz", newHealthHandler(dp, routeMgr, log))
+	mux.HandleFunc("/debug/routing", newRoutingStatusHandler(routeMgr))
 
 	srv := &http.Server{
 		Addr:              cfg.MetricsAddr,
@@ -108,6 +99,38 @@ func run(ctx context.Context, cfg *config.Config, log *zap.Logger, factory runne
 	return g.Wait()
 }
 
+func newRoutingStatusHandler(routeMgr routing.Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(routeMgr.Status()); err != nil {
+			http.Error(w, "encode routing status", http.StatusInternalServerError)
+		}
+	}
+}
+
+func logStartup(cfg *config.Config, log *zap.Logger) {
+	log.Info("starting envelope",
+		zap.String("udp_bind", cfg.UDPBind),
+		zap.String("tun_name", cfg.TunName),
+		zap.Int("tun_mtu", cfg.TunMTU),
+		zap.String("tailscale_iface", cfg.TailscaleIface),
+		zap.String("underlay_interface", cfg.UnderlayIface),
+		zap.String("routing_mode", string(cfg.RoutingMode)),
+		zap.Strings("gwlb_return_cidrs", cfg.EffectiveGWLBReturnCIDRs()),
+		zap.Strings("local_delivery_cidrs", cfg.EffectiveLocalDeliveryCIDRs()),
+		zap.Strings("remote_tailnet_cidrs", cfg.EffectiveRemoteTailnetCIDRs()),
+		zap.Int("routing_table_id", cfg.RoutingTableID),
+		zap.Int("routing_rule_priority", cfg.RoutingRulePriority),
+		zap.String("metrics_addr", cfg.MetricsAddr),
+		zap.Any("vni", cfg.VNI),
+		zap.Int("flow_capacity", cfg.FlowCapacity),
+		zap.Duration("tcp_flow_timeout", cfg.TCPFlowTimeout),
+		zap.Duration("udp_flow_timeout", cfg.UDPFlowTimeout),
+		zap.Duration("other_flow_timeout", cfg.OtherFlowTimeout),
+		zap.Int("persistent_error_threshold", cfg.PersistentErrorThreshold),
+	)
+}
+
 type datapathRunner struct {
 	*datapath.Datapath
 }
@@ -135,12 +158,12 @@ func newHealthHandler(dp Runner, routeMgr routing.Manager, log *zap.Logger) http
 		reason := "ok"
 		if !dp.Ready() {
 			status = http.StatusServiceUnavailable
-			body = "datapath not ready"
-			reason = "datapath_not_ready"
+			reason = dp.HealthReason()
+			body = "datapath not ready: " + reason
 		} else if routeMgr.Mode() != config.RoutingModeOff && !routeMgr.Ready() {
 			status = http.StatusServiceUnavailable
-			body = "routing not ready"
-			reason = "routing_not_ready"
+			reason = routeMgr.HealthReason()
+			body = "routing not ready: " + reason
 		}
 
 		if debug {

@@ -10,7 +10,7 @@ context: |
   - Language: Go (preferred) with no cgo/c bindings.
   - OS: Linux only (initially).
   - Tailscale integration:
-    - Preferred mode: Envelope creates/owns a TUN device (envelope0) and runs tailscaled with --tun=envelope0.
+    - Envelope creates/owns envelope0 and tailscaled independently owns tailscale0; Linux routing connects them.
   - AWS: Targeted for deployment behind GWLB as a transparent appliance endpoint.
 
   Networking conventions & assumptions:

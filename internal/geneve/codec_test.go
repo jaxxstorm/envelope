@@ -2,6 +2,7 @@ package geneve
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 )
 
@@ -33,8 +34,8 @@ func TestEncodeDecodeMinimal(t *testing.T) {
 
 func TestEncodeDecodeOptions(t *testing.T) {
 	payload := []byte{0x60, 0x00, 0x00, 0x00}
-	options := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
-	hdr := Header{VNI: 0x010203, Options: options}
+	options := []byte{0x01, 0x08, 0x83, 0x01, 0xde, 0xad, 0xbe, 0xef}
+	hdr := Header{VNI: 0x010203, Options: options, Critical: true, OAM: true}
 	buf := make([]byte, 128)
 	n, err := Encode(buf, hdr, payload)
 	if err != nil {
@@ -56,6 +57,12 @@ func TestEncodeDecodeOptions(t *testing.T) {
 	if decoded.Protocol != ProtoIPv6 {
 		t.Fatalf("unexpected protocol: %x", decoded.Protocol)
 	}
+	if !decoded.Critical {
+		t.Fatalf("expected base critical bit")
+	}
+	if !decoded.OAM || decoded.FixedFlags() != FlagOAM|FlagCritical {
+		t.Fatalf("fixed flags were not retained: %#x", decoded.FixedFlags())
+	}
 }
 
 func TestEncodeInvalidOptions(t *testing.T) {
@@ -66,11 +73,30 @@ func TestEncodeInvalidOptions(t *testing.T) {
 	}
 }
 
+func TestFixedReservedBitsIgnoredAndZeroed(t *testing.T) {
+	packet := []byte{0, 0x3f, 0x08, 0x00, 0, 0, 0, 0xff, 0x45}
+	header, payload, err := Decode(packet)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if header.FixedFlags() != 0 {
+		t.Fatalf("reserved flags leaked into header: %#x", header.FixedFlags())
+	}
+	encoded := make([]byte, 32)
+	n, err := Encode(encoded, header, payload)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if encoded[1] != 0 || encoded[7] != 0 {
+		t.Fatalf("reserved bytes were not zeroed: %x", encoded[:n])
+	}
+}
+
 func TestDecodeOversizedHeader(t *testing.T) {
 	pkt := make([]byte, BaseHeaderLen)
 	pkt[0] = byte((Version << 6) | 1) // claims 4 bytes of options
 	_, _, err := Decode(pkt)
-	if err == nil {
-		t.Fatalf("expected error for short packet")
+	if !errors.Is(err, ErrOptionsStructure) {
+		t.Fatalf("got %v, want options structure error", err)
 	}
 }

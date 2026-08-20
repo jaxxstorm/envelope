@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 
 	"github.com/jaxxstorm/envelope/internal/app"
@@ -13,7 +14,18 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
+var (
+	version        = "dev"
+	revision       = "unknown"
+	buildDate      = "unknown"
+	sourceModified = "unknown"
+)
+
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--version" {
+		fmt.Println(versionString())
+		return
+	}
 	cfg, err := config.Parse(os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -35,6 +47,10 @@ func main() {
 		log.Error("envelope exited with error", zap.Error(err))
 		os.Exit(1)
 	}
+}
+
+func versionString() string {
+	return fmt.Sprintf("envelope %s revision=%s modified=%s built=%s go=%s", version, revision, sourceModified, buildDate, runtime.Version())
 }
 
 func newLogger(level string) *zap.Logger {
