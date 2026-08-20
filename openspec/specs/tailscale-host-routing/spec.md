@@ -67,6 +67,10 @@ The system SHALL symbolically audit ordered policy rules and every selected rout
 - **WHEN** route lookup is evaluated for every boundary/source combination from `envelope0` to a remote Tailnet CIDR
 - **THEN** every result is unicast through `tailscale0` in table 52
 
+#### Scenario: Kernel cannot represent an asymmetric TUN lookup
+- **WHEN** Linux returns `EINVAL` or `EXDEV` for an ordinary-unicast IPv4 boundary lookup entering the configured Envelope TUN
+- **THEN** the supplementary result may be omitted only when the complete policy/FIB audit passes and effective reverse-path filtering is disabled through both `conf/all` and the Envelope interface
+
 #### Scenario: Remote route absent or shadowed
 - **WHEN** a remote Tailnet route is missing or another route wins effective lookup
 - **THEN** routing readiness is false and the affected CIDR is reported

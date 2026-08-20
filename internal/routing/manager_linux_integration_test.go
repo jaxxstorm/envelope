@@ -5,11 +5,15 @@ package routing
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -17,8 +21,10 @@ import (
 
 	"github.com/jaxxstorm/envelope/internal/config"
 	"github.com/jaxxstorm/envelope/internal/metrics"
+	"github.com/jaxxstorm/envelope/internal/tun"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"golang.org/x/sys/unix"
 )
 
 const routingNamespaceHelperEnv = "ENVELOPE_ROUTING_NAMESPACE_HELPER"
@@ -98,6 +104,102 @@ func TestRoutingNamespaceIPv6SourceSpecificRouteRejection(t *testing.T) {
 	)
 	if err == nil || !strings.Contains(err.Error(), "source-specific route") {
 		t.Fatalf("live source-specific route was not rejected by full-prefix audit: %v", err)
+	}
+}
+
+func TestRoutingNamespaceDisabledRPFilterTUNLookup(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root")
+	}
+	tools := make(map[string]string)
+	for _, command := range []string{"ip", "sysctl", "tcpdump"} {
+		path, err := exec.LookPath(command)
+		if err != nil {
+			t.Skipf("requires %s", command)
+		}
+		tools[command] = path
+	}
+
+	suffix := strconv.Itoa(os.Getpid())
+	routerNS := "env-ar-" + suffix
+	destinationNS := "env-ad-" + suffix
+	underlayNS := "env-au-" + suffix
+	for _, namespace := range []string{routerNS, destinationNS, underlayNS} {
+		runIntegrationCommand(t, tools["ip"], "netns", "add", namespace)
+		namespace := namespace
+		t.Cleanup(func() { _ = exec.Command(tools["ip"], "netns", "del", namespace).Run() })
+		runIntegrationCommand(t, tools["ip"], "-n", namespace, "link", "set", "lo", "up")
+	}
+
+	createVethPair(t, routerNS, destinationNS, "tailscale0", "destination0")
+	createVethPair(t, routerNS, underlayNS, "underlay0", "underlay-peer0")
+	for _, address := range [][3]string{
+		{routerNS, "tailscale0", "10.30.0.254/24"},
+		{destinationNS, "destination0", "10.30.0.1/24"},
+		{routerNS, "underlay0", "192.0.2.1/24"},
+		{underlayNS, "underlay-peer0", "192.0.2.2/24"},
+	} {
+		runIntegrationCommand(t, tools["ip"], "-n", address[0], "addr", "add", address[2], "dev", address[1])
+	}
+	device, err := inIntegrationNetworkNamespace(routerNS, func() (*tun.Device, error) {
+		return tun.Open("envelope0", 1280)
+	})
+	if err != nil {
+		t.Fatalf("open namespaced TUN: %v", err)
+	}
+	t.Cleanup(func() { _ = device.Close() })
+
+	runIntegrationCommand(t, tools["ip"], "-n", routerNS, "route", "add", "10.10.0.0/24", "via", "192.0.2.2", "dev", "underlay0")
+	runIntegrationCommand(t, tools["ip"], "-n", routerNS, "route", "add", "table", "52", "10.30.0.0/24", "dev", "tailscale0")
+	runIntegrationCommand(t, tools["ip"], "-n", routerNS, "rule", "add", "priority", "5200", "iif", "envelope0", "table", "52")
+	for _, setting := range []string{
+		"net.ipv4.ip_forward=1",
+		"net.ipv4.conf.all.rp_filter=0",
+		"net.ipv4.conf.envelope0.rp_filter=0",
+		"net.ipv4.conf.tailscale0.rp_filter=0",
+		"net.ipv4.conf.underlay0.rp_filter=0",
+	} {
+		runIntegrationCommand(t, tools["ip"], "netns", "exec", routerNS, tools["sysctl"], "-q", "-w", setting)
+	}
+
+	ops := newSystemOps().(*systemOpsLinux)
+	ops.paths.ip = tools["ip"]
+	ops.runner = integrationNamespaceRunner{ipPath: tools["ip"], namespace: routerNS}
+	result, err := ops.RouteLookup(context.Background(), routeQuery{
+		Family: "-4", Destination: "10.30.0.1", Source: "10.10.0.1", Input: "envelope0",
+	})
+	if err != nil && !errors.Is(err, errSupplementaryRouteLookupUnavailable) {
+		t.Fatalf("asymmetric route lookup error=%v", err)
+	}
+	if err == nil && (result.Device != "tailscale0" || result.Table != config.TailscaleRouteTableID || normalizedRouteType(result.Type) != "unicast") {
+		t.Fatalf("asymmetric route lookup result=%+v, want tailscale0 table 52 unicast", result)
+	}
+
+	payload := []byte("asymmetric-tun-packet")
+	packet := integrationIPv4UDPPacket(net.ParseIP("10.10.0.1"), net.ParseIP("10.30.0.1"), 18083, 18084, payload)
+	captureCtx, cancelCapture := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelCapture()
+	capture := exec.CommandContext(captureCtx, tools["ip"], "netns", "exec", destinationNS, tools["tcpdump"], "-l", "-nn", "-i", "destination0", "-c", "1", "src host 10.10.0.1 and dst host 10.30.0.1")
+	var captureOutput bytes.Buffer
+	capture.Stdout = &captureOutput
+	capture.Stderr = &captureOutput
+	if err := capture.Start(); err != nil {
+		t.Fatalf("start asymmetric packet capture: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	for range 5 {
+		if _, err := device.Write(packet); err != nil {
+			t.Fatalf("inject TUN packet: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := capture.Wait(); err != nil {
+		routerLinks := integrationCommandOutput(t, tools["ip"], "-n", routerNS, "-s", "link", "show")
+		destinationLinks := integrationCommandOutput(t, tools["ip"], "-n", destinationNS, "-s", "link", "show")
+		t.Fatalf("disabled reverse-path TUN packet was dropped: %v: %s\nrouter:\n%s\ndestination:\n%s", err, captureOutput.String(), routerLinks, destinationLinks)
+	}
+	if !strings.Contains(captureOutput.String(), "10.10.0.1.18083 > 10.30.0.1.18084") {
+		t.Fatalf("unexpected asymmetric packet capture: %s", captureOutput.String())
 	}
 }
 
@@ -389,6 +491,58 @@ func runRoutingNamespaceHelper(t *testing.T) {
 	if err := mgr.releaseLock(); err != nil {
 		t.Fatalf("release lock: %v", err)
 	}
+}
+
+func inIntegrationNetworkNamespace[T any](namespace string, operation func() (T, error)) (T, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	var zero T
+	current, err := os.Open("/proc/self/ns/net")
+	if err != nil {
+		return zero, err
+	}
+	defer current.Close()
+	target, err := os.Open("/var/run/netns/" + namespace)
+	if err != nil {
+		return zero, err
+	}
+	defer target.Close()
+	if err := unix.Setns(int(target.Fd()), unix.CLONE_NEWNET); err != nil {
+		return zero, err
+	}
+	value, operationErr := operation()
+	restoreErr := unix.Setns(int(current.Fd()), unix.CLONE_NEWNET)
+	return value, errors.Join(operationErr, restoreErr)
+}
+
+func integrationIPv4UDPPacket(source, destination net.IP, sourcePort, destinationPort uint16, payload []byte) []byte {
+	const ipv4HeaderLength = 20
+	const udpHeaderLength = 8
+	packet := make([]byte, ipv4HeaderLength+udpHeaderLength+len(payload))
+	packet[0] = 0x45
+	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
+	binary.BigEndian.PutUint16(packet[4:6], 1)
+	packet[8] = 64
+	packet[9] = 17
+	copy(packet[12:16], source.To4())
+	copy(packet[16:20], destination.To4())
+	binary.BigEndian.PutUint16(packet[10:12], integrationIPv4Checksum(packet[:ipv4HeaderLength]))
+	binary.BigEndian.PutUint16(packet[20:22], sourcePort)
+	binary.BigEndian.PutUint16(packet[22:24], destinationPort)
+	binary.BigEndian.PutUint16(packet[24:26], uint16(udpHeaderLength+len(payload)))
+	copy(packet[28:], payload)
+	return packet
+}
+
+func integrationIPv4Checksum(header []byte) uint16 {
+	var sum uint32
+	for offset := 0; offset < len(header); offset += 2 {
+		sum += uint32(binary.BigEndian.Uint16(header[offset : offset+2]))
+	}
+	for sum > 0xffff {
+		sum = sum&0xffff + sum>>16
+	}
+	return ^uint16(sum)
 }
 
 func createVethPair(t *testing.T, routerNS, peerNS, routerName, peerName string) {

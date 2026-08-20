@@ -300,6 +300,13 @@ func (s *systemOpsLinux) RouteLookup(ctx context.Context, query routeQuery) (rou
 	}
 	out, err := s.runIP(ctx, args...)
 	if err != nil {
+		// RTM_GETROUTE applies checks to TUN ingress queries that packet forwarding
+		// does not use with disabled rp_filter. Kernels report EINVAL or
+		// EXDEV when they cannot provide this supplementary result.
+		message := err.Error()
+		if query.Source != "" && query.Input != "" && (strings.Contains(message, "RTNETLINK answers: Invalid argument") || strings.Contains(message, "RTNETLINK answers: Invalid cross-device link")) {
+			return routeResult{}, fmt.Errorf("%w: %v", errSupplementaryRouteLookupUnavailable, err)
+		}
 		return routeResult{}, err
 	}
 	var routes []map[string]json.RawMessage

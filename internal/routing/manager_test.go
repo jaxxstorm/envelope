@@ -494,6 +494,95 @@ func TestManagedInitializeUsesStructuredCartesianValidation(t *testing.T) {
 	}
 }
 
+func TestSupplementaryLookupUnavailableDoesNotOverrideFullPrefixAudit(t *testing.T) {
+	tests := []struct {
+		name       string
+		lookupErr  error
+		shadowFIB  bool
+		inputRPF   int
+		wantReady  bool
+		wantReason string
+	}{
+		{
+			name:      "kernel ingress source validation",
+			lookupErr: fmt.Errorf("%w: RTNETLINK answers: Invalid cross-device link", errSupplementaryRouteLookupUnavailable),
+			wantReady: true,
+		},
+		{
+			name:       "loose reverse path remains fatal",
+			lookupErr:  fmt.Errorf("%w: RTNETLINK answers: Invalid cross-device link", errSupplementaryRouteLookupUnavailable),
+			inputRPF:   2,
+			wantReason: metrics.RoutingFailureReasonRouteUnaccepted,
+		},
+		{
+			name:       "generic lookup failure",
+			lookupErr:  errors.New("route command failed"),
+			wantReason: metrics.RoutingFailureReasonRouteUnaccepted,
+		},
+		{
+			name:       "full-prefix shadow remains fatal",
+			lookupErr:  fmt.Errorf("%w: RTNETLINK answers: Invalid cross-device link", errSupplementaryRouteLookupUnavailable),
+			shadowFIB:  true,
+			wantReason: metrics.RoutingFailureReasonRouteUnaccepted,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := routingConfig(t, config.RoutingModeVerify)
+			ops := readyFakeOps(cfg)
+			addEquivalentReturnState(cfg, ops)
+			remote := cfg.EffectiveRemoteTailnetCIDRs()[0]
+			ops.lookupErrors[prefixBoundaryAddresses(remote)[0]] = tt.lookupErr
+			ops.sysctls["/proc/sys/net/ipv4/conf/"+cfg.TunName+"/rp_filter"] = tt.inputRPF
+			if tt.shadowFIB {
+				addRouteToTable(ops, "10.30.0.64/26", routeEntry{Prefix: "10.30.0.64/26", Table: config.TailscaleRouteTableID, Type: "blackhole"})
+			}
+			mgr, _ := newTestManager(t, cfg, ops, time.Hour)
+			if err := mgr.Initialize(context.Background()); err != nil {
+				t.Fatalf("verify initialize: %v", err)
+			}
+			if mgr.Ready() != tt.wantReady || !tt.wantReady && mgr.HealthReason() != tt.wantReason {
+				t.Fatalf("ready=%v reason=%q, want ready=%v reason=%q", mgr.Ready(), mgr.HealthReason(), tt.wantReady, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestSupplementaryLookupSkipRequiresProvenIPv4TUNContext(t *testing.T) {
+	base := routeQuery{Family: "-4", Source: "10.10.0.1", Destination: "10.30.0.1", Input: "envelope0"}
+	tests := []struct {
+		name     string
+		mutate   func(*routeQuery, *fakeOps)
+		wantSkip bool
+	}{
+		{name: "ordinary IPv4 TUN", wantSkip: true},
+		{name: "IPv6", mutate: func(query *routeQuery, _ *fakeOps) {
+			query.Family, query.Source, query.Destination = "-6", "2001:db8:10::1", "2001:db8:30::1"
+		}},
+		{name: "different input", mutate: func(query *routeQuery, _ *fakeOps) { query.Input = "tailscale0" }},
+		{name: "special source", mutate: func(query *routeQuery, _ *fakeOps) { query.Source = "0.0.0.1" }},
+		{name: "special destination", mutate: func(query *routeQuery, _ *fakeOps) { query.Destination = "127.0.0.1" }},
+		{name: "global loose mode", mutate: func(_ *routeQuery, ops *fakeOps) { ops.sysctls[ipv4RPFilterAllPath] = 2 }},
+		{name: "input loose mode", mutate: func(query *routeQuery, ops *fakeOps) {
+			ops.sysctls["/proc/sys/net/ipv4/conf/"+query.Input+"/rp_filter"] = 2
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := routingConfig(t, config.RoutingModeVerify)
+			ops := readyFakeOps(cfg)
+			query := base
+			if tt.mutate != nil {
+				tt.mutate(&query, ops)
+			}
+			mgr, _ := newTestManager(t, cfg, ops, time.Hour)
+			if got := mgr.canSkipSupplementaryRouteLookup(query); got != tt.wantSkip {
+				t.Fatalf("canSkipSupplementaryRouteLookup(%+v)=%v, want %v", query, got, tt.wantSkip)
+			}
+		})
+	}
+}
+
 func TestVerifyModeNeverMutates(t *testing.T) {
 	cfg := routingConfig(t, config.RoutingModeVerify)
 	ops := readyFakeOps(cfg)

@@ -2026,8 +2026,8 @@ class CloudInitSandboxTest(unittest.TestCase):
         self.assertIn("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW", service_unit)
         self.assertIn("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW", service_unit)
         self.assertIn("ProtectKernelTunables=yes", service_unit)
-        self.assertIn("net.ipv4.conf.default.rp_filter = 2", rendered)
-        self.assertIn('"net.ipv4.conf.$envelope.rp_filter=2"', host)
+        self.assertIn("net.ipv4.conf.default.rp_filter = 0", rendered)
+        self.assertIn('"net.ipv4.conf.$envelope.rp_filter=0"', host)
         self.assertIn('"net.ipv4.conf.$iface.rp_filter=0"', host)
         self.assertIn('"$save_bin" -t "$table"', preflight)
         self.assertNotIn('rules=$("$save_bin")', preflight)
@@ -2179,7 +2179,7 @@ fi
                 """
 case "${@: -1}" in
   net.ipv4.ip_forward|net.ipv6.conf.all.forwarding) printf '%s\n' 1 ;;
-  net.ipv4.conf.envelope0.rp_filter) printf '%s\n' 2 ;;
+  net.ipv4.conf.envelope0.rp_filter) printf '%s\n' 0 ;;
   net.ipv4.conf.*.rp_filter) printf '%s\n' 0 ;;
   *) exit 1 ;;
 esac

@@ -33,7 +33,10 @@ const (
 	mssChainName             = "ENVELOPE-MSS"
 )
 
-var errMSSContract = errors.New("MSS contract validation failed")
+var (
+	errMSSContract                         = errors.New("MSS contract validation failed")
+	errSupplementaryRouteLookupUnavailable = errors.New("supplementary route lookup unavailable")
+)
 
 var forwardingDirections = [][2]string{
 	{"underlay", "tailscale"},
@@ -890,6 +893,15 @@ func (m *manager) verifyRoleLookups(ctx context.Context, audit *policyAuditor, d
 				query := routeQuery{Family: destination.family, Destination: destinationAddress, Source: sourceAddress, Input: input}
 				result, err := m.op.RouteLookup(ctx, query)
 				if err != nil {
+					if errors.Is(err, errSupplementaryRouteLookupUnavailable) && m.canSkipSupplementaryRouteLookup(query) {
+						m.log.Debug("supplementary route lookup unavailable after successful full-prefix audit",
+							zap.String("source", query.Source),
+							zap.String("destination", query.Destination),
+							zap.String("input", query.Input),
+							zap.Error(err),
+						)
+						continue
+					}
 					return fail(reason, "effective lookup %+v failed: %v", query, err)
 				}
 				if result.Device != expectedDevice || result.Table != expectedTable || normalizedRouteType(result.Type) != "unicast" {
@@ -899,6 +911,28 @@ func (m *manager) verifyRoleLookups(ctx context.Context, audit *policyAuditor, d
 		}
 	}
 	return nil
+}
+
+func (m *manager) canSkipSupplementaryRouteLookup(query routeQuery) bool {
+	if query.Family != "-4" || query.Input != m.cfg.TunName || !ordinaryUnicastAddress(query.Source) || !ordinaryUnicastAddress(query.Destination) {
+		return false
+	}
+	for _, path := range []string{ipv4RPFilterAllPath, "/proc/sys/net/ipv4/conf/" + query.Input + "/rp_filter"} {
+		value, err := m.op.SysctlValue(path)
+		if err != nil || value != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func ordinaryUnicastAddress(value string) bool {
+	address, err := netip.ParseAddr(value)
+	if err != nil || !address.Is4() || !address.IsGlobalUnicast() || address.IsLoopback() || address.IsLinkLocalUnicast() {
+		return false
+	}
+	firstOctet := address.As4()[0]
+	return firstOctet != 0 && firstOctet < 224
 }
 
 type policyAuditor struct {

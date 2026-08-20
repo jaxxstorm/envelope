@@ -249,6 +249,27 @@ func TestLinuxEffectiveRouteAndFIBAdaptersUseStructuredDetails(t *testing.T) {
 	}
 }
 
+func TestLinuxEffectiveRouteClassifiesUnavailableIngressValidation(t *testing.T) {
+	command := "/test/ip -j -details -N -4 route get 10.30.0.0 from 10.10.0.0 iif envelope0"
+	for _, message := range []string{
+		"RTNETLINK answers: Invalid argument",
+		"RTNETLINK answers: Invalid cross-device link",
+	} {
+		t.Run(message, func(t *testing.T) {
+			runner := &scriptedCommandRunner{
+				outputs: map[string][]byte{},
+				errors:  map[string]error{command: errors.New("exit status 2: " + message)},
+			}
+			_, err := testLinuxOps(runner).RouteLookup(context.Background(), routeQuery{
+				Family: "-4", Destination: "10.30.0.0", Source: "10.10.0.0", Input: "envelope0",
+			})
+			if !errors.Is(err, errSupplementaryRouteLookupUnavailable) {
+				t.Fatalf("route lookup error=%v, want supplementary lookup unavailable", err)
+			}
+		})
+	}
+}
+
 func TestLinuxIPv6RoutesRetainSourceSelector(t *testing.T) {
 	command := "/test/ip -j -details -N -6 route show table 254"
 	runner := &scriptedCommandRunner{outputs: map[string][]byte{

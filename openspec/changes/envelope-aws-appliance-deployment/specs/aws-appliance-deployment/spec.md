@@ -68,7 +68,7 @@ The deployment SHALL render independent west and east Envelope configurations, i
 - **THEN** Terraform validation rejects the configuration
 
 ### Requirement: Persistent host forwarding prerequisites
-The deployment SHALL persist IPv4 forwarding, required IPv6 forwarding when enabled, non-strict reverse-path filtering, forwarding firewall policy, and TCP MSS rules compatible with the configured Tailscale MTU.
+The deployment SHALL persist IPv4 forwarding, required IPv6 forwarding when enabled, disabled reverse-path filtering for `conf/all` and the dynamically created Envelope TUN, non-strict reverse-path filtering for the underlay and Tailscale interfaces, forwarding firewall policy, and TCP MSS rules compatible with the configured Tailscale MTU.
 
 #### Scenario: Required host state after boot
 - **WHEN** cloud-init and systemd preflight complete
@@ -77,6 +77,10 @@ The deployment SHALL persist IPv4 forwarding, required IPv6 forwarding when enab
 #### Scenario: Host prerequisite missing
 - **WHEN** a required sysctl or forwarding rule is absent after boot
 - **THEN** Envelope readiness remains unhealthy and the missing state is reported
+
+#### Scenario: Asymmetric TUN source validation
+- **WHEN** Linux returns `EINVAL` or `EXDEV` for an ordinary-unicast IPv4 boundary lookup entering the configured Envelope TUN
+- **THEN** the supplementary lookup may be omitted only when the full-prefix policy/FIB audit passes and effective reverse-path filtering is disabled through both `conf/all` and the Envelope interface
 
 ### Requirement: Fresh-state Terraform convergence
 The deployment SHALL support a clean Terraform plan and one non-targeted apply from empty state, followed by a no-change plan and complete destroy.
