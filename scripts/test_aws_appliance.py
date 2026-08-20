@@ -2632,6 +2632,10 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("curl --fail --silent --show-error", commands)
         self.assertIn("for unit in tailscaled.service envelope-host-network.service envelope.service", commands)
         subprocess.run(["bash", "-n"], input=commands, text=True, capture_output=True, check=True)
+        inner = appliance.READINESS_COMMANDS[2].split("'ENVELOPE_READINESS'\n", 1)[1].split(
+            "\nENVELOPE_READINESS\n", 1
+        )[0]
+        subprocess.run(["bash", "-n"], input=inner, text=True, capture_output=True, check=True)
         self.assertNotIn("get-parameter", commands)
 
     def test_readiness_payload_has_remote_execution_timeout_and_cancels_on_local_deadline(self):

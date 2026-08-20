@@ -2231,6 +2231,7 @@ while true; do
     exit 0
   fi
   sleep 2
+done
 ENVELOPE_READINESS
 then
   exit 0
