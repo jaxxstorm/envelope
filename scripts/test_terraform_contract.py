@@ -123,6 +123,8 @@ class TerraformStaticContractTest(unittest.TestCase):
         self.assertIn('sse_algorithm = "AES256"', artifact)
         self.assertIn('server_side_encryption = "AES256"', artifact)
         self.assertIn("force_destroy = true", artifact)
+        self.assertIn("bucket       = local.artifact_bucket_name", artifact)
+        self.assertIn("key          = local.artifact_object_key", artifact)
         iam = self.files["iam.tf"]
         self.assertEqual(iam.count("Resource = [local.artifact_object_arn]"), 2)
         self.assertNotIn("DecryptExactArtifactKey", iam)

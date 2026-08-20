@@ -96,8 +96,8 @@ resource "aws_s3_object" "envelope" {
 
 output "artifact_identity" {
   value = {
-    bucket       = aws_s3_bucket.artifact.id
-    key          = aws_s3_object.envelope.key
+    bucket       = local.artifact_bucket_name
+    key          = local.artifact_object_key
     sha256       = var.artifact_sha256
     architecture = var.architecture
     ec2_arch     = local.ec2_architecture
