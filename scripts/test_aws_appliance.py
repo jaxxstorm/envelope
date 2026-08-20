@@ -282,11 +282,90 @@ class ConfigAndPathTest(unittest.TestCase):
         self.assertNotIn("CUSTOM_TS_ID", child_env)
         self.assertNotIn("CUSTOM_TS_SECRET", child_env)
 
+    def test_terraform_source_snapshot_is_exactly_materialized_from_artifact_revision(self):
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, capture_output=True, check=True
+        ).stdout.strip()
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = pathlib.Path(temporary) / "run"
+            snapshot, identity = appliance.materialize_reviewed_terraform_source(
+                appliance.SubprocessRunner(), ROOT / "example/terraform", run_dir, revision
+            )
+            expected = subprocess.run(
+                ["git", "show", f"{revision}:example/terraform/gwlb.tf"],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout
+            self.assertEqual((snapshot / "gwlb.tf").read_text(), expected)
+            self.assertFalse((snapshot / ".terraform").exists())
+            self.assertEqual(identity["revision"], revision)
+            self.assertEqual(identity["repository_path"], "example/terraform")
+            self.assertEqual(identity["sha256"], appliance.terraform_source_digest(snapshot))
+            baseline = identity["sha256"]
+            source_record = appliance.terraform_source_record(snapshot, identity)
+            restored, restored_identity = appliance.materialize_durable_terraform_source(source_record, run_dir)
+            self.assertEqual(restored_identity, identity)
+            self.assertEqual(appliance.terraform_source_digest(restored), baseline)
+            gwlb = restored / "gwlb.tf"
+            original = gwlb.read_text()
+            gwlb.write_text(
+                original.replace(
+                    "target_id        = aws_instance.envelope_west.id",
+                    'target_id        = format("%s-unexpected", aws_instance.envelope_west.id)',
+                )
+            )
+            with self.assertRaisesRegex(appliance.LifecycleError, "direct regional target"):
+                appliance.validate_terraform_source_contract(restored)
+            west_block = '''resource "aws_lb_target_group_attachment" "west" {
+  target_group_arn = aws_lb_target_group.west.arn
+  target_id        = aws_instance.envelope_west.id
+}'''
+            commented_bypass = original.replace(
+                west_block,
+                f'''/*
+{west_block}
+*/
+resource /* separator */ "aws_lb_target_group_attachment" "west" {{
+  target_group_arn = aws_lb_target_group.west.arn
+  target_id        = format("%s-unexpected", aws_instance.envelope_west.id)
+}}''',
+            )
+            gwlb.write_text(commented_bypass)
+            with self.assertRaisesRegex(appliance.LifecycleError, "direct regional target"):
+                appliance.validate_terraform_source_contract(restored)
+            gwlb.write_text("locals { fixture = <<-EOT\n" + west_block + "\nEOT\n}\n" + original)
+            with self.assertRaisesRegex(appliance.LifecycleError, "heredoc"):
+                appliance.validate_terraform_source_contract(restored)
+            gwlb.write_text(original)
+            (restored / "override.tf").write_text('resource "terraform_data" "unexpected" {}\n')
+            self.assertNotEqual(appliance.terraform_source_digest(restored), baseline)
+            with self.assertRaisesRegex(appliance.LifecycleError, "override"):
+                appliance.validate_terraform_source_contract(restored)
+            (restored / "override.tf").unlink()
+            (restored / "unsafe.tf").symlink_to(restored / "gwlb.tf")
+            with self.assertRaisesRegex(appliance.LifecycleError, "symlink"):
+                appliance.terraform_source_digest(restored)
+
     def test_apply_boundary_is_durable_before_the_terraform_child_runs(self):
         class ManifestAWS:
+            def __init__(self):
+                self.remote = b""
+                self.etag = '"manifest-0"'
+                self.version = 0
+
             def json(self, args, *, region=None):
                 if args[1] == "put-object":
-                    return {}
+                    if "--if-match" in args and args[args.index("--if-match") + 1] != self.etag:
+                        raise appliance.CommandError(args, 412, "PreconditionFailed")
+                    self.remote = pathlib.Path(args[args.index("--body") + 1]).read_bytes()
+                    self.version += 1
+                    self.etag = f'"manifest-{self.version}"'
+                    return {"ETag": self.etag}
+                if args[1] == "get-object":
+                    pathlib.Path(args[-1]).write_bytes(self.remote)
+                    return {"ETag": self.etag, "VersionId": str(self.version)}
                 raise AssertionError(args)
 
         class FailingRunner:
@@ -310,20 +389,42 @@ class ConfigAndPathTest(unittest.TestCase):
             plan = store.run_dir / "apply.tfplan"
             store.run_dir.mkdir(parents=True)
             plan.write_bytes(b"reviewed-plan")
+            source_identity = {
+                "revision": manifest["artifact"]["revision"],
+                "repository_path": "example/terraform",
+                "sha256": "b" * 64,
+            }
             manifest["saved_plan"] = {
                 "path": str(plan.resolve()),
                 "sha256": hashlib.sha256(plan.read_bytes()).hexdigest(),
                 "replacement": None,
+                "source": source_identity,
+                "apply_started": False,
+                "applied": False,
             }
+            manifest["terraform_source"] = source_identity
             manifest["phase"] = "planned"
             store.write(manifest)
             runner = FailingRunner()
-            with mock.patch.object(appliance.BackendValidator, "validate"):
+            with mock.patch.object(appliance.BackendValidator, "validate"), mock.patch.object(
+                appliance,
+                "materialize_durable_terraform_source",
+                return_value=(terraform_dir, source_identity),
+            ):
                 with self.assertRaisesRegex(appliance.LifecycleError, "runner loss"):
                     appliance.terraform_apply(config, aws, runner, store.run_dir, terraform_dir, plan)
             persisted = store.load_local()
-            self.assertEqual(persisted["phase"], "apply_started")
+            self.assertEqual(persisted["phase"], "apply_failed")
             self.assertTrue(persisted["tailnet"]["nodes_expected"])
+            self.assertTrue(persisted["saved_plan"]["apply_started"])
+            self.assertNotIn("apply_claimed_at", persisted)
+            with mock.patch.object(
+                appliance,
+                "materialize_durable_terraform_source",
+                return_value=(terraform_dir, source_identity),
+            ):
+                with self.assertRaisesRegex(appliance.LifecycleError, "exactly once"):
+                    appliance.terraform_apply(config, aws, runner, store.run_dir, terraform_dir, plan)
 
     def test_no_drift_runner_uses_durable_inputs_and_maps_exit_two_to_drift(self):
         class CaptureRunner:
@@ -344,12 +445,22 @@ class ConfigAndPathTest(unittest.TestCase):
             terraform_dir.mkdir()
             store = appliance.ManifestStore(config, BackendAWS(config), root / "run")
             manifest = appliance.new_manifest(config, artifact_identity(root), "123456789012")
+            source_identity = {
+                "revision": manifest["artifact"]["revision"],
+                "repository_path": "example/terraform",
+                "sha256": "b" * 64,
+            }
+            manifest["terraform_source"] = source_identity
             store.write(manifest, upload=False)
             for drift in (False, True):
                 with self.subTest(drift=drift):
                     runner = CaptureRunner(drift)
                     with mock.patch.object(appliance.BackendValidator, "validate"), mock.patch.object(
                         appliance, "artifact_for_recovery", return_value=artifact_identity(root)
+                    ), mock.patch.object(
+                        appliance,
+                        "materialize_durable_terraform_source",
+                        return_value=(terraform_dir, source_identity),
                     ), mock.patch.dict(
                         os.environ,
                         {"TS_OAUTH_CLIENT_ID": "fixture-client", "TS_OAUTH_CLIENT_SECRET": "fixture-secret"},
@@ -787,6 +898,44 @@ class SecurityAndBackendTest(unittest.TestCase):
             appliance.validate_manifest(json.loads(serialized), config)
             self.assertEqual(set(manifest["terraform_variables"]), set(appliance.terraform_variables(config, artifact, manifest["ssm_parameters"])))
             self.assertEqual([value["created"] for value in manifest["ssm_parameters"]], [False, False])
+
+    def test_manifest_compare_and_swap_rejects_a_stale_lifecycle_writer(self):
+        class AWS:
+            def __init__(self):
+                self.remote = b""
+                self.etag = '"manifest-0"'
+                self.version = 0
+
+            def json(self, args, *, region=None):
+                operation = args[1]
+                if operation == "put-object":
+                    if "--if-match" in args and args[args.index("--if-match") + 1] != self.etag:
+                        raise appliance.CommandError(args, 412, "PreconditionFailed")
+                    self.remote = pathlib.Path(args[args.index("--body") + 1]).read_bytes()
+                    self.version += 1
+                    self.etag = f'"manifest-{self.version}"'
+                    return {"ETag": self.etag, "VersionId": str(self.version)}
+                if operation == "get-object":
+                    pathlib.Path(args[-1]).write_bytes(self.remote)
+                    return {"ETag": self.etag, "VersionId": str(self.version)}
+                raise AssertionError(args)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            aws = AWS()
+            initial = appliance.new_manifest(config, artifact_identity(root), "123456789012")
+            appliance.ManifestStore(config, aws, root / "initial").write(initial)
+            first = appliance.ManifestStore(config, aws, root / "first")
+            second = appliance.ManifestStore(config, aws, root / "second")
+            first_manifest = first.recover()
+            second_manifest = second.recover()
+            first_manifest["phase"] = "first-claim"
+            first.write(first_manifest)
+            second_manifest["phase"] = "stale-claim"
+            with self.assertRaisesRegex(appliance.CommandError, "PreconditionFailed"):
+                second.write(second_manifest)
+            self.assertEqual(second.load_local()["phase"], "preflight_complete")
 
     def test_residual_allowlist_never_accepts_shared_backend_and_enforces_janitor_ttl(self):
         class UnusedAWS:
@@ -1454,6 +1603,112 @@ class SSMAndCleanupTest(unittest.TestCase):
             self.assertEqual(persisted["tailnet"]["device_ids"], identifiers)
             self.assertEqual(persisted["phase"], "ready")
 
+    def test_replacement_retires_exact_recorded_and_numeric_retry_nodes(self):
+        class API:
+            def __init__(self):
+                self.deleted = []
+                self.devices = [
+                    {"id": "west-old", "hostname": "envelope-fixture-west", "tags": ["tag:envelope-ci"]},
+                    {"id": "west-retry", "hostname": "envelope-fixture-west-1", "tags": ["tag:envelope-ci"]},
+                    {"id": "east", "hostname": "envelope-fixture-east", "tags": ["tag:envelope-ci"]},
+                    {"id": "wrong-tag", "hostname": "envelope-fixture-west-2", "tags": ["tag:other"]},
+                ]
+
+            def list_devices(self):
+                return self.devices
+
+            def delete_device(self, device_id):
+                self.deleted.append(device_id)
+                self.devices = [device for device in self.devices if device["id"] != device_id]
+
+        class Store:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, manifest):
+                self.writes.append(copy.deepcopy(manifest))
+
+        api, store = API(), Store()
+        manifest = {
+            "tailnet": {
+                "expected_hostnames": ["envelope-fixture-west", "envelope-fixture-east"],
+                "tag": "tag:envelope-ci",
+                "nodes_expected": True,
+                "device_ids": {"west": "west-old", "east": "east"},
+            }
+        }
+        retired = appliance.retire_replacement_devices(
+            api, store, manifest, "aws_instance.envelope_west"
+        )
+        self.assertEqual(retired, ["west-old", "west-retry"])
+        self.assertEqual(api.deleted, retired)
+        self.assertEqual(manifest["tailnet"]["device_ids"], {"east": "east"})
+        self.assertEqual(manifest["phase"], "replacement_device_retired")
+        self.assertEqual([device["id"] for device in api.devices], ["east", "wrong-tag"])
+
+    def test_replacement_retirement_retry_uses_only_durable_ids(self):
+        class API:
+            def __init__(self):
+                self.deleted = []
+                self.devices = [
+                    {"id": "new-west", "hostname": "envelope-fixture-west", "tags": ["tag:envelope-ci"]},
+                    {"id": "east", "hostname": "envelope-fixture-east", "tags": ["tag:envelope-ci"]},
+                ]
+
+            def list_devices(self):
+                return self.devices
+
+            def delete_device(self, device_id):
+                self.deleted.append(device_id)
+                self.devices = [device for device in self.devices if device["id"] != device_id]
+
+        manifest = {
+            "tailnet": {
+                "expected_hostnames": ["envelope-fixture-west", "envelope-fixture-east"],
+                "tag": "tag:envelope-ci",
+                "nodes_expected": True,
+                "device_ids": {"east": "east"},
+                "replacement_retirement": {"site": "west", "device_ids": ["old-west", "west-retry"]},
+            }
+        }
+        api = API()
+        with self.assertRaisesRegex(appliance.LifecycleError, "left a run-scoped site node"):
+            appliance.retire_replacement_devices(api, mock.Mock(), manifest, "aws_instance.envelope_west")
+        self.assertEqual(api.deleted, [])
+        self.assertEqual([device["id"] for device in api.devices], ["new-west", "east"])
+
+    def test_cleanup_uses_pending_retirement_ids_and_one_current_replacement(self):
+        class API:
+            def __init__(self):
+                self.deleted = []
+                self.devices = [
+                    {"id": "old-west", "hostname": "envelope-fixture-west-1", "tags": ["tag:envelope-ci"]},
+                    {"id": "new-west", "hostname": "envelope-fixture-west", "tags": ["tag:envelope-ci"]},
+                    {"id": "east", "hostname": "envelope-fixture-east", "tags": ["tag:envelope-ci"]},
+                ]
+
+            def list_devices(self):
+                return self.devices
+
+            def delete_device(self, device_id):
+                self.deleted.append(device_id)
+                self.devices = [device for device in self.devices if device["id"] != device_id]
+
+        manifest = {
+            "tailnet": {
+                "expected_hostnames": ["envelope-fixture-west", "envelope-fixture-east"],
+                "tag": "tag:envelope-ci",
+                "nodes_expected": True,
+                "device_ids": {"east": "east"},
+                "replacement_retirement": {"site": "west", "device_ids": ["old-west", "already-absent"]},
+            }
+        }
+        api = API()
+        selected = appliance.cleanup_tailnet_devices(api, manifest, dry_run=False)
+        self.assertEqual(selected, ["already-absent", "east", "new-west", "old-west"])
+        self.assertEqual(api.deleted, selected)
+        self.assertEqual(api.devices, [])
+
     def test_backend_cleanup_deletes_only_exact_run_key_versions(self):
         class FakeAWS:
             def __init__(self):
@@ -1488,12 +1743,18 @@ class SSMAndCleanupTest(unittest.TestCase):
             def __init__(self):
                 self.sites = []
                 self.phases = []
+                self.version = 0
+                self.etag = '"manifest-0"'
 
             def json(inner, args, *, region=None):
                 if args[1] == "put-object":
+                    if "--if-match" in args and args[args.index("--if-match") + 1] != inner.etag:
+                        raise appliance.CommandError(args, 412, "PreconditionFailed")
                     body = pathlib.Path(args[args.index("--body") + 1])
                     inner.phases.append(json.loads(body.read_text())["phase"])
-                    return {"VersionId": "manifest"}
+                    inner.version += 1
+                    inner.etag = f'"manifest-{inner.version}"'
+                    return {"VersionId": "manifest", "ETag": inner.etag}
                 if args[1] == "put-parameter":
                     payload = json.loads(pathlib.Path(args[3].removeprefix("file://")).read_text())
                     self.assertEqual(payload["Value"], "fixture-auth-material")
@@ -1596,11 +1857,22 @@ class SSMAndCleanupTest(unittest.TestCase):
                 self.terminated = False
                 self.deleted_parameters = []
                 self.backend_version_reads = 0
+                self.remote = b""
+                self.etag = '"manifest-0"'
+                self.version = 0
 
             def json(inner, args, *, region=None):
                 operation = args[1]
                 if operation == "put-object":
-                    return {}
+                    if "--if-match" in args and args[args.index("--if-match") + 1] != inner.etag:
+                        raise appliance.CommandError(args, 412, "PreconditionFailed")
+                    inner.remote = pathlib.Path(args[args.index("--body") + 1]).read_bytes()
+                    inner.version += 1
+                    inner.etag = f'"manifest-{inner.version}"'
+                    return {"ETag": inner.etag}
+                if operation == "get-object":
+                    pathlib.Path(args[-1]).write_bytes(inner.remote)
+                    return {"ETag": inner.etag, "VersionId": str(inner.version)}
                 if operation == "delete-parameter":
                     inner.deleted_parameters.append((region, args[-1]))
                     return {}
@@ -1772,11 +2044,22 @@ class SSMAndCleanupTest(unittest.TestCase):
                 self.values = {"us-west-2": "old-west", "us-east-1": "old-east"}
                 self.fail_east = fail_east
                 self.failed = False
+                self.remote = b""
+                self.etag = '"manifest-0"'
+                self.version = 0
 
             def json(self, args, *, region=None):
                 operation = args[1]
                 if operation == "put-object":
-                    return {}
+                    if "--if-match" in args and args[args.index("--if-match") + 1] != self.etag:
+                        raise appliance.CommandError(args, 412, "PreconditionFailed")
+                    self.remote = pathlib.Path(args[args.index("--body") + 1]).read_bytes()
+                    self.version += 1
+                    self.etag = f'"manifest-{self.version}"'
+                    return {"ETag": self.etag}
+                if operation == "get-object":
+                    pathlib.Path(args[-1]).write_bytes(self.remote)
+                    return {"ETag": self.etag, "VersionId": str(self.version)}
                 if operation == "get-parameter":
                     return {"Parameter": {"Value": self.values[region]}}
                 if operation == "put-parameter":
@@ -1809,7 +2092,7 @@ class SSMAndCleanupTest(unittest.TestCase):
             config = make_config(root)
             manifest = appliance.new_manifest(config, artifact_identity(root), "123456789012")
             manifest["tailnet"]["auth_key_id"] = "old-key-id"
-            manifest["phase"] = "prepared"
+            manifest["phase"] = "ready"
 
             failing_aws = RotationAWS(True)
             failing_api = RotationAPI()
@@ -1838,11 +2121,22 @@ class SSMAndCleanupTest(unittest.TestCase):
                 self.values = {"us-west-2": "old-west", "us-east-1": "old-east"}
                 self.failing_region = failing_region
                 self.verification_failed = False
+                self.remote = b""
+                self.etag = '"manifest-0"'
+                self.version = 0
 
             def json(self, args, *, region=None):
                 operation = args[1]
                 if operation == "put-object":
-                    return {}
+                    if "--if-match" in args and args[args.index("--if-match") + 1] != self.etag:
+                        raise appliance.CommandError(args, 412, "PreconditionFailed")
+                    self.remote = pathlib.Path(args[args.index("--body") + 1]).read_bytes()
+                    self.version += 1
+                    self.etag = f'"manifest-{self.version}"'
+                    return {"ETag": self.etag}
+                if operation == "get-object":
+                    pathlib.Path(args[-1]).write_bytes(self.remote)
+                    return {"ETag": self.etag, "VersionId": str(self.version)}
                 if operation == "get-parameter":
                     return {"Parameter": {"Value": self.values[region]}}
                 if operation == "put-parameter":
@@ -1879,7 +2173,7 @@ class SSMAndCleanupTest(unittest.TestCase):
             config = make_config(root)
             manifest = appliance.new_manifest(config, artifact_identity(root), "123456789012")
             manifest["tailnet"]["auth_key_id"] = "old-key-id"
-            manifest["phase"] = "prepared"
+            manifest["phase"] = "ready"
             for region in ("us-west-2", "us-east-1"):
                 with self.subTest(region=region):
                     aws = VerificationFailureAWS(region)
@@ -2331,14 +2625,81 @@ class ReadinessTest(unittest.TestCase):
             aws, region="us-west-2", target_group_arn="arn:fixture", deadline=deadline, sleep=lambda _: None
         )
         commands = "\n".join(appliance.READINESS_COMMANDS)
-        self.assertIn("cloud-init status --wait", commands)
+        self.assertIn("600s cloud-init status --wait", commands)
         self.assertIn("envelope-preflight", commands)
+        self.assertIn("signal=KILL 120s", commands)
+        self.assertIn("sleep 2", commands)
+        self.assertIn("curl --fail --silent --show-error", commands)
+        self.assertIn("for unit in tailscaled.service envelope-host-network.service envelope.service", commands)
+        subprocess.run(["bash", "-n"], input=commands, text=True, capture_output=True, check=True)
         self.assertNotIn("get-parameter", commands)
+
+    def test_readiness_payload_has_remote_execution_timeout_and_cancels_on_local_deadline(self):
+        class FakeAWS:
+            def __init__(self):
+                self.payload = None
+                self.cancelled = []
+
+            def json(self, args, *, region=None):
+                operation = args[1]
+                if operation == "describe-instance-information":
+                    return {"InstanceInformationList": [{"PingStatus": "Online"}]}
+                if operation == "send-command":
+                    self.payload = json.loads(args[args.index("--parameters") + 1])
+                    return {"Command": {"CommandId": "command-fixture"}}
+                if operation == "get-command-invocation":
+                    return {"Status": "Cancelled" if self.cancelled else "InProgress"}
+                if operation == "cancel-command":
+                    self.cancelled.append(args[args.index("--command-id") + 1])
+                    return {}
+                raise AssertionError(args)
+
+        aws = FakeAWS()
+        with mock.patch.object(appliance.time, "monotonic", side_effect=[0, 0, 2, 2, 2]):
+            with self.assertRaisesRegex(appliance.LifecycleError, "timed out"):
+                appliance.wait_for_instance(
+                    aws, region="us-west-2", instance_id="i-fixture", deadline=1, sleep=lambda _: None
+                )
+        self.assertEqual(aws.payload["executionTimeout"], ["750"])
+        self.assertEqual(aws.payload["commands"], appliance.READINESS_COMMANDS)
+        self.assertEqual(aws.cancelled, ["command-fixture"])
+
+    def test_readiness_retries_eventually_consistent_ssm_invocation(self):
+        class FakeAWS:
+            def __init__(self):
+                self.invocations = 0
+
+            def json(self, args, *, region=None):
+                operation = args[1]
+                if operation == "describe-instance-information":
+                    return {"InstanceInformationList": [{"PingStatus": "Online"}]}
+                if operation == "send-command":
+                    return {"Command": {"CommandId": "command-fixture"}}
+                if operation == "get-command-invocation":
+                    self.invocations += 1
+                    if self.invocations == 1:
+                        raise appliance.CommandError(args, 255, "InvocationDoesNotExist")
+                    return {"Status": "Success"}
+                raise AssertionError(args)
+
+        aws = FakeAWS()
+        appliance.wait_for_instance(
+            aws,
+            region="us-west-2",
+            instance_id="i-fixture",
+            deadline=time.monotonic() + 1,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(aws.invocations, 2)
 
     def test_diagnostics_are_bounded_and_redacted(self):
         class FakeAWS:
+            def __init__(self):
+                self.payload = None
+
             def json(self, args, *, region=None):
                 if args[1] == "send-command":
+                    self.payload = json.loads(args[args.index("--parameters") + 1])
                     return {"Command": {"CommandId": "diagnostic-fixture"}}
                 return {
                     "Status": "Success",
@@ -2346,10 +2707,10 @@ class ReadinessTest(unittest.TestCase):
                     "StandardErrorContent": "",
                 }
 
-        result = appliance.collect_diagnostics(
-            FakeAWS(), {"region": "us-west-2"}, "i-fixture", sleep=lambda _: None
-        )
+        aws = FakeAWS()
+        result = appliance.collect_diagnostics(aws, {"region": "us-west-2"}, "i-fixture", sleep=lambda _: None)
         self.assertEqual(result["status"], "Success")
+        self.assertEqual(aws.payload["executionTimeout"], ["90"])
         self.assertNotIn("fixture-sensitive-value", result["stdout"])
         self.assertIn("[REDACTED]", result["stdout"])
 

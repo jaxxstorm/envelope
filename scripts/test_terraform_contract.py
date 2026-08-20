@@ -63,6 +63,12 @@ class TerraformStaticContractTest(unittest.TestCase):
         self.assertGreaterEqual(lock.count('"h1:'), 6)
         self.assertIn("!example/terraform/.terraform.lock.hcl", (ROOT / ".gitignore").read_text())
 
+    def test_target_attachments_use_direct_regional_instance_ids(self):
+        gwlb = self.files["gwlb.tf"]
+        self.assertEqual(gwlb.count("target_id        = aws_instance.envelope_west.id"), 1)
+        self.assertEqual(gwlb.count("target_id        = aws_instance.envelope_east.id"), 1)
+        self.assertNotRegex(gwlb, r"target_id\s*=\s*\".*aws_instance\.envelope_(west|east)\.id")
+
     def test_secret_resolver_and_exact_runtime_iam(self):
         user_data = self.files["user_data.tf"]
         self.assertEqual(user_data.count("command:AWS_PAGER="), 2)
@@ -144,6 +150,8 @@ class TerraformStaticContractTest(unittest.TestCase):
         self.assertIn('checksum_algorithm     = "SHA256"', artifact)
         self.assertIn("filesha256(var.artifact_path) == var.artifact_sha256", artifact)
         self.assertIn('sse_algorithm = "AES256"', artifact)
+        self.assertIn('blocked_encryption_types = ["SSE-C"]', artifact)
+        self.assertIn("bucket_key_enabled       = false", artifact)
         self.assertIn('server_side_encryption = "AES256"', artifact)
         self.assertIn("force_destroy = true", artifact)
         self.assertIn("bucket       = local.artifact_bucket_name", artifact)
@@ -313,17 +321,102 @@ class PlanAndSecurityFixtureTest(unittest.TestCase):
         self.assertTrue(any("raw user data" in error for error in oversized_errors))
         self.assertTrue(PLAN.validate(destructive, "envelope-plan", {"aws_vpc.west"}, AZ_KEYS))
         replacement = copy.deepcopy(self.plan)
+        target_group_arn = "arn:aws:elasticloadbalancing:us-west-2:123456789012:targetgroup/west/fixture"
+        next(
+            resource
+            for resource in replacement["planned_values"]["root_module"]["resources"]
+            if resource["address"] == "aws_lb_target_group.west"
+        )["values"] = {"arn": target_group_arn, "region": "us-west-2"}
+        replacement["configuration"] = {
+            "root_module": {
+                "resources": [
+                    {
+                        "address": "aws_lb_target_group_attachment.west",
+                        "mode": "managed",
+                        "type": "aws_lb_target_group_attachment",
+                        "expressions": {
+                            "target_group_arn": {
+                                "references": ["aws_lb_target_group.west.arn", "aws_lb_target_group.west"]
+                            },
+                            "target_id": {
+                                "references": ["aws_instance.envelope_west.id", "aws_instance.envelope_west"]
+                            },
+                        },
+                    }
+                ]
+            }
+        }
         replacement["resource_changes"] = [
             {
                 "address": "aws_instance.envelope_west",
                 "type": "aws_instance",
-                "change": {"actions": ["delete", "create"]},
-            }
+                "action_reason": "replace_by_request",
+                "change": {"actions": ["delete", "create"], "before": {"id": "i-old-west"}},
+            },
+            {
+                "address": "aws_lb_target_group_attachment.west",
+                "type": "aws_lb_target_group_attachment",
+                "action_reason": "replace_because_cannot_update",
+                "change": {
+                    "actions": ["delete", "create"],
+                    "before": {
+                        "availability_zone": None,
+                        "id": "attachment-old",
+                        "port": None,
+                        "quic_server_id": None,
+                        "region": "us-west-2",
+                        "target_group_arn": target_group_arn,
+                        "target_id": "i-old-west",
+                    },
+                    "after": {
+                        "availability_zone": None,
+                        "port": None,
+                        "quic_server_id": None,
+                        "region": "us-west-2",
+                        "target_group_arn": target_group_arn,
+                    },
+                    "before_sensitive": {},
+                    "after_sensitive": {},
+                    "after_unknown": {"id": True, "target_id": True},
+                    "replace_paths": [["target_id"]],
+                },
+            },
         ]
         self.assertEqual(
             PLAN.validate(replacement, "envelope-plan", {"aws_instance.envelope_west"}, AZ_KEYS),
             [],
         )
+        missing_dependency = copy.deepcopy(replacement)
+        missing_dependency["resource_changes"] = missing_dependency["resource_changes"][:1]
+        self.assertTrue(PLAN.validate(missing_dependency, "envelope-plan", {"aws_instance.envelope_west"}, AZ_KEYS))
+        mutated_dependency = copy.deepcopy(replacement)
+        foreign_arn = target_group_arn.replace("targetgroup/west", "targetgroup/foreign")
+        mutated_dependency["resource_changes"][1]["change"]["before"]["target_group_arn"] = foreign_arn
+        mutated_dependency["resource_changes"][1]["change"]["after"]["target_group_arn"] = foreign_arn
+        self.assertTrue(PLAN.validate(mutated_dependency, "envelope-plan", {"aws_instance.envelope_west"}, AZ_KEYS))
+        missing_identity = copy.deepcopy(replacement)
+        del missing_identity["resource_changes"][0]["change"]["before"]["id"]
+        del missing_identity["resource_changes"][1]["change"]["before"]["target_id"]
+        self.assertTrue(PLAN.validate(missing_identity, "envelope-plan", {"aws_instance.envelope_west"}, AZ_KEYS))
+        create_before_destroy = copy.deepcopy(replacement)
+        create_before_destroy["resource_changes"][0]["change"]["actions"] = ["create", "delete"]
+        create_before_destroy["resource_changes"][1]["change"]["actions"] = ["create", "delete"]
+        self.assertTrue(PLAN.validate(create_before_destroy, "envelope-plan", {"aws_instance.envelope_west"}, AZ_KEYS))
+        wrong_reference = copy.deepcopy(replacement)
+        wrong_reference["configuration"]["root_module"]["resources"][0]["expressions"]["target_id"]["references"] = [
+            "aws_instance.envelope_west.private_ip",
+            "aws_instance.envelope_west",
+        ]
+        self.assertTrue(PLAN.validate(wrong_reference, "envelope-plan", {"aws_instance.envelope_west"}, AZ_KEYS))
+        unrelated_create = copy.deepcopy(replacement)
+        unrelated_create["resource_changes"].append(
+            {
+                "address": "aws_security_group.test_west",
+                "type": "aws_security_group",
+                "change": {"actions": ["create"]},
+            }
+        )
+        self.assertTrue(PLAN.validate(unrelated_create, "envelope-plan", {"aws_instance.envelope_west"}, AZ_KEYS))
 
     def test_plan_and_state_fixtures_are_secret_free(self):
         paths = [self.plan_path, ROOT / "testdata/deployment/state-secret-reference.json"]

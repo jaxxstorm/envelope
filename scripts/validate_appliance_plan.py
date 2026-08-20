@@ -38,6 +38,15 @@ def resources(module: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
+def configured_resources(module: dict[str, Any]) -> list[dict[str, Any]]:
+    result = [value for value in module.get("resources", []) if isinstance(value, dict)]
+    for call in module.get("module_calls", {}).values():
+        child = call.get("module") if isinstance(call, dict) else None
+        if isinstance(child, dict):
+            result.extend(configured_resources(child))
+    return result
+
+
 def output_value(plan: dict[str, Any], name: str) -> Any:
     value = plan.get("planned_values", {}).get("outputs", {}).get(name)
     if isinstance(value, dict) and "value" in value:
@@ -176,14 +185,41 @@ def validate(
     for address in sorted(set(expected_resources) - set(actual_resources)):
         errors.append(f"approved planned resource is missing: {address}")
 
-    approved_replacements = {"aws_instance.envelope_west", "aws_instance.envelope_east"}
+    replacement_dependencies = {
+        "aws_instance.envelope_west": "aws_lb_target_group_attachment.west",
+        "aws_instance.envelope_east": "aws_lb_target_group_attachment.east",
+    }
+    dependency_owners = {dependency: instance for instance, dependency in replacement_dependencies.items()}
+    approved_replacements = set(replacement_dependencies)
     if not allowed_replacements.issubset(approved_replacements):
         errors.append("replacement allowlist contains an address other than an exact regional Envelope instance")
     changes = plan.get("resource_changes")
     seen_replacements: set[str] = set()
+    seen_replacement_dependencies: set[str] = set()
     if not isinstance(changes, list):
         errors.append("resource_changes must be a list")
         changes = []
+    replacement_instance_ids: dict[str, str] = {}
+    for change in changes:
+        if not isinstance(change, dict) or change.get("address") not in allowed_replacements:
+            continue
+        change_body = change.get("change")
+        before = change_body.get("before") if isinstance(change_body, dict) else None
+        instance_id = before.get("id") if isinstance(before, dict) else None
+        if isinstance(instance_id, str) and instance_id:
+            replacement_instance_ids[str(change["address"])] = instance_id
+    configured_root = plan.get("configuration", {}).get("root_module", {})
+    configured = configured_resources(configured_root) if isinstance(configured_root, dict) else []
+    configured_by_address = {
+        str(resource.get("address")): resource
+        for resource in configured
+        if isinstance(resource.get("address"), str)
+    }
+    planned_by_address = {
+        str(resource.get("address")): resource
+        for resource in values
+        if isinstance(resource.get("address"), str)
+    }
     for change in changes:
         if not isinstance(change, dict):
             errors.append("resource_changes contains a non-object entry")
@@ -202,15 +238,80 @@ def validate(
         if action_tuple == ("no-op",):
             continue
         if action_tuple == ("create",) and mode != "data":
+            if not allowed_replacements:
+                continue
+            errors.append(f"replacement plan contains an unrelated managed create on {address}")
             continue
         if action_tuple == ("read",) and mode == "data":
             continue
-        if address in allowed_replacements and action_tuple in {("create", "delete"), ("delete", "create")}:
-            seen_replacements.add(address)
+        if address in allowed_replacements and action_tuple == ("delete", "create"):
+            if change.get("action_reason") != "replace_by_request" or address not in replacement_instance_ids:
+                errors.append(f"requested replacement identity is incomplete for {address}")
+            else:
+                seen_replacements.add(address)
+            continue
+        dependency_owner = dependency_owners.get(address)
+        if dependency_owner in allowed_replacements and action_tuple == ("delete", "create"):
+            before = change_body.get("before") if isinstance(change_body, dict) else None
+            after = change_body.get("after") if isinstance(change_body, dict) else None
+            site = dependency_owner.rsplit("_", 1)[-1]
+            target_group_address = f"aws_lb_target_group.{site}"
+            target_group = planned_by_address.get(target_group_address, {})
+            target_group_values = target_group.get("values") if isinstance(target_group, dict) else None
+            target_group_arn = target_group_values.get("arn") if isinstance(target_group_values, dict) else None
+            target_group_region = target_group_values.get("region") if isinstance(target_group_values, dict) else None
+            configuration = configured_by_address.get(str(address), {})
+            expressions = configuration.get("expressions") if isinstance(configuration, dict) else None
+            target_references = expressions.get("target_id", {}).get("references") if isinstance(expressions, dict) else None
+            group_references = (
+                expressions.get("target_group_arn", {}).get("references") if isinstance(expressions, dict) else None
+            )
+            expected_target_references = {f"{dependency_owner}.id", dependency_owner}
+            expected_group_references = {f"{target_group_address}.arn", target_group_address}
+            dependency_valid = (
+                isinstance(before, dict)
+                and isinstance(after, dict)
+                and set(before) == {"availability_zone", "id", "port", "quic_server_id", "region", "target_group_arn", "target_id"}
+                and set(after) == {"availability_zone", "port", "quic_server_id", "region", "target_group_arn"}
+                and isinstance(before.get("id"), str)
+                and bool(before["id"])
+                and isinstance(before.get("target_group_arn"), str)
+                and bool(before["target_group_arn"])
+                and isinstance(target_group_arn, str)
+                and bool(target_group_arn)
+                and isinstance(target_group_region, str)
+                and bool(target_group_region)
+                and before.get("target_id") == replacement_instance_ids.get(dependency_owner)
+                and before.get("target_group_arn") == after.get("target_group_arn") == target_group_arn
+                and before.get("region") == after.get("region") == target_group_region
+                and target_group_arn.split(":")[3:4] == [target_group_region]
+                and all(before.get(field) is None and after.get(field) is None for field in ("availability_zone", "port", "quic_server_id"))
+                and isinstance(target_references, list)
+                and len(target_references) == 2
+                and set(target_references) == expected_target_references
+                and isinstance(group_references, list)
+                and len(group_references) == 2
+                and set(group_references) == expected_group_references
+                and configuration.get("mode", "managed") == "managed"
+                and configuration.get("type") == "aws_lb_target_group_attachment"
+                and change.get("action_reason") == "replace_because_cannot_update"
+                and change_body.get("before_sensitive") == {}
+                and change_body.get("after_sensitive") == {}
+                and change_body.get("replace_paths") == [["target_id"]]
+                and change_body.get("after_unknown") == {"id": True, "target_id": True}
+            )
+            if dependency_valid:
+                seen_replacement_dependencies.add(address)
+                continue
+            errors.append(f"dependent target attachment replacement is not limited to {dependency_owner}'s target_id: {address}")
             continue
         errors.append(f"resource-change actions are outside the approved set on {address}: {list(action_tuple)}")
     for address in sorted(allowed_replacements - seen_replacements):
         errors.append(f"requested replacement action is absent for {address}")
+    for address in sorted(allowed_replacements & approved_replacements):
+        dependency = replacement_dependencies[address]
+        if dependency not in seen_replacement_dependencies:
+            errors.append(f"requested replacement dependency action is absent for {dependency}")
 
     by_type: dict[str, list[dict[str, Any]]] = {}
     for resource in values:
