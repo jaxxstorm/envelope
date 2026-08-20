@@ -36,15 +36,15 @@ def verify_privilege_contract(text: str, units: dict[str, str]) -> None:
     host = scripts["host"]
     preflight = scripts["preflight"]
     for required in (
-        "/usr/sbin/sysctl -p /etc/sysctl.d/90-envelope.conf",
+        '/usr/sbin/sysctl -q -w "$setting"',
         "sysctl -q -w",
         "nft flush ruleset",
         '"$binary" -A',
     ):
         if required not in host:
             raise RuntimeError(f"root host-network script omits mutation contract: {required}")
-    if "sysctl --system" in host:
-        raise RuntimeError("root host-network script must not load unowned sysctl configuration")
+    if "sysctl --system" in host or "sysctl -p" in host:
+        raise RuntimeError("root host-network script must not load unowned or wildcard sysctl configuration")
     for prohibited in ("sysctl --system", "sysctl -q -w", "nft flush ruleset", "/usr/local/sbin/envelope-host-network"):
         if prohibited in preflight:
             raise RuntimeError(f"unprivileged ExecStartPre contains mutation path: {prohibited}")

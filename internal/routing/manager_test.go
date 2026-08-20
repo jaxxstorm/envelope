@@ -549,7 +549,7 @@ func TestSupplementaryLookupUnavailableDoesNotOverrideFullPrefixAudit(t *testing
 }
 
 func TestSupplementaryLookupSkipRequiresProvenIPv4TUNContext(t *testing.T) {
-	base := routeQuery{Family: "-4", Source: "10.10.0.1", Destination: "10.30.0.1", Input: "envelope0"}
+	base := routeQuery{Family: "-4", Source: "10.10.0.0", Destination: "10.30.0.0", Input: "envelope0"}
 	tests := []struct {
 		name     string
 		mutate   func(*routeQuery, *fakeOps)

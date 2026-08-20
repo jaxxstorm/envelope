@@ -1996,7 +1996,7 @@ class CloudInitSandboxTest(unittest.TestCase):
             flags=re.DOTALL,
         ).group(1)
         for mutation in (
-            "/usr/sbin/sysctl -p /etc/sysctl.d/90-envelope.conf",
+            "/usr/sbin/sysctl -q -w \"$setting\"",
             "sysctl -q -w",
             "nft flush ruleset",
             '"$binary" -A',
@@ -2027,6 +2027,7 @@ class CloudInitSandboxTest(unittest.TestCase):
         self.assertIn("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW", service_unit)
         self.assertIn("ProtectKernelTunables=yes", service_unit)
         self.assertIn("net.ipv4.conf.default.rp_filter = 0", rendered)
+        self.assertIn("net.ipv4.conf.*.rp_filter = 0", rendered)
         self.assertIn('"net.ipv4.conf.$envelope.rp_filter=0"', host)
         self.assertIn('"net.ipv4.conf.$iface.rp_filter=0"', host)
         self.assertIn('"$save_bin" -t "$table"', preflight)
