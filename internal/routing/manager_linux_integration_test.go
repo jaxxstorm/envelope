@@ -453,6 +453,7 @@ func configureNamespaceAddresses(t *testing.T, routerNS, deliveryNS, remoteNS, r
 	}
 	runIntegrationCommand(t, "ip", "-n", routerNS, "route", "add", "10.20.0.0/24", "dev", "underlay0")
 	runIntegrationCommand(t, "ip", "-n", routerNS, "-6", "route", "add", "2001:db8:20::/64", "dev", "underlay0")
+	runIntegrationCommand(t, "ip", "-n", routerNS, "route", "add", "10.10.0.0/24", "dev", "envelope0")
 	runIntegrationCommand(t, "ip", "-n", routerNS, "route", "add", "table", strconv.Itoa(config.TailscaleRouteTableID), "10.30.0.0/24", "dev", "tailscale0")
 	runIntegrationCommand(t, "ip", "-n", routerNS, "-6", "route", "add", "table", strconv.Itoa(config.TailscaleRouteTableID), "2001:db8:30::/64", "dev", "tailscale0")
 	for _, family := range []string{"-4", "-6"} {
@@ -469,9 +470,10 @@ func configureRouterHostPolicy(t *testing.T, routerNS, iptablesPath, ip6tablesPa
 		"net.ipv4.ip_forward=1",
 		"net.ipv6.conf.all.forwarding=1",
 		"net.ipv4.conf.all.rp_filter=0",
+		"net.ipv4.conf.default.rp_filter=2",
 		"net.ipv4.conf.underlay0.rp_filter=0",
 		"net.ipv4.conf.tailscale0.rp_filter=0",
-		"net.ipv4.conf.envelope0.rp_filter=0",
+		"net.ipv4.conf.envelope0.rp_filter=2",
 	} {
 		runIntegrationCommand(t, "ip", "netns", "exec", routerNS, "sysctl", "-q", "-w", setting)
 	}

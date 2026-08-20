@@ -40,6 +40,8 @@ var defaultExecutablePaths = executablePaths{
 	nft:           "/usr/sbin/nft",
 }
 
+var legacyFirewallTables = [...]string{"raw", "mangle", "nat", "filter", "security"}
+
 type systemOpsLinux struct {
 	runner   commandRunner
 	paths    executablePaths
@@ -413,13 +415,23 @@ func (s *systemOpsLinux) ValidateFirewall(ctx context.Context, contracts []forwa
 		if !strings.Contains(string(version), "(legacy)") {
 			return fmt.Errorf("%s is not the supported legacy backend: %s", binary, strings.TrimSpace(string(version)))
 		}
-		saved, err := s.runner.Run(ctx, save)
-		if err != nil {
-			return err
-		}
-		ruleset, err := parseSavedRules(string(saved))
-		if err != nil {
-			return fmt.Errorf("%s decode legacy ruleset: %w", family, err)
+		ruleset := make(savedRuleset, len(legacyFirewallTables))
+		for _, table := range legacyFirewallTables {
+			saved, err := s.runner.Run(ctx, save, "-t", table)
+			if err != nil {
+				if isMissingLegacyTableErr(err) {
+					continue
+				}
+				return fmt.Errorf("%s read legacy %s table: %w", family, table, err)
+			}
+			parsed, err := parseSavedRules(string(saved))
+			if err != nil {
+				return fmt.Errorf("%s decode legacy %s table: %w", family, table, err)
+			}
+			if len(parsed) != 1 || parsed[table] == nil {
+				return fmt.Errorf("%s legacy %s command returned an unexpected table schema", family, table)
+			}
+			ruleset[table] = parsed[table]
 		}
 		if err := validatePristineLegacyHooks(ruleset); err != nil {
 			return fmt.Errorf("%s legacy forwarding surface: %w", family, err)
@@ -849,4 +861,8 @@ func (s *systemOpsLinux) runIP(ctx context.Context, args ...string) ([]byte, err
 
 func isMissingFIBTableErr(err error) bool {
 	return strings.Contains(err.Error(), "FIB table does not exist")
+}
+
+func isMissingLegacyTableErr(err error) bool {
+	return strings.Contains(err.Error(), "Table does not exist")
 }

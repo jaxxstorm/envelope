@@ -603,6 +603,61 @@ func TestFullPrefixAuditRejectsInteriorRouteAndSourcePolicyShadows(t *testing.T)
 	}
 }
 
+func TestFullPrefixAuditAcceptsCompatibleAWSResolverHostRoute(t *testing.T) {
+	cfg := routingConfig(t, config.RoutingModeVerify)
+	ops := readyFakeOps(cfg)
+	addEquivalentReturnState(cfg, ops)
+	addRouteToTable(ops, "10.20.0.2/32", routeEntry{
+		Prefix: "10.20.0.2/32", Device: cfg.UnderlayIface, Table: mainRouteTable, Type: "unicast",
+	})
+	mgr, _ := newTestManager(t, cfg, ops, time.Hour)
+	if err := mgr.Initialize(context.Background()); err != nil || !mgr.Ready() {
+		t.Fatalf("compatible AWS resolver route rejected: ready=%v reason=%q err=%v", mgr.Ready(), mgr.HealthReason(), err)
+	}
+}
+
+func TestFullPrefixAuditRejectsIncompatibleResolverHostRoutes(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		route routeEntry
+	}{
+		{name: "wrong device", route: routeEntry{Device: "envelope0", Table: mainRouteTable, Type: "unicast"}},
+		{name: "wrong table", route: routeEntry{Device: "eth0", Table: 123, Type: "unicast"}},
+		{name: "blackhole", route: routeEntry{Table: mainRouteTable, Type: "blackhole"}},
+		{name: "unreachable", route: routeEntry{Table: mainRouteTable, Type: "unreachable"}},
+		{name: "prohibit", route: routeEntry{Table: mainRouteTable, Type: "prohibit"}},
+		{name: "source specific", route: routeEntry{Source: "10.30.0.0/24", Device: "eth0", Table: mainRouteTable, Type: "unicast"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := routingConfig(t, config.RoutingModeVerify)
+			ops := readyFakeOps(cfg)
+			addEquivalentReturnState(cfg, ops)
+			route := tt.route
+			route.Prefix = "10.20.0.2/32"
+			if tt.name == "wrong device" || tt.name == "source specific" {
+				route.Device = tt.route.Device
+			} else if route.Device == "" && route.Type == "unicast" {
+				route.Device = cfg.UnderlayIface
+			}
+			if tt.name == "wrong table" {
+				route.Family = "-4"
+				ops.tableRoutes[tableKey("-4", mainRouteTable)] = append(
+					ops.tableRoutes[tableKey("-4", mainRouteTable)], route,
+				)
+			} else {
+				addRouteToTable(ops, route.Prefix, route)
+			}
+			mgr, _ := newTestManager(t, cfg, ops, time.Hour)
+			if err := mgr.Initialize(context.Background()); err != nil {
+				t.Fatalf("verify initialize: %v", err)
+			}
+			if mgr.Ready() || mgr.HealthReason() != metrics.RoutingFailureReasonDeliveryRoute {
+				t.Fatalf("incompatible resolver route accepted: ready=%v reason=%q", mgr.Ready(), mgr.HealthReason())
+			}
+		})
+	}
+}
+
 func TestFullPrefixAuditRejectsRelevantIPv6SourceSpecificRoute(t *testing.T) {
 	ops := newFakeOps()
 	ops.policyRules["-6"] = []policyRule{{Family: "-6", Priority: 32766, Table: mainRouteTable, Action: "lookup", SuppressPrefixLength: -1}}
@@ -680,6 +735,28 @@ func TestHostAndMTUContracts(t *testing.T) {
 	mgr.reconcile(context.Background(), false)
 	if mgr.Ready() || mgr.HealthReason() != metrics.RoutingFailureReasonMSS {
 		t.Fatalf("missing MTU ready=%v reason=%q", mgr.Ready(), mgr.HealthReason())
+	}
+}
+
+func TestRPFilterAcceptsDisabledOrLooseAndRejectsStrict(t *testing.T) {
+	for _, tt := range []struct {
+		value   int
+		wantErr bool
+	}{
+		{value: 0},
+		{value: 2},
+		{value: 1, wantErr: true},
+	} {
+		t.Run(strconv.Itoa(tt.value), func(t *testing.T) {
+			cfg := routingConfig(t, config.RoutingModeVerify)
+			ops := readyFakeOps(cfg)
+			ops.sysctls["/proc/sys/net/ipv4/conf/"+cfg.TunName+"/rp_filter"] = tt.value
+			mgr, _ := newTestManager(t, cfg, ops, time.Hour)
+			err := mgr.checkRPFilter()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("rp_filter=%d err=%v wantErr=%v", tt.value, err, tt.wantErr)
+			}
+		})
 	}
 }
 

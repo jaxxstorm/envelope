@@ -920,7 +920,7 @@ func (a *policyAuditor) auditPath(source, destination targetRoute, input, expect
 	if route, ok := firstRelevantSourceSpecificRoute(expectedRoutes, source, destination); ok {
 		return fail(reason, "source-specific route %s from %s in table %d intersects source %s destination %s", route.Prefix, routeSourcePrefix(route), expectedTable, sourceCIDR(source), destination.cidr)
 	}
-	if _, err := selectExpectedRoute(expectedRoutes, destination.cidr, expectedDevice, expectedTable, -1); err != nil {
+	if _, err := selectExpectedRoute(expectedRoutes, source, destination, expectedDevice, expectedTable, -1); err != nil {
 		return fail(reason, "full-prefix route audit for %s: %v", destination.cidr, err)
 	}
 	rules, err := a.policyRules(destination.family)
@@ -959,7 +959,7 @@ func (a *policyAuditor) auditPath(source, destination targetRoute, input, expect
 		}
 		if rule.Table == expectedTable {
 			if policyRuleCoversPath(rule, source, destination, input) {
-				if _, err := selectExpectedRoute(routes, destination.cidr, expectedDevice, expectedTable, rule.SuppressPrefixLength); err == nil {
+				if _, err := selectExpectedRoute(routes, source, destination, expectedDevice, expectedTable, rule.SuppressPrefixLength); err == nil {
 					resolvedPriority = rule.Priority
 				}
 			}
@@ -1104,19 +1104,34 @@ func normalizedRuleAction(rule policyRule) string {
 	return action
 }
 
-func selectExpectedRoute(routes []routeEntry, destination, expectedDevice string, expectedTable, suppressPrefixLength int) (routeEntry, error) {
+func selectExpectedRoute(routes []routeEntry, source, destination targetRoute, expectedDevice string, expectedTable, suppressPrefixLength int) (routeEntry, error) {
 	bestBits := -1
 	var best []routeEntry
+	sourcePrefix := source.cidr
+	if sourcePrefix == "" {
+		sourcePrefix = familyDefaultPrefix(destination.family)
+	}
 	for _, route := range routes {
 		prefix, err := netip.ParsePrefix(route.Prefix)
-		if err != nil || !prefixesOverlap(route.Prefix, destination) || routeSuppressed(prefix, suppressPrefixLength) {
+		if err != nil || !prefixesOverlap(route.Prefix, destination.cidr) || routeSuppressed(prefix, suppressPrefixLength) {
+			continue
+		}
+		routeSource := routeSourcePrefix(route)
+		if routeSource != familyDefaultPrefix(destination.family) {
+			if prefixesOverlap(routeSource, sourcePrefix) {
+				return routeEntry{}, fmt.Errorf("intersecting route %s has source selector %s", route.Prefix, routeSource)
+			}
 			continue
 		}
 		if normalizedRouteType(route.Type) != "unicast" {
 			return routeEntry{}, fmt.Errorf("intersecting route %s has terminal type %s", route.Prefix, normalizedRouteType(route.Type))
 		}
-		if !prefixCovers(route.Prefix, destination) {
-			return routeEntry{}, fmt.Errorf("intersecting route %s is more specific than required prefix %s", route.Prefix, destination)
+		if route.Table != expectedTable || route.Device != expectedDevice {
+			return routeEntry{}, fmt.Errorf("intersecting route %s selects dev=%s table=%d, want dev=%s table=%d", route.Prefix, route.Device, route.Table, expectedDevice, expectedTable)
+		}
+		if !prefixCovers(route.Prefix, destination.cidr) {
+			// A more-specific route is safe only because every path selector above is identical.
+			continue
 		}
 		if prefix.Bits() > bestBits {
 			bestBits = prefix.Bits()
@@ -1126,12 +1141,7 @@ func selectExpectedRoute(routes []routeEntry, destination, expectedDevice string
 		}
 	}
 	if len(best) == 0 {
-		return routeEntry{}, fmt.Errorf("table %d has no route covering %s", expectedTable, destination)
-	}
-	for _, route := range best {
-		if route.Table != expectedTable || route.Device != expectedDevice {
-			return routeEntry{}, fmt.Errorf("best route %s selects dev=%s table=%d, want dev=%s table=%d", route.Prefix, route.Device, route.Table, expectedDevice, expectedTable)
-		}
+		return routeEntry{}, fmt.Errorf("table %d has no route covering %s", expectedTable, destination.cidr)
 	}
 	return best[0], nil
 }

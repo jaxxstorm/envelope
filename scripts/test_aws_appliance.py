@@ -2009,9 +2009,28 @@ class CloudInitSandboxTest(unittest.TestCase):
         self.assertNotIn("/usr/local/sbin/envelope-host-network", preflight)
         self.assertIn("User=root", host_unit)
         self.assertIn("Before=envelope.service", host_unit)
+        self.assertIn("Environment=XTABLES_LOCKFILE=/run/envelope-host-network/xtables.lock", host_unit)
+        self.assertIn("RuntimeDirectory=envelope-host-network", host_unit)
+        self.assertIn("RuntimeDirectoryMode=0700", host_unit)
+        self.assertEqual(
+            re.findall(r"^ReadWritePaths=.*$", host_unit, re.MULTILINE),
+            ["ReadWritePaths=/run/envelope-host-network"],
+        )
+        self.assertIn("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW", host_unit)
+        self.assertIn("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW", host_unit)
         self.assertIn("User=envelope", service_unit)
-        self.assertIn("ExecStartPre=/usr/local/sbin/envelope-preflight", service_unit)
+        self.assertIn("Group=envelope", service_unit)
+        self.assertNotRegex(service_unit, r"(?m)^User=root$")
+        self.assertIn("ExecStartPre=!/usr/local/sbin/envelope-preflight", service_unit)
+        self.assertIn("ExecStart=/usr/local/bin/envelope", service_unit)
+        self.assertIn("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW", service_unit)
+        self.assertIn("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW", service_unit)
         self.assertIn("ProtectKernelTunables=yes", service_unit)
+        self.assertIn("net.ipv4.conf.default.rp_filter = 2", rendered)
+        self.assertIn('"net.ipv4.conf.$envelope.rp_filter=2"', host)
+        self.assertIn('"net.ipv4.conf.$iface.rp_filter=0"', host)
+        self.assertIn('"$save_bin" -t "$table"', preflight)
+        self.assertNotIn('rules=$("$save_bin")', preflight)
 
     def test_vendored_tailscale_module_has_only_exact_package_installation_before_auth(self):
         module = ROOT / "example/terraform/modules/tailscale-cloudinit"
@@ -2160,12 +2179,13 @@ fi
                 """
 case "${@: -1}" in
   net.ipv4.ip_forward|net.ipv6.conf.all.forwarding) printf '%s\n' 1 ;;
+  net.ipv4.conf.envelope0.rp_filter) printf '%s\n' 2 ;;
   net.ipv4.conf.*.rp_filter) printf '%s\n' 0 ;;
   *) exit 1 ;;
 esac
 """,
             )
-            rules = """*filter
+            filter_rules = """*filter
 -P INPUT ACCEPT
 -P FORWARD ACCEPT
 -P OUTPUT ACCEPT
@@ -2176,7 +2196,8 @@ esac
 -A ENVELOPE-FORWARD -i envelope0 -o tailscale0 -j ACCEPT
 -A ENVELOPE-FORWARD -i tailscale0 -o envelope0 -j ACCEPT
 COMMIT
-*mangle
+"""
+            mangle_rules = """*mangle
 -N ENVELOPE-MSS
 -A FORWARD -j ENVELOPE-MSS
 -A ENVELOPE-MSS -i ens5 -o tailscale0 -p tcp -j TCPMSS
@@ -2185,10 +2206,33 @@ COMMIT
 -A ENVELOPE-MSS -i tailscale0 -o envelope0 -p tcp -j TCPMSS
 COMMIT
 """
-            save = executable("iptables-save", "cat \"$RULES_FILE\"\n")
+            save_body = """
+printf '%s %s\n' "${0##*/}" "$*" >>"$SAVE_LOG"
+table=${@: -1}
+binary=${0##*/}
+if [[ -n ${DENIED_TABLE:-} && "$table" == "$DENIED_TABLE" ]]; then
+  printf 'Permission denied while opening xtables lock\nsecond line %0400d\n' 0 >&2
+  exit 1
+fi
+if [[ -n ${EXTRA_ERROR_TABLE:-} && "$table" == "$EXTRA_ERROR_TABLE" ]]; then
+  printf '%s v1.8.9 (legacy): Cannot initialize: Table does not exist (do you need to insmod?)\nunexpected extra stderr\n' "$binary" >&2
+  exit 1
+fi
+if [[ "$table" == security || ( -n ${MISSING_TABLE:-} && "$table" == "$MISSING_TABLE" ) ]]; then
+  printf '%s v1.8.9 (legacy): Cannot initialize: Table does not exist (do you need to insmod?)\n' "$binary" >&2
+  exit 1
+fi
+cat "$RULES_DIR/$table"
+"""
+            save = executable("iptables-save", save_body)
+            save6 = executable("ip6tables-save", save_body)
             nft = executable("nft", "printf '%s\n' '{\"nftables\":[{\"metainfo\":{}}]}'\n")
-            rules_file = root / "rules"
-            rules_file.write_text(rules)
+            rules_dir = root / "rules"
+            rules_dir.mkdir()
+            (rules_dir / "filter").write_text(filter_rules)
+            (rules_dir / "mangle").write_text(mangle_rules)
+            for table in ("raw", "nat", "security"):
+                (rules_dir / table).write_text(f"*{table}\nCOMMIT\n")
             env = {
                 **os.environ,
                 "TAILSCALE_BIN": tailscale,
@@ -2198,7 +2242,7 @@ COMMIT
                 "SYSTEMCTL_BIN": success,
                 "SYSCTL_BIN": sysctl,
                 "IPTABLES_SAVE_BIN": save,
-                "IP6TABLES_SAVE_BIN": save,
+                "IP6TABLES_SAVE_BIN": save6,
                 "NFT_BIN": nft,
                 "SHA256_BIN": sha,
                 "ENVELOPE_BIN": str(root / "envelope"),
@@ -2207,10 +2251,51 @@ COMMIT
                 "PREFLIGHT_RETRY_SECONDS": "0",
                 "BACKEND_STATE": "Running",
                 "ROUTES_READY": "true",
-                "RULES_FILE": str(rules_file),
+                "RULES_DIR": str(rules_dir),
+                "SAVE_LOG": str(root / "save.log"),
+                "MISSING_TABLE": "",
+                "DENIED_TABLE": "",
+                "EXTRA_ERROR_TABLE": "",
             }
+            save_log = pathlib.Path(env["SAVE_LOG"])
+            save_log.write_text("")
             healthy = subprocess.run(["bash"], input=preflight, text=True, env=env, capture_output=True)
             self.assertEqual(healthy.returncode, 0, healthy.stderr)
+            expected_tables = [
+                f"{binary} -t {table}"
+                for binary in ("iptables-save", "ip6tables-save")
+                for table in ("raw", "mangle", "nat", "filter", "security")
+            ]
+            self.assertEqual(save_log.read_text().splitlines(), expected_tables)
+
+            for name, overrides, table, detail in (
+                ("absent filter", {"MISSING_TABLE": "filter"}, "filter", "Table does not exist"),
+                ("absent mangle", {"MISSING_TABLE": "mangle"}, "mangle", "Table does not exist"),
+                ("optional table permission error", {"DENIED_TABLE": "raw"}, "raw", "Permission denied"),
+                ("optional table extra stderr", {"EXTRA_ERROR_TABLE": "nat"}, "nat", "unexpected extra stderr"),
+            ):
+                with self.subTest(name=name):
+                    save_log.write_text("")
+                    failed = subprocess.run(
+                        ["bash"], input=preflight, text=True, env={**env, **overrides}, capture_output=True
+                    )
+                    self.assertNotEqual(failed.returncode, 0)
+                    self.assertEqual(
+                        save_log.read_text().splitlines(),
+                        [
+                            f"iptables-save -t {candidate}"
+                            for candidate in ("raw", "mangle", "nat", "filter", "security")
+                        ],
+                    )
+                    diagnostic = next(
+                        line for line in failed.stderr.splitlines() if line.startswith("legacy firewall inspection failed:")
+                    )
+                    self.assertIn(f"binary=iptables-save table={table} status=1", diagnostic)
+                    self.assertIn(detail, diagnostic)
+                    self.assertLessEqual(len(diagnostic), 400)
+                    if name == "optional table permission error":
+                        self.assertIn("lock second line", diagnostic)
+
             for name, overrides in {
                 "backend": {"BACKEND_STATE": "Stopped"},
                 "route withdrawal": {"ROUTES_READY": "false"},

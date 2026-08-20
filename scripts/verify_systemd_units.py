@@ -50,16 +50,36 @@ def verify_privilege_contract(text: str, units: dict[str, str]) -> None:
             raise RuntimeError(f"unprivileged ExecStartPre contains mutation path: {prohibited}")
     host_unit = units["envelope-host-network.service"]
     service_unit = units["envelope.service"]
-    if "User=root" not in host_unit or "Before=envelope.service" not in host_unit:
+    required_host = (
+        "User=root",
+        "Before=envelope.service",
+        "Environment=XTABLES_LOCKFILE=/run/envelope-host-network/xtables.lock",
+        "RuntimeDirectory=envelope-host-network",
+        "RuntimeDirectoryMode=0700",
+        "ReadWritePaths=/run/envelope-host-network",
+        "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW",
+        "AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW",
+    )
+    if any(value not in host_unit for value in required_host):
         raise RuntimeError("host-network mutations must run in the ordered root oneshot")
+    if re.findall(r"^ReadWritePaths=.*$", host_unit, re.MULTILINE) != [
+        "ReadWritePaths=/run/envelope-host-network"
+    ]:
+        raise RuntimeError("host-network unit must write only its private runtime directory")
     required_service = (
         "User=envelope",
-        "ExecStartPre=/usr/local/sbin/envelope-preflight",
+        "Group=envelope",
+        "ExecStartPre=!/usr/local/sbin/envelope-preflight",
+        "ExecStart=/usr/local/bin/envelope",
+        "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW",
+        "AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW",
         "ProtectKernelTunables=yes",
         "Requires=envelope-host-network.service",
     )
     if any(value not in service_unit for value in required_service):
-        raise RuntimeError("Envelope unit does not enforce the read-only unprivileged preflight boundary")
+        raise RuntimeError("Envelope unit does not separate root preflight from the unprivileged main process")
+    if re.search(r"^User=root$", service_unit, re.MULTILINE):
+        raise RuntimeError("Envelope main process must not run as root")
 
 
 def main() -> int:

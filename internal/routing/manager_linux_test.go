@@ -384,8 +384,10 @@ func TestValidateFirewallRequiresLegacyBackendAndRejectsNativeNFT(t *testing.T) 
 	outputs := map[string][]byte{
 		"/test/iptables --version":  []byte("iptables v1.8.9 (legacy)"),
 		"/test/ip6tables --version": []byte("ip6tables v1.8.9 (legacy)"),
-		"/test/iptables-save":       []byte(legacy4),
-		"/test/ip6tables-save":      []byte(legacy6),
+	}
+	for _, table := range legacyFirewallTables {
+		outputs["/test/iptables-save -t "+table] = []byte(legacyTableFixture(legacy4, table))
+		outputs["/test/ip6tables-save -t "+table] = []byte(legacyTableFixture(legacy6, table))
 	}
 	nft := filepath.Join(t.TempDir(), "nft")
 	if err := os.WriteFile(nft, []byte("fixture"), 0o700); err != nil {
@@ -397,6 +399,33 @@ func TestValidateFirewallRequiresLegacyBackendAndRejectsNativeNFT(t *testing.T) 
 	ops.paths.nft = nft
 	if err := ops.ValidateFirewall(context.Background(), contracts); err != nil {
 		t.Fatalf("valid legacy firewall: %v", err)
+	}
+	wantCalls := []string{"/test/iptables --version"}
+	for _, table := range legacyFirewallTables {
+		wantCalls = append(wantCalls, "/test/iptables-save -t "+table)
+	}
+	wantCalls = append(wantCalls, "/test/ip6tables --version")
+	for _, table := range legacyFirewallTables {
+		wantCalls = append(wantCalls, "/test/ip6tables-save -t "+table)
+	}
+	wantCalls = append(wantCalls, nft+" -j list ruleset")
+	if strings.Join(runner.calls, "\n") != strings.Join(wantCalls, "\n") {
+		t.Fatalf("firewall inspection calls:\n%s", strings.Join(runner.calls, "\n"))
+	}
+	for _, call := range runner.calls {
+		if call == "/test/iptables-save" || call == "/test/ip6tables-save" {
+			t.Fatalf("firewall inspection regressed to no-argument save: %s", call)
+		}
+	}
+	unsupported := testLinuxOps(&scriptedCommandRunner{
+		outputs: outputs,
+		errors: map[string]error{
+			"/test/iptables-save -t security": errors.New("Table does not exist"),
+		},
+	})
+	unsupported.paths.nft = nft
+	if err := unsupported.ValidateFirewall(context.Background(), contracts); err != nil {
+		t.Fatalf("unsupported legacy table was not skipped safely: %v", err)
 	}
 
 	outputs["/test/iptables --version"] = []byte("iptables v1.8.9 (nf_tables)")
@@ -446,6 +475,32 @@ func TestValidateFirewallRequiresLegacyBackendAndRejectsNativeNFT(t *testing.T) 
 	if err := metadataFree.ValidateFirewall(context.Background(), contracts); err == nil {
 		t.Fatal("metadata-free nft output was accepted as an empty ruleset")
 	}
+
+	for _, save := range []string{"/test/iptables-save", "/test/ip6tables-save"} {
+		for _, table := range legacyFirewallTables {
+			t.Run(save+"-"+table+"-failure", func(t *testing.T) {
+				failed := make(map[string]error)
+				failed[save+" -t "+table] = errors.New("injected table read failure")
+				candidate := testLinuxOps(&scriptedCommandRunner{outputs: outputs, errors: failed})
+				candidate.paths.nft = nft
+				if err := candidate.ValidateFirewall(context.Background(), contracts); err == nil {
+					t.Fatal("table command failure was accepted")
+				}
+			})
+			t.Run(save+"-"+table+"-schema", func(t *testing.T) {
+				malformed := make(map[string][]byte, len(outputs))
+				for key, value := range outputs {
+					malformed[key] = value
+				}
+				malformed[save+" -t "+table] = []byte("*" + table + "\n:INPUT ACCEPT [0:0]\n")
+				candidate := testLinuxOps(&scriptedCommandRunner{outputs: malformed, errors: map[string]error{}})
+				candidate.paths.nft = nft
+				if err := candidate.ValidateFirewall(context.Background(), contracts); err == nil {
+					t.Fatal("table schema failure was accepted")
+				}
+			})
+		}
+	}
 }
 
 func legacyRulesetFixture(contracts []forwardingPathContract) string {
@@ -480,6 +535,19 @@ func legacyRulesetFixture(contracts []forwardingPathContract) string {
 		strings.Join(filter, "\n"),
 		"*security\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]\nCOMMIT",
 	}, "\n")
+}
+
+func legacyTableFixture(ruleset, table string) string {
+	start := strings.Index(ruleset, "*"+table+"\n")
+	if start < 0 {
+		return ""
+	}
+	end := strings.Index(ruleset[start:], "\nCOMMIT")
+	if end < 0 {
+		return ""
+	}
+	end += start + len("\nCOMMIT")
+	return ruleset[start:end]
 }
 
 func insertRuleBeforeCommit(rules, table, rule string) string {
