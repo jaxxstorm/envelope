@@ -144,6 +144,13 @@ resource "aws_instance" "envelope_west" {
       condition     = contains(data.aws_ec2_instance_type.west_appliance.supported_architectures, local.ec2_architecture)
       error_message = "The west appliance instance type does not support the reviewed architecture."
     }
+    precondition {
+      condition = (
+        local.west_user_data_raw_bytes <= local.ec2_user_data_raw_limit_bytes &&
+        local.west_user_data_base64_bytes <= local.ec2_user_data_base64_limit_bytes
+      )
+      error_message = "The gzip-compressed west cloud-init MIME exceeds EC2's 16 KiB raw or base64-encoded user-data limit."
+    }
   }
 }
 
@@ -191,6 +198,13 @@ resource "aws_instance" "envelope_east" {
     precondition {
       condition     = contains(data.aws_ec2_instance_type.east_appliance.supported_architectures, local.ec2_architecture)
       error_message = "The east appliance instance type does not support the reviewed architecture."
+    }
+    precondition {
+      condition = (
+        local.east_user_data_raw_bytes <= local.ec2_user_data_raw_limit_bytes &&
+        local.east_user_data_base64_bytes <= local.ec2_user_data_base64_limit_bytes
+      )
+      error_message = "The gzip-compressed east cloud-init MIME exceeds EC2's 16 KiB raw or base64-encoded user-data limit."
     }
   }
 }

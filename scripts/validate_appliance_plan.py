@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gzip
 import json
 import pathlib
 import re
@@ -13,6 +14,8 @@ from typing import Any
 
 
 KEY_PATTERN = re.compile("tskey-" + r"(?:auth|client|api)-[A-Za-z0-9_-]{8,}", re.IGNORECASE)
+EC2_USER_DATA_RAW_LIMIT_BYTES = 16 * 1024
+EC2_USER_DATA_BASE64_LIMIT_BYTES = 4 * ((EC2_USER_DATA_RAW_LIMIT_BYTES + 2) // 3)
 APPROVED_DATA_RESOURCES = {
     "data.aws_caller_identity.current": "aws_caller_identity",
     "data.aws_iam_policy_document.artifact_bucket": "aws_iam_policy_document",
@@ -287,11 +290,39 @@ def validate(
             errors.append(f"appliance public-IP/source-destination contract failed on {resource.get('address')}")
         user_data = instance.get("user_data_base64")
         if isinstance(user_data, str):
+            if not user_data.isascii():
+                errors.append(f"appliance user_data_base64 is not ASCII on {resource.get('address')}")
+                continue
+            encoded = user_data.encode("ascii")
+            if len(encoded) > EC2_USER_DATA_BASE64_LIMIT_BYTES:
+                errors.append(
+                    f"appliance base64 user data is {len(encoded)} bytes, exceeds EC2 limit "
+                    f"{EC2_USER_DATA_BASE64_LIMIT_BYTES} on {resource.get('address')}"
+                )
             try:
-                decoded = base64.b64decode(user_data, validate=True).decode(errors="replace")
+                compressed = base64.b64decode(encoded, validate=True)
             except ValueError:
                 errors.append(f"invalid appliance user_data_base64 on {resource.get('address')}")
                 continue
+            if len(compressed) > EC2_USER_DATA_RAW_LIMIT_BYTES:
+                errors.append(
+                    f"appliance raw user data is {len(compressed)} bytes, exceeds EC2 limit "
+                    f"{EC2_USER_DATA_RAW_LIMIT_BYTES} on {resource.get('address')}"
+                )
+            try:
+                mime_bytes = gzip.decompress(compressed)
+            except (EOFError, OSError):
+                errors.append(f"appliance user data is not valid gzip on {resource.get('address')}")
+                continue
+            try:
+                decoded = mime_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                errors.append(f"appliance gzip user data is not UTF-8 MIME on {resource.get('address')}")
+                continue
+            if not re.search(r"(?im)^Content-Type:\s*multipart/", decoded) or not re.search(
+                r"(?im)^MIME-Version:\s*1\.0\s*$", decoded
+            ):
+                errors.append(f"appliance gzip user data is not multipart cloud-init MIME on {resource.get('address')}")
             if KEY_PATTERN.search(decoded) or "tailscale_auth_key" in decoded:
                 errors.append(f"plaintext Tailscale credential material appears in {resource.get('address')}")
             if "command:" not in decoded or ":ssm:" not in decoded or "--with-decryption" not in decoded:

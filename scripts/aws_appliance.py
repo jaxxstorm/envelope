@@ -283,8 +283,9 @@ class TailscaleAPI:
             f"{self.base_url}{path}",
             headers={"Authorization": f"Bearer {self._oauth_token()}"},
         )
-        if status != 404:
-            self._decode(status, body, "revoke Tailscale auth key")
+        if status == 404 or 200 <= status < 300:
+            return
+        self._decode(status, body, "revoke Tailscale auth key")
 
     def delete_device(self, device_id: str) -> None:
         path = f"/device/{urllib.parse.quote(device_id, safe='')}"
@@ -293,8 +294,9 @@ class TailscaleAPI:
             f"{self.base_url}{path}",
             headers={"Authorization": f"Bearer {self._oauth_token()}"},
         )
-        if status != 404:
-            self._decode(status, body, "delete Tailscale device")
+        if status == 404 or 200 <= status < 300:
+            return
+        self._decode(status, body, "delete Tailscale device")
 
 
 def parse_hujson(value: str) -> dict[str, Any]:
@@ -2069,7 +2071,7 @@ def cleanup_tailnet_devices(tailscale: TailscaleAPI, manifest: dict[str, Any], *
 
 
 def audit_run_resources(config: RunConfig, aws: AwsCLI) -> list[dict[str, str]]:
-    residuals: list[dict[str, str]] = []
+    tagged: dict[str, dict[str, str]] = {}
     for site in ("west", "east"):
         response = aws.json(
             [
@@ -2080,18 +2082,29 @@ def audit_run_resources(config: RunConfig, aws: AwsCLI) -> list[dict[str, str]]:
             ],
             region=config.sites[site]["region"],
         )
-        for item in response.get("ResourceTagMappingList", []):
-            if not isinstance(item, dict) or not item.get("ResourceARN"):
-                continue
-            tags = {str(tag.get("Key")): str(tag.get("Value")) for tag in item.get("Tags", []) if isinstance(tag, dict)}
+        mappings = response.get("ResourceTagMappingList")
+        if not isinstance(mappings, list):
+            raise LifecycleError("tag audit returned an invalid resource mapping schema")
+        for item in mappings:
+            if not isinstance(item, dict) or not isinstance(item.get("ResourceARN"), str) or not item["ResourceARN"]:
+                raise LifecycleError("tag audit returned a resource without an exact ARN")
+            raw_tags = item.get("Tags")
+            if not isinstance(raw_tags, list) or not all(
+                isinstance(tag, dict) and isinstance(tag.get("Key"), str) and isinstance(tag.get("Value"), str)
+                for tag in raw_tags
+            ):
+                raise LifecycleError("tag audit returned an invalid tag schema")
+            tags = {str(tag["Key"]): str(tag["Value"]) for tag in raw_tags}
             if tags.get("EnvelopeRun") != config.run_id or tags.get("ExpiresAt") != config.expires_at:
                 raise LifecycleError("tag audit returned a resource whose run/TTL identity is not exact")
             arn = str(item["ResourceARN"])
             service = arn.split(":", 5)[2] if arn.startswith("arn:") else ""
             effective_region = config.sites["west"]["region"] if service in {"s3", "iam"} else config.sites[site]["region"]
-            residuals.append({"arn": arn, "region": effective_region})
-    unique = {item["arn"]: item for item in residuals}
-    return [unique[key] for key in sorted(unique)]
+            candidate = {"arn": arn, "region": effective_region}
+            if arn in tagged and tagged[arn] != candidate:
+                raise LifecycleError("tag audit returned one resource under conflicting regional identities")
+            tagged[arn] = candidate
+    return [tagged[arn] for arn in sorted(tagged) if owned_resource_is_live(aws, tagged[arn])]
 
 
 def owned_resource_kind(arn: str) -> tuple[str, str]:
@@ -2132,6 +2145,153 @@ def owned_resource_kind(arn: str) -> tuple[str, str]:
         if kind in allowed:
             return kind, identifier
     raise LifecycleError(f"owned residual type is not in the cleanup allowlist: {arn}")
+
+
+OWNED_RESOURCE_ABSENT_MARKERS = {
+    "s3-bucket": ("(404)", "Not Found", "NoSuchBucket"),
+    "load-balancer": ("LoadBalancerNotFound",),
+    "listener": ("ListenerNotFound",),
+    "target-group": ("TargetGroupNotFound",),
+    "instance-profile": ("NoSuchEntity",),
+    "role": ("NoSuchEntity",),
+    "ssm-parameter": ("ParameterNotFound",),
+    "instance": ("InvalidInstanceID.NotFound",),
+    "volume": ("InvalidVolume.NotFound",),
+    "vpc-endpoint": ("InvalidVpcEndpointId.NotFound",),
+    "vpc-endpoint-service": ("InvalidServiceId.NotFound", "InvalidVpcEndpointService.NotFound"),
+    "natgateway": ("NatGatewayNotFound",),
+    "elastic-ip": ("InvalidAllocationID.NotFound",),
+    "internet-gateway": ("InvalidInternetGatewayID.NotFound",),
+    "route-table": ("InvalidRouteTableID.NotFound",),
+    "subnet": ("InvalidSubnetID.NotFound",),
+    "security-group": ("InvalidGroup.NotFound",),
+    "network-interface": ("InvalidNetworkInterfaceID.NotFound",),
+    "vpc": ("InvalidVpcID.NotFound",),
+}
+
+
+def exact_described_item(
+    response: dict[str, Any], collection: str, identity_field: str, expected: str
+) -> dict[str, Any] | None:
+    values = response.get(collection)
+    if not isinstance(values, list):
+        raise LifecycleError(f"authoritative {collection} response has an invalid schema")
+    if not values:
+        return None
+    if not all(isinstance(value, dict) for value in values):
+        raise LifecycleError(f"authoritative {collection} response contains a non-object item")
+    if len(values) != 1 or values[0].get(identity_field) != expected:
+        raise LifecycleError(f"authoritative {collection} response differs from the exact requested identity")
+    return values[0]
+
+
+def owned_resource_is_live(aws: AwsCLI, resource: dict[str, str]) -> bool:
+    arn, region = resource["arn"], resource["region"]
+    kind, identifier = owned_resource_kind(arn)
+    try:
+        if kind == "s3-bucket":
+            aws.json(["s3api", "head-bucket", "--bucket", identifier], region=region)
+            return True
+        if kind in {"load-balancer", "listener", "target-group"}:
+            operation, argument, collection, identity_field = {
+                "load-balancer": ("describe-load-balancers", "--load-balancer-arns", "LoadBalancers", "LoadBalancerArn"),
+                "listener": ("describe-listeners", "--listener-arns", "Listeners", "ListenerArn"),
+                "target-group": ("describe-target-groups", "--target-group-arns", "TargetGroups", "TargetGroupArn"),
+            }[kind]
+            response = aws.json(["elbv2", operation, argument, identifier], region=region)
+            return exact_described_item(response, collection, identity_field, identifier) is not None
+        if kind == "instance-profile":
+            response = aws.json(["iam", "get-instance-profile", "--instance-profile-name", identifier])
+            profile = response.get("InstanceProfile")
+            if not isinstance(profile, dict) or profile.get("InstanceProfileName") != identifier:
+                raise LifecycleError("authoritative instance-profile response differs from the exact requested identity")
+            return True
+        if kind == "role":
+            response = aws.json(["iam", "get-role", "--role-name", identifier])
+            role = response.get("Role")
+            if not isinstance(role, dict) or role.get("RoleName") != identifier:
+                raise LifecycleError("authoritative role response differs from the exact requested identity")
+            return True
+        if kind == "ssm-parameter":
+            response = aws.json(
+                ["ssm", "describe-parameters", "--parameter-filters", f"Key=Name,Values={identifier}"], region=region
+            )
+            return exact_described_item(response, "Parameters", "Name", identifier) is not None
+        if kind == "instance":
+            response = aws.json(["ec2", "describe-instances", "--instance-ids", identifier], region=region)
+            reservations = response.get("Reservations")
+            if not isinstance(reservations, list) or not all(isinstance(value, dict) for value in reservations):
+                raise LifecycleError("authoritative instance response has an invalid reservation schema")
+            instances: list[dict[str, Any]] = []
+            for reservation in reservations:
+                values = reservation.get("Instances")
+                if not isinstance(values, list) or not all(isinstance(value, dict) for value in values):
+                    raise LifecycleError("authoritative instance response has an invalid instance schema")
+                instances.extend(values)
+            if not instances:
+                return False
+            if len(instances) != 1 or instances[0].get("InstanceId") != identifier:
+                raise LifecycleError("authoritative instance response differs from the exact requested identity")
+            state_value = instances[0].get("State")
+            if not isinstance(state_value, dict):
+                raise LifecycleError("authoritative instance response omitted its state object")
+            state = state_value.get("Name")
+            if not isinstance(state, str):
+                raise LifecycleError("authoritative instance response omitted its state")
+            return state.lower() != "terminated"
+        if kind == "natgateway":
+            response = aws.json(["ec2", "describe-nat-gateways", "--nat-gateway-ids", identifier], region=region)
+            gateway = exact_described_item(response, "NatGateways", "NatGatewayId", identifier)
+            if gateway is None:
+                return False
+            state = gateway.get("State")
+            if not isinstance(state, str):
+                raise LifecycleError("authoritative NAT gateway response omitted its state")
+            return state.lower() not in {"deleted", "failed"}
+        ec2_specs = {
+            "volume": ("describe-volumes", "--volume-ids", "Volumes", "VolumeId"),
+            "vpc-endpoint": ("describe-vpc-endpoints", "--vpc-endpoint-ids", "VpcEndpoints", "VpcEndpointId"),
+            "vpc-endpoint-service": (
+                "describe-vpc-endpoint-service-configurations",
+                "--service-ids",
+                "ServiceConfigurations",
+                "ServiceId",
+            ),
+            "elastic-ip": ("describe-addresses", "--allocation-ids", "Addresses", "AllocationId"),
+            "internet-gateway": (
+                "describe-internet-gateways",
+                "--internet-gateway-ids",
+                "InternetGateways",
+                "InternetGatewayId",
+            ),
+            "route-table": ("describe-route-tables", "--route-table-ids", "RouteTables", "RouteTableId"),
+            "subnet": ("describe-subnets", "--subnet-ids", "Subnets", "SubnetId"),
+            "security-group": ("describe-security-groups", "--group-ids", "SecurityGroups", "GroupId"),
+            "network-interface": (
+                "describe-network-interfaces",
+                "--network-interface-ids",
+                "NetworkInterfaces",
+                "NetworkInterfaceId",
+            ),
+            "vpc": ("describe-vpcs", "--vpc-ids", "Vpcs", "VpcId"),
+        }
+        operation, argument, collection, identity_field = ec2_specs[kind]
+        response = aws.json(["ec2", operation, argument, identifier], region=region)
+        item = exact_described_item(response, collection, identity_field, identifier)
+        if item is None:
+            return False
+        if kind in {"volume", "vpc-endpoint", "vpc-endpoint-service"}:
+            state_field = {"volume": "State", "vpc-endpoint": "State", "vpc-endpoint-service": "ServiceState"}[kind]
+            state = item.get(state_field)
+            if not isinstance(state, str):
+                raise LifecycleError(f"authoritative {kind} response omitted its state")
+            if state.lower() == "deleted":
+                return False
+        return True
+    except CommandError as error:
+        if any(marker in error.raw_stderr for marker in OWNED_RESOURCE_ABSENT_MARKERS[kind]):
+            return False
+        raise
 
 
 def empty_owned_bucket(aws: AwsCLI, bucket: str, region: str) -> None:

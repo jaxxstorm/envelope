@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import copy
+import gzip
+import hashlib
 import importlib.util
 import json
 import pathlib
@@ -66,6 +69,11 @@ class TerraformStaticContractTest(unittest.TestCase):
         self.assertEqual(user_data.count("--with-decryption"), 2)
         self.assertIn("snat_subnet_routes = false", user_data)
         self.assertIn('netfilter_mode     = "off"', user_data)
+        self.assertEqual(len(re.findall(r"\bgzip\s*=\s*true", user_data)), 2)
+        module = (TF / "modules/tailscale-cloudinit/main.tf").read_text()
+        self.assertRegex(module, r"gzip\s*=\s*var\.gzip")
+        self.assertIn("ec2_user_data_raw_limit_bytes", user_data)
+        self.assertIn("ec2_user_data_base64_limit_bytes", user_data)
         iam = self.files["iam.tf"]
         for action in ('"ssm:GetParameter"', '"kms:Decrypt"', '"s3:GetObject"'):
             self.assertIn(action, iam)
@@ -165,6 +173,26 @@ class PlanAndSecurityFixtureTest(unittest.TestCase):
     def test_valid_plan_shape_fixture(self):
         self.assertEqual(PLAN.validate(self.plan, "envelope-plan", expected_az_keys=AZ_KEYS), [])
 
+    def test_west_and_east_user_data_are_bounded_gzip_multipart_without_credentials(self):
+        resources = self.plan["planned_values"]["root_module"]["resources"]
+        for site in ("west", "east"):
+            with self.subTest(site=site):
+                encoded = next(
+                    value
+                    for value in resources
+                    if value["address"] == f"aws_instance.envelope_{site}"
+                )["values"]["user_data_base64"]
+                compressed = base64.b64decode(encoded, validate=True)
+                mime = gzip.decompress(compressed).decode("utf-8")
+                self.assertLessEqual(len(encoded.encode("ascii")), PLAN.EC2_USER_DATA_BASE64_LIMIT_BYTES)
+                self.assertLessEqual(len(compressed), PLAN.EC2_USER_DATA_RAW_LIMIT_BYTES)
+                self.assertRegex(mime, r"(?im)^Content-Type:\s*multipart/")
+                self.assertRegex(mime, r"(?im)^MIME-Version:\s*1\.0\s*$")
+                self.assertIn(f"arn:aws:ssm:us-{'west-2' if site == 'west' else 'east-1'}", mime)
+                self.assertIn('filename="20-setup-tailscale.sh"', mime)
+                self.assertIsNone(PLAN.KEY_PATTERN.search(mime))
+                self.assertNotIn("tailscale_auth_key", mime)
+
     def test_plan_shape_negative_matrix(self):
         cases = {}
         destructive = copy.deepcopy(self.plan)
@@ -177,9 +205,26 @@ class PlanAndSecurityFixtureTest(unittest.TestCase):
         next(value for value in cross_zone["planned_values"]["root_module"]["resources"] if value["address"] == "aws_lb.west")["values"]["enable_cross_zone_load_balancing"] = False
         cases["cross zone"] = cross_zone
         secret = copy.deepcopy(self.plan)
-        encoded = "dHNrZXktYXV0aC1maXh0dXJlMTIzNDU2Nzg5"
-        next(value for value in secret["planned_values"]["root_module"]["resources"] if value["address"] == "aws_instance.envelope_west")["values"]["user_data_base64"] = encoded
+        secret_resource = next(
+            value
+            for value in secret["planned_values"]["root_module"]["resources"]
+            if value["address"] == "aws_instance.envelope_west"
+        )
+        mime = gzip.decompress(base64.b64decode(secret_resource["values"]["user_data_base64"])).decode()
+        key_shaped_fixture = "tskey-" + "auth-fixture123456789"
+        secret_resource["values"]["user_data_base64"] = base64.b64encode(
+            gzip.compress((mime + f"\n{key_shaped_fixture}\n").encode(), mtime=0)
+        ).decode()
         cases["secret"] = secret
+        oversized = copy.deepcopy(self.plan)
+        incompressible = b"".join(hashlib.sha256(str(index).encode()).digest() for index in range(600))
+        oversized_data = base64.b64encode(gzip.compress(incompressible, mtime=0)).decode()
+        next(
+            value
+            for value in oversized["planned_values"]["root_module"]["resources"]
+            if value["address"] == "aws_instance.envelope_west"
+        )["values"]["user_data_base64"] = oversized_data
+        cases["oversized user data"] = oversized
         incomplete = copy.deepcopy(self.plan)
         incomplete["planned_values"]["root_module"]["resources"] = [
             value
@@ -246,6 +291,11 @@ class PlanAndSecurityFixtureTest(unittest.TestCase):
         for name, candidate in cases.items():
             with self.subTest(name=name):
                 self.assertTrue(PLAN.validate(candidate, "envelope-plan", expected_az_keys=AZ_KEYS))
+        secret_errors = PLAN.validate(secret, "envelope-plan", expected_az_keys=AZ_KEYS)
+        self.assertTrue(any("plaintext Tailscale credential" in error for error in secret_errors))
+        oversized_errors = PLAN.validate(oversized, "envelope-plan", expected_az_keys=AZ_KEYS)
+        self.assertTrue(any("base64 user data" in error for error in oversized_errors))
+        self.assertTrue(any("raw user data" in error for error in oversized_errors))
         self.assertTrue(PLAN.validate(destructive, "envelope-plan", {"aws_vpc.west"}, AZ_KEYS))
         replacement = copy.deepcopy(self.plan)
         replacement["resource_changes"] = [

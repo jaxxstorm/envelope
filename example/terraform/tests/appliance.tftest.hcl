@@ -139,23 +139,27 @@ run "fresh_mocked_plan" {
 
   assert {
     condition = (
-      strcontains(nonsensitive(base64decode(module.tailscale_client_west.rendered)), var.west_tailscale_secret_arn) &&
-      strcontains(nonsensitive(base64decode(module.tailscale_client_east.rendered)), var.east_tailscale_secret_arn) &&
-      !strcontains(nonsensitive(base64decode(module.tailscale_client_west.rendered)), "tskey-auth-") &&
-      !strcontains(nonsensitive(base64decode(module.tailscale_client_east.rendered)), "tskey-auth-")
+      startswith(nonsensitive(module.tailscale_client_west.rendered), "H4sI") &&
+      startswith(nonsensitive(module.tailscale_client_east.rendered), "H4sI") &&
+      local.west_user_data_raw_bytes <= local.ec2_user_data_raw_limit_bytes &&
+      local.east_user_data_raw_bytes <= local.ec2_user_data_raw_limit_bytes &&
+      local.west_user_data_base64_bytes <= local.ec2_user_data_base64_limit_bytes &&
+      local.east_user_data_base64_bytes <= local.ec2_user_data_base64_limit_bytes &&
+      strcontains(local.west_auth_resolver, var.west_tailscale_secret_arn) &&
+      strcontains(local.east_auth_resolver, var.east_tailscale_secret_arn) &&
+      !strcontains(local.west_auth_resolver, "tskey-auth-") &&
+      !strcontains(local.east_auth_resolver, "tskey-auth-")
     )
-    error_message = "rendered MIME must contain only regional SSM references, never auth-key material"
+    error_message = "rendered MIME must be gzip-compressed within both EC2 limits and use only regional SSM references"
   }
 
 
   assert {
     condition = (
-      strcontains(nonsensitive(base64decode(module.tailscale_client_west.rendered)), "tailscale_1.80.3_x86_64.rpm") &&
-      strcontains(nonsensitive(base64decode(module.tailscale_client_west.rendered)), "aab2beef68039b77b143f07e1f7595433c2c6d7bc52aec871dcb8cec97f6aad2") &&
-      !strcontains(nonsensitive(base64decode(module.tailscale_client_west.rendered)), "tailscale.com/install.sh") &&
-      !strcontains(nonsensitive(base64decode(module.tailscale_client_west.rendered)), "TRACK=")
+      local.tailscale_packages.amd64.url == "https://pkgs.tailscale.com/stable/amazon-linux/2023/x86_64/tailscale_1.80.3_x86_64.rpm" &&
+      local.tailscale_packages.amd64.sha256 == "aab2beef68039b77b143f07e1f7595433c2c6d7bc52aec871dcb8cec97f6aad2"
     )
-    error_message = "rendered MIME must install only the exact checksummed Tailscale package before auth"
+    error_message = "rendered MIME inputs must install only the exact checksummed Tailscale package before auth"
   }
 
   assert {

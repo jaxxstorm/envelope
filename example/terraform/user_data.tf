@@ -81,6 +81,7 @@ locals {
 module "tailscale_client_west" {
   source = "./modules/tailscale-cloudinit"
 
+  gzip               = true
   auth_key           = local.west_auth_resolver
   hostname           = "${var.name}-west"
   advertise_tags     = [var.tailscale_tag]
@@ -112,6 +113,7 @@ module "tailscale_client_west" {
 module "tailscale_client_east" {
   source = "./modules/tailscale-cloudinit"
 
+  gzip               = true
   auth_key           = local.east_auth_resolver
   hostname           = "${var.name}-east"
   advertise_tags     = [var.tailscale_tag]
@@ -138,6 +140,22 @@ module "tailscale_client_east" {
       content      = local.east_bootstrap
     },
   ]
+}
+
+locals {
+  ec2_user_data_raw_limit_bytes    = 16384
+  ec2_user_data_base64_limit_bytes = 4 * ceil(local.ec2_user_data_raw_limit_bytes / 3)
+
+  west_user_data_base64_bytes = length(nonsensitive(module.tailscale_client_west.rendered))
+  east_user_data_base64_bytes = length(nonsensitive(module.tailscale_client_east.rendered))
+  west_user_data_raw_bytes = floor(local.west_user_data_base64_bytes * 3 / 4) - (
+    endswith(nonsensitive(module.tailscale_client_west.rendered), "==") ? 2 :
+    endswith(nonsensitive(module.tailscale_client_west.rendered), "=") ? 1 : 0
+  )
+  east_user_data_raw_bytes = floor(local.east_user_data_base64_bytes * 3 / 4) - (
+    endswith(nonsensitive(module.tailscale_client_east.rendered), "==") ? 2 :
+    endswith(nonsensitive(module.tailscale_client_east.rendered), "=") ? 1 : 0
+  )
 }
 
 output "cloud_init_sha256" {

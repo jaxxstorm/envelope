@@ -4,6 +4,11 @@ variable "auth_key" {
   sensitive   = true
 }
 
+variable "gzip" {
+  description = "Compress rendered multipart MIME before base64 encoding"
+  type        = bool
+}
+
 variable "hostname" {
   type = string
 }

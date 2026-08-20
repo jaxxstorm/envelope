@@ -616,6 +616,81 @@ class PolicyAndAdapterTest(unittest.TestCase):
         )
         self.assertEqual(create["expirySeconds"], 1800)
 
+    def test_delete_accepts_every_success_body_shape_and_bounds_failures(self):
+        class DeleteHTTP:
+            def __init__(self, status, body):
+                self.status = status
+                self.body = body
+
+            def request(self, method, url, *, headers=None, body=None):
+                if urllib.parse.urlparse(url).path.endswith("/oauth/token"):
+                    return 200, b'{"access_token":"fixture-bearer"}'
+                if method == "DELETE":
+                    return self.status, self.body
+                raise AssertionError((method, url))
+
+        responses = (
+            (200, b""),
+            (200, b"{}"),
+            (200, b"[]"),
+            (202, b"null"),
+            (202, b"plain text"),
+            (204, b""),
+            (404, b"[]"),
+        )
+        for operation in ("key", "device"):
+            for status, body in responses:
+                with self.subTest(operation=operation, status=status, body=body):
+                    api = appliance.TailscaleAPI(
+                        "fixture.example", "client", "fixture-secret", DeleteHTTP(status, body)
+                    )
+                    if operation == "key":
+                        api.revoke_auth_key("key-fixture")
+                    else:
+                        api.delete_device("device-fixture")
+
+        secret = "tskey-" + "auth-fixture123456789"
+        api = appliance.TailscaleAPI(
+            "fixture.example",
+            "client",
+            "fixture-secret",
+            DeleteHTTP(500, (f'{{"message":"auth_key={secret}"}}' + "x" * 2048).encode()),
+        )
+        with self.assertRaises(appliance.LifecycleError) as raised:
+            api.revoke_auth_key("key-fixture")
+        self.assertNotIn(secret, str(raised.exception))
+        self.assertLess(len(str(raised.exception)), 700)
+
+    def test_non_object_delete_success_is_followed_by_confirmed_absence(self):
+        class StatefulHTTP:
+            def __init__(self):
+                self.keys = [{"id": "key-fixture", "description": "fixture"}]
+                self.devices = [{"id": "device-fixture", "hostname": "fixture"}]
+
+            def request(self, method, url, *, headers=None, body=None):
+                path = urllib.parse.urlparse(url).path
+                if path.endswith("/oauth/token"):
+                    return 200, b'{"access_token":"fixture-bearer"}'
+                if path.endswith("/keys") and method == "GET":
+                    return 200, json.dumps({"keys": self.keys}).encode()
+                if path.endswith("/devices") and method == "GET":
+                    return 200, json.dumps({"devices": self.devices}).encode()
+                if "/keys/" in path and method == "DELETE":
+                    self.keys = []
+                    return 200, b"[]"
+                if path.endswith("/device-fixture") and method == "DELETE":
+                    self.devices = []
+                    return 200, b"null"
+                raise AssertionError((method, url))
+
+        api = appliance.TailscaleAPI("fixture.example", "client", "fixture-secret", StatefulHTTP())
+        self.assertEqual(len(api.list_auth_keys()), 1)
+        self.assertEqual(len(api.list_devices()), 1)
+        api.revoke_auth_key("key-fixture")
+        api.delete_device("device-fixture")
+        self.assertEqual(api.list_auth_keys(), [])
+        self.assertEqual(api.list_devices(), [])
+
 
 class SecurityAndBackendTest(unittest.TestCase):
     def test_redaction(self):
@@ -838,6 +913,210 @@ class SecurityAndBackendTest(unittest.TestCase):
             appliance.RESIDUAL_CLEANUP_MAX_BACKOFF_SECONDS,
         )
 
+    def test_authoritative_liveness_covers_every_allowlisted_resource_kind(self):
+        cases = (
+            ("arn:aws:s3:::run-artifact", "head-bucket", {}),
+            (
+                "arn:aws:elasticloadbalancing:us-west-2:123456789012:loadbalancer/gwy/run/id",
+                "describe-load-balancers",
+                {"LoadBalancers": [{"LoadBalancerArn": "arn:aws:elasticloadbalancing:us-west-2:123456789012:loadbalancer/gwy/run/id"}]},
+            ),
+            (
+                "arn:aws:elasticloadbalancing:us-west-2:123456789012:listener/gwy/run/id/listener",
+                "describe-listeners",
+                {"Listeners": [{"ListenerArn": "arn:aws:elasticloadbalancing:us-west-2:123456789012:listener/gwy/run/id/listener"}]},
+            ),
+            (
+                "arn:aws:elasticloadbalancing:us-west-2:123456789012:targetgroup/run/id",
+                "describe-target-groups",
+                {"TargetGroups": [{"TargetGroupArn": "arn:aws:elasticloadbalancing:us-west-2:123456789012:targetgroup/run/id"}]},
+            ),
+            (
+                "arn:aws:iam::123456789012:instance-profile/run-profile",
+                "get-instance-profile",
+                {"InstanceProfile": {"InstanceProfileName": "run-profile"}},
+            ),
+            ("arn:aws:iam::123456789012:role/run-role", "get-role", {"Role": {"RoleName": "run-role"}}),
+            (
+                "arn:aws:ssm:us-west-2:123456789012:parameter/envelope-fixture/tailscale-auth",
+                "describe-parameters",
+                {"Parameters": [{"Name": "/envelope-fixture/tailscale-auth"}]},
+            ),
+            (
+                "arn:aws:ec2:us-west-2:123456789012:instance/i-live",
+                "describe-instances",
+                {"Reservations": [{"Instances": [{"InstanceId": "i-live", "State": {"Name": "running"}}]}]},
+            ),
+            (
+                "arn:aws:ec2:us-west-2:123456789012:volume/vol-live",
+                "describe-volumes",
+                {"Volumes": [{"VolumeId": "vol-live", "State": "available"}]},
+            ),
+            (
+                "arn:aws:ec2:us-west-2:123456789012:vpc-endpoint/vpce-live",
+                "describe-vpc-endpoints",
+                {"VpcEndpoints": [{"VpcEndpointId": "vpce-live", "State": "available"}]},
+            ),
+            (
+                "arn:aws:ec2:us-west-2:123456789012:vpc-endpoint-service/vpce-svc-live",
+                "describe-vpc-endpoint-service-configurations",
+                {"ServiceConfigurations": [{"ServiceId": "vpce-svc-live", "ServiceState": "Available"}]},
+            ),
+            (
+                "arn:aws:ec2:us-west-2:123456789012:natgateway/nat-live",
+                "describe-nat-gateways",
+                {"NatGateways": [{"NatGatewayId": "nat-live", "State": "available"}]},
+            ),
+            (
+                "arn:aws:ec2:us-west-2:123456789012:elastic-ip/eipalloc-live",
+                "describe-addresses",
+                {"Addresses": [{"AllocationId": "eipalloc-live"}]},
+            ),
+            (
+                "arn:aws:ec2:us-west-2:123456789012:internet-gateway/igw-live",
+                "describe-internet-gateways",
+                {"InternetGateways": [{"InternetGatewayId": "igw-live"}]},
+            ),
+            (
+                "arn:aws:ec2:us-west-2:123456789012:route-table/rtb-live",
+                "describe-route-tables",
+                {"RouteTables": [{"RouteTableId": "rtb-live"}]},
+            ),
+            (
+                "arn:aws:ec2:us-west-2:123456789012:subnet/subnet-live",
+                "describe-subnets",
+                {"Subnets": [{"SubnetId": "subnet-live"}]},
+            ),
+            (
+                "arn:aws:ec2:us-west-2:123456789012:security-group/sg-live",
+                "describe-security-groups",
+                {"SecurityGroups": [{"GroupId": "sg-live"}]},
+            ),
+            (
+                "arn:aws:ec2:us-west-2:123456789012:network-interface/eni-live",
+                "describe-network-interfaces",
+                {"NetworkInterfaces": [{"NetworkInterfaceId": "eni-live"}]},
+            ),
+            (
+                "arn:aws:ec2:us-west-2:123456789012:vpc/vpc-live",
+                "describe-vpcs",
+                {"Vpcs": [{"VpcId": "vpc-live"}]},
+            ),
+        )
+
+        class DescribeAWS:
+            def __init__(self, operation, response):
+                self.operation = operation
+                self.response = response
+                self.calls = []
+
+            def json(self, args, *, region=None):
+                self.calls.append((args, region))
+                self.assert_operation(args[1])
+                return self.response
+
+            def assert_operation(self, operation):
+                if operation != self.operation:
+                    raise AssertionError((operation, self.operation))
+
+        self.assertEqual(len(cases), len(appliance.RESIDUAL_DELETE_PRIORITY))
+        for arn, operation, response in cases:
+            with self.subTest(arn=arn):
+                aws = DescribeAWS(operation, response)
+                self.assertTrue(appliance.owned_resource_is_live(aws, {"arn": arn, "region": "us-west-2"}))
+                self.assertIn(appliance.owned_resource_kind(arn)[1], " ".join(aws.calls[0][0]))
+
+        volume = {"arn": "arn:aws:ec2:us-west-2:123456789012:volume/vol-live", "region": "us-west-2"}
+        with self.assertRaisesRegex(appliance.LifecycleError, "exact requested identity"):
+            appliance.owned_resource_is_live(
+                DescribeAWS("describe-volumes", {"Volumes": [{"VolumeId": "vol-other", "State": "available"}]}),
+                volume,
+            )
+        denied = mock.Mock()
+        denied.json.side_effect = appliance.CommandError(["aws", "describe-volumes"], 255, "AccessDenied")
+        with self.assertRaises(appliance.CommandError):
+            appliance.owned_resource_is_live(denied, volume)
+
+    def test_tag_tombstones_are_filtered_before_cleanup_without_delete_retries(self):
+        tombstones = [
+            {"arn": "arn:aws:ec2:us-west-2:123456789012:instance/i-terminated", "region": "us-west-2"},
+            {"arn": "arn:aws:ec2:us-west-2:123456789012:natgateway/nat-deleted", "region": "us-west-2"},
+            {"arn": "arn:aws:ec2:us-west-2:123456789012:volume/vol-absent", "region": "us-west-2"},
+            {"arn": "arn:aws:ec2:us-west-2:123456789012:vpc-endpoint/vpce-empty", "region": "us-west-2"},
+            {"arn": "arn:aws:ec2:us-west-2:123456789012:vpc-endpoint/vpce-absent", "region": "us-west-2"},
+            {
+                "arn": "arn:aws:ec2:us-west-2:123456789012:vpc-endpoint-service/vpce-svc-absent",
+                "region": "us-west-2",
+            },
+        ]
+
+        class TombstoneAWS:
+            def __init__(self, config):
+                self.config = config
+                self.delete_calls = []
+
+            def json(self, args, *, region=None):
+                operation = args[1]
+                if operation == "get-resources":
+                    if region != self.config.sites["west"]["region"]:
+                        return {"ResourceTagMappingList": []}
+                    return {
+                        "ResourceTagMappingList": [
+                            {
+                                "ResourceARN": resource["arn"],
+                                "Tags": [
+                                    {"Key": "EnvelopeRun", "Value": self.config.run_id},
+                                    {"Key": "ExpiresAt", "Value": self.config.expires_at},
+                                ],
+                            }
+                            for resource in tombstones
+                        ]
+                    }
+                if operation == "describe-instances":
+                    return {
+                        "Reservations": [
+                            {"Instances": [{"InstanceId": "i-terminated", "State": {"Name": "terminated"}}]}
+                        ]
+                    }
+                if operation == "describe-nat-gateways":
+                    return {"NatGateways": [{"NatGatewayId": "nat-deleted", "State": "deleted"}]}
+                if operation == "describe-volumes":
+                    raise appliance.CommandError(args, 255, "InvalidVolume.NotFound: fixture tombstone")
+                if operation == "describe-vpc-endpoints":
+                    endpoint_id = args[-1]
+                    if endpoint_id == "vpce-empty":
+                        return {"VpcEndpoints": []}
+                    raise appliance.CommandError(args, 255, "InvalidVpcEndpointId.NotFound: fixture tombstone")
+                if operation == "describe-vpc-endpoint-service-configurations":
+                    return {"ServiceConfigurations": []}
+                if operation.startswith(("delete", "terminate", "release")):
+                    self.delete_calls.append(operation)
+                    return {}
+                raise AssertionError(args)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            aws = TombstoneAWS(config)
+            residuals = appliance.audit_run_resources(config, aws)
+            self.assertEqual(residuals, [])
+            self.assertEqual(
+                appliance.remove_owned_residuals(
+                    config,
+                    aws,
+                    residuals,
+                    dry_run=False,
+                    allow_unexpired=True,
+                    sleep=lambda _: self.fail("filtered tombstones must not retry"),
+                ),
+                [],
+            )
+            self.assertEqual(aws.delete_calls, [])
+            for state in ("deleted", "failed"):
+                with self.subTest(nat_state=state):
+                    response = {"NatGateways": [{"NatGatewayId": "nat-deleted", "State": state}]}
+                    with mock.patch.object(aws, "json", return_value=response):
+                        self.assertFalse(appliance.owned_resource_is_live(aws, tombstones[1]))
+
     def test_residual_dependencies_are_reaudited_retried_and_eventually_absent(self):
         class Clock:
             def __init__(self):
@@ -875,6 +1154,39 @@ class SecurityAndBackendTest(unittest.TestCase):
                             for resource in self.remaining.values()
                         ]
                     }
+                describes = {
+                    "describe-vpc-endpoints": (
+                        "delete-vpc-endpoints",
+                        "VpcEndpoints",
+                        "VpcEndpointId",
+                        "State",
+                        "available",
+                    ),
+                    "describe-vpc-endpoint-service-configurations": (
+                        "delete-vpc-endpoint-service-configurations",
+                        "ServiceConfigurations",
+                        "ServiceId",
+                        "ServiceState",
+                        "Available",
+                    ),
+                    "describe-nat-gateways": (
+                        "delete-nat-gateway",
+                        "NatGateways",
+                        "NatGatewayId",
+                        "State",
+                        "available",
+                    ),
+                    "describe-addresses": ("release-address", "Addresses", "AllocationId", None, None),
+                }
+                if operation in describes:
+                    delete_operation, collection, identity_field, state_field, state = describes[operation]
+                    arn = self.operations[delete_operation][0]
+                    if arn not in self.remaining:
+                        return {collection: []}
+                    value = {identity_field: arn.rsplit("/", 1)[1]}
+                    if state_field is not None:
+                        value[state_field] = state
+                    return {collection: [value]}
                 arn, resource, error_code = self.operations[operation]
                 self.calls[operation] += 1
                 if self.calls[operation] == 1:
@@ -1292,6 +1604,12 @@ class SSMAndCleanupTest(unittest.TestCase):
                     return {}
                 if operation == "describe-parameters":
                     return {"Parameters": []}
+                if operation == "describe-instances":
+                    return {
+                        "Reservations": [
+                            {"Instances": [{"InstanceId": "i-residual", "State": {"Name": "running"}}]}
+                        ]
+                    }
                 if operation == "terminate-instances":
                     inner.terminated = True
                     return {}

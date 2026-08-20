@@ -3,7 +3,7 @@ locals {
 }
 
 data "cloudinit_config" "main" {
-  gzip          = false
+  gzip          = var.gzip
   base64_encode = true
 
   lifecycle {
