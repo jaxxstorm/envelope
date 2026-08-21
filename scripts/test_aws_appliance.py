@@ -186,7 +186,16 @@ def aws_preflight_summary_document(architecture: str = "amd64") -> dict:
         "principal": {"kind": "assumed-role", "policy_source_sha256": "d" * 64},
         "actions": {
             "operator": list(appliance.AWS_OPERATOR_ACTIONS),
+            "operator_simulated": [
+                action
+                for action in appliance.AWS_OPERATOR_ACTIONS
+                if action != "ec2:RunInstances"
+            ],
             "operator_decision": "allowed",
+            "run_instances_dry_run": {
+                "west": {"appliance": instance_type, "test": workload_type},
+                "east": {"appliance": instance_type, "test": workload_type},
+            },
             "flow_log_delivery_role": list(appliance.AWS_FLOW_LOG_DELIVERY_ACTIONS),
         },
         "regions": regions,
@@ -1229,6 +1238,62 @@ class CapabilityAWS:
                     "GlobalQuota": gate in appliance.AWS_GLOBAL_QUOTA_CONTRACT,
                 }
             }
+        if service == "ec2" and operation in {
+            "describe-vpcs",
+            "describe-subnets",
+            "describe-security-groups",
+            "run-instances",
+        }:
+            site = next(
+                site
+                for site in ("west", "east")
+                if self.config.sites[site]["region"] == region
+            )
+            identities = {
+                "west": {
+                    "vpc": "vpc-11111111111111111",
+                    "subnet": "subnet-22222222222222222",
+                    "security_group": "sg-33333333333333333",
+                },
+                "east": {
+                    "vpc": "vpc-aaaaaaaaaaaaaaaaa",
+                    "subnet": "subnet-bbbbbbbbbbbbbbbbb",
+                    "security_group": "sg-ccccccccccccccccc",
+                },
+            }[site]
+            if operation == "describe-vpcs" and "Name=is-default,Values=true" in args:
+                return {"Vpcs": [{"VpcId": identities["vpc"], "IsDefault": True}]}
+            if operation == "describe-subnets":
+                zone = self.config.sites[site]["azs"][
+                    self.config.sites[site]["appliance_az_key"]
+                ]
+                return {
+                    "Subnets": [
+                        {
+                            "SubnetId": identities["subnet"],
+                            "VpcId": identities["vpc"],
+                            "AvailabilityZone": zone,
+                            "DefaultForAz": True,
+                        }
+                    ]
+                }
+            if operation == "describe-security-groups":
+                return {
+                    "SecurityGroups": [
+                        {
+                            "GroupId": identities["security_group"],
+                            "VpcId": identities["vpc"],
+                            "GroupName": "default",
+                        }
+                    ]
+                }
+            if operation == "run-instances":
+                raise appliance.CommandError(
+                    args,
+                    255,
+                    "An error occurred (DryRunOperation) when calling the RunInstances operation: "
+                    "Request would have succeeded, but DryRun flag is set.\n",
+                )
         if service == "ec2" and operation == "describe-instance-type-offerings":
             site = next(site for site in ("west", "east") if self.config.sites[site]["region"] == region)
             return {
@@ -1320,6 +1385,27 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
         self.assertEqual(account_id, "123456789012")
         self.assertEqual(summary["actions"]["operator"], list(appliance.AWS_OPERATOR_ACTIONS))
         self.assertEqual(
+            summary["actions"]["operator_simulated"],
+            [
+                action
+                for action in appliance.AWS_OPERATOR_ACTIONS
+                if action != "ec2:RunInstances"
+            ],
+        )
+        self.assertEqual(
+            summary["actions"]["run_instances_dry_run"],
+            {
+                "west": {
+                    "appliance": config.raw["instance_type"],
+                    "test": config.raw["test_instance_type"],
+                },
+                "east": {
+                    "appliance": config.raw["instance_type"],
+                    "test": config.raw["test_instance_type"],
+                },
+            },
+        )
+        self.assertEqual(
             summary["actions"]["flow_log_delivery_role"],
             list(appliance.AWS_FLOW_LOG_DELIVERY_ACTIONS),
         )
@@ -1375,6 +1461,15 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
         serialized = json.dumps(summary, sort_keys=True)
         self.assertNotIn(aws.role_arn, serialized)
         self.assertNotIn("fixture-session", serialized)
+        for selected_default_id in (
+            "vpc-11111111111111111",
+            "subnet-22222222222222222",
+            "sg-33333333333333333",
+            "vpc-aaaaaaaaaaaaaaaaa",
+            "subnet-bbbbbbbbbbbbbbbbb",
+            "sg-ccccccccccccccccc",
+        ):
+            self.assertNotIn(selected_default_id, serialized)
         self.assertEqual(appliance.redact(serialized), serialized)
         get_role = next(args for args, _ in aws.calls if args[:2] == ["iam", "get-role"])
         self.assertEqual(get_role[-1], aws.role_name)
@@ -1413,8 +1508,20 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
             "send",
             "cancel",
         }
-        called_operations = {args[1] for args, _ in aws.calls}
-        self.assertFalse(any(operation.split("-", 1)[0] in mutating_verbs for operation in called_operations))
+        dry_run_calls = [
+            (args, region)
+            for args, region in aws.calls
+            if args[:2] == ["ec2", "run-instances"]
+        ]
+        self.assertEqual(len(dry_run_calls), 4)
+        self.assertTrue(all("--dry-run" in args for args, _region in dry_run_calls))
+        non_dry_mutations = [
+            args
+            for args, _region in aws.calls
+            if args[1].split("-", 1)[0] in mutating_verbs
+            and not (args[:2] == ["ec2", "run-instances"] and "--dry-run" in args)
+        ]
+        self.assertEqual(non_dry_mutations, [])
         self.assertIn("servicequotas:GetServiceQuota", appliance.AWS_OPERATOR_ACTIONS)
         self.assertNotIn("servicequotas:ListServiceQuotas", appliance.AWS_OPERATOR_ACTIONS)
         self.assertFalse(any(args[:2] == ["service-quotas", "list-service-quotas"] for args, _ in aws.calls))
@@ -1455,6 +1562,244 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
                 statement["Condition"]["StringEquals"]["kms:EncryptionContext:PARAMETER_ARN"],
                 context["kms:EncryptionContext:PARAMETER_ARN"][0],
             )
+
+    def test_run_instances_dry_run_uses_exact_four_safe_probe_commands(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            aws = CapabilityAWS(config)
+            summary = appliance.run_instances_dry_run_preflight(config, aws)
+
+        expected_summary = {
+            "west": {
+                "appliance": config.raw["instance_type"],
+                "test": config.raw["test_instance_type"],
+            },
+            "east": {
+                "appliance": config.raw["instance_type"],
+                "test": config.raw["test_instance_type"],
+            },
+        }
+        self.assertEqual(summary, expected_summary)
+        serialized_summary = json.dumps(summary, sort_keys=True)
+        for resource_prefix in ("vpc-", "subnet-", "sg-"):
+            self.assertNotIn(resource_prefix, serialized_summary)
+
+        expected_resources = {
+            "west": {
+                "vpc": "vpc-11111111111111111",
+                "subnet": "subnet-22222222222222222",
+                "security_group": "sg-33333333333333333",
+            },
+            "east": {
+                "vpc": "vpc-aaaaaaaaaaaaaaaaa",
+                "subnet": "subnet-bbbbbbbbbbbbbbbbb",
+                "security_group": "sg-ccccccccccccccccc",
+            },
+        }
+        expected_tags = {
+            "EnvelopeRun": config.run_id,
+            "ExpiresAt": config.expires_at,
+            "ManagedBy": "terraform",
+            "Profile": "envelope-aws-appliance",
+        }
+        run_calls = [
+            (args, region)
+            for args, region in aws.calls
+            if args[:2] == ["ec2", "run-instances"]
+        ]
+        self.assertEqual(len(run_calls), 4)
+        observed = set()
+        for args, region in run_calls:
+            site = next(
+                site
+                for site in ("west", "east")
+                if config.sites[site]["region"] == region
+            )
+            instance_type = args[args.index("--instance-type") + 1]
+            observed.add((site, instance_type))
+            self.assertEqual(args.count("--dry-run"), 1)
+            self.assertEqual(args[args.index("--image-id") + 1], config.sites[site]["ami_id"])
+            self.assertEqual(args[args.index("--count") + 1], "1")
+            self.assertEqual(
+                args[args.index("--subnet-id") + 1],
+                expected_resources[site]["subnet"],
+            )
+            self.assertEqual(
+                args[args.index("--security-group-ids") + 1],
+                expected_resources[site]["security_group"],
+            )
+            self.assertEqual(
+                args[args.index("--metadata-options") + 1],
+                "HttpTokens=required,HttpEndpoint=enabled",
+            )
+            self.assertNotIn("--iam-instance-profile", args)
+            tag_specifications = json.loads(args[args.index("--tag-specifications") + 1])
+            self.assertEqual(len(tag_specifications), 2)
+            self.assertEqual(
+                {value["ResourceType"] for value in tag_specifications},
+                {"instance", "volume"},
+            )
+            for value in tag_specifications:
+                self.assertEqual(set(value), {"ResourceType", "Tags"})
+                self.assertEqual(len(value["Tags"]), len(expected_tags))
+                self.assertEqual(
+                    {tag["Key"]: tag["Value"] for tag in value["Tags"]},
+                    expected_tags,
+                )
+        self.assertEqual(
+            observed,
+            {
+                (site, instance_type)
+                for site in ("west", "east")
+                for instance_type in (
+                    config.raw["instance_type"],
+                    config.raw["test_instance_type"],
+                )
+            },
+        )
+        for site in ("west", "east"):
+            region = config.sites[site]["region"]
+            zone = config.sites[site]["azs"][config.sites[site]["appliance_az_key"]]
+            regional_calls = [args for args, called_region in aws.calls if called_region == region]
+            self.assertIn(
+                ["ec2", "describe-vpcs", "--filters", "Name=is-default,Values=true"],
+                regional_calls,
+            )
+            self.assertIn(
+                [
+                    "ec2",
+                    "describe-subnets",
+                    "--filters",
+                    f"Name=vpc-id,Values={expected_resources[site]['vpc']}",
+                    f"Name=availability-zone,Values={zone}",
+                    "Name=default-for-az,Values=true",
+                ],
+                regional_calls,
+            )
+            self.assertIn(
+                [
+                    "ec2",
+                    "describe-security-groups",
+                    "--filters",
+                    f"Name=vpc-id,Values={expected_resources[site]['vpc']}",
+                    "Name=group-name,Values=default",
+                ],
+                regional_calls,
+            )
+
+    def test_run_instances_dry_run_rejects_missing_ambiguous_and_malformed_defaults(self):
+        class InvalidDefaultAWS(CapabilityAWS):
+            def __init__(self, config, mode):
+                super().__init__(config)
+                self.mode = mode
+
+            def json(self, args, *, region=None):
+                response = super().json(args, region=region)
+                operation = args[1]
+                target = self.mode.split("-", 1)[0]
+                operation_by_target = {
+                    "vpc": "describe-vpcs",
+                    "subnet": "describe-subnets",
+                    "sg": "describe-security-groups",
+                }
+                if operation != operation_by_target[target]:
+                    return response
+                field = {
+                    "vpc": "Vpcs",
+                    "subnet": "Subnets",
+                    "sg": "SecurityGroups",
+                }[target]
+                mutation = self.mode.split("-", 1)[1]
+                if mutation == "missing":
+                    response[field] = []
+                elif mutation == "ambiguous":
+                    response[field].append(copy.deepcopy(response[field][0]))
+                elif mutation == "malformed":
+                    identity_field = {
+                        "vpc": "VpcId",
+                        "subnet": "SubnetId",
+                        "sg": "GroupId",
+                    }[target]
+                    response[field][0][identity_field] = "malformed"
+                else:
+                    raise AssertionError(self.mode)
+                return response
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            for resource, gate in (
+                ("vpc", "default-vpc"),
+                ("subnet", "default-subnet"),
+                ("sg", "default-security-group"),
+            ):
+                for mutation in ("missing", "ambiguous", "malformed"):
+                    with self.subTest(resource=resource, mutation=mutation):
+                        with self.assertRaisesRegex(
+                            appliance.LifecycleError,
+                            rf"RunInstances dry-run gate west/{gate}",
+                        ):
+                            appliance.run_instances_dry_run_preflight(
+                                config,
+                                InvalidDefaultAWS(config, f"{resource}-{mutation}"),
+                            )
+
+    def test_run_instances_dry_run_fails_closed_for_every_non_success_status(self):
+        class DryRunStatusAWS(CapabilityAWS):
+            def __init__(self, config, mode):
+                super().__init__(config)
+                self.mode = mode
+
+            def json(self, args, *, region=None):
+                if args[:2] != ["ec2", "run-instances"]:
+                    return super().json(args, region=region)
+                self.calls.append((list(args), region))
+                if "--dry-run" not in args:
+                    raise AssertionError("non-dry RunInstances command")
+                exact_success = (
+                    "An error occurred (DryRunOperation) when calling the RunInstances operation: "
+                    "Request would have succeeded, but DryRun flag is set."
+                )
+                errors = {
+                    "unauthorized": "An error occurred (UnauthorizedOperation): You are not authorized.",
+                    "explicit-deny": "An error occurred (UnauthorizedOperation): explicit deny in a service control policy.",
+                    "invalid-ami": "An error occurred (InvalidAMIID.NotFound): The image id does not exist.",
+                    "invalid-type": "An error occurred (InvalidParameterValue): Invalid instance type.",
+                    "invalid-subnet": "An error occurred (InvalidSubnetID.NotFound): The subnet does not exist.",
+                    "other": "An error occurred (RequestLimitExceeded): Retry later.",
+                    "wrong-message": exact_success + " unexpected",
+                }
+                if self.mode == "normal-response":
+                    return {}
+                if self.mode == "non-command-error":
+                    raise appliance.LifecycleError("unexpected fixture failure with subnet-sensitive")
+                returncode = 0 if self.mode == "zero-returncode" else 255
+                stderr = exact_success if self.mode == "zero-returncode" else errors[self.mode]
+                raise appliance.CommandError(args, returncode, stderr)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            for mode in (
+                "unauthorized",
+                "explicit-deny",
+                "invalid-ami",
+                "invalid-type",
+                "invalid-subnet",
+                "normal-response",
+                "other",
+                "wrong-message",
+                "zero-returncode",
+                "non-command-error",
+            ):
+                with self.subTest(mode=mode):
+                    with self.assertRaises(appliance.LifecycleError) as raised:
+                        appliance.run_instances_dry_run_preflight(
+                            config,
+                            DryRunStatusAWS(config, mode),
+                        )
+                    message = str(raised.exception)
+                    self.assertIn("RunInstances dry-run gate west/appliance", message)
+                    self.assertNotIn("UnauthorizedOperation", message)
+                    self.assertNotIn("subnet-sensitive", message)
 
     def test_quota_codes_account_limit_names_and_structural_defaults_are_independent_literals(self):
         expected_regional = {
@@ -1773,6 +2118,7 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
             set(appliance.AWS_OPERATOR_ACTION_RESOURCE_CONTRACT),
             set(appliance.AWS_OPERATOR_ACTIONS),
         )
+        self.assertEqual(len(appliance.AWS_OPERATOR_ACTIONS), 203)
         self.assertEqual(
             appliance.AWS_OPERATOR_ACTION_RESOURCE_CONTRACT["elasticloadbalancing:CreateTargetGroup"],
             ("target-group",),
@@ -1811,6 +2157,16 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
                 artifact,
                 policy_source_arn="arn:aws:iam::123456789012:role/operator",
             )
+            simulated_actions = {
+                action
+                for batch in batches
+                for action in batch["actions"]
+            }
+            expected_simulated_actions = set(appliance.AWS_OPERATOR_ACTIONS)
+            expected_simulated_actions.remove("ec2:RunInstances")
+            self.assertEqual(simulated_actions, expected_simulated_actions)
+            self.assertEqual(len(simulated_actions), 202)
+            self.assertNotIn("ec2:RunInstances", simulated_actions)
 
             def west_batches(action):
                 matches = [
@@ -1894,32 +2250,6 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
             assert_context_mode(
                 west_resource_batch("ec2:CreateSubnet", (vpc_arn,)),
                 "resource",
-            )
-
-            run_new_resources = (
-                "arn:aws:ec2:us-west-2:123456789012:instance/*",
-                "arn:aws:ec2:us-west-2:123456789012:volume/*",
-            )
-            run_existing_resources = (
-                "arn:aws:ec2:us-west-2:123456789012:security-group/*",
-                subnet_arn,
-            )
-            run_regional_resources = (
-                "arn:aws:ec2:us-west-2:123456789012:network-interface/*",
-                "arn:aws:ec2:us-west-2::image/ami-0123456789abcdef0",
-            )
-            self.assertEqual(len(west_batches("ec2:RunInstances")), 3)
-            assert_context_mode(
-                west_resource_batch("ec2:RunInstances", run_new_resources),
-                "request",
-            )
-            assert_context_mode(
-                west_resource_batch("ec2:RunInstances", run_existing_resources),
-                "resource",
-            )
-            assert_context_mode(
-                west_resource_batch("ec2:RunInstances", run_regional_resources),
-                "regional",
             )
 
             load_balancer_arn = (
@@ -2044,7 +2374,7 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
             )
             self.assertFalse(any(":role/" in resource for resource in profile_links["resources"]))
 
-            self.assertEqual(len(batches), 216)
+            self.assertEqual(len(batches), 212)
             self.assertLess(len(batches), 225)
 
             class LeastPrivilegeAWS(CapabilityAWS):
@@ -2076,28 +2406,6 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
                 "123456789012",
                 artifact,
             )
-
-            class MissingRunResourceAWS(CapabilityAWS):
-                def json(self, args, *, region=None):
-                    response = super().json(args, region=region)
-                    if args[:2] == ["iam", "simulate-principal-policy"]:
-                        for result in response["EvaluationResults"]:
-                            if result["EvalActionName"] == "ec2:RunInstances":
-                                result["ResourceSpecificResults"] = [
-                                    resource
-                                    for resource in result["ResourceSpecificResults"]
-                                    if ":volume/" not in resource["EvalResourceName"]
-                                ]
-                    return response
-
-            with self.assertRaisesRegex(appliance.LifecycleError, "RunInstances.*volume"):
-                appliance.simulate_operator_actions(
-                    MissingRunResourceAWS(config),
-                    "arn:aws:iam::123456789012:role/operator",
-                    config,
-                    "123456789012",
-                    artifact,
-                )
 
     def test_mixed_create_rejects_policy_that_only_allows_fabricated_all_request_context(self):
         class FabricatedAllRequestPolicyAWS(CapabilityAWS):
@@ -2263,11 +2571,6 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
                     "ec2:CreateVpcEndpoint": {
                         frozenset({"vpc-endpoint"}): "request",
                         frozenset({"vpc", "subnet"}): "resource",
-                    },
-                    "ec2:RunInstances": {
-                        frozenset({"instance", "volume"}): "request",
-                        frozenset({"subnet", "security-group"}): "resource",
-                        frozenset({"image", "network-interface"}): "regional",
                     },
                     "elasticloadbalancing:CreateListener": {
                         frozenset({"loadbalancer"}): "request-resource",

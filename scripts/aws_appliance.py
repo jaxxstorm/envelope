@@ -310,6 +310,14 @@ AWS_OPERATOR_ACTIONS = tuple(
         }
     )
 )
+AWS_RUN_INSTANCES_DRY_RUN_ACTION = "ec2:RunInstances"
+AWS_IAM_SIMULATED_OPERATOR_ACTIONS = tuple(
+    action for action in AWS_OPERATOR_ACTIONS if action != AWS_RUN_INSTANCES_DRY_RUN_ACTION
+)
+AWS_RUN_INSTANCES_DRY_RUN_SUCCESS = (
+    "An error occurred (DryRunOperation) when calling the RunInstances operation: "
+    "Request would have succeeded, but DryRun flag is set."
+)
 
 
 def action_resource_contract(
@@ -2435,6 +2443,16 @@ def simulation_pass_role_arns(config: RunConfig, account_id: str) -> list[str]:
     return [f"arn:{partition}:iam::{account_id}:role/{name}" for name in names]
 
 
+def protected_common_tags(config: RunConfig) -> dict[str, str]:
+    return {
+        **{str(key): str(value) for key, value in config.raw["tags"].items()},
+        "EnvelopeRun": config.run_id,
+        "ExpiresAt": config.expires_at,
+        "ManagedBy": "terraform",
+        "Profile": "envelope-aws-appliance",
+    }
+
+
 def simulation_context_entries(
     config: RunConfig,
     *,
@@ -2454,13 +2472,7 @@ def simulation_context_entries(
     if region is not None:
         values["aws:RequestedRegion"] = ("string", (region,))
     if request_tags or resource_tags or tag_keys:
-        tags = {
-            **{str(key): str(value) for key, value in config.raw["tags"].items()},
-            "EnvelopeRun": config.run_id,
-            "ExpiresAt": config.expires_at,
-            "ManagedBy": "terraform",
-            "Profile": "envelope-aws-appliance",
-        }
+        tags = protected_common_tags(config)
         for key, value in sorted(tags.items()):
             if request_tags:
                 values[f"aws:RequestTag/{key}"] = ("string", (value,))
@@ -2700,7 +2712,7 @@ def build_operator_simulation_batches(
         ec2_core_contract = {
             action: resource_kinds
             for action, resource_kinds in AWS_EC2_ACTION_RESOURCE_CONTRACT.items()
-            if action not in ec2_tag_actions
+            if action not in ec2_tag_actions and action != AWS_RUN_INSTANCES_DRY_RUN_ACTION
         }
         ec2_mixed_create_contexts = {
             "ec2:CreateFlowLogs": (
@@ -2734,11 +2746,6 @@ def build_operator_simulation_batches(
             "ec2:CreateVpcEndpoint": (
                 (("vpc-endpoint",), request_tag_context),
                 (("vpc", "subnet"), resource_tag_context),
-            ),
-            "ec2:RunInstances": (
-                (("instance", "volume"), request_tag_context),
-                (("subnet", "security-group"), resource_tag_context),
-                (("image", "network-interface"), regional_context),
             ),
         }
         ec2_resource_contexts: dict[
@@ -3367,9 +3374,10 @@ def build_operator_simulation_batches(
     )
 
     covered = {action for batch in batches for action in batch["actions"]}
-    if covered != set(AWS_OPERATOR_ACTIONS):
+    if covered != set(AWS_IAM_SIMULATED_OPERATOR_ACTIONS):
         raise LifecycleError(
-            f"AWS IAM simulation batches do not cover the exact action contract: {sorted(set(AWS_OPERATOR_ACTIONS) - covered)}"
+            "AWS IAM simulation batches do not cover the exact simulated action contract: "
+            f"{sorted(set(AWS_IAM_SIMULATED_OPERATOR_ACTIONS) - covered)}"
         )
     return sorted(batches, key=lambda value: str(value["name"]))
 
@@ -3494,6 +3502,152 @@ def response_object_list(response: dict[str, Any], field: str, gate: str) -> lis
     if not isinstance(values, list) or not all(isinstance(value, dict) for value in values):
         raise LifecycleError(f"AWS preflight gate {gate} returned a malformed {field} schema")
     return values
+
+
+def run_instances_dry_run_preflight(config: RunConfig, aws: AwsCLI) -> dict[str, dict[str, str]]:
+    def exact_default_resource(
+        site: str,
+        name: str,
+        args: list[str],
+        field: str,
+    ) -> dict[str, Any]:
+        gate = f"AWS RunInstances dry-run gate {site}/{name}"
+        try:
+            response = aws.json(args, region=str(config.sites[site]["region"]))
+        except Exception:
+            raise LifecycleError(f"{gate} could not read an exact default resource") from None
+        if not isinstance(response, dict) or "NextToken" in response:
+            raise LifecycleError(f"{gate} returned malformed or incomplete default resource metadata")
+        values = response.get(field)
+        if (
+            not isinstance(values, list)
+            or len(values) != 1
+            or not isinstance(values[0], dict)
+        ):
+            raise LifecycleError(f"{gate} requires exactly one matching default resource")
+        return values[0]
+
+    common_tags = [
+        {"Key": key, "Value": value}
+        for key, value in sorted(protected_common_tags(config).items())
+    ]
+    tag_specifications = json.dumps(
+        [
+            {"ResourceType": "instance", "Tags": common_tags},
+            {"ResourceType": "volume", "Tags": common_tags},
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    summary: dict[str, dict[str, str]] = {}
+    for site in ("west", "east"):
+        region = str(config.sites[site]["region"])
+        zone = str(
+            config.sites[site]["azs"][config.sites[site]["appliance_az_key"]]
+        )
+        vpc = exact_default_resource(
+            site,
+            "default-vpc",
+            ["ec2", "describe-vpcs", "--filters", "Name=is-default,Values=true"],
+            "Vpcs",
+        )
+        vpc_id = vpc.get("VpcId")
+        if (
+            not isinstance(vpc_id, str)
+            or not re.fullmatch(r"vpc-[0-9a-f]{8,17}", vpc_id)
+            or vpc.get("IsDefault") is not True
+        ):
+            raise LifecycleError(
+                f"AWS RunInstances dry-run gate {site}/default-vpc returned a malformed identity"
+            )
+        subnet = exact_default_resource(
+            site,
+            "default-subnet",
+            [
+                "ec2",
+                "describe-subnets",
+                "--filters",
+                f"Name=vpc-id,Values={vpc_id}",
+                f"Name=availability-zone,Values={zone}",
+                "Name=default-for-az,Values=true",
+            ],
+            "Subnets",
+        )
+        subnet_id = subnet.get("SubnetId")
+        if (
+            not isinstance(subnet_id, str)
+            or not re.fullmatch(r"subnet-[0-9a-f]{8,17}", subnet_id)
+            or subnet.get("VpcId") != vpc_id
+            or subnet.get("AvailabilityZone") != zone
+            or subnet.get("DefaultForAz") is not True
+        ):
+            raise LifecycleError(
+                f"AWS RunInstances dry-run gate {site}/default-subnet returned a malformed identity"
+            )
+        security_group = exact_default_resource(
+            site,
+            "default-security-group",
+            [
+                "ec2",
+                "describe-security-groups",
+                "--filters",
+                f"Name=vpc-id,Values={vpc_id}",
+                "Name=group-name,Values=default",
+            ],
+            "SecurityGroups",
+        )
+        security_group_id = security_group.get("GroupId")
+        if (
+            not isinstance(security_group_id, str)
+            or not re.fullmatch(r"sg-[0-9a-f]{8,17}", security_group_id)
+            or security_group.get("VpcId") != vpc_id
+            or security_group.get("GroupName") != "default"
+        ):
+            raise LifecycleError(
+                f"AWS RunInstances dry-run gate {site}/default-security-group returned a malformed identity"
+            )
+
+        summary[site] = {}
+        for instance_class, instance_type in (
+            ("appliance", str(config.raw["instance_type"])),
+            ("test", str(config.raw["test_instance_type"])),
+        ):
+            gate = f"AWS RunInstances dry-run gate {site}/{instance_class}"
+            args = [
+                "ec2",
+                "run-instances",
+                "--dry-run",
+                "--image-id",
+                str(config.sites[site]["ami_id"]),
+                "--instance-type",
+                instance_type,
+                "--count",
+                "1",
+                "--subnet-id",
+                subnet_id,
+                "--security-group-ids",
+                security_group_id,
+                "--metadata-options",
+                "HttpTokens=required,HttpEndpoint=enabled",
+                "--tag-specifications",
+                tag_specifications,
+            ]
+            try:
+                aws.json(args, region=region)
+            except CommandError as error:
+                if (
+                    type(error.returncode) is int
+                    and error.returncode != 0
+                    and isinstance(error.raw_stderr, str)
+                    and error.raw_stderr.strip() == AWS_RUN_INSTANCES_DRY_RUN_SUCCESS
+                ):
+                    summary[site][instance_class] = instance_type
+                    continue
+                raise LifecycleError(f"{gate} did not return exact DryRunOperation success") from None
+            except Exception:
+                raise LifecycleError(f"{gate} failed before exact DryRunOperation success") from None
+            raise LifecycleError(f"{gate} returned normally instead of exact DryRunOperation success")
+    return summary
 
 
 def normalized_capacity_number(value: float) -> int | float:
@@ -4132,11 +4286,27 @@ def validate_aws_preflight_summary(summary: Any, config: RunConfig, account_id: 
     ):
         raise LifecycleError("AWS preflight summary principal identity is invalid")
     actions = summary.get("actions")
+    expected_run_instances_dry_run = {
+        site: {
+            "appliance": str(config.raw["instance_type"]),
+            "test": str(config.raw["test_instance_type"]),
+        }
+        for site in ("west", "east")
+    }
     if (
         not isinstance(actions, dict)
-        or set(actions) != {"operator", "operator_decision", "flow_log_delivery_role"}
+        or set(actions)
+        != {
+            "operator",
+            "operator_simulated",
+            "operator_decision",
+            "run_instances_dry_run",
+            "flow_log_delivery_role",
+        }
         or actions.get("operator") != list(AWS_OPERATOR_ACTIONS)
+        or actions.get("operator_simulated") != list(AWS_IAM_SIMULATED_OPERATOR_ACTIONS)
         or actions.get("operator_decision") != "allowed"
+        or actions.get("run_instances_dry_run") != expected_run_instances_dry_run
         or actions.get("flow_log_delivery_role") != list(AWS_FLOW_LOG_DELIVERY_ACTIONS)
     ):
         raise LifecycleError("AWS preflight summary action contract is invalid")
@@ -4284,6 +4454,7 @@ def aws_capability_quota_preflight(
     if aws_partition(identity["arn"]) != configured_partition:
         raise LifecycleError("AWS caller and all configured resources must use the commercial aws partition")
     principal_kind, policy_source_arn = resolve_iam_simulation_principal(aws, identity)
+    run_instances_dry_run = run_instances_dry_run_preflight(config, aws)
     simulate_operator_actions(aws, policy_source_arn, config, identity["account_id"], artifact)
 
     account_summary = aws.json(["iam", "get-account-summary"]).get("SummaryMap")
@@ -4390,7 +4561,9 @@ def aws_capability_quota_preflight(
         },
         "actions": {
             "operator": list(AWS_OPERATOR_ACTIONS),
+            "operator_simulated": list(AWS_IAM_SIMULATED_OPERATOR_ACTIONS),
             "operator_decision": "allowed",
+            "run_instances_dry_run": run_instances_dry_run,
             "flow_log_delivery_role": list(AWS_FLOW_LOG_DELIVERY_ACTIONS),
         },
         "regions": regions,
