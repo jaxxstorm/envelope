@@ -178,6 +178,7 @@ def aws_preflight_summary_document(architecture: str = "amd64") -> dict:
             "ssm_kms_key_sha256": hashlib.sha256(
                 f"arn:aws:kms:{region}:123456789012:key/{site}".encode()
             ).hexdigest(),
+            "excluded_regional_nat_gateways": 0,
             "quotas": quotas,
         }
     return {
@@ -1413,6 +1414,7 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
         )
         self.assertEqual(set(summary["regions"]), {"us-west-2", "us-east-1"})
         self.assertEqual(summary["regions"]["us-west-2"]["planned_instances"], 3)
+        self.assertEqual(summary["regions"]["us-west-2"]["excluded_regional_nat_gateways"], 0)
         self.assertEqual(summary["regions"]["us-west-2"]["quotas"]["standard-vcpus"]["required"], 6)
         self.assertEqual(
             summary["regions"]["us-west-2"]["quotas"]["standard-vcpus"]["quota_code"],
@@ -3383,6 +3385,224 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
                     fixture_instance_vcpus(config),
                     artifact_identity(pathlib.Path(temporary)),
                 )
+
+    def test_nat_per_az_headroom_counts_literal_zonal_schema_and_excludes_regional(self):
+        class NatUsageAWS(CapabilityAWS):
+            def json(self, args, *, region=None):
+                if args[:2] == ["ec2", "describe-nat-gateways"]:
+                    self.calls.append((list(args), region))
+                    if region != "us-west-2":
+                        return {"NatGateways": []}
+                    return {
+                        "NatGateways": [
+                            {
+                                "NatGatewayId": "nat-00000000000000001",
+                                "State": "available",
+                                "AvailabilityMode": "zonal",
+                                "SubnetId": "subnet-00000000000000001",
+                                "VpcId": "vpc-00000000000000001",
+                                "NatGatewayAddresses": [{"PrivateIp": "10.0.0.10"}],
+                            },
+                            {
+                                "NatGatewayId": "nat-00000000000000002",
+                                "State": "pending",
+                                "AvailabilityMode": "zonal",
+                                "SubnetId": "subnet-00000000000000002",
+                                "VpcId": "vpc-00000000000000001",
+                                "NatGatewayAddresses": [{"PrivateIp": "10.0.0.11"}],
+                            },
+                            {
+                                "NatGatewayId": "nat-00000000000000003",
+                                "State": "deleting",
+                                "AvailabilityMode": "zonal",
+                                "SubnetId": "subnet-00000000000000003",
+                                "VpcId": "vpc-00000000000000001",
+                                "NatGatewayAddresses": [{"PrivateIp": "10.0.0.12"}],
+                            },
+                            {
+                                "NatGatewayId": "nat-00000000000000004",
+                                "State": "available",
+                                "AvailabilityMode": "zonal",
+                                "SubnetId": "subnet-00000000000000004",
+                                "VpcId": "vpc-00000000000000001",
+                                "NatGatewayAddresses": [{"PrivateIp": "10.0.1.10"}],
+                            },
+                            {
+                                "NatGatewayId": "nat-10000000000000001",
+                                "State": "available",
+                                "AvailabilityMode": "regional",
+                                "VpcId": "vpc-10000000000000001",
+                                "RouteTableId": "rtb-10000000000000001",
+                                "NatGatewayAddresses": [
+                                    {"AvailabilityZone": "us-west-2a", "PrivateIp": "10.1.0.10"},
+                                    {"AvailabilityZone": "us-west-2b", "PrivateIp": "10.1.1.10"},
+                                ],
+                            },
+                        ]
+                    }
+                if args[:2] == ["ec2", "describe-subnets"] and "--subnet-ids" in args:
+                    self.calls.append((list(args), region))
+                    zones = {
+                        "subnet-00000000000000001": "us-west-2a",
+                        "subnet-00000000000000002": "us-west-2a",
+                        "subnet-00000000000000003": "us-west-2a",
+                        "subnet-00000000000000004": "us-west-2b",
+                    }
+                    requested = args[args.index("--subnet-ids") + 1 :]
+                    if set(requested) != set(zones):
+                        raise AssertionError(requested)
+                    return {
+                        "Subnets": [
+                            {"SubnetId": subnet_id, "AvailabilityZone": zones[subnet_id]}
+                            for subnet_id in requested
+                        ]
+                    }
+                response = super().json(args, region=region)
+                if (
+                    args[:2] == ["service-quotas", "get-service-quota"]
+                    and args[args.index("--quota-code") + 1] == "L-FE5A380F"
+                ):
+                    response["Quota"]["Value"] = 4.0
+                return response
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            aws = NatUsageAWS(config)
+            _, summary = appliance.aws_capability_quota_preflight(
+                config,
+                aws,
+                fixture_instance_vcpus(config),
+                artifact_identity(root),
+            )
+
+        west = summary["regions"]["us-west-2"]
+        nat_quota = west["quotas"]["nat-gateways-per-availability-zone"]
+        self.assertEqual(
+            (nat_quota["limit"], nat_quota["used"], nat_quota["required"], nat_quota["available"]),
+            (4, 3, 1, 1),
+        )
+        self.assertEqual(west["quotas"]["elastic-ips"]["used"], 0)
+        self.assertEqual(west["excluded_regional_nat_gateways"], 1)
+        self.assertEqual(summary["regions"]["us-east-1"]["excluded_regional_nat_gateways"], 0)
+        subnet_calls = [
+            (args, region)
+            for args, region in aws.calls
+            if args[:2] == ["ec2", "describe-subnets"] and "--subnet-ids" in args
+        ]
+        self.assertEqual(len(subnet_calls), 1)
+        self.assertEqual(subnet_calls[0][1], "us-west-2")
+        self.assertEqual(
+            set(subnet_calls[0][0][subnet_calls[0][0].index("--subnet-ids") + 1 :]),
+            {
+                "subnet-00000000000000001",
+                "subnet-00000000000000002",
+                "subnet-00000000000000003",
+                "subnet-00000000000000004",
+            },
+        )
+        serialized = json.dumps(summary, sort_keys=True)
+        for identifier in (
+            "nat-00000000000000001",
+            "nat-10000000000000001",
+            "subnet-00000000000000001",
+            "vpc-10000000000000001",
+            "rtb-10000000000000001",
+        ):
+            self.assertNotIn(identifier, serialized)
+
+    def test_nat_usage_rejects_unknown_modes_and_malformed_literal_schemas(self):
+        zonal = {
+            "NatGatewayId": "nat-20000000000000001",
+            "State": "available",
+            "AvailabilityMode": "zonal",
+            "SubnetId": "subnet-20000000000000001",
+            "VpcId": "vpc-20000000000000001",
+            "NatGatewayAddresses": [{"PrivateIp": "10.2.0.10"}],
+        }
+        regional = {
+            "NatGatewayId": "nat-30000000000000001",
+            "State": "available",
+            "AvailabilityMode": "regional",
+            "VpcId": "vpc-30000000000000001",
+            "RouteTableId": "rtb-30000000000000001",
+            "NatGatewayAddresses": [
+                {"AvailabilityZone": "us-west-2a", "PrivateIp": "10.3.0.10"}
+            ],
+        }
+        malformed = (
+            ("missing-mode", {key: value for key, value in zonal.items() if key != "AvailabilityMode"}),
+            ("unknown-mode", {**zonal, "AvailabilityMode": "multi-az"}),
+            ("unknown-state", {**zonal, "State": "active"}),
+            ("zonal-missing-subnet", {key: value for key, value in zonal.items() if key != "SubnetId"}),
+            ("zonal-malformed-subnet", {**zonal, "SubnetId": "subnet-not-an-id"}),
+            ("regional-with-subnet", {**regional, "SubnetId": "subnet-30000000000000001"}),
+            ("regional-missing-vpc", {key: value for key, value in regional.items() if key != "VpcId"}),
+            (
+                "regional-missing-route-table",
+                {key: value for key, value in regional.items() if key != "RouteTableId"},
+            ),
+            ("regional-empty-addresses", {**regional, "NatGatewayAddresses": []}),
+            (
+                "regional-invalid-address-zone",
+                {**regional, "NatGatewayAddresses": [{"AvailabilityZone": "us-east-1a"}]},
+            ),
+        )
+
+        class LiteralNatAWS(CapabilityAWS):
+            def __init__(self, config, gateway, subnets=None):
+                super().__init__(config)
+                self.gateway = gateway
+                self.subnets = (
+                    [
+                        {
+                            "SubnetId": "subnet-20000000000000001",
+                            "AvailabilityZone": "us-west-2a",
+                        }
+                    ]
+                    if subnets is None
+                    else subnets
+                )
+
+            def json(self, args, *, region=None):
+                if args[:2] == ["ec2", "describe-nat-gateways"]:
+                    self.calls.append((list(args), region))
+                    return {"NatGateways": [copy.deepcopy(self.gateway)]}
+                if args[:2] == ["ec2", "describe-subnets"] and "--subnet-ids" in args:
+                    self.calls.append((list(args), region))
+                    return {"Subnets": copy.deepcopy(self.subnets)}
+                return super().json(args, region=region)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            for name, gateway in malformed:
+                with self.subTest(name=name):
+                    with self.assertRaisesRegex(appliance.LifecycleError, "NAT current usage"):
+                        appliance.regional_quota_usage(
+                            config,
+                            LiteralNatAWS(config, gateway),
+                            "west",
+                        )
+            malformed_subnet_responses = (
+                ("missing", []),
+                (
+                    "wrong-region",
+                    [
+                        {
+                            "SubnetId": "subnet-20000000000000001",
+                            "AvailabilityZone": "us-east-1a",
+                        }
+                    ],
+                ),
+            )
+            for name, subnets in malformed_subnet_responses:
+                with self.subTest(zonal_subnet_resolution=name):
+                    with self.assertRaisesRegex(appliance.LifecycleError, "NAT current usage"):
+                        appliance.regional_quota_usage(
+                            config,
+                            LiteralNatAWS(config, zonal, subnets),
+                            "west",
+                        )
 
     def test_standard_vcpu_quota_subtracts_default_weight_of_current_on_demand_instances(self):
         class UsageAWS(CapabilityAWS):

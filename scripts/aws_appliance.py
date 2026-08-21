@@ -4061,18 +4061,63 @@ def regional_quota_usage(config: RunConfig, aws: AwsCLI, site: str) -> dict[str,
         "NatGateways",
         "nat-gateways-per-availability-zone/current-usage",
     )
-    active_gateways: list[dict[str, Any]] = []
+    active_zonal_gateways: list[dict[str, Any]] = []
+    excluded_regional_gateways = 0
+    valid_states = {"available", "pending", "deleting", "deleted", "failed"}
+    capacity_states = {"available", "pending", "deleting"}
+    gateway_ids: set[str] = set()
     for gateway in gateways:
+        gateway_id = gateway.get("NatGatewayId")
+        state = gateway.get("State")
+        availability_mode = gateway.get("AvailabilityMode")
         if (
-            not isinstance(gateway.get("NatGatewayId"), str)
-            or not isinstance(gateway.get("State"), str)
+            not isinstance(gateway_id, str)
+            or not re.fullmatch(r"nat-(?:[0-9a-f]{8}|[0-9a-f]{17})", gateway_id)
+            or gateway_id in gateway_ids
+            or not isinstance(state, str)
+            or state not in valid_states
+            or not isinstance(availability_mode, str)
+            or availability_mode not in {"zonal", "regional"}
         ):
             raise LifecycleError("AWS preflight gate NAT current usage returned malformed gateway metadata")
-        if str(gateway["State"]).lower() not in {"deleted", "failed"}:
-            if not isinstance(gateway.get("SubnetId"), str):
-                raise LifecycleError("AWS preflight gate NAT current usage omitted a subnet identity")
-            active_gateways.append(gateway)
-    nat_subnet_ids = sorted({str(value["SubnetId"]) for value in active_gateways})
+        gateway_ids.add(gateway_id)
+        if availability_mode == "zonal":
+            subnet_id = gateway.get("SubnetId")
+            if not isinstance(subnet_id, str) or not re.fullmatch(
+                r"subnet-(?:[0-9a-f]{8}|[0-9a-f]{17})",
+                subnet_id,
+            ):
+                raise LifecycleError("AWS preflight gate NAT current usage omitted an exact zonal subnet identity")
+            if state in capacity_states:
+                active_zonal_gateways.append(gateway)
+            continue
+
+        vpc_id = gateway.get("VpcId")
+        route_table_id = gateway.get("RouteTableId")
+        gateway_addresses = gateway.get("NatGatewayAddresses")
+        if (
+            "SubnetId" in gateway
+            or not isinstance(vpc_id, str)
+            or not re.fullmatch(r"vpc-(?:[0-9a-f]{8}|[0-9a-f]{17})", vpc_id)
+            or not isinstance(route_table_id, str)
+            or not re.fullmatch(r"rtb-(?:[0-9a-f]{8}|[0-9a-f]{17})", route_table_id)
+            or not isinstance(gateway_addresses, list)
+            or not gateway_addresses
+            or not all(isinstance(address, dict) for address in gateway_addresses)
+            or any(
+                not isinstance(address.get("AvailabilityZone"), str)
+                or not re.fullmatch(
+                    rf"{re.escape(region)}[a-z]",
+                    address["AvailabilityZone"],
+                )
+                for address in gateway_addresses
+            )
+        ):
+            raise LifecycleError("AWS preflight gate NAT current usage returned malformed regional gateway metadata")
+        if state in capacity_states:
+            excluded_regional_gateways += 1
+
+    nat_subnet_ids = sorted({str(value["SubnetId"]) for value in active_zonal_gateways})
     subnet_azs: dict[str, str] = {}
     if nat_subnet_ids:
         subnets = response_object_list(
@@ -4082,7 +4127,13 @@ def regional_quota_usage(config: RunConfig, aws: AwsCLI, site: str) -> dict[str,
         )
         for subnet in subnets:
             subnet_id, zone = subnet.get("SubnetId"), subnet.get("AvailabilityZone")
-            if not isinstance(subnet_id, str) or not isinstance(zone, str) or subnet_id in subnet_azs:
+            if (
+                not isinstance(subnet_id, str)
+                or not re.fullmatch(r"subnet-(?:[0-9a-f]{8}|[0-9a-f]{17})", subnet_id)
+                or not isinstance(zone, str)
+                or not re.fullmatch(rf"{re.escape(region)}[a-z]", zone)
+                or subnet_id in subnet_azs
+            ):
                 raise LifecycleError("AWS preflight gate NAT current usage returned malformed subnet metadata")
             subnet_azs[subnet_id] = zone
         if set(subnet_azs) != set(nat_subnet_ids):
@@ -4169,8 +4220,9 @@ def regional_quota_usage(config: RunConfig, aws: AwsCLI, site: str) -> dict[str,
         "geneve-target-groups": geneve_target_groups,
         "listeners-per-gateway-load-balancer": 0,
         "nat-gateways-per-availability-zone": sum(
-            subnet_azs[str(value["SubnetId"])] == target_zone for value in active_gateways
+            subnet_azs[str(value["SubnetId"])] == target_zone for value in active_zonal_gateways
         ),
+        "excluded_regional_nat_gateways": excluded_regional_gateways,
         "standard-vcpus": current_standard_vcpus(aws, region),
         "target-groups": len(target_groups),
         "targets-per-availability-zone-per-gateway-load-balancer": 0,
@@ -4316,6 +4368,7 @@ def validate_aws_preflight_summary(summary: Any, config: RunConfig, account_id: 
             "instance_vcpus",
             "instance_offerings",
             "ssm_kms_key_sha256",
+            "excluded_regional_nat_gateways",
             "quotas",
         }:
             raise LifecycleError(f"AWS preflight summary for {region} has an invalid schema")
@@ -4326,6 +4379,9 @@ def validate_aws_preflight_summary(summary: Any, config: RunConfig, account_id: 
             or not isinstance(instance_vcpus, dict)
             or set(instance_vcpus) != {"appliance", "workload"}
             or any(isinstance(number, bool) or not isinstance(number, int) or number <= 0 for number in instance_vcpus.values())
+            or isinstance(value.get("excluded_regional_nat_gateways"), bool)
+            or not isinstance(value.get("excluded_regional_nat_gateways"), int)
+            or value["excluded_regional_nat_gateways"] < 0
         ):
             raise LifecycleError(f"AWS preflight summary for {region} has invalid instance capacity")
         expected_offerings = {
@@ -4518,6 +4574,7 @@ def aws_capability_quota_preflight(
             "instance_vcpus": per_role_vcpus,
             "instance_offerings": offerings,
             "ssm_kms_key_sha256": ssm_kms_key_sha256,
+            "excluded_regional_nat_gateways": usage["excluded_regional_nat_gateways"],
             "quotas": quotas,
         }
     summary = {
