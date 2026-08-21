@@ -1056,6 +1056,18 @@ class FlowLedgerTest(unittest.TestCase):
         self.assertIn("udp and dst port 6081", command)
         subprocess.run(["bash", "-n", "-c", command], check=True, capture_output=True, text=True)
 
+        client = e2e.AwsLiveOperations._icmp_client_command(
+            flow,
+            payload_bytes=1253,
+            timeout_seconds=20,
+            expect_timeout=True,
+        )
+        self.assertIn("e2e-live-observer icmp-client", client)
+        self.assertIn("--payload-bytes 1253", client)
+        self.assertIn("--expect-timeout", client)
+        self.assertNotIn(" ping ", client)
+        subprocess.run(["bash", "-n", "-c", client], check=True, capture_output=True, text=True)
+
 
 def internet_checksum(data: bytes) -> int:
     if len(data) % 2:
@@ -1397,6 +1409,10 @@ class CaptureControllerTest(unittest.TestCase):
                 output = '{"deleted":true,"success":true}\n'
             elif command.comment == "Envelope E2E explicit appliance readiness":
                 output = '{"pid":123,"success":true}\n'
+            elif command.comment == "Envelope E2E appliance readiness":
+                output = '{"pid":123,"ready":true,"success":true}\n'
+            elif command.comment == "Envelope E2E explicit workload readiness":
+                output = '{"success":true}\n'
             else:
                 output = ""
             return e2e.SSMResult(command.target, f"execute-{len(self.executed)}", "Success", 0, stdout=output)
@@ -1483,7 +1499,40 @@ class CaptureControllerTest(unittest.TestCase):
         self.assertEqual(result["pid"], 123)
         command = fake.executed[-1]
         self.assertEqual(command.comment, "Envelope E2E explicit appliance readiness")
+        self.assertIn("for unit in tailscaled.service envelope-host-network.service envelope.service", command.commands[0])
+        self.assertIn("for tool in tcpdump timeout python3 sha256sum gzip base64", command.commands[0])
         subprocess.run(["bash", "-n", "-c", command.commands[0]], check=True, capture_output=True, text=True)
+
+    def test_all_readiness_commands_require_each_managed_service(self) -> None:
+        fake = self.FakeSSM()
+        operations, deployment, _flows = self.fixture(fake)
+
+        operations._wait_appliance_ready(deployment.appliance("west"), timeout_seconds=60)
+        operations._workload_readiness_details(
+            deployment.workloads.west.initiator,
+            deployment.workloads.east.responder,
+            timeout_seconds=60,
+        )
+
+        appliance, workload = fake.executed[-2:]
+        self.assertIn("for unit in tailscaled.service envelope-host-network.service envelope.service", appliance.commands[0])
+        self.assertIn(
+            "for unit in amazon-ssm-agent.service envelope-e2e-agent-tcp.service envelope-e2e-agent-udp.service",
+            workload.commands[0],
+        )
+        for command in (appliance, workload):
+            subprocess.run(["bash", "-n", "-c", command.commands[0]], check=True, capture_output=True, text=True)
+
+    def test_emergency_return_rule_accepts_concurrent_reconciliation(self) -> None:
+        fake = self.FakeSSM()
+        operations, deployment, _flows = self.fixture(fake)
+        restored = {"priority": 100, "protocol": "186", "table": "100"}
+
+        with (
+            mock.patch.object(operations, "_return_rule_snapshot", side_effect=[[], [restored]]),
+            mock.patch.object(operations, "_execute", side_effect=e2e.SSMError("rule already exists")),
+        ):
+            operations._ensure_return_rule(deployment, "west")
 
     def test_inspector_failure_still_deletes_every_raw_capture(self) -> None:
         fake = self.FakeSSM(fail_inspection=True)
@@ -4344,11 +4393,79 @@ class ProtectedExecutionTest(unittest.TestCase):
 
     def test_embedded_remote_agent_is_valid_python_and_bounded_for_ssm(self) -> None:
         compile(e2e.REMOTE_AGENT_SOURCE, "<remote-agent>", "exec")
+        self.assertIn('stream.add_argument("--ready-path", required=True)', e2e.REMOTE_AGENT_SOURCE)
+        self.assertIn("os.O_WRONLY | os.O_CREAT | os.O_EXCL", e2e.REMOTE_AGENT_SOURCE)
         compressed = gzip.compress(e2e.REMOTE_AGENT_SOURCE.encode("utf-8"), mtime=0)
         self.assertLess(len(base64.b64encode(compressed)), 12_000)
         compile(e2e.WIRE_INSPECTOR_SOURCE, "<wire-inspector>", "exec")
         wire_compressed = gzip.compress(e2e.WIRE_INSPECTOR_SOURCE.encode("utf-8"), mtime=0)
         self.assertLess(len(base64.b64encode(wire_compressed)), 12_000)
+
+    def test_embedded_icmp_sender_preserves_every_payload_byte(self) -> None:
+        namespace: dict[str, Any] = {"__name__": "remote_agent_fixture"}
+        exec(e2e.REMOTE_AGENT_SOURCE, namespace)
+
+        class FakeRawSocket:
+            def __init__(self) -> None:
+                self.packet = b""
+                self.reply = b""
+
+            def bind(self, _address: tuple[str, int]) -> None:
+                pass
+
+            def setsockopt(self, _level: int, _option: int, _value: int) -> None:
+                pass
+
+            def settimeout(self, _seconds: float) -> None:
+                pass
+
+            def sendto(self, packet: bytes, target: tuple[str, int]) -> None:
+                self.packet = packet
+                _request_type, _code, _checksum, identifier, sequence = struct.unpack("!BBHHH", packet[:8])
+                payload = packet[8:]
+                header = struct.pack("!BBHHH", 0, 0, 0, identifier, sequence)
+                checksum = namespace["internet_checksum"](header + payload)
+                response = struct.pack("!BBHHH", 0, 0, checksum, identifier, sequence) + payload
+                ipv4 = bytearray(20)
+                ipv4[0] = 0x45
+                ipv4[9] = socket.IPPROTO_ICMP
+                ipv4[12:16] = socket.inet_aton(target[0])
+                ipv4[16:20] = socket.inet_aton("192.0.2.10")
+                self.reply = bytes(ipv4) + response
+
+            def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+                return self.reply, ("198.51.100.20", 0)
+
+            def close(self) -> None:
+                pass
+
+        raw_socket = FakeRawSocket()
+        namespace["socket"] = SimpleNamespace(
+            AF_INET=socket.AF_INET,
+            SOCK_RAW=socket.SOCK_RAW,
+            IPPROTO_ICMP=socket.IPPROTO_ICMP,
+            IPPROTO_IP=socket.IPPROTO_IP,
+            timeout=socket.timeout,
+            inet_ntoa=socket.inet_ntoa,
+            socket=lambda *_args: raw_socket,
+        )
+        output = io.StringIO()
+        args = SimpleNamespace(
+            expect_timeout=False,
+            flow_id="fixture-icmp",
+            host="198.51.100.20",
+            payload_bytes=1253,
+            source_ip="192.0.2.10",
+            timeout=1.0,
+        )
+
+        with contextlib.redirect_stdout(output):
+            namespace["icmp_client"](args)
+
+        result = json.loads(output.getvalue())
+        self.assertTrue(result["reply_received"])
+        self.assertEqual(raw_socket.packet[8:], b"\xa5" * 1253)
+        self.assertEqual(namespace["internet_checksum"](raw_socket.packet), 0)
 
     def test_durable_claim_proves_load_thresholds_predate_apply(self) -> None:
         raw = protected_output()

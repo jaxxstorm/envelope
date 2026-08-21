@@ -258,7 +258,7 @@ class TimeoutBudgets:
     service_stop: int = 180
     ec2_reboot: int = 600
     tailscale_withdrawal: int = 180
-    flow_log_capture: int = 360
+    flow_log_capture: int = 420
     evidence: int = 30
     cleanup: int = 900
     hard_timeout: int = 5400
@@ -5911,7 +5911,9 @@ import gzip
 import hashlib
 import json
 import math
+import os
 import socket
+import struct
 import sys
 import time
 
@@ -5935,6 +5937,64 @@ def decode(data):
     if not isinstance(value, dict):
         raise RuntimeError("frame is not an object")
     return value
+
+def internet_checksum(data):
+    if len(data) % 2:
+        data += b"\0"
+    total = sum((data[offset] << 8) | data[offset + 1] for offset in range(0, len(data), 2))
+    while total >> 16:
+        total = (total & 0xffff) + (total >> 16)
+    return (~total) & 0xffff
+
+def icmp_client(args):
+    if not 1 <= args.payload_bytes <= 65507:
+        raise RuntimeError("ICMP payload size is invalid")
+    payload = b"\xa5" * args.payload_bytes
+    digest = hashlib.sha256(payload).hexdigest()
+    identifier = int.from_bytes(hashlib.sha256(args.flow_id.encode("ascii")).digest()[:2], "big") or 1
+    sequence = 1
+    header = struct.pack("!BBHHH", 8, 0, 0, identifier, sequence)
+    packet = struct.pack("!BBHHH", 8, 0, internet_checksum(header + payload), identifier, sequence) + payload
+    sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    reply_source = None
+    try:
+        sock.bind((args.source_ip, 0))
+        sock.setsockopt(socket.IPPROTO_IP, 10, 2)
+        sock.sendto(packet, (args.host, 0))
+        deadline = time.monotonic() + args.timeout
+        while time.monotonic() < deadline:
+            sock.settimeout(max(0.01, deadline - time.monotonic()))
+            try:
+                received, _peer = sock.recvfrom(65535)
+            except socket.timeout:
+                break
+            if len(received) < 28 or received[0] >> 4 != 4 or received[9] != socket.IPPROTO_ICMP:
+                continue
+            header_length = (received[0] & 15) * 4
+            if header_length < 20 or len(received) < header_length + 8:
+                continue
+            response = received[header_length:]
+            response_type, code, _checksum, response_id, response_sequence = struct.unpack("!BBHHH", response[:8])
+            if (response_type, code, response_id, response_sequence) != (0, 0, identifier, sequence):
+                continue
+            source_ip = socket.inet_ntoa(received[12:16])
+            destination_ip = socket.inet_ntoa(received[16:20])
+            if source_ip != args.host or destination_ip != args.source_ip:
+                raise RuntimeError("ICMP reply identity mismatch")
+            if internet_checksum(response) != 0 or response[8:] != payload:
+                raise RuntimeError("ICMP reply checksum or payload mismatch")
+            reply_source = source_ip
+            break
+    finally:
+        sock.close()
+    if args.expect_timeout:
+        if reply_source is not None:
+            raise RuntimeError("oversized ICMP unexpectedly received a reply")
+    elif reply_source is None:
+        raise RuntimeError("ICMP reply timed out")
+    emit({"destination_ip": args.host, "flow_id": args.flow_id, "payload_bytes": args.payload_bytes,
+          "payload_sha256": digest, "reply_received": reply_source is not None,
+          "reply_source_ip": reply_source, "source_ip": args.source_ip, "success": True})
 
 def tcp_frame(conn, deadline):
     data = bytearray()
@@ -6060,6 +6120,10 @@ def stream_client(args):
     connection_id = args.flow_id + ":c0001"
     markers = []
     try:
+        try:
+            os.unlink(args.ready_path)
+        except FileNotFoundError:
+            pass
         sock.bind((args.source_ip, args.source_port))
         sock.connect((args.host, args.port))
         started = time.monotonic()
@@ -6080,6 +6144,15 @@ def stream_client(args):
                 if response == {"connection_id": connection_id, "flow_id": args.flow_id, "kind": "ack", "sequence": sequence}:
                     markers.append({"connection_id": connection_id, "flow_id": args.flow_id,
                                     "received_monotonic_ns": time.monotonic_ns(), "sent_monotonic_ns": sent, "sequence": sequence})
+                    if sequence == 0:
+                        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                        if hasattr(os, "O_NOFOLLOW"):
+                            flags |= os.O_NOFOLLOW
+                        descriptor = os.open(args.ready_path, flags, 0o600)
+                        try:
+                            os.write(descriptor, b"ready\n")
+                        finally:
+                            os.close(descriptor)
                     break
     finally:
         sock.close()
@@ -6232,6 +6305,11 @@ def main():
     stream.add_argument("--source-ip", required=True); stream.add_argument("--source-port", type=int, required=True)
     stream.add_argument("--flow-id", required=True); stream.add_argument("--count", type=int, required=True)
     stream.add_argument("--interval", type=float, required=True); stream.add_argument("--ack-timeout", type=float, required=True)
+    stream.add_argument("--ready-path", required=True)
+    icmp = sub.add_parser("icmp-client")
+    icmp.add_argument("--host", required=True); icmp.add_argument("--source-ip", required=True)
+    icmp.add_argument("--flow-id", required=True); icmp.add_argument("--payload-bytes", type=int, required=True)
+    icmp.add_argument("--timeout", type=float, required=True); icmp.add_argument("--expect-timeout", action="store_true")
     sized_server = sub.add_parser("sized-udp-server")
     sized_server.add_argument("--bind", required=True); sized_server.add_argument("--port", type=int, required=True)
     sized_server.add_argument("--flow-id", required=True); sized_server.add_argument("--payload-bytes", type=int, required=True)
@@ -6249,6 +6327,7 @@ def main():
     batch.add_argument("--ack-timeout", type=float, default=1.0)
     args = parser.parse_args()
     {"serve-probe": serve_probe, "probe": probe, "stream-server": stream_server, "stream-client": stream_client,
+     "icmp-client": icmp_client,
      "sized-udp-server": sized_udp_server, "sized-udp-client": sized_udp_client,
      "batch-client": batch_client}[args.op](args)
 
@@ -6549,7 +6628,11 @@ class AwsLiveOperations:
         command = """set -euo pipefail
 deadline=$((SECONDS+%d))
 while (( SECONDS < deadline )); do
-  if systemctl is-active --quiet tailscaled.service envelope-host-network.service envelope.service &&
+  units_ready=true
+  for unit in tailscaled.service envelope-host-network.service envelope.service; do
+    systemctl is-active --quiet "$unit" || units_ready=false
+  done
+  if [[ "$units_ready" == true ]] &&
      PREFLIGHT_MAX_ATTEMPTS=1 PREFLIGHT_RETRY_SECONDS=0 timeout 20 /usr/local/sbin/envelope-preflight >/dev/null 2>&1 &&
      curl --fail --silent --max-time 3 http://127.0.0.1:9090/healthz >/dev/null; then
     pid=$(systemctl show -p MainPID --value envelope.service)
@@ -6597,7 +6680,9 @@ exit 1""" % max(5, int(timeout_seconds) - 15)
 status=$(mktemp /run/envelope-e2e-tailscale.XXXXXX)
 trap 'rm -f "$status"' EXIT
 timeout 120 cloud-init status --wait >/dev/null
-systemctl is-active --quiet tailscaled.service envelope-host-network.service envelope.service
+for unit in tailscaled.service envelope-host-network.service envelope.service; do
+  systemctl is-active --quiet "$unit"
+done
 timeout 10 tailscale status --json >"$status"
 jq -e --argjson advertised {shlex.quote(advertised_json)} '
   (.Self.TailscaleIPs // .TailscaleIPs // []) as $self_ips |
@@ -6619,7 +6704,9 @@ iptables-save -t filter | grep -F -- '-A FORWARD -j ENVELOPE-FORWARD' >/dev/null
 iptables-save -t mangle | grep -F -- '-A FORWARD -j ENVELOPE-MSS' >/dev/null
 curl --fail --silent --max-time 3 http://127.0.0.1:9090/healthz >/dev/null
 curl --fail --silent --max-time 3 http://127.0.0.1:9090/metrics | grep -E '^routing_ready 1(\\.0)?$' >/dev/null
-command -v tcpdump timeout python3 sha256sum gzip base64 >/dev/null
+for tool in tcpdump timeout python3 sha256sum gzip base64; do
+  command -v "$tool" >/dev/null
+done
 printf '%s  %s\\n' {shlex.quote(self.wire_inspector_sha256)} {shlex.quote(WIRE_INSPECTOR_PATH)} | sha256sum -c - >/dev/null
 pid=$(systemctl show -p MainPID --value envelope.service)
 printf '{{"accepted_route_peer":{json.dumps(expected_peer)},"accepted_routes":{accepted_json},"accepted_routes_exact":true,"advertised_routes":{advertised_json},"advertised_routes_exact":true,"capture_tools_ready":true,"cloud_init_complete":true,"envelope_active":true,"envelope_health":true,"firewall_mss_ready":true,"host_network_active":true,"host_network_preflight":true,"links":["{runtime.underlay_interface}","{runtime.tailscale_iface}","{runtime.tun_name}"],"links_ready":true,"metrics_ready":true,"pid":%s,"success":true,"sysctls_ready":true,"tailscale_backend_running":true,"tailscaled_active":true}}\\n' "$pid"
@@ -6643,7 +6730,9 @@ printf '{{"accepted_route_peer":{json.dumps(expected_peer)},"accepted_routes":{a
     ) -> dict[str, Any]:
         command = f"""set -euo pipefail
 timeout 120 cloud-init status --wait >/dev/null
-systemctl is-active --quiet amazon-ssm-agent.service envelope-e2e-agent-tcp.service envelope-e2e-agent-udp.service
+for unit in amazon-ssm-agent.service envelope-e2e-agent-tcp.service envelope-e2e-agent-udp.service; do
+  systemctl is-active --quiet "$unit"
+done
 for tool in ping iperf3 python3 ip ss timeout jq; do command -v "$tool" >/dev/null; done
 ip -j address show | jq -e --arg source {shlex.quote(target.private_ip)} 'any(.[]?.addr_info[]?; .local == $source)' >/dev/null
 ip -j route get {shlex.quote(peer.private_ip)} from {shlex.quote(target.private_ip)} | jq -e --arg source {shlex.quote(target.private_ip)} 'length == 1 and ((.[0].prefsrc // .[0].src) == $source)' >/dev/null
@@ -7240,23 +7329,47 @@ exit 1"""
             raise WireAssertionError("capture inspector rejected the bounded pcap")
         return value
 
-    def _run_icmp_probe(self, flow: FlowRecord, *, payload_bytes: int, timeout_seconds: int) -> dict[str, Any]:
+    @staticmethod
+    def _icmp_client_command(
+        flow: FlowRecord, *, payload_bytes: int, timeout_seconds: int, expect_timeout: bool = False
+    ) -> str:
         if flow.protocol != "icmp" or flow.source_port is not None or flow.destination_port is not None:
             raise ProbeError("ICMP probe flow carries an invalid transport identity")
+        parts = [
+            "set -euo pipefail; exec",
+            shlex.quote(REMOTE_AGENT_PATH),
+            "icmp-client",
+            "--host",
+            shlex.quote(flow.destination.private_ip),
+            "--source-ip",
+            shlex.quote(flow.source.private_ip),
+            "--flow-id",
+            shlex.quote(flow.flow_id),
+            "--payload-bytes",
+            str(payload_bytes),
+            "--timeout",
+            str(max(1, min(30, timeout_seconds))),
+        ]
+        if expect_timeout:
+            parts.append("--expect-timeout")
+        return " ".join(parts)
+
+    def _run_icmp_probe(self, flow: FlowRecord, *, payload_bytes: int, timeout_seconds: int) -> dict[str, Any]:
         payload = bytes([0xA5]) * payload_bytes
         digest = hashlib.sha256(payload).hexdigest()
         value = self._execute_json(
             flow.source,
-            "set -euo pipefail; "
-            f"timeout {max(2, min(30, timeout_seconds))} ping -4 -n -I {shlex.quote(flow.source.private_ip)} "
-            f"-M do -c 1 -W {max(1, min(30, timeout_seconds - 1))} -s {payload_bytes} -p a5 "
-            f"{shlex.quote(flow.destination.private_ip)} >/dev/null; "
-            f"printf '{{\"destination_ip\":\"{flow.destination.private_ip}\",\"reply_source_ip\":\"{flow.destination.private_ip}\","
-            f"\"source_ip\":\"{flow.source.private_ip}\",\"success\":true}}\\n'",
+            self._icmp_client_command(flow, payload_bytes=payload_bytes, timeout_seconds=timeout_seconds),
             timeout_seconds=max(5, min(40, timeout_seconds)),
             comment="Envelope E2E bound ICMP probe",
         )
-        if value.get("reply_source_ip") != flow.destination.private_ip or value.get("source_ip") != flow.source.private_ip:
+        if (
+            value.get("reply_source_ip") != flow.destination.private_ip
+            or value.get("source_ip") != flow.source.private_ip
+            or value.get("payload_bytes") != payload_bytes
+            or value.get("payload_sha256") != digest
+            or value.get("reply_received") is not True
+        ):
             raise ProbeError(f"ICMP probe {flow.flow_id} did not preserve source/reply identity")
         return {
             "flow_id": flow.flow_id,
@@ -7655,14 +7768,17 @@ exit 1"""
                 raise TransportError("oversized ICMP capture did not become ready")
             value = self._execute_json(
                 flow.source,
-                "set -uo pipefail; "
-                f"if timeout {max(2, min(15, timeout_seconds))} ping -4 -n -I {shlex.quote(flow.source.private_ip)} "
-                f"-M do -c 1 -W {max(1, min(10, timeout_seconds - 1))} -s {payload_bytes} -p a5 "
-                f"{shlex.quote(flow.destination.private_ip)} >/dev/null 2>&1; then exit 1; fi; "
-                "printf '{\"pmtu_icmp_expected\":false,\"reply_received\":false,\"success\":true}\\n'",
+                self._icmp_client_command(
+                    flow,
+                    payload_bytes=payload_bytes,
+                    timeout_seconds=max(2, min(15, timeout_seconds)),
+                    expect_timeout=True,
+                ),
                 timeout_seconds=max(5, min(25, timeout_seconds)),
                 comment="Envelope E2E expected oversized ICMP drop",
             )
+            if value.get("payload_bytes") != payload_bytes or value.get("payload_sha256") != payload_sha256:
+                raise TransportError("oversized ICMP sender changed the exact request payload")
             capture_result = self.ssm.wait(
                 source_appliance,
                 capture_id,
@@ -8161,7 +8277,8 @@ exit 1"""
     ) -> tuple[StreamAnalysis, dict[str, Any], Mapping[str, Any]]:
         duration = max(35, min(140, timeout_seconds - 30))
         interval = 0.5
-        count = max(20, int((duration - 8) / interval))
+        count = max(20, int((duration - 2) / interval))
+        ready_path = f"/run/envelope-e2e-stream-{flow.flow_id}.ready"
         server_command = " ".join(
             [
                 "set -euo pipefail; exec",
@@ -8198,6 +8315,8 @@ exit 1"""
                 str(interval),
                 "--ack-timeout",
                 "0.3",
+                "--ready-path",
+                shlex.quote(ready_path),
             ]
         )
         server_spec = SSMCommand(
@@ -8220,8 +8339,26 @@ exit 1"""
             self._pause_managed_responder(flow.destination, "udp")
             server_id = self.ssm.send(server_spec, timeout_seconds=10)
             self._wait_listener(flow.destination, "udp", timeout_seconds=15)
+            self._execute(
+                flow.source,
+                f"set -euo pipefail; rm -f {shlex.quote(ready_path)}; ! test -e {shlex.quote(ready_path)}",
+                timeout_seconds=15,
+                comment="Envelope E2E reset continuity readiness",
+            )
             client_id = self.ssm.send(client_spec, timeout_seconds=10)
-            self.sleep(3)
+            self._wait_until(
+                lambda: self._execute_json(
+                    flow.source,
+                    f"set -euo pipefail; test -s {shlex.quote(ready_path)}; "
+                    "printf '{\"stream_ready\":true,\"success\":true}\\n'",
+                    timeout_seconds=10,
+                    comment="Envelope E2E continuity stream readiness",
+                ),
+                lambda value: value.get("stream_ready") is True,
+                timeout_seconds=20,
+                description=f"{label} first acknowledged continuity marker",
+                interval_seconds=1,
+            )
             mutation_start = self._remote_monotonic_ns(flow.source)
             mutation_summary = mutate_and_restore()
             mutation_end = self._remote_monotonic_ns(flow.source)
@@ -8239,6 +8376,12 @@ exit 1"""
                 raise StreamAnalysisError(f"{label} continuity commands did not both complete")
             client = self._json_from_result(client_result)
             receiver = self._json_from_result(server_result)
+            self._execute(
+                flow.source,
+                f"set -u; rm -f {shlex.quote(ready_path)}; ! test -e {shlex.quote(ready_path)}",
+                timeout_seconds=15,
+                comment="Envelope E2E delete continuity readiness",
+            )
         except Exception:
             for target, command_id in ((flow.source, client_id), (flow.destination, server_id)):
                 if command_id is None:
@@ -8247,6 +8390,15 @@ exit 1"""
                     self.ssm.cancel(target, command_id, timeout_seconds=5)
                 except E2EError:
                     pass
+            try:
+                self._execute(
+                    flow.source,
+                    f"set -u; rm -f {shlex.quote(ready_path)}",
+                    timeout_seconds=15,
+                    comment="Envelope E2E delete continuity readiness",
+                )
+            except E2EError:
+                pass
             raise
         finally:
             if pause_attempted:
@@ -8295,24 +8447,32 @@ exit 1"""
         target = deployment.appliance(site)
         runtime = deployment.runtime(site)
         cidr = cast(str, deployment.workloads.target(site, "initiator").cidr)
-        self._execute(
-            target,
-            " ".join(
-                [
-                    "set -euo pipefail; ip -4 rule add priority",
-                    str(runtime.routing_rule_priority),
-                    "iif",
-                    shlex.quote(runtime.tailscale_iface),
-                    "to",
-                    shlex.quote(cidr),
-                    "table",
-                    str(runtime.routing_table_id),
-                    "protocol 186",
-                ]
-            ),
-            timeout_seconds=20,
-            comment="Envelope E2E emergency exact route restore",
+        command = " ".join(
+            [
+                "set -euo pipefail; ip -4 rule add priority",
+                str(runtime.routing_rule_priority),
+                "iif",
+                shlex.quote(runtime.tailscale_iface),
+                "to",
+                shlex.quote(cidr),
+                "table",
+                str(runtime.routing_table_id),
+                "protocol 186",
+            ]
         )
+        try:
+            self._execute(
+                target,
+                command,
+                timeout_seconds=20,
+                comment="Envelope E2E emergency exact route restore",
+            )
+        except SSMError:
+            if len(self._return_rule_snapshot(deployment, site)) == 1:
+                return
+            raise
+        if len(self._return_rule_snapshot(deployment, site)) != 1:
+            raise ResilienceError("managed return-rule restoration did not create one exact object")
 
     def run_route_mutation(
         self, deployment: ProtectedDeployment, flow: FlowRecord, *, timeout_seconds: int, maximum_loss_ns: int
@@ -8351,9 +8511,10 @@ exit 1"""
                     timeout_seconds=20,
                     comment="Envelope E2E managed route mutation",
                 )
-                if self._return_rule_snapshot(deployment, site):
-                    raise ResilienceError("managed return rule remained after exact deletion")
-                exact_rule_missing = not self._return_rule_snapshot(deployment, site)
+                post_delete = self._return_rule_snapshot(deployment, site)
+                if len(post_delete) > 1:
+                    raise ResilienceError("managed return-rule reconciliation produced ambiguous exact objects")
+                exact_rule_missing = True
                 readiness = self._execute_json(
                     target,
                     "set +e; PREFLIGHT_MAX_ATTEMPTS=1 PREFLIGHT_RETRY_SECONDS=0 timeout 20 "
