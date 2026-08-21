@@ -1463,7 +1463,8 @@ class CaptureControllerTest(unittest.TestCase):
             self.assertEqual(rendered.count("tcpdump"), 3)
             self.assertEqual(rendered.count("-c 48"), 3)
             self.assertEqual(rendered.count("sleep 60"), 3)
-            self.assertEqual(rendered.count("kill -INT"), 3)
+            self.assertEqual(rendered.count('kill -TERM "$capture_pid"'), 3)
+            self.assertNotIn('kill -INT "$capture_pid"', rendered)
             self.assertLessEqual(command.timeout_seconds, 315)
         for command in [*fake.sent, *fake.executed]:
             for rendered in command.commands:

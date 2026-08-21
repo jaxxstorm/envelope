@@ -7190,7 +7190,7 @@ exit 1"""
                             f"tcpdump -U -n -i {shlex.quote(interface)} "
                             f"-s 512 -c 48 -w {shlex.quote(path)} {shlex.quote(capture_filter)} >/dev/null 2>&1 &",
                             "capture_pid=$!",
-                            f"( sleep {duration}; kill -INT \"$capture_pid\" 2>/dev/null || true ) &",
+                            f"( sleep {duration}; kill -TERM \"$capture_pid\" 2>/dev/null || true ) &",
                             "watchdog_pid=$!",
                             f"printf '%s %s\\n' \"$capture_pid\" \"$watchdog_pid\" > {shlex.quote(pid_path)}",
                         ]
@@ -7262,7 +7262,7 @@ exit 1"""
                 for pid_path in handle.pid_paths[site].values():
                     stop_commands.append(
                         f"if test -s {shlex.quote(pid_path)}; then read -r capture_pid watchdog_pid < {shlex.quote(pid_path)}; "
-                        "kill -INT \"$capture_pid\" 2>/dev/null || true; "
+                        "kill -TERM \"$capture_pid\" 2>/dev/null || true; "
                         "kill -TERM \"$watchdog_pid\" 2>/dev/null || true; fi"
                     )
                 self._execute(
