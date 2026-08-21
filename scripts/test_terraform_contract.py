@@ -185,7 +185,6 @@ class TerraformStaticContractTest(unittest.TestCase):
         for package in (
             "amazon-ssm-agent",
             "coreutils",
-            "curl",
             "grep",
             "gzip",
             "iperf3",
@@ -197,6 +196,7 @@ class TerraformStaticContractTest(unittest.TestCase):
             "tcpdump",
         ):
             self.assertIn(package, workload_bootstrap)
+        self.assertNotIn("\n  curl \\\n", workload_bootstrap)
         self.assertEqual(workload_bootstrap.count("KillMode=control-group"), 2)
         self.assertEqual(workload_bootstrap.count("KillSignal=SIGTERM"), 2)
         self.assertEqual(workload_bootstrap.count("TimeoutStopSec=5"), 2)
@@ -306,7 +306,7 @@ class PlanAndSecurityFixtureTest(unittest.TestCase):
 
     def workload_user_data(self, suffix=""):
         bootstrap = """#!/usr/bin/env bash
-dnf install -y amazon-ssm-agent coreutils curl grep gzip iperf3 iproute iputils jq procps-ng python3 tcpdump
+dnf install -y amazon-ssm-agent coreutils grep gzip iperf3 iproute iputils jq procps-ng python3 tcpdump
 systemctl enable --now amazon-ssm-agent
 mv -f "$agent_tmp" /opt/envelope/e2e-agent
 envelope-e2e-agent-tcp.service

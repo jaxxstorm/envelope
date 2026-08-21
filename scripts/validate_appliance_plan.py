@@ -1107,7 +1107,6 @@ def validate(
                                 for package in (
                                     "amazon-ssm-agent",
                                     "coreutils",
-                                    "curl",
                                     "grep",
                                     "gzip",
                                     "iperf3",

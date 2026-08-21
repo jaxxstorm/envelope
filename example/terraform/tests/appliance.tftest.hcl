@@ -341,7 +341,7 @@ run "fresh_mocked_apply" {
       local.workload_user_data_base64_bytes <= local.ec2_user_data_base64_limit_bytes &&
       strcontains(local.workload_bootstrap, base64encode(file("${path.module}/cloud-init/envelope-e2e-agent.py"))) &&
       alltrue([
-        for package in ["amazon-ssm-agent", "coreutils", "curl", "grep", "gzip", "iperf3", "iproute", "iputils", "jq", "procps-ng", "python3", "tcpdump"] :
+        for package in ["amazon-ssm-agent", "coreutils", "grep", "gzip", "iperf3", "iproute", "iputils", "jq", "procps-ng", "python3", "tcpdump"] :
         strcontains(local.workload_bootstrap, package)
       ]) &&
       strcontains(local.workload_bootstrap, "mv -f \"$agent_tmp\" /opt/envelope/e2e-agent") &&

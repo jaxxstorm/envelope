@@ -2571,6 +2571,28 @@ class ReadinessGateTest(unittest.TestCase):
             with self.subTest(index=index), self.assertRaises(e2e.ReadinessError):
                 e2e._validate_readiness_summary(self.deployment, candidate, run_id="fixture-live")
 
+    def test_ec2_route_response_uses_gateway_id_for_gwlbe_targets(self) -> None:
+        endpoint_id = "vpce-0123456789abcdef0"
+        endpoint_route = {
+            "DestinationCidrBlock": "172.17.0.0/24",
+            "GatewayId": endpoint_id,
+            "Origin": "CreateRoute",
+            "State": "active",
+        }
+        self.assertTrue(
+            e2e.AwsLiveOperations._route_selects_only_target(
+                endpoint_route, "GatewayId", endpoint_id
+            )
+        )
+        wrong_field = {**endpoint_route, "GatewayId": None, "VpcEndpointId": endpoint_id}
+        self.assertFalse(
+            e2e.AwsLiveOperations._route_selects_only_target(wrong_field, "GatewayId", endpoint_id)
+        )
+        extra_target = {**endpoint_route, "NetworkInterfaceId": "eni-0123456789abcdef0"}
+        self.assertFalse(
+            e2e.AwsLiveOperations._route_selects_only_target(extra_target, "GatewayId", endpoint_id)
+        )
+
 
 class LiveRunnerTest(unittest.TestCase):
     def run_fixture(

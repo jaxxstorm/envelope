@@ -92,6 +92,20 @@ _LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
 _PROCESS_RE = re.compile(r"[a-z][a-z0-9-]{0,47}")
 _METRIC_NAME_RE = re.compile(r"[A-Za-z_:][A-Za-z0-9_:]*")
 _LABEL_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_ROUTE_TARGET_FIELDS = {
+    "CarrierGatewayId",
+    "CoreNetworkArn",
+    "EgressOnlyInternetGatewayId",
+    "GatewayId",
+    "IpAddress",
+    "LocalGatewayId",
+    "NatGatewayId",
+    "NetworkInterfaceId",
+    "OdbNetworkArn",
+    "TransitGatewayId",
+    "VpcEndpointId",
+    "VpcPeeringConnectionId",
+}
 
 
 class E2EError(LifecycleError):
@@ -6651,6 +6665,12 @@ printf '{{"cloud_init_complete":true,"host_network_preflight":true,"links_ready"
             raise ReadinessError(f"route table does not contain one active exact route for {destination}")
         return matches[0]
 
+    @staticmethod
+    def _route_selects_only_target(route: Mapping[str, Any], field: str, target_id: str) -> bool:
+        return route.get(field) == target_id and all(
+            route.get(other) in (None, "") for other in _ROUTE_TARGET_FIELDS - {field}
+        )
+
     def verify_readiness_and_topology(
         self, deployment: ProtectedDeployment, *, timeout_seconds: int
     ) -> Mapping[str, Any]:
@@ -6829,17 +6849,13 @@ printf '{{"cloud_init_complete":true,"host_network_preflight":true,"links_ready"
                 by_id[initiator.route_table_id].get("Routes"), cast(str, peer_responder.cidr)
             )
             expected_endpoint = endpoint_values[cast(str, initiator.az_key)]
-            if initiator_route.get("VpcEndpointId") != expected_endpoint or any(
-                initiator_route.get(key)
-                for key in ("NetworkInterfaceId", "NatGatewayId", "TransitGatewayId", "GatewayId")
-            ):
+            if not self._route_selects_only_target(initiator_route, "GatewayId", expected_endpoint):
                 raise ReadinessError(f"{site} initiator route does not select only its same-AZ GWLB endpoint")
             responder_route = self._exact_route(
                 by_id[responder.route_table_id].get("Routes"), cast(str, peer_initiator.cidr)
             )
-            if responder_route.get("NetworkInterfaceId") != self.appliance_enis[site] or any(
-                responder_route.get(key)
-                for key in ("VpcEndpointId", "NatGatewayId", "TransitGatewayId", "GatewayId")
+            if not self._route_selects_only_target(
+                responder_route, "NetworkInterfaceId", self.appliance_enis[site]
             ):
                 raise ReadinessError(f"{site} responder route does not select only its local appliance ENI")
             lane_routes.extend(
