@@ -7187,22 +7187,19 @@ exit 1"""
                     commands.extend(
                         [
                             f"rm -f {shlex.quote(path)} {shlex.quote(pid_path)}",
-                            f"tcpdump -U -n -i {shlex.quote(interface)} "
+                            f"timeout --signal=TERM --kill-after=2 {duration}s tcpdump -U -n -i {shlex.quote(interface)} "
                             f"-s 512 -c 48 -w {shlex.quote(path)} {shlex.quote(capture_filter)} >/dev/null 2>&1 &",
                             "capture_pid=$!",
-                            f"( sleep {duration}; kill -TERM \"$capture_pid\" 2>/dev/null || true ) &",
-                            "watchdog_pid=$!",
-                            f"printf '%s %s\\n' \"$capture_pid\" \"$watchdog_pid\" > {shlex.quote(pid_path)}",
+                            f"printf '%s\\n' \"$capture_pid\" > {shlex.quote(pid_path)}",
                         ]
                     )
                 commands.extend(
                     [
                         "status=0",
                         *[
-                            f"read -r capture_pid watchdog_pid < {shlex.quote(pid_path)}; "
-                            "wait \"$capture_pid\" || status=$?; "
-                            "kill -TERM \"$watchdog_pid\" 2>/dev/null || true; "
-                            "wait \"$watchdog_pid\" 2>/dev/null || true"
+                            f"read -r capture_pid < {shlex.quote(pid_path)}; "
+                            "capture_status=0; wait \"$capture_pid\" || capture_status=$?; "
+                            "case \"$capture_status\" in 0|124|143) ;; *) status=$capture_status ;; esac"
                             for pid_path in pid_paths[site].values()
                         ],
                         "exit \"$status\"",
@@ -7222,8 +7219,8 @@ exit 1"""
                 checks = " ".join(
                     f"test -f {shlex.quote(paths[site][logical])}; "
                     f"test -s {shlex.quote(pid_paths[site][logical])}; "
-                    f"read -r capture_pid watchdog_pid < {shlex.quote(pid_paths[site][logical])}; "
-                    "kill -0 \"$capture_pid\"; kill -0 \"$watchdog_pid\";"
+                    f"read -r capture_pid < {shlex.quote(pid_paths[site][logical])}; "
+                    "kill -0 \"$capture_pid\";"
                     for logical in sorted(paths[site])
                 )
                 ready = self._execute_json(
@@ -7261,9 +7258,8 @@ exit 1"""
                 stop_commands = ["set -u"]
                 for pid_path in handle.pid_paths[site].values():
                     stop_commands.append(
-                        f"if test -s {shlex.quote(pid_path)}; then read -r capture_pid watchdog_pid < {shlex.quote(pid_path)}; "
-                        "kill -TERM \"$capture_pid\" 2>/dev/null || true; "
-                        "kill -TERM \"$watchdog_pid\" 2>/dev/null || true; fi"
+                        f"if test -s {shlex.quote(pid_path)}; then read -r capture_pid < {shlex.quote(pid_path)}; "
+                        "kill -TERM \"$capture_pid\" 2>/dev/null || true; fi"
                     )
                 self._execute(
                     target,
@@ -7594,7 +7590,8 @@ exit 1"""
         if primary_error is not None:
             if capture_error is not None:
                 raise WireAssertionError(
-                    f"cold direction failed and capture cleanup/assertion also failed: {_sanitize_string(str(capture_error))}"
+                    f"cold direction failed: {_sanitize_string(str(primary_error))}; "
+                    f"capture cleanup/assertion also failed: {_sanitize_string(str(capture_error))}"
                 ) from primary_error
             raise primary_error
         if capture_error is not None:
