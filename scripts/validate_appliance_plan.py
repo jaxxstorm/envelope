@@ -134,7 +134,7 @@ def output_value(plan: dict[str, Any], name: str) -> Any:
     value = plan.get("planned_values", {}).get("outputs", {}).get(name)
     if isinstance(value, dict) and "value" in value:
         return value["value"]
-    return value
+    return None
 
 
 def indexed_address(prefix: str, key: str) -> str:
@@ -221,13 +221,13 @@ def validate(
     run_name: str,
     allowed_replacements: set[str] | None = None,
     expected_az_keys: dict[str, set[str]] | None = None,
+    expected_initiator_az_keys: dict[str, str] | None = None,
 ) -> list[str]:
     errors: list[str] = []
     allowed_replacements = allowed_replacements or set()
     root = plan.get("planned_values", {}).get("root_module", {})
     values = resources(root) if isinstance(root, dict) else []
     runtime = output_value(plan, "envelope_runtime_config")
-    workload_output = output_value(plan, "workload_instances")
     normalized_az_keys: dict[str, set[str]] = {"west": set(), "east": set()}
     if (
         not isinstance(expected_az_keys, dict)
@@ -260,13 +260,18 @@ def validate(
         )
     )
     initiator_az_keys: dict[str, str] = {}
-    if isinstance(workload_output, dict):
-        for site in SITES:
-            site_output = workload_output.get(site)
-            initiator = site_output.get("initiator") if isinstance(site_output, dict) else None
-            az_key = initiator.get("az_key") if isinstance(initiator, dict) else None
-            if isinstance(az_key, str) and az_key in normalized_az_keys[site]:
-                initiator_az_keys[site] = az_key
+    if (
+        not isinstance(expected_initiator_az_keys, dict)
+        or set(expected_initiator_az_keys) != set(SITES)
+        or any(
+            not isinstance(expected_initiator_az_keys[site], str)
+            or expected_initiator_az_keys[site] not in normalized_az_keys[site]
+            for site in SITES
+        )
+    ):
+        errors.append("exact reviewed west/east initiator AZ keys are required for protected address validation")
+    else:
+        initiator_az_keys = dict(expected_initiator_az_keys)
     expected_resources = (
         approved_managed_resources(normalized_az_keys, initiator_az_keys)
         if all(normalized_az_keys.values())
@@ -410,6 +415,139 @@ def validate(
         if isinstance(value, list):
             return any(has_true_marker(child) for child in value)
         return False
+
+    def validated_computed_output(
+        name: str,
+        expected_references: list[str],
+        expected_unknown: dict[str, Any],
+    ) -> Any:
+        outputs = plan.get("planned_values", {}).get("outputs", {})
+        entry = outputs.get(name) if isinstance(outputs, dict) else None
+        configured_output = configured_outputs.get(name) if isinstance(configured_outputs, dict) else None
+        configured_output_expression = (
+            configured_output.get("expression") if isinstance(configured_output, dict) else None
+        )
+        references = (
+            configured_output_expression.get("references")
+            if isinstance(configured_output_expression, dict)
+            else None
+        )
+        change = plan.get("output_changes", {}).get(name)
+        actions = change.get("actions") if isinstance(change, dict) else None
+        base_change_valid = (
+            isinstance(change, dict)
+            and set(change)
+            == {
+                "actions",
+                "before",
+                "after",
+                "after_unknown",
+                "before_sensitive",
+                "after_sensitive",
+            }
+            and actions in (["create"], ["no-op"])
+            and change.get("before_sensitive") is False
+            and change.get("after_sensitive") is False
+            and isinstance(configured_output, dict)
+            and set(configured_output) == {"expression"}
+            and isinstance(configured_output_expression, dict)
+            and set(configured_output_expression) == {"references"}
+            and references == expected_references
+        )
+        if not isinstance(entry, dict) or entry.get("sensitive") is not False:
+            errors.append(f"{name} output must be explicitly non-sensitive")
+            return None
+        if "value" in entry:
+            value = entry["value"]
+            if (
+                not {"sensitive", "value"}.issubset(entry)
+                or not set(entry).issubset({"sensitive", "type", "value"})
+                or not base_change_valid
+                or change.get("after") != value
+                or change.get("after_unknown") is not False
+                or actions == ["create"] and change.get("before") is not None
+                or actions == ["no-op"] and change.get("before") != value
+            ):
+                errors.append(f"{name} known output change does not match its configured planned value")
+            return value
+
+        partial = change.get("after") if isinstance(change, dict) else None
+        partial_valid = isinstance(partial, dict) and set(partial) == set(SITES)
+        if partial_valid and name == "workload_instances":
+            partial_valid = all(
+                isinstance(partial[site], dict)
+                and set(partial[site]) == set(WORKLOAD_ROLES)
+                and all(
+                    isinstance(partial[site][role], dict)
+                    and set(partial[site][role]) == {"availability_zone", "az_key", "cidr"}
+                    for role in WORKLOAD_ROLES
+                )
+                for site in SITES
+            )
+        elif partial_valid and name == "flow_log_evidence":
+            partial_valid = all(
+                isinstance(partial[site], dict) and set(partial[site]) == {"region"}
+                for site in SITES
+            )
+        if (
+            set(entry) != {"sensitive"}
+            or not base_change_valid
+            or actions != ["create"]
+            or change.get("before") is not None
+            or change.get("after_unknown") != expected_unknown
+            or not partial_valid
+        ):
+            errors.append(f"{name} unknown output does not have the exact protected plan-time shape")
+        return partial
+
+    workload_output = validated_computed_output(
+        "workload_instances",
+        [
+            "local.west_workloads",
+            "aws_instance.workload_west",
+            "aws_instance.workload_west",
+            "var.west_azs",
+            "aws_subnet.workload_west",
+            "aws_route_table.workload_west",
+            "local.east_workloads",
+            "aws_instance.workload_east",
+            "aws_instance.workload_east",
+            "var.east_azs",
+            "aws_subnet.workload_east",
+            "aws_route_table.workload_east",
+        ],
+        {
+            site: {
+                role: {
+                    "instance_id": True,
+                    "private_ip": True,
+                    "route_table_id": True,
+                    "subnet_id": True,
+                }
+                for role in WORKLOAD_ROLES
+            }
+            for site in SITES
+        },
+    )
+    flow_log_evidence = validated_computed_output(
+        "flow_log_evidence",
+        [
+            "aws_flow_log.west.id",
+            "aws_flow_log.west",
+            "aws_cloudwatch_log_group.flow_west.arn",
+            "aws_cloudwatch_log_group.flow_west",
+            "var.west_region",
+            "aws_flow_log.east.id",
+            "aws_flow_log.east",
+            "aws_cloudwatch_log_group.flow_east.arn",
+            "aws_cloudwatch_log_group.flow_east",
+            "var.east_region",
+        ],
+        {
+            site: {"flow_log_id": True, "log_group_arn": True}
+            for site in SITES
+        },
+    )
 
     profile_valid = isinstance(profile, dict) and set(profile) == E2E_LOAD_PROFILE_FIELDS
     if profile_valid:
@@ -843,6 +981,8 @@ def validate(
                 if not isinstance(az_key, str) or az_key not in normalized_az_keys[site]:
                     errors.append(f"workload_instances.{site}.{role} has an unreviewed AZ key")
                     continue
+                if role == "initiator" and az_key != initiator_az_keys.get(site):
+                    errors.append(f"workload_instances.{site}.initiator differs from the reviewed initiator AZ key")
                 role_az_keys.append(az_key)
                 instance_address = indexed_address(f"aws_instance.workload_{site}", role)
                 security_group_address = indexed_address(f"aws_security_group.workload_{site}", role)
@@ -919,8 +1059,8 @@ def validate(
                     else set()
                 )
                 actual_ingress: set[tuple[Any, Any, Any, Any]] = set()
-                ingress_valid = isinstance(ingress, list)
-                if ingress_valid:
+                ingress_valid = (ingress is None and role == "initiator") or isinstance(ingress, list)
+                if isinstance(ingress, list):
                     for rule in ingress:
                         cidrs = rule.get("cidr_blocks") if isinstance(rule, dict) else None
                         if (
@@ -937,7 +1077,10 @@ def validate(
                         actual_ingress.add(
                             (rule.get("protocol"), rule.get("from_port"), rule.get("to_port"), cidrs[0])
                         )
-                ingress_count = len(ingress) if isinstance(ingress, list) else -1
+                if ingress is None and role == "initiator":
+                    ingress_count = 0
+                else:
+                    ingress_count = len(ingress) if isinstance(ingress, list) else -1
                 if not ingress_valid or actual_ingress != expected_ingress or ingress_count != len(expected_ingress):
                     errors.append(f"{site} {role} workload application ingress is not the exact paired probe set")
                 sensitive_values = instance_resource.get("sensitive_values")
@@ -1122,7 +1265,6 @@ def validate(
             ):
                 errors.append(f"{route_address} has an extra or wrong target type")
 
-    flow_log_evidence = output_value(plan, "flow_log_evidence")
     flow_evidence_details: dict[str, dict[str, Any]] = {}
     site_regions: dict[str, str] = {}
     if not isinstance(flow_log_evidence, dict) or set(flow_log_evidence) != set(SITES):
@@ -1486,6 +1628,8 @@ def main() -> int:
     parser.add_argument("--allow-replace", action="append", default=[])
     parser.add_argument("--west-az-key", action="append", required=True)
     parser.add_argument("--east-az-key", action="append", required=True)
+    parser.add_argument("--west-initiator-az-key", required=True)
+    parser.add_argument("--east-initiator-az-key", required=True)
     args = parser.parse_args()
     try:
         plan = json.loads(args.plan.read_text())
@@ -1497,6 +1641,7 @@ def main() -> int:
         args.run_name,
         set(args.allow_replace),
         {"west": set(args.west_az_key), "east": set(args.east_az_key)},
+        {"west": args.west_initiator_az_key, "east": args.east_initiator_az_key},
     )
     if failures:
         for failure in failures:

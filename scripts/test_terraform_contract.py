@@ -17,6 +17,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 TF = ROOT / "example/terraform"
 AZ_KEYS = {"west": {"a", "b"}, "east": {"a", "b"}}
+INITIATOR_AZ_KEYS = {"west": "a", "east": "b"}
 
 
 def load_module(name: str, path: pathlib.Path):
@@ -30,6 +31,21 @@ def load_module(name: str, path: pathlib.Path):
 
 PLAN = load_module("validate_appliance_plan", ROOT / "scripts/validate_appliance_plan.py")
 SCAN = load_module("secret_scan", ROOT / "scripts/secret_scan.py")
+
+
+def validate_plan(
+    plan,
+    allowed_replacements=None,
+    az_keys=AZ_KEYS,
+    initiator_az_keys=INITIATOR_AZ_KEYS,
+):
+    return PLAN.validate(
+        plan,
+        "envelope-plan",
+        allowed_replacements,
+        az_keys,
+        initiator_az_keys,
+    )
 
 
 class TerraformStaticContractTest(unittest.TestCase):
@@ -386,7 +402,73 @@ TimeoutStopSec=5
         return plan
 
     def test_valid_plan_shape_fixture(self):
-        self.assertEqual(PLAN.validate(self.plan, "envelope-plan", expected_az_keys=AZ_KEYS), [])
+        self.assertEqual(validate_plan(self.plan), [])
+
+    def test_plan_time_unknown_outputs_have_an_exact_fail_closed_shape(self):
+        plan = copy.deepcopy(self.plan)
+        workload_after = {}
+        workload_unknown = {}
+        for site in ("west", "east"):
+            workload_after[site] = {}
+            workload_unknown[site] = {}
+            for role in ("initiator", "responder"):
+                details = plan["planned_values"]["outputs"]["workload_instances"]["value"][site][role]
+                workload_after[site][role] = {
+                    key: details[key] for key in ("availability_zone", "az_key", "cidr")
+                }
+                workload_unknown[site][role] = {
+                    key: True for key in ("instance_id", "private_ip", "route_table_id", "subnet_id")
+                }
+        plan["planned_values"]["outputs"]["workload_instances"] = {"sensitive": False}
+        plan["output_changes"]["workload_instances"]["after"] = workload_after
+        plan["output_changes"]["workload_instances"]["after_unknown"] = workload_unknown
+
+        flow_after = {
+            site: {
+                "region": plan["planned_values"]["outputs"]["flow_log_evidence"]["value"][site]["region"]
+            }
+            for site in ("west", "east")
+        }
+        plan["planned_values"]["outputs"]["flow_log_evidence"] = {"sensitive": False}
+        plan["output_changes"]["flow_log_evidence"]["after"] = flow_after
+        plan["output_changes"]["flow_log_evidence"]["after_unknown"] = {
+            site: {"flow_log_id": True, "log_group_arn": True} for site in ("west", "east")
+        }
+        for site in ("west", "east"):
+            for role in ("initiator", "responder"):
+                instance = self.resource(plan, f'aws_instance.workload_{site}["{role}"]')["values"]
+                az_key = workload_after[site][role]["az_key"]
+                for field in ("id", "private_ip", "subnet_id"):
+                    instance.pop(field, None)
+                self.resource(plan, f'aws_subnet.workload_{site}["{az_key}"]')["values"].pop("id", None)
+                self.resource(plan, f'aws_route_table.workload_{site}["{az_key}"]')["values"].pop(
+                    "id", None
+                )
+                association = self.resource(
+                    plan, f'aws_route_table_association.workload_{site}["{az_key}"]'
+                )["values"]
+                association.pop("subnet_id", None)
+                association.pop("route_table_id", None)
+            self.resource(plan, f'aws_security_group.workload_{site}["initiator"]')["values"][
+                "ingress"
+            ] = None
+            self.resource(plan, f"aws_cloudwatch_log_group.flow_{site}")["values"].pop("arn", None)
+            self.resource(plan, f"aws_flow_log.{site}")["values"].pop("id", None)
+        self.resource(plan, "aws_iam_role_policy.flow_logs")["values"]["policy"] = None
+
+        self.assertEqual(validate_plan(plan), [])
+
+        bad_unknown = copy.deepcopy(plan)
+        bad_unknown["output_changes"]["workload_instances"]["after_unknown"]["west"][
+            "initiator"
+        ].pop("subnet_id")
+        errors = validate_plan(bad_unknown)
+        self.assertTrue(any("exact protected plan-time shape" in error for error in errors))
+
+        wrong_initiator = validate_plan(
+            plan, initiator_az_keys={"west": "b", "east": "b"}
+        )
+        self.assertTrue(any("reviewed initiator AZ key" in error for error in wrong_initiator))
 
     def test_directional_fixture_has_exact_role_and_route_shape(self):
         resources = self.plan["planned_values"]["root_module"]["resources"]
@@ -522,7 +604,7 @@ TimeoutStopSec=5
                 },
             }
         )
-        self.assertEqual(PLAN.validate(raw, "envelope-plan", expected_az_keys=AZ_KEYS), [])
+        self.assertEqual(validate_plan(raw), [])
         for site in ("west", "east"):
             for role in ("initiator", "responder"):
                 resource = self.resource(raw, f'aws_instance.workload_{site}["{role}"]')
@@ -681,17 +763,17 @@ TimeoutStopSec=5
         cases["unknown resource change"] = unknown_change
         for name, candidate in cases.items():
             with self.subTest(name=name):
-                self.assertTrue(PLAN.validate(candidate, "envelope-plan", expected_az_keys=AZ_KEYS))
-        secret_errors = PLAN.validate(secret, "envelope-plan", expected_az_keys=AZ_KEYS)
+                self.assertTrue(validate_plan(candidate))
+        secret_errors = validate_plan(secret)
         self.assertTrue(any("plaintext Tailscale credential" in error for error in secret_errors))
-        oversized_errors = PLAN.validate(oversized, "envelope-plan", expected_az_keys=AZ_KEYS)
+        oversized_errors = validate_plan(oversized)
         self.assertTrue(any("base64 user data" in error for error in oversized_errors))
         self.assertTrue(any("raw user data" in error for error in oversized_errors))
-        broad_errors = PLAN.validate(broad_route, "envelope-plan", expected_az_keys=AZ_KEYS)
+        broad_errors = validate_plan(broad_route)
         self.assertTrue(any("broad or incorrect directional destination" in error for error in broad_errors))
-        eni_errors = PLAN.validate(wrong_eni, "envelope-plan", expected_az_keys=AZ_KEYS)
+        eni_errors = validate_plan(wrong_eni)
         self.assertTrue(any("responder_return_west target" in error for error in eni_errors))
-        self.assertTrue(PLAN.validate(destructive, "envelope-plan", {"aws_vpc.west"}, AZ_KEYS))
+        self.assertTrue(validate_plan(destructive, {"aws_vpc.west"}))
 
     def test_flow_log_nacl_sg_and_cost_negative_matrix(self):
         cases = {}
@@ -840,11 +922,11 @@ TimeoutStopSec=5
 
         for name, candidate in cases.items():
             with self.subTest(name=name):
-                self.assertTrue(PLAN.validate(candidate, "envelope-plan", expected_az_keys=AZ_KEYS))
+                self.assertTrue(validate_plan(candidate))
 
-        trust_errors = PLAN.validate(wrong_trust, "envelope-plan", expected_az_keys=AZ_KEYS)
+        trust_errors = validate_plan(wrong_trust)
         self.assertTrue(any("Flow Log service ARN" in error for error in trust_errors))
-        acl_errors = PLAN.validate(wrong_acl_order, "envelope-plan", expected_az_keys=AZ_KEYS)
+        acl_errors = validate_plan(wrong_acl_order)
         self.assertTrue(any("exact ordered directional rules" in error for error in acl_errors))
 
     def test_e2e_load_profile_saved_plan_negative_matrix(self):
@@ -916,7 +998,7 @@ TimeoutStopSec=5
         cases["output is not direct variable"] = indirect_output
         for name, candidate in cases.items():
             with self.subTest(name=name):
-                errors = PLAN.validate(candidate, "envelope-plan", expected_az_keys=AZ_KEYS)
+                errors = validate_plan(candidate)
                 self.assertTrue(any("e2e_load_profile" in error for error in errors))
 
     def test_exactly_two_distinct_az_keys_are_required(self):
@@ -926,7 +1008,7 @@ TimeoutStopSec=5
             {"west": ["a", "a"], "east": ["a", "b"]},
         ):
             with self.subTest(az_keys=az_keys):
-                errors = PLAN.validate(self.plan, "envelope-plan", expected_az_keys=az_keys)
+                errors = validate_plan(self.plan, az_keys=az_keys)
                 self.assertTrue(any("exactly two west/east AZ keys" in error for error in errors))
 
     def test_replacement_accepts_only_direct_attachment_and_optional_same_site_return_route(self):
@@ -935,7 +1017,7 @@ TimeoutStopSec=5
             for route_action in (None, "update", "replace"):
                 with self.subTest(site=site, route_action=route_action):
                     replacement = self.replacement_plan(site, route_action)
-                    self.assertEqual(PLAN.validate(replacement, "envelope-plan", allowed, AZ_KEYS), [])
+                    self.assertEqual(validate_plan(replacement, allowed), [])
 
     def test_replacement_negative_matrix(self):
         allowed = {"aws_instance.envelope_west"}
@@ -1038,9 +1120,9 @@ TimeoutStopSec=5
         cases["replacement load profile drift"] = drifted_profile
         for name, candidate in cases.items():
             with self.subTest(name=name):
-                self.assertTrue(PLAN.validate(candidate, "envelope-plan", allowed, AZ_KEYS))
+                self.assertTrue(validate_plan(candidate, allowed))
 
-        route_errors = PLAN.validate(wrong_old_eni, "envelope-plan", allowed, AZ_KEYS)
+        route_errors = validate_plan(wrong_old_eni, allowed)
         self.assertTrue(any("responder-return route change" in error for error in route_errors))
 
     def test_plan_and_state_fixtures_are_secret_free(self):

@@ -5,7 +5,9 @@
     "e2e_load_profile": {"value":{"profile_id":"envelope-e2e-v1","approved_at":"2026-08-20T10:00:00Z","safe_inner_mtu":1280,"maximum_tcp_mss":1240,"sustained_tcp_duration_seconds":15,"minimum_sustained_tcp_bytes":1048576,"iperf_duration_seconds":10,"minimum_throughput_mbps":5.0,"concurrent_duration_seconds":15,"concurrent_tcp_flows":4,"concurrent_udp_flows":4,"maximum_udp_loss_percent":1.0,"maximum_p99_latency_ms":250.0}}
   },
   "output_changes": {
-    "e2e_load_profile": {"actions":["create"],"before":null,"after":{"profile_id":"envelope-e2e-v1","approved_at":"2026-08-20T10:00:00Z","safe_inner_mtu":1280,"maximum_tcp_mss":1240,"sustained_tcp_duration_seconds":15,"minimum_sustained_tcp_bytes":1048576,"iperf_duration_seconds":10,"minimum_throughput_mbps":5.0,"concurrent_duration_seconds":15,"concurrent_tcp_flows":4,"concurrent_udp_flows":4,"maximum_udp_loss_percent":1.0,"maximum_p99_latency_ms":250.0},"after_unknown":false,"before_sensitive":false,"after_sensitive":false}
+    "e2e_load_profile": {"actions":["create"],"before":null,"after":{"profile_id":"envelope-e2e-v1","approved_at":"2026-08-20T10:00:00Z","safe_inner_mtu":1280,"maximum_tcp_mss":1240,"sustained_tcp_duration_seconds":15,"minimum_sustained_tcp_bytes":1048576,"iperf_duration_seconds":10,"minimum_throughput_mbps":5.0,"concurrent_duration_seconds":15,"concurrent_tcp_flows":4,"concurrent_udp_flows":4,"maximum_udp_loss_percent":1.0,"maximum_p99_latency_ms":250.0},"after_unknown":false,"before_sensitive":false,"after_sensitive":false},
+    "workload_instances": {"actions":["create"],"before":null,"after":{"west":{"initiator":{"instance_id":"i-workload-west-initiator","private_ip":"172.16.0.10","az_key":"a","availability_zone":"us-west-2a","subnet_id":"subnet-workload-west-a","cidr":"172.16.0.0/24","route_table_id":"rtb-workload-west-a"},"responder":{"instance_id":"i-workload-west-responder","private_ip":"172.16.1.10","az_key":"b","availability_zone":"us-west-2b","subnet_id":"subnet-workload-west-b","cidr":"172.16.1.0/24","route_table_id":"rtb-workload-west-b"}},"east":{"initiator":{"instance_id":"i-workload-east-initiator","private_ip":"172.17.1.10","az_key":"b","availability_zone":"us-east-1b","subnet_id":"subnet-workload-east-b","cidr":"172.17.1.0/24","route_table_id":"rtb-workload-east-b"},"responder":{"instance_id":"i-workload-east-responder","private_ip":"172.17.0.10","az_key":"a","availability_zone":"us-east-1a","subnet_id":"subnet-workload-east-a","cidr":"172.17.0.0/24","route_table_id":"rtb-workload-east-a"}}},"after_unknown":false,"before_sensitive":false,"after_sensitive":false},
+    "flow_log_evidence": {"actions":["create"],"before":null,"after":{"west":{"flow_log_id":"fl-west","log_group_arn":"arn:aws:logs:us-west-2:123456789012:log-group:/aws/vpc-flow-logs/envelope-plan/west","region":"us-west-2"},"east":{"flow_log_id":"fl-east","log_group_arn":"arn:aws:logs:us-east-1:123456789012:log-group:/aws/vpc-flow-logs/envelope-plan/east","region":"us-east-1"}},"after_unknown":false,"before_sensitive":false,"after_sensitive":false}
   },
   "resource_changes": [
     {"address":"aws_vpc.west","type":"aws_vpc","change":{"actions":["create"]}},
@@ -30,7 +32,9 @@
         {"address":"aws_flow_log.east","mode":"managed","type":"aws_flow_log","depends_on":["aws_iam_role_policy.flow_logs"],"expressions":{"vpc_id":{"references":["aws_vpc.east.id","aws_vpc.east"]},"log_destination":{"references":["aws_cloudwatch_log_group.flow_east.arn","aws_cloudwatch_log_group.flow_east"]},"iam_role_arn":{"references":["aws_iam_role.flow_logs.arn","aws_iam_role.flow_logs"]},"log_format":{"references":["local.flow_log_format"]}}}
       ],
       "outputs": {
-        "e2e_load_profile": {"expression":{"references":["var.e2e_load_profile"]}}
+        "e2e_load_profile": {"expression":{"references":["var.e2e_load_profile"]}},
+        "workload_instances": {"expression":{"references":["local.west_workloads","aws_instance.workload_west","aws_instance.workload_west","var.west_azs","aws_subnet.workload_west","aws_route_table.workload_west","local.east_workloads","aws_instance.workload_east","aws_instance.workload_east","var.east_azs","aws_subnet.workload_east","aws_route_table.workload_east"]}},
+        "flow_log_evidence": {"expression":{"references":["aws_flow_log.west.id","aws_flow_log.west","aws_cloudwatch_log_group.flow_west.arn","aws_cloudwatch_log_group.flow_west","var.west_region","aws_flow_log.east.id","aws_flow_log.east","aws_cloudwatch_log_group.flow_east.arn","aws_cloudwatch_log_group.flow_east","var.east_region"]}}
       }
     }
   },
@@ -48,7 +52,7 @@
         "resource_counts":{"vpcs":2,"nat_gateways":2,"elastic_ips":2,"gateway_load_balancers":2,"gwlbe_endpoints":2,"semantic_lane_routes":4,"appliance_instances":2,"workload_instances":4,"artifact_buckets":1,"network_acls":2,"vpc_flow_logs":2,"cloudwatch_log_groups":2,"flow_log_iam_roles":1,"regional_targets":{"west":1,"east":1}}
       }},
       "e2e_load_profile": {"sensitive":false,"value":{"profile_id":"envelope-e2e-v1","approved_at":"2026-08-20T10:00:00Z","safe_inner_mtu":1280,"maximum_tcp_mss":1240,"sustained_tcp_duration_seconds":15,"minimum_sustained_tcp_bytes":1048576,"iperf_duration_seconds":10,"minimum_throughput_mbps":5.0,"concurrent_duration_seconds":15,"concurrent_tcp_flows":4,"concurrent_udp_flows":4,"maximum_udp_loss_percent":1.0,"maximum_p99_latency_ms":250.0}},
-      "workload_instances": {"value":{
+      "workload_instances": {"sensitive":false,"value":{
         "west":{
           "initiator":{"instance_id":"i-workload-west-initiator","private_ip":"172.16.0.10","az_key":"a","availability_zone":"us-west-2a","subnet_id":"subnet-workload-west-a","cidr":"172.16.0.0/24","route_table_id":"rtb-workload-west-a"},
           "responder":{"instance_id":"i-workload-west-responder","private_ip":"172.16.1.10","az_key":"b","availability_zone":"us-west-2b","subnet_id":"subnet-workload-west-b","cidr":"172.16.1.0/24","route_table_id":"rtb-workload-west-b"}
@@ -58,7 +62,7 @@
           "responder":{"instance_id":"i-workload-east-responder","private_ip":"172.17.0.10","az_key":"a","availability_zone":"us-east-1a","subnet_id":"subnet-workload-east-a","cidr":"172.17.0.0/24","route_table_id":"rtb-workload-east-a"}
         }
       }},
-      "flow_log_evidence": {"value":{
+      "flow_log_evidence": {"sensitive":false,"value":{
         "west":{"flow_log_id":"fl-west","log_group_arn":"arn:aws:logs:us-west-2:123456789012:log-group:/aws/vpc-flow-logs/envelope-plan/west","region":"us-west-2"},
         "east":{"flow_log_id":"fl-east","log_group_arn":"arn:aws:logs:us-east-1:123456789012:log-group:/aws/vpc-flow-logs/envelope-plan/east","region":"us-east-1"}
       }}

@@ -5472,11 +5472,22 @@ def terraform_plan(
         document = json.loads(rendered)
     except json.JSONDecodeError as error:
         raise LifecycleError("Terraform produced invalid saved-plan JSON") from error
+    initiator_az_keys: dict[str, str] = {}
+    for site in DEPLOYMENT_SITES:
+        matches = [
+            az_key
+            for az_key, cidr in config.sites[site]["workload_subnet_cidrs"].items()
+            if cidr in config.sites[site]["gwlb_return_cidrs"]
+        ]
+        if len(matches) != 1:
+            raise LifecycleError(f"{site} protected plan requires exactly one reviewed initiator AZ key")
+        initiator_az_keys[site] = matches[0]
     failures = validate_saved_plan(
         document,
         config.run_id,
         {replace_address} if replace_address else set(),
         {site: set(config.sites[site]["azs"]) for site in ("west", "east")},
+        initiator_az_keys,
     )
     if failures:
         raise LifecycleError("saved plan failed protected shape validation: " + "; ".join(failures))
