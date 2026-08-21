@@ -1455,6 +1455,23 @@ class CaptureControllerTest(unittest.TestCase):
             2,
         )
 
+    def test_wire_inspector_installer_creates_parent_directory_before_writing(self) -> None:
+        fake = self.FakeSSM()
+        operations, deployment, _flows = self.fixture(fake)
+
+        operations._install_wire_inspector(deployment.appliance("west"))
+
+        self.assertEqual(len(fake.executed), 1)
+        command = fake.executed[0]
+        self.assertEqual(command.comment, "Envelope E2E install bounded wire inspector")
+        rendered = command.commands[0]
+        directory_install = "install -d -o root -g root -m 0755 /opt/envelope"
+        temporary_write = "> /opt/envelope/e2e-wire-inspector.tmp"
+        self.assertIn(directory_install, rendered)
+        self.assertIn(temporary_write, rendered)
+        self.assertLess(rendered.index(directory_install), rendered.index(temporary_write))
+        subprocess.run(["bash", "-n", "-c", rendered], check=True, capture_output=True, text=True)
+
     def test_inspector_failure_still_deletes_every_raw_capture(self) -> None:
         fake = self.FakeSSM(fail_inspection=True)
         operations, deployment, flows = self.fixture(fake)

@@ -6502,7 +6502,7 @@ class AwsLiveOperations:
         encoded = base64.b64encode(gzip.compress(WIRE_INSPECTOR_SOURCE.encode("utf-8"), mtime=0)).decode("ascii")
         temporary = WIRE_INSPECTOR_PATH + ".tmp"
         command = (
-            "set -euo pipefail; umask 077; "
+            "set -euo pipefail; umask 077; install -d -o root -g root -m 0755 /opt/envelope; "
             f"printf %s {shlex.quote(encoded)} | base64 -d | gzip -d > {shlex.quote(temporary)}; "
             f"printf '%s  %s\\n' {shlex.quote(self.wire_inspector_sha256)} {shlex.quote(temporary)} | sha256sum -c - >/dev/null; "
             f"install -m 0700 {shlex.quote(temporary)} {shlex.quote(WIRE_INSPECTOR_PATH)}; rm -f {shlex.quote(temporary)}"
