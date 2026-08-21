@@ -7912,7 +7912,7 @@ exit 1"""
         return (
             "set -euo pipefail; install -d -m 0700 /run/envelope-e2e-capture; "
             f"rm -f {shlex.quote(capture_path)}; exec timeout --signal=INT --kill-after=2 "
-            f"{max(5, min(timeout_seconds, 30))}s tcpdump -n -i {shlex.quote(interface)} -s 0 -c 1 "
+            f"{max(5, min(timeout_seconds, 30))}s tcpdump -U -n -i {shlex.quote(interface)} -s 0 -c 1 "
             f"-w {shlex.quote(capture_path)} {shlex.quote(capture_filter)} >/dev/null 2>&1"
         )
 
@@ -8061,7 +8061,7 @@ exit 1"""
         return (
             "set -euo pipefail; install -d -m 0700 /run/envelope-e2e-capture; "
             f"rm -f {shlex.quote(capture_path)}; exec timeout --signal=INT --kill-after=2 "
-            f"{duration_seconds + 15}s tcpdump -n -i {shlex.quote(interface)} -s 0 -c 1 "
+            f"{duration_seconds + 15}s tcpdump -U -n -i {shlex.quote(interface)} -s 0 -c 1 "
             f"-w {shlex.quote(capture_path)} {shlex.quote(capture_filter)} >/dev/null 2>&1"
         )
 

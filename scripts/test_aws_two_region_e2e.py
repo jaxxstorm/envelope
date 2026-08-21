@@ -1023,6 +1023,7 @@ class FlowLedgerTest(unittest.TestCase):
             duration_seconds=10,
         )
 
+        self.assertIn("tcpdump -U -n", command)
         self.assertIn("-s 0 -c 1", command)
         self.assertIn(f"src host {flow.source.private_ip}", command)
         self.assertIn(f"dst host {flow.destination.private_ip}", command)
@@ -1052,6 +1053,7 @@ class FlowLedgerTest(unittest.TestCase):
             timeout_seconds=20,
         )
 
+        self.assertIn("tcpdump -U -n", command)
         self.assertIn("-s 0 -c 1", command)
         self.assertIn("udp and dst port 6081", command)
         subprocess.run(["bash", "-n", "-c", command], check=True, capture_output=True, text=True)
