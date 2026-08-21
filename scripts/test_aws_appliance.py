@@ -677,6 +677,10 @@ class ConfigAndPathTest(unittest.TestCase):
                 check=True,
             ).stdout
             self.assertEqual((snapshot / "gwlb.tf").read_text(), expected)
+            self.assertEqual(
+                stat.S_IMODE((snapshot / "cloud-init" / "envelope-e2e-agent.py").stat().st_mode),
+                0o700,
+            )
             self.assertFalse((snapshot / ".terraform").exists())
             self.assertEqual(identity["revision"], revision)
             self.assertEqual(identity["repository_path"], "example/terraform")
@@ -945,7 +949,7 @@ class BackendAWS:
         self.versioning = "Enabled"
         self.algorithm = "aws:kms"
         self.key = config.backend["kms_key_arn"]
-        self.bucket_key_enabled = False
+        self.bucket_key_enabled = True
         self.public = True
         self.existing: set[str] = set()
         self.versions: dict[str, list[dict[str, str]]] = {}
@@ -1021,17 +1025,17 @@ class BackendAWS:
         if operation == "get-bucket-versioning":
             return {"Status": self.versioning}
         if operation == "get-bucket-encryption":
+            rule = {
+                "ApplyServerSideEncryptionByDefault": {
+                    "SSEAlgorithm": self.algorithm,
+                    "KMSMasterKeyID": self.key,
+                },
+            }
+            if hasattr(self, "bucket_key_enabled"):
+                rule["BucketKeyEnabled"] = self.bucket_key_enabled
             return {
                 "ServerSideEncryptionConfiguration": {
-                    "Rules": [
-                        {
-                            "ApplyServerSideEncryptionByDefault": {
-                                "SSEAlgorithm": self.algorithm,
-                                "KMSMasterKeyID": self.key,
-                            },
-                            "BucketKeyEnabled": self.bucket_key_enabled,
-                        }
-                    ]
+                    "Rules": [rule]
                 }
             }
         if operation == "get-public-access-block":
@@ -2363,9 +2367,8 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
                         allowed = isinstance(via_service, str) and (
                             via_service.startswith("s3.")
                             and context.get("kms:EncryptionContextKeys") == ["aws:s3:arn"]
-                            and context.get("kms:EncryptionContext:aws:s3:arn", [""])[0].startswith(
-                                "arn:aws:s3:::operator-backend/runs/envelope-fixture/"
-                            )
+                            and context.get("kms:EncryptionContext:aws:s3:arn")
+                            == ["arn:aws:s3:::operator-backend"]
                             or via_service.startswith("ssm.")
                             and context.get("kms:EncryptionContextKeys") == ["PARAMETER_ARN"]
                             and context.get("kms:EncryptionContext:PARAMETER_ARN", [""])[0].endswith(
@@ -2573,14 +2576,40 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
                     values["kms:EncryptionContext:aws:s3:arn"][0]
                     for values in kms_contexts.values()
                 },
-                {
-                    f"arn:aws:s3:::{config.backend['bucket']}/{key}"
-                    for key in (config.backend["state_key"], config.lock_key, config.manifest_key)
-                },
+                {f"arn:aws:s3:::{config.backend['bucket']}"},
             )
             self.assertTrue(
                 all(values["kms:EncryptionContextKeys"] == ["aws:s3:arn"] for values in kms_contexts.values())
             )
+            self.assertTrue(
+                all(
+                    by_name[name]["resources"] == (config.backend["kms_key_arn"],)
+                    for name in kms_contexts
+                )
+            )
+            backend_object_resources = {
+                "s3-backend-state-read-delete": config.backend["state_key"],
+                "s3-backend-state-put": config.backend["state_key"],
+                "s3-backend-lock-read-delete": config.lock_key,
+                "s3-backend-lock-put": config.lock_key,
+                "s3-backend-manifest-get": config.manifest_key,
+                "s3-backend-manifest-read-delete": config.manifest_key,
+                "s3-backend-manifest-put": config.manifest_key,
+                "s3-backend-manifest-put-tags": config.manifest_key,
+            }
+            for name, key in backend_object_resources.items():
+                self.assertEqual(
+                    by_name[name]["resources"],
+                    (f"arn:aws:s3:::{config.backend['bucket']}/{key}",),
+                )
+            for site in ("west", "east"):
+                ssm_kms_context = {
+                    entry["ContextKeyName"]: entry["ContextKeyValues"]
+                    for entry in by_name[f"kms-{site}-ssm"]["context"]
+                }
+                self.assertEqual(ssm_kms_context["kms:EncryptionContextKeys"], ["PARAMETER_ARN"])
+                self.assertIn("kms:EncryptionContext:PARAMETER_ARN", ssm_kms_context)
+                self.assertNotIn("kms:EncryptionContext:aws:s3:arn", ssm_kms_context)
             quota_batches = [batch for name, batch in by_name.items() if name.startswith("service-quota-")]
             self.assertEqual(
                 len(quota_batches),
@@ -2610,6 +2639,70 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
                     for call in api.calls
                 )
             )
+
+    def test_backend_kms_identity_policy_rejects_object_only_and_wrong_bucket_contexts(self):
+        class ContextRestrictedAWS(CapabilityAWS):
+            def __init__(self, config, mode):
+                super().__init__(config)
+                self.mode = mode
+
+            def json(self, args, *, region=None):
+                response = super().json(args, region=region)
+                if args[:2] != ["iam", "simulate-principal-policy"]:
+                    return response
+                context_start = (
+                    args.index("--context-entries")
+                    if "--context-entries" in args
+                    else len(args)
+                )
+                context = (
+                    {
+                        entry["ContextKeyName"]: entry["ContextKeyValues"]
+                        for entry in json.loads(args[context_start + 1])
+                    }
+                    if context_start < len(args)
+                    else {}
+                )
+                encryption_context = context.get("kms:EncryptionContext:aws:s3:arn")
+                if encryption_context is None:
+                    return response
+                bucket_arn = f"arn:aws:s3:::{self.config.backend['bucket']}"
+                if self.mode == "object-only":
+                    allowed = (
+                        len(encryption_context) == 1
+                        and encryption_context[0].startswith(f"{bucket_arn}/")
+                    )
+                elif self.mode == "wrong-bucket":
+                    allowed = encryption_context == ["arn:aws:s3:::other-backend"]
+                else:
+                    raise AssertionError(self.mode)
+                decision = "allowed" if allowed else "implicitDeny"
+                for result in response["EvaluationResults"]:
+                    if result["EvalActionName"] not in {
+                        "kms:Encrypt",
+                        "kms:Decrypt",
+                        "kms:GenerateDataKey",
+                    }:
+                        continue
+                    result["EvalDecision"] = decision
+                    for resource_result in result["ResourceSpecificResults"]:
+                        resource_result["EvalResourceDecision"] = decision
+                return response
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            artifact = artifact_identity(root)
+            for mode in ("object-only", "wrong-bucket"):
+                with self.subTest(mode=mode):
+                    with self.assertRaisesRegex(appliance.LifecycleError, "kms:"):
+                        appliance.simulate_operator_actions(
+                            ContextRestrictedAWS(config, mode),
+                            "arn:aws:iam::123456789012:role/operator",
+                            config,
+                            "123456789012",
+                            artifact,
+                        )
 
     def test_missing_operator_action_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3382,7 +3475,6 @@ class SecurityAndBackendTest(unittest.TestCase):
                 ("versioning", "Suspended"),
                 ("algorithm", "AES256"),
                 ("key", "arn:aws:kms:us-west-2:123456789012:key/wrong"),
-                ("bucket_key_enabled", True),
                 ("public", False),
                 ("policy_public", True),
                 ("key_enabled", False),
@@ -3392,6 +3484,20 @@ class SecurityAndBackendTest(unittest.TestCase):
                     candidate = BackendAWS(config)
                     setattr(candidate, field, value)
                     with self.assertRaises(appliance.LifecycleError):
+                        appliance.BackendValidator(candidate).validate(config, require_empty=True)
+            disabled_bucket_key = BackendAWS(config)
+            disabled_bucket_key.bucket_key_enabled = False
+            with self.assertRaisesRegex(appliance.LifecycleError, "must enable S3 Bucket Keys"):
+                appliance.BackendValidator(disabled_bucket_key).validate(config, require_empty=True)
+            missing_bucket_key = BackendAWS(config)
+            del missing_bucket_key.bucket_key_enabled
+            with self.assertRaisesRegex(appliance.LifecycleError, "malformed default encryption metadata"):
+                appliance.BackendValidator(missing_bucket_key).validate(config, require_empty=True)
+            for malformed in (None, "true", 1, [], {}):
+                with self.subTest(bucket_key_enabled=malformed):
+                    candidate = BackendAWS(config)
+                    candidate.bucket_key_enabled = malformed
+                    with self.assertRaisesRegex(appliance.LifecycleError, "malformed default encryption metadata"):
                         appliance.BackendValidator(candidate).validate(config, require_empty=True)
             aws.versions[config.backend["state_key"]] = [
                 {"Key": config.backend["state_key"], "VersionId": "historical"}
@@ -3435,7 +3541,7 @@ class SecurityAndBackendTest(unittest.TestCase):
                     with self.assertRaisesRegex(appliance.LifecycleError, re.escape(action)):
                         appliance.BackendValidator(candidate).validate(config, require_empty=True)
 
-    def test_backend_policy_accepts_exact_prefix_encryption_tag_and_kms_conditions_with_root_delegation(self):
+    def test_backend_policy_accepts_kms_bucket_key_context_with_root_delegation(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = make_config(pathlib.Path(temporary))
             candidate = BackendAWS(config)
@@ -3510,7 +3616,7 @@ class SecurityAndBackendTest(unittest.TestCase):
                     "Condition": {
                         "StringEquals": {
                             "kms:ViaService": f"s3.{config.backend['region']}.amazonaws.com",
-                            "kms:EncryptionContext:aws:s3:arn": object_arns,
+                            "kms:EncryptionContext:aws:s3:arn": bucket_arn,
                         },
                         "ForAllValues:StringEquals": {
                             "kms:EncryptionContextKeys": ["aws:s3:arn"]
@@ -3555,7 +3661,7 @@ class SecurityAndBackendTest(unittest.TestCase):
                     "Condition": {
                         "StringEquals": {
                             "kms:ViaService": f"s3.{config.backend['region']}.amazonaws.com",
-                            "kms:EncryptionContext:aws:s3:arn": state_arn,
+                            "kms:EncryptionContext:aws:s3:arn": bucket_arn,
                         }
                     },
                 }
@@ -3598,25 +3704,43 @@ class SecurityAndBackendTest(unittest.TestCase):
             with self.assertRaisesRegex(appliance.LifecycleError, "s3:ListBucket"):
                 appliance.BackendValidator(wrong_prefix).validate(config, require_empty=True)
 
-            wrong_kms_context = BackendAWS(config)
-            key_allow = wrong_kms_context.key_policy["Statement"][0]
-            key_allow["Action"].remove("kms:GenerateDataKey")
-            wrong_kms_context.key_policy["Statement"].append(
-                {
-                    "Effect": "Allow",
-                    "Principal": {"AWS": principal},
-                    "Action": "kms:GenerateDataKey",
-                    "Resource": "*",
-                    "Condition": {
-                        "StringEquals": {
-                            "kms:ViaService": "s3.us-east-2.amazonaws.com",
-                            "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::other/*",
+            for label, via_service, encryption_context in (
+                (
+                    "object-only",
+                    f"s3.{config.backend['region']}.amazonaws.com",
+                    f"{bucket_arn}/{config.backend['state_key']}",
+                ),
+                (
+                    "wrong-bucket",
+                    f"s3.{config.backend['region']}.amazonaws.com",
+                    "arn:aws:s3:::other-backend",
+                ),
+                (
+                    "wrong-service",
+                    "s3.us-east-2.amazonaws.com",
+                    bucket_arn,
+                ),
+            ):
+                with self.subTest(kms_context=label):
+                    wrong_kms_context = BackendAWS(config)
+                    key_allow = wrong_kms_context.key_policy["Statement"][0]
+                    key_allow["Action"].remove("kms:GenerateDataKey")
+                    wrong_kms_context.key_policy["Statement"].append(
+                        {
+                            "Effect": "Allow",
+                            "Principal": {"AWS": principal},
+                            "Action": "kms:GenerateDataKey",
+                            "Resource": "*",
+                            "Condition": {
+                                "StringEquals": {
+                                    "kms:ViaService": via_service,
+                                    "kms:EncryptionContext:aws:s3:arn": encryption_context,
+                                }
+                            },
                         }
-                    },
-                }
-            )
-            with self.assertRaisesRegex(appliance.LifecycleError, "kms:GenerateDataKey"):
-                appliance.BackendValidator(wrong_kms_context).validate(config, require_empty=True)
+                    )
+                    with self.assertRaisesRegex(appliance.LifecycleError, "kms:GenerateDataKey"):
+                        appliance.BackendValidator(wrong_kms_context).validate(config, require_empty=True)
 
             invalid_key_policy_resource = BackendAWS(config)
             invalid_key_policy_resource.key_policy["Statement"][0]["Resource"] = config.backend["kms_key_arn"]

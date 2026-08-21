@@ -1915,16 +1915,14 @@ class BackendValidator:
         matching_rules: list[dict[str, Any]] = []
         for rule in rules:
             default = rule.get("ApplyServerSideEncryptionByDefault")
-            if not isinstance(default, dict) or rule.get("BucketKeyEnabled") not in (None, True, False):
+            if not isinstance(default, dict) or type(rule.get("BucketKeyEnabled")) is not bool:
                 raise LifecycleError("backend bucket returned malformed default encryption metadata")
             if default.get("SSEAlgorithm") == "aws:kms" and default.get("KMSMasterKeyID") == kms_key:
                 matching_rules.append(rule)
         if len(matching_rules) != 1:
             raise LifecycleError("backend bucket must default to the exact operator-owned KMS key")
-        if matching_rules[0].get("BucketKeyEnabled") is True:
-            raise LifecycleError(
-                "backend S3 bucket keys are unsupported because exact object KMS encryption contexts are required"
-            )
+        if matching_rules[0]["BucketKeyEnabled"] is not True:
+            raise LifecycleError("backend bucket must enable S3 Bucket Keys for the fixed backend contract")
         public = self.aws.json(["s3api", "get-public-access-block", "--bucket", bucket], region=region)
         block = public.get("PublicAccessBlockConfiguration", {})
         required = ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")
@@ -2081,9 +2079,8 @@ class BackendValidator:
                             **contexts[0],
                             "kms:ViaService": f"s3.{region}.{dns_suffix}",
                             "kms:EncryptionContextKeys": ["aws:s3:arn"],
-                            "kms:EncryptionContext:aws:s3:arn": object_arn,
+                            "kms:EncryptionContext:aws:s3:arn": bucket_arn,
                         }
-                        for object_arn in object_actions
                     ]
                 for context in contexts:
                     require_policy_decision(
@@ -3175,7 +3172,7 @@ def build_operator_simulation_batches(
         (str(config.backend["kms_key_arn"]),),
         simulation_context_entries(config, region=backend_region),
     )
-    for label, object_arn in zip(("state", "lock", "manifest"), backend_object_arns, strict=True):
+    for label in ("state", "lock", "manifest"):
         add(
             f"kms-backend-s3-{label}",
             kms_crypto_actions,
@@ -3184,7 +3181,7 @@ def build_operator_simulation_batches(
                 config,
                 region=backend_region,
                 kms_via_service=f"s3.{backend_region}.{dns_suffix}",
-                kms_encryption_context=("aws:s3:arn", object_arn),
+                kms_encryption_context=("aws:s3:arn", backend_bucket_arn),
             ),
         )
     for site in ("west", "east"):
@@ -5143,7 +5140,7 @@ def materialize_reviewed_terraform_source(
     listing = runner.run(
         ["git", "-C", str(repository), "ls-tree", "-r", revision, "--", source_prefix.as_posix()], env=git_env
     )
-    entries: list[tuple[str, str]] = []
+    entries: list[tuple[str, str, str]] = []
     prefix = source_prefix.as_posix().rstrip("/") + "/"
     for line in listing.splitlines():
         try:
@@ -5151,14 +5148,14 @@ def materialize_reviewed_terraform_source(
             mode, object_type, object_id = metadata.split(" ", 2)
         except ValueError as error:
             raise LifecycleError("Git returned an invalid Terraform source tree entry") from error
-        if mode != "100644" or object_type != "blob" or not tracked_path.startswith(prefix):
+        if mode not in {"100644", "100755"} or object_type != "blob" or not tracked_path.startswith(prefix):
             raise LifecycleError("reviewed Terraform source tree contains an unsupported entry")
         relative = tracked_path.removeprefix(prefix)
         if not relative or pathlib.PurePosixPath(relative).is_absolute() or ".." in pathlib.PurePosixPath(relative).parts:
             raise LifecycleError("reviewed Terraform source tree contains an unsafe path")
-        entries.append((relative, object_id))
-    if not entries or not any(path.endswith(".tf") for path, _ in entries) or not any(
-        path == ".terraform.lock.hcl" for path, _ in entries
+        entries.append((relative, object_id, mode))
+    if not entries or not any(path.endswith(".tf") for path, _object_id, _mode in entries) or not any(
+        path == ".terraform.lock.hcl" for path, _object_id, _mode in entries
     ):
         raise LifecycleError("reviewed Terraform source tree is incomplete")
     snapshot = (run_dir / "terraform-source").resolve()
@@ -5167,13 +5164,13 @@ def materialize_reviewed_terraform_source(
     if snapshot.exists():
         shutil.rmtree(snapshot)
     snapshot.mkdir(mode=0o700, parents=True)
-    for relative, object_id in entries:
+    for relative, object_id, mode in entries:
         destination = snapshot / relative
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         destination.write_text(
             runner.run(["git", "-C", str(repository), "cat-file", "blob", object_id], env=git_env)
         )
-        os.chmod(destination, 0o600)
+        os.chmod(destination, 0o700 if mode == "100755" else 0o600)
     validate_terraform_source_contract(snapshot)
     identity = {
         "revision": revision,
