@@ -1597,6 +1597,42 @@ class CaptureControllerTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_gwlbe_stabilization_waits_from_the_newest_endpoint_creation(self) -> None:
+        clock = {"monotonic": 100.0, "wall": 2_000_000_000.0}
+        sleeps: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            clock["monotonic"] += seconds
+            clock["wall"] += seconds
+
+        operations = e2e.AwsLiveOperations(
+            SimpleNamespace(run_id="fixture-live", sites={}),
+            SimpleNamespace(),
+            pathlib.Path("/tmp/not-used"),
+            ssm=self.FakeSSM(),
+            sleep=sleep,
+            monotonic=lambda: clock["monotonic"],
+            wall_time=lambda: clock["wall"],
+        )
+        created = dt.datetime.fromtimestamp(clock["wall"] - 240, tz=dt.timezone.utc).isoformat()
+
+        age = operations._wait_for_gwlbe_stability(
+            "west",
+            [{"CreationTimestamp": created}],
+            deadline=clock["monotonic"] + 120,
+        )
+
+        self.assertEqual(sleeps, [60.0])
+        self.assertEqual(age, e2e.GWLBE_STABILIZATION_SECONDS)
+
+        with self.assertRaisesRegex(e2e.ReadinessError, "readiness deadline"):
+            operations._wait_for_gwlbe_stability(
+                "west",
+                [{"CreationTimestamp": dt.datetime.fromtimestamp(clock["wall"], tz=dt.timezone.utc).isoformat()}],
+                deadline=clock["monotonic"] + 30,
+            )
+
     def test_emergency_return_rule_accepts_concurrent_reconciliation(self) -> None:
         fake = self.FakeSSM()
         operations, deployment, _flows = self.fixture(fake)
@@ -2231,6 +2267,7 @@ class FakeLiveOperations:
                     "accepted_route_peer": f"fixture-live-{'east' if site == 'west' else 'west'}",
                     "links": [runtime.underlay_interface, runtime.tailscale_iface, runtime.tun_name],
                     "target_status": "healthy",
+                    "gwlbe_endpoint_age_seconds": e2e.GWLBE_STABILIZATION_SECONDS,
                 }
             )
             for role in e2e.WORKLOAD_ROLES:
@@ -2720,6 +2757,11 @@ class ReadinessGateTest(unittest.TestCase):
         duplicate_eni = copy.deepcopy(self.summary)
         duplicate_eni["workload_checks"]["east-responder"]["interface_id"] = duplicate_eni["workload_checks"]["west-initiator"]["interface_id"]
         mutations.append(duplicate_eni)
+        young_endpoint = copy.deepcopy(self.summary)
+        young_endpoint["appliance_checks"]["west"]["gwlbe_endpoint_age_seconds"] = (
+            e2e.GWLBE_STABILIZATION_SECONDS - 1
+        )
+        mutations.append(young_endpoint)
         for index, candidate in enumerate(mutations):
             with self.subTest(index=index), self.assertRaises(e2e.ReadinessError):
                 e2e._validate_readiness_summary(self.deployment, candidate, run_id="fixture-live")

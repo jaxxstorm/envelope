@@ -71,6 +71,7 @@ EXIT_ACCEPTANCE_FAILED = 1
 EXIT_CONTRACT_ERROR = 2
 EXIT_CLEANUP_FAILED = 3
 RUN_ALL_HARD_TIMEOUT_SECONDS = 5400
+GWLBE_STABILIZATION_SECONDS = 300
 
 _VPC_ID_RE = re.compile(r"vpc-[0-9a-f]{8,17}")
 _VPCE_ID_RE = re.compile(r"vpce-[0-9a-f]{8,17}")
@@ -4585,6 +4586,7 @@ _APPLIANCE_READINESS_GATES = (
     "metrics_ready",
     "capture_tools_ready",
     "target_healthy",
+    "gwlbe_endpoint_stable",
 )
 _WORKLOAD_READINESS_GATES = (
     "cloud_init_complete",
@@ -4626,6 +4628,9 @@ def _validate_readiness_summary(
             or checks.get("links")
             != [runtime.underlay_interface, runtime.tailscale_iface, runtime.tun_name]
             or checks.get("target_status") != "healthy"
+            or isinstance(checks.get("gwlbe_endpoint_age_seconds"), bool)
+            or not isinstance(checks.get("gwlbe_endpoint_age_seconds"), (int, float))
+            or checks["gwlbe_endpoint_age_seconds"] < GWLBE_STABILIZATION_SECONDS
         ):
             raise ReadinessError(f"{site} appliance route, link, or target identity is not exact")
     workload_interface_ids: list[str] = []
@@ -6592,6 +6597,42 @@ class AwsLiveOperations:
             )
         raise ReadinessError(f"timed out waiting for {description}{detail}")
 
+    def _wait_for_gwlbe_stability(
+        self,
+        site: Site,
+        endpoints: Sequence[Mapping[str, Any]],
+        *,
+        deadline: float,
+    ) -> int:
+        creation_epochs: list[float] = []
+        for endpoint in endpoints:
+            value = endpoint.get("CreationTimestamp")
+            if not isinstance(value, str):
+                raise ReadinessError(f"{site} GWLB endpoint omitted its creation timestamp")
+            try:
+                created = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as error:
+                raise ReadinessError(f"{site} GWLB endpoint creation timestamp is invalid") from error
+            if created.tzinfo is None or created.utcoffset() is None:
+                raise ReadinessError(f"{site} GWLB endpoint creation timestamp has no timezone")
+            creation_epochs.append(created.timestamp())
+        if not creation_epochs:
+            raise ReadinessError(f"{site} has no GWLB endpoint creation timestamp")
+
+        started = self.monotonic()
+        initial_age = self.wall_time() - max(creation_epochs)
+        if initial_age < -60:
+            raise ReadinessError(f"{site} GWLB endpoint creation timestamp is unexpectedly in the future")
+        wait_seconds = max(0.0, GWLBE_STABILIZATION_SECONDS - initial_age)
+        if wait_seconds > deadline - started:
+            raise ReadinessError(f"{site} GWLB endpoint cannot stabilize within the readiness deadline")
+        if wait_seconds > 0:
+            self.sleep(wait_seconds)
+        age = initial_age + max(0.0, self.monotonic() - started)
+        if age < GWLBE_STABILIZATION_SECONDS:
+            raise ReadinessError(f"{site} GWLB endpoint stabilization wait ended early")
+        return max(GWLBE_STABILIZATION_SECONDS, int(math.floor(age)))
+
     @staticmethod
     def _instances(response: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
         reservations = response.get("Reservations")
@@ -6951,6 +6992,11 @@ printf '{{"cloud_init_complete":true,"host_network_preflight":true,"links_ready"
                 for value in described_endpoints
                 if isinstance(value, Mapping) and isinstance(value.get("VpcEndpointId"), str)
             }
+            endpoint_age_seconds = self._wait_for_gwlbe_stability(
+                site,
+                list(endpoints_by_id.values()),
+                deadline=deadline,
+            )
             endpoint_subnets: dict[str, str] = {}
             for az_key, endpoint_id in endpoint_values.items():
                 subnet_ids = endpoints_by_id[endpoint_id].get("SubnetIds")
@@ -7057,6 +7103,8 @@ printf '{{"cloud_init_complete":true,"host_network_preflight":true,"links_ready"
             )
             appliance_ready["target_healthy"] = True
             appliance_ready["target_status"] = target_health["status"]
+            appliance_ready["gwlbe_endpoint_stable"] = True
+            appliance_ready["gwlbe_endpoint_age_seconds"] = endpoint_age_seconds
             appliance_checks[site] = appliance_ready
             host_summaries.append(
                 {"site": site, "role": "appliance", "instance_id": appliance.instance_id, "ready": True, "pid": appliance_ready["pid"]}
