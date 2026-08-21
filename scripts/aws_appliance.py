@@ -455,7 +455,7 @@ AWS_ELBV2_ACTION_RESOURCE_CONTRACT = action_resource_contract(
                 "elasticloadbalancing:DescribeTargetHealth",
             ),
         ),
-        (("load-balancer", "listener", "target-group"), ("elasticloadbalancing:AddTags", "elasticloadbalancing:RemoveTags")),
+        (("*", "load-balancer", "target-group"), ("elasticloadbalancing:AddTags", "elasticloadbalancing:RemoveTags")),
         (("load-balancer",), ("elasticloadbalancing:CreateListener", "elasticloadbalancing:CreateLoadBalancer", "elasticloadbalancing:DeleteLoadBalancer", "elasticloadbalancing:ModifyLoadBalancerAttributes", "elasticloadbalancing:SetSubnets")),
         (("target-group",), ("elasticloadbalancing:CreateTargetGroup", "elasticloadbalancing:DeleteTargetGroup", "elasticloadbalancing:DeregisterTargets", "elasticloadbalancing:ModifyTargetGroup", "elasticloadbalancing:ModifyTargetGroupAttributes", "elasticloadbalancing:RegisterTargets")),
         (("listener",), ("elasticloadbalancing:DeleteListener", "elasticloadbalancing:ModifyListenerAttributes")),
@@ -2862,7 +2862,7 @@ def build_operator_simulation_batches(
             "elasticloadbalancing:CreateTargetGroup",
         }
         elb_create_tag_paths = {
-            "CreateListener": "listener",
+            "CreateListener": "*",
             "CreateLoadBalancer": "load-balancer",
             "CreateTargetGroup": "target-group",
         }
@@ -2917,9 +2917,7 @@ def build_operator_simulation_batches(
             {"elasticloadbalancing:AddTags"},
             tuple(
                 resource
-                for resource_kind in AWS_ELBV2_ACTION_RESOURCE_CONTRACT[
-                    "elasticloadbalancing:AddTags"
-                ]
+                for resource_kind in ("load-balancer", "target-group")
                 for resource in elb_resources[resource_kind]
             ),
             simulation_context_entries(
@@ -2930,16 +2928,26 @@ def build_operator_simulation_batches(
             ),
         )
         add(
+            f"elbv2-{site}-tag-listener",
+            {"elasticloadbalancing:AddTags"},
+            ("*",),
+            request_tag_context,
+        )
+        add(
             f"elbv2-{site}-remove-tags",
             {"elasticloadbalancing:RemoveTags"},
             tuple(
                 resource
-                for resource_kind in AWS_ELBV2_ACTION_RESOURCE_CONTRACT[
-                    "elasticloadbalancing:RemoveTags"
-                ]
+                for resource_kind in ("load-balancer", "target-group")
                 for resource in elb_resources[resource_kind]
             ),
             remove_tag_context,
+        )
+        add(
+            f"elbv2-{site}-remove-tags-listener",
+            {"elasticloadbalancing:RemoveTags"},
+            ("*",),
+            simulation_context_entries(config, region=region, tag_keys=True),
         )
 
         logs_actions = actions_by_service["logs"]

@@ -2129,7 +2129,11 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
         )
         self.assertEqual(
             appliance.AWS_OPERATOR_ACTION_RESOURCE_CONTRACT["elasticloadbalancing:AddTags"],
-            ("load-balancer", "listener", "target-group"),
+            ("*", "load-balancer", "target-group"),
+        )
+        self.assertEqual(
+            appliance.AWS_OPERATOR_ACTION_RESOURCE_CONTRACT["elasticloadbalancing:RemoveTags"],
+            ("*", "load-balancer", "target-group"),
         )
         self.assertEqual(
             appliance.AWS_OPERATOR_ACTION_RESOURCE_CONTRACT["ec2:RunInstances"],
@@ -2197,7 +2201,7 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
                     for entry in batch["context"]
                 }
 
-            def assert_context_mode(batch, mode):
+            def assert_context_mode(batch, mode, extra_context=None):
                 values = context(batch)
                 expected_tags = {
                     "EnvelopeRun": config.run_id,
@@ -2205,23 +2209,35 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
                     "ManagedBy": "terraform",
                     "Profile": "envelope-aws-appliance",
                 }
-                if mode not in {"regional", "request", "resource", "request-resource"}:
+                if mode not in {
+                    "regional",
+                    "request",
+                    "resource",
+                    "request-resource",
+                    "tag-keys",
+                    "resource-tag-keys",
+                }:
                     self.fail(f"unknown context mode {mode}")
                 expected_keys = {"aws:RequestedRegion"}
-                if mode in {"request", "request-resource"}:
+                if mode in {"request", "request-resource", "tag-keys", "resource-tag-keys"}:
                     expected_keys.add("aws:TagKeys")
+                if mode in {"request", "request-resource"}:
                     expected_keys.update(f"aws:RequestTag/{key}" for key in expected_tags)
-                if mode in {"resource", "request-resource"}:
+                if mode in {"resource", "request-resource", "resource-tag-keys"}:
                     expected_keys.update(f"aws:ResourceTag/{key}" for key in expected_tags)
+                expected_keys.update((extra_context or {}).keys())
                 self.assertEqual(set(values), expected_keys)
                 self.assertEqual(values["aws:RequestedRegion"], ["us-west-2"])
-                if mode in {"request", "request-resource"}:
+                if mode in {"request", "request-resource", "tag-keys", "resource-tag-keys"}:
                     self.assertEqual(values["aws:TagKeys"], sorted(expected_tags))
+                if mode in {"request", "request-resource"}:
                     for key, value in expected_tags.items():
                         self.assertEqual(values[f"aws:RequestTag/{key}"], [value])
-                if mode in {"resource", "request-resource"}:
+                if mode in {"resource", "request-resource", "resource-tag-keys"}:
                     for key, value in expected_tags.items():
                         self.assertEqual(values[f"aws:ResourceTag/{key}"], [value])
+                for key, value in (extra_context or {}).items():
+                    self.assertEqual(values[key], value)
 
             target_group_batch = west_batch("elasticloadbalancing:CreateTargetGroup")
             self.assertEqual(
@@ -2325,37 +2341,89 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
             self.assertIn("aws:TagKeys", delete_tag_context)
             self.assertNotIn("aws:RequestTag/EnvelopeRun", delete_tag_context)
 
-            for create_action, resource_prefix in {
-                "CreateListener": "listener/",
-                "CreateLoadBalancer": "loadbalancer/",
-                "CreateTargetGroup": "targetgroup/",
-            }.items():
+            expected_elb_create_tag_resources = {
+                "CreateListener": ("*",),
+                "CreateLoadBalancer": (load_balancer_arn,),
+                "CreateTargetGroup": target_group_batch["resources"],
+            }
+            for create_action, expected_resources in expected_elb_create_tag_resources.items():
                 with self.subTest(elbv2_create_action=create_action):
                     tag_batch = next(
                         batch
                         for batch in batches
                         if batch["name"] == f"elbv2-west-add-tags-{create_action}"
                     )
-                    tag_context = context(tag_batch)
-                    self.assertEqual(
-                        tag_context["elasticloadbalancing:CreateAction"],
-                        [create_action],
+                    self.assertEqual(tag_batch["resources"], expected_resources)
+                    assert_context_mode(
+                        tag_batch,
+                        "request",
+                        {
+                            "elasticloadbalancing:CreateAction": [create_action],
+                        },
                     )
-                    self.assertIn("aws:RequestTag/EnvelopeRun", tag_context)
-                    self.assertNotIn("aws:ResourceTag/EnvelopeRun", tag_context)
-                    self.assertTrue(
-                        all(resource_prefix in value.split(":", 5)[5] for value in tag_batch["resources"])
-                    )
-            listener_remove_batch = next(
+
+            scoped_tag_resources = {
+                load_balancer_arn,
+                target_group_batch["resources"][0],
+            }
+            existing_elb_tag_batch = next(
+                batch for batch in batches if batch["name"] == "elbv2-west-tag-existing"
+            )
+            self.assertEqual(set(existing_elb_tag_batch["resources"]), scoped_tag_resources)
+            self.assertNotIn("*", existing_elb_tag_batch["resources"])
+            assert_context_mode(existing_elb_tag_batch, "request-resource")
+
+            listener_tag_batch = next(
+                batch for batch in batches if batch["name"] == "elbv2-west-tag-listener"
+            )
+            self.assertEqual(listener_tag_batch["resources"], ("*",))
+            assert_context_mode(listener_tag_batch, "request")
+
+            scoped_remove_batch = next(
                 batch for batch in batches if batch["name"] == "elbv2-west-remove-tags"
             )
-            self.assertTrue(any(":listener/gwy/" in value for value in listener_remove_batch["resources"]))
-            existing_elb_tag_context = context(
-                next(batch for batch in batches if batch["name"] == "elbv2-west-tag-existing")
+            self.assertEqual(set(scoped_remove_batch["resources"]), scoped_tag_resources)
+            self.assertNotIn("*", scoped_remove_batch["resources"])
+            assert_context_mode(scoped_remove_batch, "resource-tag-keys")
+
+            listener_remove_batch = next(
+                batch
+                for batch in batches
+                if batch["name"] == "elbv2-west-remove-tags-listener"
             )
-            self.assertIn("aws:RequestTag/EnvelopeRun", existing_elb_tag_context)
-            self.assertIn("aws:ResourceTag/EnvelopeRun", existing_elb_tag_context)
-            self.assertNotIn("elasticloadbalancing:CreateAction", existing_elb_tag_context)
+            self.assertEqual(listener_remove_batch["resources"], ("*",))
+            assert_context_mode(listener_remove_batch, "tag-keys")
+
+            west_elb_tag_batches = [
+                batch
+                for batch in batches
+                if "west" in batch["name"]
+                and set(batch["actions"]).intersection(
+                    {
+                        "elasticloadbalancing:AddTags",
+                        "elasticloadbalancing:RemoveTags",
+                    }
+                )
+            ]
+            self.assertEqual(
+                {
+                    batch["name"]
+                    for batch in west_elb_tag_batches
+                    if batch["resources"] == ("*",)
+                },
+                {
+                    "elbv2-west-add-tags-CreateListener",
+                    "elbv2-west-tag-listener",
+                    "elbv2-west-remove-tags-listener",
+                },
+            )
+            self.assertFalse(
+                any(
+                    ":listener/" in resource
+                    for batch in west_elb_tag_batches
+                    for resource in batch["resources"]
+                )
+            )
 
             self_simulation = next(batch for batch in batches if batch["name"] == "iam-policy-source")
             self.assertEqual(self_simulation["actions"], ("iam:SimulatePrincipalPolicy",))
@@ -2374,7 +2442,7 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
             )
             self.assertFalse(any(":role/" in resource for resource in profile_links["resources"]))
 
-            self.assertEqual(len(batches), 212)
+            self.assertEqual(len(batches), 216)
             self.assertLess(len(batches), 225)
 
             class LeastPrivilegeAWS(CapabilityAWS):
@@ -2711,23 +2779,53 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
                         create_action = context.get("elasticloadbalancing:CreateAction")
                         if create_action:
                             expected_resource_type = {
-                                "CreateListener": "listener/",
+                                "CreateListener": "*",
                                 "CreateLoadBalancer": "loadbalancer/",
                                 "CreateTargetGroup": "targetgroup/",
                             }.get(create_action[0] if len(create_action) == 1 else "")
-                            allowed = (
-                                expected_resource_type is not None
+                            resource_matches = (
+                                resources == ["*"]
+                                if expected_resource_type == "*"
+                                else expected_resource_type is not None
                                 and all(expected_resource_type in resource for resource in resources)
+                            )
+                            allowed = (
+                                resource_matches
                                 and bool(request_tag_keys)
                                 and not resource_tag_keys
                             )
+                        elif resources == ["*"]:
+                            allowed = bool(request_tag_keys) and not resource_tag_keys
                         else:
-                            allowed = bool(request_tag_keys) and bool(resource_tag_keys)
+                            allowed = (
+                                bool(request_tag_keys)
+                                and bool(resource_tag_keys)
+                                and "*" not in resources
+                                and all(
+                                    ":loadbalancer/" in resource or ":targetgroup/" in resource
+                                    for resource in resources
+                                )
+                            )
                     elif action == "elasticloadbalancing:RemoveTags":
+                        if resources == ["*"]:
+                            allowed = (
+                                not resource_tag_keys
+                                and not request_tag_keys
+                                and "aws:TagKeys" in context
+                            )
+                        else:
+                            allowed = (
+                                bool(resource_tag_keys)
+                                and not request_tag_keys
+                                and "aws:TagKeys" in context
+                                and "*" not in resources
+                                and all(
+                                    ":loadbalancer/" in resource or ":targetgroup/" in resource
+                                    for resource in resources
+                                )
+                            )
                         allowed = (
-                            bool(resource_tag_keys)
-                            and not request_tag_keys
-                            and any(":listener/gwy/" in resource for resource in resources)
+                            allowed
                             and "elasticloadbalancing:CreateAction" not in context
                         )
                     elif action == "iam:SimulatePrincipalPolicy":
