@@ -3660,8 +3660,9 @@ def service_quota_values(
         quota = response.get("Quota") if isinstance(response, dict) else None
         name = quota.get("QuotaName") if isinstance(quota, dict) else None
         value = quota.get("Value") if isinstance(quota, dict) else None
+        quota_arn_region = "" if global_quotas else region
         expected_quota_arn = (
-            f"arn:{partition}:servicequotas:{region}:{account_id}:{service}/{quota_code}"
+            f"arn:{partition}:servicequotas:{quota_arn_region}:{account_id}:{service}/{quota_code}"
         )
         if (
             not isinstance(quota, dict)

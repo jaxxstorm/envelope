@@ -1225,17 +1225,19 @@ class CapabilityAWS:
             gate, quota_service, code, name = matches[0]
             if gate == self.omitted_quota_gate:
                 return {}
+            global_quota = gate in appliance.AWS_GLOBAL_QUOTA_CONTRACT
+            quota_arn_region = "" if global_quota else region
             return {
                 "Quota": {
                     "ServiceCode": quota_service,
                     "QuotaName": name,
                     "QuotaCode": code,
                     "QuotaArn": (
-                        f"arn:{self.role_arn.split(':', 2)[1]}:servicequotas:{region}:"
+                        f"arn:{self.role_arn.split(':', 2)[1]}:servicequotas:{quota_arn_region}:"
                         f"123456789012:{quota_service}/{code}"
                     ),
                     "Value": 0 if gate == self.low_quota_gate else 100,
-                    "GlobalQuota": gate in appliance.AWS_GLOBAL_QUOTA_CONTRACT,
+                    "GlobalQuota": global_quota,
                 }
             }
         if service == "ec2" and operation in {
@@ -1960,6 +1962,7 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
             {**baseline, "ServiceCode": "vpc"},
             {**baseline, "QuotaCode": "L-WRONG"},
             {**baseline, "QuotaArn": "arn:aws:servicequotas:us-east-1:123456789012:ec2/L-1216C47A"},
+            {**baseline, "QuotaArn": "arn:aws:servicequotas::123456789012:ec2/L-1216C47A"},
             {**baseline, "QuotaName": ""},
             {**baseline, "Value": True},
             {**baseline, "Value": float("nan")},
@@ -1991,6 +1994,67 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
                 global_quotas=False,
             )
 
+    def test_global_quota_requires_literal_empty_region_arn(self):
+        baseline = {
+            "ServiceCode": "s3",
+            "QuotaCode": "L-DC2B2D3D",
+            "QuotaArn": "arn:aws:servicequotas::123456789012:s3/L-DC2B2D3D",
+            "QuotaName": "General purpose buckets",
+            "Value": 100.0,
+            "GlobalQuota": True,
+        }
+
+        class LiteralQuotaAWS:
+            def __init__(self, quota):
+                self.quota = quota
+                self.calls = []
+
+            def json(self, args, *, region=None):
+                self.calls.append((list(args), region))
+                return {"Quota": copy.deepcopy(self.quota)}
+
+        identity_arn = "arn:aws:iam::123456789012:role/operator"
+        aws = LiteralQuotaAWS(baseline)
+        values = appliance.global_service_quota_values(aws, identity_arn)
+        self.assertEqual(
+            values["s3-artifact-buckets"]["QuotaArn"],
+            "arn:aws:servicequotas::123456789012:s3/L-DC2B2D3D",
+        )
+        self.assertEqual(
+            aws.calls,
+            [
+                (
+                    [
+                        "service-quotas",
+                        "get-service-quota",
+                        "--service-code",
+                        "s3",
+                        "--quota-code",
+                        "L-DC2B2D3D",
+                    ],
+                    "us-east-1",
+                )
+            ],
+        )
+
+        invalid_arns = (
+            "arn:aws:servicequotas:us-east-1:123456789012:s3/L-DC2B2D3D",
+            "arn:aws-us-gov:servicequotas::123456789012:s3/L-DC2B2D3D",
+            "arn:aws:servicequotas::000000000000:s3/L-DC2B2D3D",
+            "arn:aws:servicequotas::123456789012:ec2/L-DC2B2D3D",
+            "arn:aws:servicequotas::123456789012:s3/L-WRONG",
+        )
+        for quota_arn in invalid_arns:
+            with self.subTest(quota_arn=quota_arn):
+                with self.assertRaisesRegex(
+                    appliance.LifecycleError,
+                    "s3-artifact-buckets.*L-DC2B2D3D",
+                ):
+                    appliance.global_service_quota_values(
+                        LiteralQuotaAWS({**baseline, "QuotaArn": quota_arn}),
+                        identity_arn,
+                    )
+
     def test_global_quota_and_bucket_inventory_use_commercial_control_region(self):
         class PartitionAWS:
             def __init__(self):
@@ -2004,10 +2068,7 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
                         "Quota": {
                             "ServiceCode": service,
                             "QuotaCode": code,
-                            "QuotaArn": (
-                                f"arn:aws:servicequotas:{region}:123456789012:"
-                                f"{service}/{code}"
-                            ),
+                            "QuotaArn": "arn:aws:servicequotas::123456789012:s3/L-DC2B2D3D",
                             "QuotaName": name,
                             "Value": 100,
                             "GlobalQuota": True,
