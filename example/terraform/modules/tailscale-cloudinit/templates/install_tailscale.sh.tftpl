@@ -30,12 +30,14 @@ for ((attempt = 1; attempt <= max_retries; attempt++)); do
     signature_output=$(/usr/bin/rpm --checksig --verbose "$package_path")
     printf '%s\n' "$signature_output"
     [[ $(/usr/bin/grep -c 'V4 RSA/SHA256 Signature, key ID 957f5868: OK' <<<"$signature_output") -eq 2 ]]
-    /usr/bin/dnf install -y "$package_path"
-    /usr/bin/tailscale version | /usr/bin/grep -Eq "^$expected_version([[:space:]]|$)"
-    exit 0
+    if /usr/bin/dnf install -y "$package_path" &&
+      /usr/bin/tailscale version | /usr/bin/grep -Eq "^$expected_version([[:space:]]|$)"; then
+      exit 0
+    fi
+    /usr/bin/dnf clean packages >/dev/null 2>&1 || true
   fi
   /usr/bin/sleep "$retry_delay"
 done
 
-printf '%s\n' 'reviewed Tailscale package download exhausted retries' >&2
+printf '%s\n' 'reviewed Tailscale package installation exhausted retries' >&2
 exit 1

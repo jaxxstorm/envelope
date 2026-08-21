@@ -6230,7 +6230,7 @@ def wait_deployment(
                         key: None if candidate is None else redact(str(candidate))[:2048]
                         for key, candidate in {
                             "target": value.get("Target", {}).get("Id"),
-                            "state": value.get("TargetHealth", {}).get("State"),
+                            "target_state": value.get("TargetHealth", {}).get("State"),
                             "reason": value.get("TargetHealth", {}).get("Reason"),
                             "description": value.get("TargetHealth", {}).get("Description"),
                         }.items()

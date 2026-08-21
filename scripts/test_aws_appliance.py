@@ -6511,6 +6511,9 @@ class CloudInitSandboxTest(unittest.TestCase):
         )
         for rendered in (rendered_install, rendered_setup):
             subprocess.run(["bash", "-n"], input=rendered, text=True, check=True, capture_output=True)
+        self.assertIn('if /usr/bin/dnf install -y "$package_path" &&', rendered_install)
+        self.assertIn("/usr/bin/dnf clean packages >/dev/null 2>&1 || true", rendered_install)
+        self.assertIn("reviewed Tailscale package installation exhausted retries", rendered_install)
 
     def test_checksum_verified_atomic_install_and_mismatch_fail_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -6969,6 +6972,8 @@ class ReadinessTest(unittest.TestCase):
             )
             self.assertEqual(set(payload["workloads"]), {"west", "east"})
             self.assertEqual(set(payload["workloads"]["west"]), {"initiator", "responder"})
+            self.assertEqual(payload["target_health"]["west"][0]["target_state"], "unhealthy")
+            self.assertNotIn("state", payload["target_health"]["west"][0])
             self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o600)
             self.assertNotIn(secret, serialized)
             self.assertNotIn(secret, str(raised.exception))
