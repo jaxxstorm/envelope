@@ -37,22 +37,22 @@ variable "east_region" {
 }
 
 variable "west_azs" {
-  description = "Reviewed logical-key to explicit Availability Zone map for west"
+  description = "Exactly two reviewed logical-key to explicit Availability Zone mappings for west"
   type        = map(string)
 
   validation {
-    condition     = length(var.west_azs) >= 1 && length(var.west_azs) <= 3 && length(distinct(values(var.west_azs))) == length(var.west_azs)
-    error_message = "west_azs must contain one to three distinct explicit Availability Zone names."
+    condition     = length(var.west_azs) == 2 && length(distinct(values(var.west_azs))) == 2
+    error_message = "west_azs must contain exactly two distinct explicit Availability Zone names."
   }
 }
 
 variable "east_azs" {
-  description = "Reviewed logical-key to explicit Availability Zone map for east"
+  description = "Exactly two reviewed logical-key to explicit Availability Zone mappings for east"
   type        = map(string)
 
   validation {
-    condition     = length(var.east_azs) >= 1 && length(var.east_azs) <= 3 && length(distinct(values(var.east_azs))) == length(var.east_azs)
-    error_message = "east_azs must contain one to three distinct explicit Availability Zone names."
+    condition     = length(var.east_azs) == 2 && length(distinct(values(var.east_azs))) == 2
+    error_message = "east_azs must contain exactly two distinct explicit Availability Zone names."
   }
 }
 
@@ -312,22 +312,34 @@ variable "envelope_underlay_interface" {
 }
 
 variable "envelope_gwlb_return_cidrs" {
-  description = "Independent per-site local initiator prefixes whose Tailnet returns enter Envelope"
+  description = "One local initiator prefix per site whose Tailnet returns enter Envelope"
   type        = map(list(string))
 
   validation {
-    condition     = toset(keys(var.envelope_gwlb_return_cidrs)) == toset(["west", "east"]) && alltrue(flatten([for values in values(var.envelope_gwlb_return_cidrs) : [for value in values : can(cidrhost(value, 0))]]))
-    error_message = "envelope_gwlb_return_cidrs must contain valid west and east CIDR lists."
+    condition = (
+      toset(keys(var.envelope_gwlb_return_cidrs)) == toset(["west", "east"]) &&
+      alltrue([
+        for cidrs in values(var.envelope_gwlb_return_cidrs) :
+        length(cidrs) == 1 && alltrue([for cidr in cidrs : can(cidrhost(cidr, 0))])
+      ])
+    )
+    error_message = "envelope_gwlb_return_cidrs must contain exactly one valid initiator CIDR for each of west and east."
   }
 }
 
 variable "envelope_local_delivery_cidrs" {
-  description = "Independent per-site local responder prefixes whose cold Tailnet traffic bypasses Envelope"
+  description = "One local responder prefix per site whose cold Tailnet traffic bypasses Envelope"
   type        = map(list(string))
 
   validation {
-    condition     = toset(keys(var.envelope_local_delivery_cidrs)) == toset(["west", "east"]) && alltrue(flatten([for values in values(var.envelope_local_delivery_cidrs) : [for value in values : can(cidrhost(value, 0))]]))
-    error_message = "envelope_local_delivery_cidrs must contain valid west and east CIDR lists."
+    condition = (
+      toset(keys(var.envelope_local_delivery_cidrs)) == toset(["west", "east"]) &&
+      alltrue([
+        for cidrs in values(var.envelope_local_delivery_cidrs) :
+        length(cidrs) == 1 && alltrue([for cidr in cidrs : can(cidrhost(cidr, 0))])
+      ])
+    )
+    error_message = "envelope_local_delivery_cidrs must contain exactly one valid responder CIDR for each of west and east."
   }
 }
 
@@ -374,6 +386,86 @@ variable "appliance_target_count" {
   }
 }
 
+variable "e2e_load_profile" {
+  description = "Required immutable load and transport thresholds approved before the saved plan is created"
+  nullable    = false
+  type = object({
+    profile_id                     = string
+    approved_at                    = string
+    safe_inner_mtu                 = number
+    maximum_tcp_mss                = number
+    sustained_tcp_duration_seconds = number
+    minimum_sustained_tcp_bytes    = number
+    iperf_duration_seconds         = number
+    minimum_throughput_mbps        = number
+    concurrent_duration_seconds    = number
+    concurrent_tcp_flows           = number
+    concurrent_udp_flows           = number
+    maximum_udp_loss_percent       = number
+    maximum_p99_latency_ms         = number
+  })
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$", var.e2e_load_profile.profile_id))
+    error_message = "e2e_load_profile.profile_id must be a 1-128 character safe identifier."
+  }
+
+  validation {
+    condition = (
+      can(formatdate("YYYY-MM-DD'T'hh:mm:ssZ", var.e2e_load_profile.approved_at)) &&
+      try(formatdate("YYYY-MM-DD'T'hh:mm:ssZ", var.e2e_load_profile.approved_at) == var.e2e_load_profile.approved_at, false)
+    )
+    error_message = "e2e_load_profile.approved_at must be canonical UTC RFC3339 with seconds and a trailing Z."
+  }
+
+  validation {
+    condition = alltrue([
+      for value in [
+        var.e2e_load_profile.safe_inner_mtu,
+        var.e2e_load_profile.maximum_tcp_mss,
+        var.e2e_load_profile.sustained_tcp_duration_seconds,
+        var.e2e_load_profile.minimum_sustained_tcp_bytes,
+        var.e2e_load_profile.iperf_duration_seconds,
+        var.e2e_load_profile.concurrent_duration_seconds,
+        var.e2e_load_profile.concurrent_tcp_flows,
+        var.e2e_load_profile.concurrent_udp_flows,
+      ] : value == floor(value)
+    ])
+    error_message = "e2e_load_profile MTU, MSS, duration, byte, and flow-count fields must be integers."
+  }
+
+  validation {
+    condition = (
+      var.e2e_load_profile.safe_inner_mtu >= 576 && var.e2e_load_profile.safe_inner_mtu <= 1500 &&
+      var.e2e_load_profile.maximum_tcp_mss >= 536 && var.e2e_load_profile.maximum_tcp_mss <= 1460 &&
+      var.e2e_load_profile.sustained_tcp_duration_seconds >= 3 && var.e2e_load_profile.sustained_tcp_duration_seconds <= 120 &&
+      var.e2e_load_profile.minimum_sustained_tcp_bytes >= 1 && var.e2e_load_profile.minimum_sustained_tcp_bytes <= 1000000000 &&
+      var.e2e_load_profile.iperf_duration_seconds >= 3 && var.e2e_load_profile.iperf_duration_seconds <= 120 &&
+      var.e2e_load_profile.concurrent_duration_seconds >= 3 && var.e2e_load_profile.concurrent_duration_seconds <= 120 &&
+      var.e2e_load_profile.concurrent_tcp_flows >= 1 && var.e2e_load_profile.concurrent_tcp_flows <= 32 &&
+      var.e2e_load_profile.concurrent_udp_flows >= 1 && var.e2e_load_profile.concurrent_udp_flows <= 32
+    )
+    error_message = "e2e_load_profile integer fields exceed their approved fail-closed bounds."
+  }
+
+  validation {
+    condition = (
+      var.e2e_load_profile.safe_inner_mtu == 1280 &&
+      var.e2e_load_profile.maximum_tcp_mss <= var.e2e_load_profile.safe_inner_mtu - 40
+    )
+    error_message = "e2e_load_profile must use safe_inner_mtu 1280 and maximum_tcp_mss no greater than 1240."
+  }
+
+  validation {
+    condition = (
+      var.e2e_load_profile.minimum_throughput_mbps >= 0.001 && var.e2e_load_profile.minimum_throughput_mbps <= 100000 &&
+      var.e2e_load_profile.maximum_udp_loss_percent >= 0 && var.e2e_load_profile.maximum_udp_loss_percent <= 100 &&
+      var.e2e_load_profile.maximum_p99_latency_ms >= 0.001 && var.e2e_load_profile.maximum_p99_latency_ms <= 60000
+    )
+    error_message = "e2e_load_profile throughput, UDP loss, and p99 latency thresholds must be finite and within approved bounds."
+  }
+}
+
 variable "estimated_fixed_hourly_usd" {
   description = "Reviewed estimate for this acceptance profile before traffic charges"
   type        = number
@@ -409,6 +501,28 @@ locals {
     arm64 = "arm64"
   }[var.architecture]
 
-  west_primary_key = sort(keys(var.west_azs))[0]
-  east_primary_key = sort(keys(var.east_azs))[0]
+  west_initiator_cidr = one(var.envelope_gwlb_return_cidrs["west"])
+  west_responder_cidr = one(var.envelope_local_delivery_cidrs["west"])
+  east_initiator_cidr = one(var.envelope_gwlb_return_cidrs["east"])
+  east_responder_cidr = one(var.envelope_local_delivery_cidrs["east"])
+
+  west_initiator_az_key = coalesce(one([for az_key, cidr in var.west_workload_subnet_cidrs : az_key if cidr == local.west_initiator_cidr]), sort(keys(var.west_workload_subnet_cidrs))[0])
+  west_responder_az_key = coalesce(one([for az_key, cidr in var.west_workload_subnet_cidrs : az_key if cidr == local.west_responder_cidr]), sort(keys(var.west_workload_subnet_cidrs))[0])
+  east_initiator_az_key = coalesce(one([for az_key, cidr in var.east_workload_subnet_cidrs : az_key if cidr == local.east_initiator_cidr]), sort(keys(var.east_workload_subnet_cidrs))[0])
+  east_responder_az_key = coalesce(one([for az_key, cidr in var.east_workload_subnet_cidrs : az_key if cidr == local.east_responder_cidr]), sort(keys(var.east_workload_subnet_cidrs))[0])
+
+  west_workloads = {
+    initiator = { az_key = local.west_initiator_az_key, cidr = local.west_initiator_cidr }
+    responder = { az_key = local.west_responder_az_key, cidr = local.west_responder_cidr }
+  }
+  east_workloads = {
+    initiator = { az_key = local.east_initiator_az_key, cidr = local.east_initiator_cidr }
+    responder = { az_key = local.east_responder_az_key, cidr = local.east_responder_cidr }
+  }
+
+  workload_probe_ingress = {
+    icmp = { description = "ICMP and MTU probes", protocol = "icmp", from_port = -1, to_port = -1 }
+    tcp  = { description = "TCP and iperf3 probes", protocol = "tcp", from_port = 5201, to_port = 5201 }
+    udp  = { description = "UDP, MTU, and iperf3 probes", protocol = "udp", from_port = 5201, to_port = 5201 }
+  }
 }

@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 022
+
+dnf install -y \
+  amazon-ssm-agent \
+  coreutils \
+  curl \
+  grep \
+  gzip \
+  iperf3 \
+  iproute \
+  iputils \
+  jq \
+  procps-ng \
+  python3 \
+  tcpdump
+systemctl enable --now amazon-ssm-agent
+
+install -d -m 0755 /opt/envelope
+agent_tmp="$(mktemp /opt/envelope/.e2e-agent.XXXXXX)"
+trap 'rm -f "$agent_tmp"' EXIT
+base64 --decode >"$agent_tmp" <<'ENVELOPE_E2E_AGENT'
+${agent_base64}
+ENVELOPE_E2E_AGENT
+chown root:root "$agent_tmp"
+chmod 0755 "$agent_tmp"
+mv -f "$agent_tmp" /opt/envelope/e2e-agent
+trap - EXIT
+
+cat >/etc/systemd/system/envelope-e2e-agent-tcp.service <<'UNIT'
+[Unit]
+Description=Envelope E2E TCP responder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/opt/envelope/e2e-agent serve --protocol tcp --bind 0.0.0.0 --port 5201 --timeout 21600 --max-messages 100000
+ExecStartPost=/bin/sh -c 'for attempt in $(seq 1 50); do ss -H -lnt "sport = :5201" | grep -q . && exit 0; sleep 0.1; done; exit 1'
+Restart=always
+RestartSec=1
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat >/etc/systemd/system/envelope-e2e-agent-udp.service <<'UNIT'
+[Unit]
+Description=Envelope E2E UDP responder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/opt/envelope/e2e-agent serve --protocol udp --bind 0.0.0.0 --port 5201 --timeout 21600 --max-messages 100000
+ExecStartPost=/bin/sh -c 'for attempt in $(seq 1 50); do ss -H -lnu "sport = :5201" | grep -q . && exit 0; sleep 0.1; done; exit 1'
+Restart=always
+RestartSec=1
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now envelope-e2e-agent-tcp.service envelope-e2e-agent-udp.service
+systemctl is-active --quiet envelope-e2e-agent-tcp.service
+systemctl is-active --quiet envelope-e2e-agent-udp.service

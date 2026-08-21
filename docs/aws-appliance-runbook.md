@@ -1,6 +1,6 @@
 # AWS Appliance Deployment Runbook
 
-This runbook operates the `example/terraform` acceptance profile. It is not a production HA design: each region has exactly one Envelope process and one GWLB target. GWLB cross-zone load balancing lets every configured endpoint AZ reach that sole process, but process restart or replacement discards flow context and promises recovery only for new flows.
+This runbook operates the `example/terraform` acceptance profile. It is not a production HA design: each region has exactly one Envelope process, one GWLB target, and one GWLBE in that region's initiator AZ. The regional GWLB spans its configured service subnets and uses cross-zone load balancing to reach the sole process, but process restart or replacement discards flow context and promises recovery only for new flows. The complete live traffic procedure is in the [two-region E2E runbook](aws-two-region-e2e-runbook.md).
 
 ## Security Boundary
 
@@ -28,7 +28,7 @@ Create a narrowly scoped Tailscale OAuth client that can read the policy, list/d
 
 ## Tailnet Policy
 
-Preconfigure policy before creating AWS resources. The required shape is equivalent to:
+Preconfigure policy in the `_lbr_sandbox` Tailnet before creating AWS resources. Do not run this acceptance profile in any other Tailnet. The required shape is equivalent to:
 
 ```json
 {
@@ -80,6 +80,25 @@ Create `.run/<run>/config.json` mode 0600. It contains references, never credent
   "artifact_manifest": "../../dist/manifest.json",
   "instance_type": "t3.medium",
   "test_instance_type": "t3.micro",
+  "cost": {
+    "estimated_fixed_hourly_usd": 1.50,
+    "approved_max_fixed_hourly_usd": 2.00
+  },
+  "e2e_load_profile": {
+    "profile_id": "envelope-e2e-v1",
+    "approved_at": "<UTC-RFC3339-APPROVED-BEFORE-APPLY>",
+    "safe_inner_mtu": 1280,
+    "maximum_tcp_mss": 1240,
+    "sustained_tcp_duration_seconds": 15,
+    "minimum_sustained_tcp_bytes": 1048576,
+    "iperf_duration_seconds": 10,
+    "minimum_throughput_mbps": 5.0,
+    "concurrent_duration_seconds": 15,
+    "concurrent_tcp_flows": 4,
+    "concurrent_udp_flows": 4,
+    "maximum_udp_loss_percent": 1.0,
+    "maximum_p99_latency_ms": 250.0
+  },
   "backend": {
     "bucket": "operator-owned-terraform-state",
     "region": "us-west-2",
@@ -120,7 +139,7 @@ Create `.run/<run>/config.json` mode 0600. It contains references, never credent
     }
   },
   "tailnet": {
-    "name": "example.com",
+    "name": "_lbr_sandbox",
     "tag": "tag:envelope-acceptance",
     "tag_owners": ["group:network-admins"],
     "snat_subnet_routes": false,
@@ -129,7 +148,9 @@ Create `.run/<run>/config.json` mode 0600. It contains references, never credent
 }
 ```
 
-Use real explicit AL2023 AMI IDs. The placeholders above intentionally fail validation. Expiry must be 30 minutes to 24 hours in the future for prepare/plan/apply operations. Cleanup and janitor recovery safely load expired configurations after validating the durable manifest identity. This JSON is the sole protected input source: the runner derives every Terraform variable and every Tailnet policy prefix from it. Do not create a separate network tfvars file. Local return and delivery roles must be a non-empty disjoint exact partition of local workload subnets; remote roles are derived from the opposite workload subnet set and cannot diverge.
+Use real explicit AL2023 AMI IDs and replace the load-profile approval timestamp with a canonical UTC timestamp recorded only after an operator approves every threshold. The placeholders above intentionally fail validation. Approval must precede the saved-plan apply claim; the profile is embedded verbatim in the plan and evidence. Expiry must be 30 minutes to 24 hours in the future for prepare/plan/apply operations. Cleanup and janitor recovery safely load expired configurations after validating the durable manifest identity. This JSON is the sole protected input source: the runner derives every Terraform variable and every Tailnet policy prefix from it. Do not create a separate network tfvars file.
+
+The four lane roles in this example are west initiator `172.16.0.0/24`, west responder `172.16.1.0/24`, east responder `172.17.0.0/24`, and east initiator `172.17.1.0/24`. At each site, `gwlb_return_cidrs` identifies its singleton initiator and `local_delivery_cidrs` identifies its singleton responder. These roles must be a non-empty disjoint exact partition of local workload subnets; remote roles are derived from the opposite workload subnet set and cannot diverge.
 
 ## Preflight And Prepare
 
@@ -165,7 +186,7 @@ The runner resolves the config, run directory, backend file, Terraform directory
 
 Do not use `-target`. The plan gate rejects unplanned deletion/replacement, a target count other than one per region, disabled cross-zone behavior, wrong fixed-cost counts, public appliance IPs, missing route domains, artifact digest drift, missing TTL ownership, or credential material in MIME.
 
-The reviewed fixed profile has two VPCs, two NAT gateways/EIPs, two GWLBs, one GWLBE per configured AZ, two appliance instances, two test instances, one artifact bucket, and one target per region. `cost_profile` records the count, pre-approved estimate, TTL, and excluded variable charges. Review current AWS prices before every apply.
+The reviewed fixed profile has two VPCs, two NAT gateways/EIPs, two GWLBs, one initiator-AZ GWLBE per region, two appliance instances, four workload instances, one artifact bucket, two managed VPC Flow Logs/log groups, and one target per region. The current configuration estimate is `$1.50/hour` with a `$2.00/hour` approved ceiling. `cost_profile` records the counts, pre-approved estimate, TTL, and excluded variable data processing, transfer, logging, request, tax, and storage charges. Review current AWS prices before every apply.
 
 ## Readiness
 
@@ -176,7 +197,7 @@ python3 ./scripts/aws_appliance.py --config .run/<run>/config.json wait \
   --deployment-file .run/<run>/deployment.json --timeout-seconds 900
 ```
 
-The runner requires both instances to be SSM-online, bounded cloud-init completion, active `tailscaled`, host-network and Envelope units, Running Tailscale v1.80.x kernel-TUN state, approved local advertisements, accepted remote table-52 routes, valid artifact checksum, HTTP health, and exactly one healthy target in each target group. After cloud-init, SSM polls the complete on-host contract for at most 120 seconds so transient service activation is not misclassified as failure. It retries SSM's eventually consistent invocation lookup and confirms cancellation before returning from a local timeout. Failure launches the separately bounded redacted diagnostic collector for both regions and records command IDs plus bounded redacted output.
+The runner requires all six EC2 nodes (two appliances and four role-keyed workloads) to be SSM-online with bounded cloud-init completion. Both appliances must also have active `tailscaled`, host-network and Envelope units, Running Tailscale v1.80.x kernel-TUN state, approved local advertisements, accepted remote table-52 routes, valid artifact checksums, HTTP health, and exactly one healthy target in each target group. After cloud-init, SSM polls the complete on-host contract for at most 120 seconds so transient service activation is not misclassified as failure. It retries SSM's eventually consistent invocation lookup and confirms cancellation before returning from a local timeout. Failure launches the separately bounded redacted diagnostic collector for both regions and records command IDs plus bounded redacted output.
 
 On-host bootstrap downloads the exact S3 object, verifies SHA-256, installs atomically, and keeps Envelope stopped on mismatch. Persistent host setup disables firewalld/native nft objects, requires executable `/usr/sbin/nft`, selects legacy iptables/ip6tables, persists `/etc/sysctl.d/90-envelope.conf`, explicitly applies only owned current-interface settings, and overrides AL2023's per-interface `rp_filter=2` wildcard so udev keeps the dynamically created Envelope TUN disabled. It also creates the sole filter and mangle `FORWARD` jumps plus exact four-direction MSS contracts. `envelope.service` runs as an unprivileged user with only `CAP_NET_ADMIN` and `CAP_NET_RAW`, starts after network/Tailscale/host setup, and restarts on failure.
 
@@ -252,6 +273,7 @@ The non-live gates are:
 ```bash
 TERRAFORM_BIN=/approved/path/to/terraform-1.10.5 ./scripts/test_terraform.sh
 python3 scripts/test_aws_appliance.py
+python3 scripts/test_aws_two_region_e2e.py
 python3 scripts/test_terraform_contract.py
 python3 scripts/test_artifacts.py
 python3 scripts/secret_scan.py --root .
@@ -259,6 +281,7 @@ go test ./...
 go test -race ./...
 go vet ./...
 openspec validate envelope-aws-appliance-deployment --strict
+openspec validate envelope-two-region-e2e --strict
 ```
 
 `test_terraform.sh` copies only an explicit source/template/module/test allowlist into a disposable directory before running fmt, clean backend-disabled init, validate, and the real refresh-disabled mocked plan. It never copies or discovers legacy tfvars/state. If `TERRAFORM_BIN` is omitted and exact 1.10.5 is unavailable, it downloads a platform-specific archive and checks a pinned SHA-256 without changing user configuration. `secret_scan.py` obtains its default file list from `git ls-files --exclude-standard`; therefore it does not open ignored legacy tfvars/state/backups. Supply only approved redacted artifacts with `--extra`.

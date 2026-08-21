@@ -40,6 +40,24 @@ VALID_POLICY = {
 }
 
 
+def e2e_load_profile_document() -> dict:
+    return {
+        "profile_id": "fixture-load-v1",
+        "approved_at": "2020-01-01T00:00:00Z",
+        "safe_inner_mtu": 1280,
+        "maximum_tcp_mss": 1240,
+        "sustained_tcp_duration_seconds": 3,
+        "minimum_sustained_tcp_bytes": 1024,
+        "iperf_duration_seconds": 3,
+        "minimum_throughput_mbps": 1.0,
+        "concurrent_duration_seconds": 3,
+        "concurrent_tcp_flows": 2,
+        "concurrent_udp_flows": 2,
+        "maximum_udp_loss_percent": 1.0,
+        "maximum_p99_latency_ms": 100.0,
+    }
+
+
 def config_document(architecture: str = "amd64", *, expired: bool = False) -> dict:
     expiry = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=-1 if expired else 2)
 
@@ -67,6 +85,7 @@ def config_document(architecture: str = "amd64", *, expired: bool = False) -> di
         "artifact_manifest": "../../dist/manifest.json",
         "instance_type": "m7g.medium" if architecture == "arm64" else "t3.medium",
         "test_instance_type": "t4g.micro" if architecture == "arm64" else "t3.micro",
+        "e2e_load_profile": e2e_load_profile_document(),
         "backend": {
             "bucket": "operator-backend",
             "region": "us-west-2",
@@ -106,6 +125,96 @@ def make_config(tmp: pathlib.Path, architecture: str = "amd64", *, expired: bool
     return appliance.RunConfig.load(path, enforce_future_expiry=not expired)
 
 
+def aws_preflight_summary_document(architecture: str = "amd64") -> dict:
+    instance_type = "m7g.medium" if architecture == "arm64" else "t3.medium"
+    workload_type = "t4g.micro" if architecture == "arm64" else "t3.micro"
+    regions = {}
+    for site, region, zones in (
+        ("west", "us-west-2", ("us-west-2a", "us-west-2b")),
+        ("east", "us-east-1", ("us-east-1a", "us-east-1b")),
+    ):
+        instance_vcpus = {"appliance": 2, "workload": 2}
+        quotas = {}
+        for gate, (service, quota_code, quota_name) in sorted(appliance.AWS_REGIONAL_QUOTA_CONTRACT.items()):
+            required = 6 if gate == "standard-vcpus" else 1
+            quotas[gate] = {
+                "service": service,
+                "quota_name": quota_name,
+                "quota_code": quota_code,
+                "source": "servicequotas:GetServiceQuota",
+                "limit": 100,
+                "used": 0,
+                "required": required,
+                "available": 100,
+            }
+        for gate, name in appliance.AWS_ELBV2_ACCOUNT_LIMIT_CONTRACT.items():
+            quotas[gate] = {
+                "service": "elasticloadbalancing",
+                "quota_name": name,
+                "quota_code": None,
+                "source": "elbv2:DescribeAccountLimits",
+                "limit": 100,
+                "used": 0,
+                "required": 1,
+                "available": 100,
+            }
+        for gate, (service, name, limit, source) in appliance.AWS_STRUCTURAL_CAPACITY_CONTRACT.items():
+            quotas[gate] = {
+                "service": service,
+                "quota_name": name,
+                "quota_code": None,
+                "source": source,
+                "limit": limit,
+                "used": 0,
+                "required": 1,
+                "available": limit,
+            }
+        offerings = {f"{instance_type}@{zones[0]}", *(f"{workload_type}@{zone}" for zone in zones)}
+        regions[region] = {
+            "site": site,
+            "planned_instances": 3,
+            "instance_vcpus": instance_vcpus,
+            "instance_offerings": sorted(offerings),
+            "ssm_kms_key_sha256": hashlib.sha256(
+                f"arn:aws:kms:{region}:123456789012:key/{site}".encode()
+            ).hexdigest(),
+            "quotas": quotas,
+        }
+    return {
+        "schema": 1,
+        "account_id": "123456789012",
+        "principal": {"kind": "assumed-role", "policy_source_sha256": "d" * 64},
+        "actions": {
+            "operator": list(appliance.AWS_OPERATOR_ACTIONS),
+            "operator_decision": "allowed",
+            "flow_log_delivery_role": list(appliance.AWS_FLOW_LOG_DELIVERY_ACTIONS),
+        },
+        "regions": regions,
+        "global_quotas": {
+            "s3-artifact-buckets": {
+                "service": "s3",
+                "quota_name": "General purpose buckets",
+                "quota_code": "L-DC2B2D3D",
+                "source": "servicequotas:GetServiceQuota",
+                "limit": 100,
+                "used": 0,
+                "required": 1,
+                "available": 100,
+            }
+        },
+        "iam_capacity": {
+            gate: {
+                "source": "iam:GetAccountSummary",
+                "limit": 100,
+                "used": 0,
+                "required": required,
+                "available": 100,
+            }
+            for gate, (_, _, required) in appliance.AWS_IAM_CAPACITY_CONTRACT.items()
+        },
+    }
+
+
 def artifact_identity(root: pathlib.Path, architecture: str = "amd64") -> dict:
     return {
         "architecture": architecture,
@@ -117,7 +226,108 @@ def artifact_identity(root: pathlib.Path, architecture: str = "amd64") -> dict:
         "manifest_sha256": "c" * 64,
         "manifest_path": str((root / "artifact-manifest.json").resolve()),
         "path": str((root / f"envelope-linux-{architecture}").resolve()),
+        "aws_preflight": aws_preflight_summary_document(architecture),
     }
+
+
+def mark_manifest_applied(manifest: dict) -> None:
+    manifest["saved_plan"] = {
+        "apply_started": True,
+        "applied": True,
+        "applied_at": "2026-08-20T12:00:00Z",
+    }
+
+
+def mark_manifest_apply_started(manifest: dict) -> None:
+    manifest["saved_plan"] = {"apply_started": True, "applied": False}
+    manifest["apply_claimed_at"] = "2026-08-20T12:00:00Z"
+
+
+def deployment_document() -> dict:
+    def workload(site, instance_id, private_ip, az_key, availability_zone, cidr):
+        return {
+            "route_table_id": f"rtb-{site}-{az_key}",
+            "cidr": cidr,
+            "subnet_id": f"subnet-{site}-{az_key}",
+            "availability_zone": availability_zone,
+            "az_key": az_key,
+            "private_ip": private_ip,
+            "instance_id": instance_id,
+        }
+
+    return {
+        "gwlb_target_group_arns": {
+            "sensitive": False,
+            "type": ["map", "string"],
+            "value": {
+                "east": "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/east/fixture",
+                "west": "arn:aws:elasticloadbalancing:us-west-2:123456789012:targetgroup/west/fixture",
+            },
+        },
+        "workload_instances": {
+            "sensitive": False,
+            "type": ["object", {}],
+            "value": {
+                "east": {
+                    "responder": workload(
+                        "east",
+                        "i-workload-east-responder",
+                        "10.20.2.10",
+                        "b",
+                        "us-east-1b",
+                        "10.20.2.0/24",
+                    ),
+                    "initiator": workload(
+                        "east",
+                        "i-workload-east-initiator",
+                        "10.20.1.10",
+                        "a",
+                        "us-east-1a",
+                        "10.20.1.0/24",
+                    ),
+                },
+                "west": {
+                    "responder": workload(
+                        "west",
+                        "i-workload-west-responder",
+                        "10.10.2.10",
+                        "b",
+                        "us-west-2b",
+                        "10.10.2.0/24",
+                    ),
+                    "initiator": workload(
+                        "west",
+                        "i-workload-west-initiator",
+                        "10.10.1.10",
+                        "a",
+                        "us-west-2a",
+                        "10.10.1.0/24",
+                    ),
+                },
+            },
+        },
+        "instance_ids": {
+            "sensitive": False,
+            "type": ["map", "string"],
+            "value": {"east": "i-appliance-east", "west": "i-appliance-west"},
+        },
+    }
+
+
+def owned_residual(config: appliance.RunConfig, arn: str) -> dict[str, str]:
+    return {
+        "arn": arn,
+        "region": arn.split(":", 5)[3],
+        "run_id": config.run_id,
+        "expires_at": config.expires_at,
+    }
+
+
+def owned_tag_list(config: appliance.RunConfig) -> list[dict[str, str]]:
+    return [
+        {"Key": "EnvelopeRun", "Value": config.run_id},
+        {"Key": "ExpiresAt", "Value": config.expires_at},
+    ]
 
 
 class ConfigAndPathTest(unittest.TestCase):
@@ -140,6 +350,9 @@ class ConfigAndPathTest(unittest.TestCase):
             parameters = appliance.intended_ssm_parameters(config, "123456789012")
             values = appliance.terraform_variables(config, artifact, parameters)
             self.assertEqual(values["west_azs"], config.sites["west"]["azs"])
+            self.assertEqual(config.raw["e2e_load_profile"], e2e_load_profile_document())
+            self.assertEqual(values["e2e_load_profile"], config.raw["e2e_load_profile"])
+            self.assertIsNot(values["e2e_load_profile"], config.raw["e2e_load_profile"])
             self.assertEqual(
                 values["envelope_remote_tailnet_cidrs"]["west"],
                 [config.sites["east"]["workload_subnet_cidrs"][key] for key in ("a", "b")],
@@ -157,6 +370,171 @@ class ConfigAndPathTest(unittest.TestCase):
             path.write_text(json.dumps(document))
             with self.assertRaisesRegex(appliance.LifecycleError, "unsupported fields"):
                 appliance.RunConfig.load(path)
+
+    def test_e2e_load_profile_is_required_and_has_an_exact_shape(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            cases = []
+            missing_object = config_document()
+            missing_object.pop("e2e_load_profile")
+            cases.append(("missing object", missing_object, "required object"))
+            missing_field = config_document()
+            missing_field["e2e_load_profile"].pop("maximum_p99_latency_ms")
+            cases.append(("missing field", missing_field, "every required"))
+            unsupported = config_document()
+            unsupported["e2e_load_profile"]["invented_threshold"] = 1
+            cases.append(("unsupported field", unsupported, "unsupported fields"))
+            invalid_id = config_document()
+            invalid_id["e2e_load_profile"]["profile_id"] = "invalid profile"
+            cases.append(("invalid profile id", invalid_id, "profile_id"))
+
+            for index, (name, document, message) in enumerate(cases):
+                with self.subTest(name=name):
+                    path = root / f"shape-{index}.json"
+                    path.write_text(json.dumps(document))
+                    with self.assertRaisesRegex(appliance.LifecycleError, message):
+                        appliance.RunConfig.load(path)
+
+    def test_e2e_load_profile_rejects_bool_nonfinite_and_out_of_bounds_values(self):
+        invalid_values = (
+            ("safe_inner_mtu", True),
+            ("safe_inner_mtu", 1279),
+            ("maximum_tcp_mss", 535),
+            ("maximum_tcp_mss", 1241),
+            ("sustained_tcp_duration_seconds", 2),
+            ("sustained_tcp_duration_seconds", 121),
+            ("minimum_sustained_tcp_bytes", 0),
+            ("minimum_sustained_tcp_bytes", 1_000_000_001),
+            ("iperf_duration_seconds", 2),
+            ("iperf_duration_seconds", 121),
+            ("concurrent_duration_seconds", 2),
+            ("concurrent_duration_seconds", 121),
+            ("concurrent_tcp_flows", 0),
+            ("concurrent_tcp_flows", 33),
+            ("concurrent_udp_flows", 0),
+            ("concurrent_udp_flows", 33),
+            ("minimum_throughput_mbps", True),
+            ("minimum_throughput_mbps", float("nan")),
+            ("minimum_throughput_mbps", 0.0009),
+            ("minimum_throughput_mbps", 100_000.1),
+            ("maximum_udp_loss_percent", float("inf")),
+            ("maximum_udp_loss_percent", -0.1),
+            ("maximum_udp_loss_percent", 100.1),
+            ("maximum_p99_latency_ms", float("-inf")),
+            ("maximum_p99_latency_ms", 0.0),
+            ("maximum_p99_latency_ms", 60_000.1),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for index, (field, value) in enumerate(invalid_values):
+                with self.subTest(field=field, value=value):
+                    document = config_document()
+                    document["e2e_load_profile"][field] = value
+                    path = root / f"bound-{index}.json"
+                    path.write_text(json.dumps(document))
+                    with self.assertRaisesRegex(appliance.LifecycleError, re.escape(f"e2e_load_profile.{field}")):
+                        appliance.RunConfig.load(path)
+
+    def test_e2e_load_profile_accepts_inclusive_minimum_and_maximum_bounds(self):
+        profiles = []
+        minimums = e2e_load_profile_document()
+        minimums.update(
+            {
+                "maximum_tcp_mss": 536,
+                "minimum_sustained_tcp_bytes": 1,
+                "minimum_throughput_mbps": 0.001,
+                "concurrent_tcp_flows": 1,
+                "concurrent_udp_flows": 1,
+                "maximum_udp_loss_percent": 0.0,
+                "maximum_p99_latency_ms": 0.001,
+            }
+        )
+        profiles.append(minimums)
+        maximums = e2e_load_profile_document()
+        maximums.update(
+            {
+                "sustained_tcp_duration_seconds": 120,
+                "minimum_sustained_tcp_bytes": 1_000_000_000,
+                "iperf_duration_seconds": 120,
+                "minimum_throughput_mbps": 100_000.0,
+                "concurrent_duration_seconds": 120,
+                "concurrent_tcp_flows": 32,
+                "concurrent_udp_flows": 32,
+                "maximum_udp_loss_percent": 100.0,
+                "maximum_p99_latency_ms": 60_000.0,
+            }
+        )
+        profiles.append(maximums)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for index, profile in enumerate(profiles):
+                with self.subTest(index=index):
+                    document = config_document()
+                    document["e2e_load_profile"] = profile
+                    path = root / f"inclusive-{index}.json"
+                    path.write_text(json.dumps(document))
+                    loaded = appliance.RunConfig.load(path)
+                    self.assertEqual(loaded.raw["e2e_load_profile"], profile)
+
+    def test_e2e_load_profile_approval_is_canonical_and_precedes_new_run_load(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for index, approved_at in enumerate(
+                (
+                    "2020-01-01T00:00:00+00:00",
+                    "2020-01-01 00:00:00Z",
+                    "2020-01-01T00:00:00.000Z",
+                )
+            ):
+                with self.subTest(approved_at=approved_at):
+                    document = config_document()
+                    document["e2e_load_profile"]["approved_at"] = approved_at
+                    path = root / f"timestamp-{index}.json"
+                    path.write_text(json.dumps(document))
+                    with self.assertRaisesRegex(appliance.LifecycleError, "canonical UTC RFC3339 ending Z"):
+                        appliance.RunConfig.load(path)
+
+            future = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)).replace(
+                microsecond=0
+            ).isoformat().replace("+00:00", "Z")
+            document = config_document()
+            document["e2e_load_profile"]["approved_at"] = future
+            path = root / "future.json"
+            path.write_text(json.dumps(document))
+            with self.assertRaisesRegex(appliance.LifecycleError, "must not be later"):
+                appliance.RunConfig.load(path)
+            recovered = appliance.RunConfig.load(path, enforce_future_expiry=False)
+            self.assertEqual(recovered.raw["e2e_load_profile"]["approved_at"], future)
+
+    def test_e2e_load_profile_is_bound_to_config_manifest_and_runtime_variables(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            original_document = config_document()
+            original_path = root / "original.json"
+            original_path.write_text(json.dumps(original_document))
+            original = appliance.RunConfig.load(original_path)
+
+            changed_document = copy.deepcopy(original_document)
+            changed_document["e2e_load_profile"]["profile_id"] = "fixture-load-v2"
+            changed_path = root / "changed.json"
+            changed_path.write_text(json.dumps(changed_document))
+            changed = appliance.RunConfig.load(changed_path)
+            self.assertNotEqual(original.config_identity, changed.config_identity)
+
+            artifact = artifact_identity(root)
+            manifest = appliance.new_manifest(original, artifact, "123456789012")
+            with self.assertRaisesRegex(appliance.LifecycleError, "configuration identity"):
+                appliance.validate_manifest(manifest, changed)
+
+            tampered = copy.deepcopy(manifest)
+            tampered["terraform_variables"]["e2e_load_profile"]["concurrent_tcp_flows"] = 3
+            with self.assertRaisesRegex(appliance.LifecycleError, "load profile differs"):
+                appliance.validate_manifest(tampered, original)
+            self.assertEqual(original.raw["e2e_load_profile"]["concurrent_tcp_flows"], 2)
+            store = appliance.ManifestStore(original, BackendAWS(original), root / "run")
+            with self.assertRaisesRegex(appliance.LifecycleError, "durable Terraform variable set"):
+                appliance.write_runtime_variables(original, store, tampered, artifact)
 
     def test_relative_artifact_is_resolved_before_cwd_changes(self):
         with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as other:
@@ -354,12 +732,14 @@ resource /* separator */ "aws_lb_target_group_attachment" "west" {{
                 self.remote = b""
                 self.etag = '"manifest-0"'
                 self.version = 0
+                self.manifests = []
 
             def json(self, args, *, region=None):
                 if args[1] == "put-object":
                     if "--if-match" in args and args[args.index("--if-match") + 1] != self.etag:
                         raise appliance.CommandError(args, 412, "PreconditionFailed")
                     self.remote = pathlib.Path(args[args.index("--body") + 1]).read_bytes()
+                    self.manifests.append(json.loads(self.remote))
                     self.version += 1
                     self.etag = f'"manifest-{self.version}"'
                     return {"ETag": self.etag}
@@ -376,6 +756,16 @@ resource /* separator */ "aws_lb_target_group_attachment" "west" {{
                 inner.calls.append((args, env, cwd))
                 if len(args) > 1 and args[1] == "apply":
                     raise appliance.LifecycleError("injected runner loss after apply boundary")
+                return ""
+
+        class SuccessRunner:
+            def __init__(self):
+                self.calls = []
+
+            def run(inner, args, *, env=None, cwd=None, input_text=None):
+                inner.calls.append((args, env, cwd))
+                if len(args) > 1 and args[1] == "output":
+                    return json.dumps(deployment_document())
                 return ""
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -418,6 +808,7 @@ resource /* separator */ "aws_lb_target_group_attachment" "west" {{
             self.assertTrue(persisted["tailnet"]["nodes_expected"])
             self.assertTrue(persisted["saved_plan"]["apply_started"])
             self.assertNotIn("apply_claimed_at", persisted)
+            self.assertNotIn("applied_at", persisted["saved_plan"])
             with mock.patch.object(
                 appliance,
                 "materialize_durable_terraform_source",
@@ -425,6 +816,43 @@ resource /* separator */ "aws_lb_target_group_attachment" "west" {{
             ):
                 with self.assertRaisesRegex(appliance.LifecycleError, "exactly once"):
                     appliance.terraform_apply(config, aws, runner, store.run_dir, terraform_dir, plan)
+
+            success_aws = ManifestAWS()
+            success_store = appliance.ManifestStore(config, success_aws, root / "success-run")
+            success_plan = success_store.run_dir / "apply.tfplan"
+            success_store.run_dir.mkdir(parents=True)
+            success_plan.write_bytes(b"reviewed-plan")
+            success_manifest = appliance.new_manifest(config, artifact_identity(root), "123456789012")
+            success_manifest["saved_plan"] = {
+                "path": str(success_plan.resolve()),
+                "sha256": hashlib.sha256(success_plan.read_bytes()).hexdigest(),
+                "replacement": None,
+                "source": source_identity,
+                "apply_started": False,
+                "applied": False,
+            }
+            success_manifest["terraform_source"] = source_identity
+            success_manifest["phase"] = "planned"
+            success_store.write(success_manifest)
+            with mock.patch.object(appliance.BackendValidator, "validate"), mock.patch.object(
+                appliance,
+                "materialize_durable_terraform_source",
+                return_value=(terraform_dir, source_identity),
+            ):
+                appliance.terraform_apply(
+                    config,
+                    success_aws,
+                    SuccessRunner(),
+                    success_store.run_dir,
+                    terraform_dir,
+                    success_plan,
+                )
+            successful = success_store.load_local()
+            claimed = next(value for value in success_aws.manifests if value["phase"] == "apply_claimed")
+            self.assertEqual(successful["phase"], "applied")
+            self.assertTrue(successful["saved_plan"]["applied"])
+            self.assertEqual(successful["saved_plan"]["applied_at"], claimed["apply_claimed_at"])
+            self.assertNotIn("apply_claimed_at", successful)
 
     def test_no_drift_runner_uses_durable_inputs_and_maps_exit_two_to_drift(self):
         class CaptureRunner:
@@ -497,7 +925,7 @@ class FakeHTTP:
         path = urllib.parse.urlparse(url).path
         self.requests.append((method, path, body))
         if path.endswith("/oauth/token"):
-            return 200, json.dumps({"access_token": "fixture-bearer"}).encode()
+            return 200, json.dumps({"access_token": "fixture-bearer", "expires_in": 3600}).encode()
         if path.endswith("/acl"):
             return 200, json.dumps(self.policy).encode()
         if path.endswith("/devices") and method == "GET":
@@ -517,6 +945,7 @@ class BackendAWS:
         self.versioning = "Enabled"
         self.algorithm = "aws:kms"
         self.key = config.backend["kms_key_arn"]
+        self.bucket_key_enabled = False
         self.public = True
         self.existing: set[str] = set()
         self.versions: dict[str, list[dict[str, str]]] = {}
@@ -578,7 +1007,7 @@ class BackendAWS:
                     "Effect": "Allow",
                     "Principal": {"AWS": principal},
                     "Action": list(appliance.BACKEND_KMS_ACTIONS),
-                    "Resource": self.key,
+                    "Resource": "*",
                 }
             ],
         }
@@ -599,7 +1028,8 @@ class BackendAWS:
                             "ApplyServerSideEncryptionByDefault": {
                                 "SSEAlgorithm": self.algorithm,
                                 "KMSMasterKeyID": self.key,
-                            }
+                            },
+                            "BucketKeyEnabled": self.bucket_key_enabled,
                         }
                     ]
                 }
@@ -667,11 +1097,2029 @@ class MetadataAWS:
                     {
                         "InstanceType": selected,
                         "ProcessorInfo": {"SupportedArchitectures": self.type_architectures},
+                        "VCpuInfo": {"DefaultVCpus": 2},
                     }
                     for selected in args[3:]
                 ]
             }
         raise AssertionError(args)
+
+
+class CapabilityAWS:
+    def __init__(self, config: appliance.RunConfig):
+        self.config = config
+        self.denied_action: str | None = None
+        self.denied_decision = "implicitDeny"
+        self.denied_resource: str | None = None
+        self.low_quota_gate: str | None = None
+        self.low_account_limit_gate: str | None = None
+        self.omitted_quota_gate: str | None = None
+        self.malformed_quota_schema = False
+        self.runtime_kms_decision = "allowed"
+        self.calls: list[tuple[list[str], str | None]] = []
+        self.role_name = "AWSReservedSSO_Envelope_fixture"
+        self.role_arn = (
+            "arn:aws:iam::123456789012:role/aws-reserved/sso.amazonaws.com/us-west-2/"
+            + self.role_name
+        )
+
+    def json(self, args, *, region=None):
+        self.calls.append((list(args), region))
+        service, operation = args[:2]
+        if service == "sts" and operation == "get-caller-identity":
+            return {
+                "Account": "123456789012",
+                "Arn": f"arn:aws:sts::123456789012:assumed-role/{self.role_name}/fixture-session",
+                "UserId": "AROAEXAMPLE:fixture-session",
+            }
+        if service == "iam" and operation == "get-role":
+            return {"Role": {"RoleName": self.role_name, "Arn": self.role_arn}}
+        if service == "iam" and operation == "simulate-custom-policy":
+            action = args[args.index("--action-names") + 1]
+            resource = args[args.index("--resource-arns") + 1]
+            return {
+                "EvaluationResults": [
+                    {
+                        "EvalActionName": action,
+                        "EvalDecision": self.runtime_kms_decision,
+                        "ResourceSpecificResults": [
+                            {
+                                "EvalResourceName": resource,
+                                "EvalResourceDecision": self.runtime_kms_decision,
+                            }
+                        ],
+                    }
+                ],
+                "IsTruncated": False,
+            }
+        if service == "iam" and operation == "simulate-principal-policy":
+            start = args.index("--action-names") + 1
+            end = args.index("--resource-arns")
+            resource_start = end + 1
+            resource_end = args.index("--context-entries") if "--context-entries" in args else len(args)
+            resources = args[resource_start:resource_end]
+            return {
+                "EvaluationResults": [
+                    {
+                        "EvalActionName": action,
+                        "EvalDecision": (
+                            self.denied_decision
+                            if action == self.denied_action and self.denied_resource is None
+                            else "allowed"
+                        ),
+                        "ResourceSpecificResults": [
+                            {
+                                "EvalResourceName": resource,
+                                "EvalResourceDecision": (
+                                    self.denied_decision
+                                    if action == self.denied_action
+                                    and (self.denied_resource is None or resource == self.denied_resource)
+                                    else "allowed"
+                                ),
+                            }
+                            for resource in resources
+                        ],
+                    }
+                    for action in args[start:end]
+                ],
+                "IsTruncated": False,
+            }
+        if service == "iam" and operation == "get-account-summary":
+            return {
+                "SummaryMap": {
+                    "Roles": 10,
+                    "RolesQuota": 100,
+                    "InstanceProfiles": 8,
+                    "InstanceProfilesQuota": 100,
+                }
+            }
+        if service == "service-quotas" and operation == "get-service-quota":
+            if self.malformed_quota_schema:
+                return {"Quota": []}
+            requested_service = args[args.index("--service-code") + 1]
+            requested_code = args[args.index("--quota-code") + 1]
+            contracts = {
+                **appliance.AWS_REGIONAL_QUOTA_CONTRACT,
+                **appliance.AWS_GLOBAL_QUOTA_CONTRACT,
+            }
+            matches = [
+                (gate, quota_service, code, name)
+                for gate, (quota_service, code, name) in contracts.items()
+                if quota_service == requested_service and code == requested_code
+            ]
+            if len(matches) != 1:
+                raise AssertionError((args, matches))
+            gate, quota_service, code, name = matches[0]
+            if gate == self.omitted_quota_gate:
+                return {}
+            return {
+                "Quota": {
+                    "ServiceCode": quota_service,
+                    "QuotaName": name,
+                    "QuotaCode": code,
+                    "QuotaArn": (
+                        f"arn:{self.role_arn.split(':', 2)[1]}:servicequotas:{region}:"
+                        f"123456789012:{quota_service}/{code}"
+                    ),
+                    "Value": 0 if gate == self.low_quota_gate else 100,
+                    "GlobalQuota": gate in appliance.AWS_GLOBAL_QUOTA_CONTRACT,
+                }
+            }
+        if service == "ec2" and operation == "describe-instance-type-offerings":
+            site = next(site for site in ("west", "east") if self.config.sites[site]["region"] == region)
+            return {
+                "InstanceTypeOfferings": [
+                    {"InstanceType": instance_type, "Location": zone}
+                    for instance_type in (
+                        self.config.raw["instance_type"],
+                        self.config.raw["test_instance_type"],
+                    )
+                    for zone in self.config.sites[site]["azs"].values()
+                ]
+            }
+        if service == "elbv2" and operation == "describe-account-limits":
+            return {
+                "Limits": [
+                    {
+                        "Name": name,
+                        "Max": "0" if gate == self.low_account_limit_gate else "100",
+                    }
+                    for gate, name in appliance.AWS_ELBV2_ACCOUNT_LIMIT_CONTRACT.items()
+                ]
+            }
+        if service == "kms" and operation == "describe-key":
+            key_arn = args[args.index("--key-id") + 1]
+            return {
+                "KeyMetadata": {
+                    "Arn": key_arn,
+                    "Enabled": True,
+                    "KeyState": "Enabled",
+                    "KeyUsage": "ENCRYPT_DECRYPT",
+                    "KeySpec": "SYMMETRIC_DEFAULT",
+                    "KeyManager": "CUSTOMER",
+                }
+            }
+        if service == "kms" and operation == "get-key-policy":
+            partition = self.role_arn.split(":", 2)[1]
+            root = f"arn:{partition}:iam::123456789012:root"
+            return {
+                "Policy": json.dumps(
+                    {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Effect": "Allow",
+                                "Principal": {"AWS": root},
+                                "Action": "kms:*",
+                                "Resource": "*",
+                            }
+                        ],
+                    }
+                )
+            }
+        empty_responses = {
+            ("ec2", "describe-vpcs"): {"Vpcs": []},
+            ("ec2", "describe-addresses"): {"Addresses": []},
+            ("ec2", "describe-nat-gateways"): {"NatGateways": []},
+            ("ec2", "describe-vpc-endpoint-service-configurations"): {"ServiceConfigurations": []},
+            ("ec2", "describe-instances"): {"Reservations": []},
+            ("elbv2", "describe-load-balancers"): {"LoadBalancers": []},
+            ("elbv2", "describe-target-groups"): {"TargetGroups": []},
+            ("logs", "describe-log-groups"): {"logGroups": []},
+            ("s3api", "list-buckets"): {"Buckets": []},
+        }
+        if (service, operation) in empty_responses:
+            return copy.deepcopy(empty_responses[(service, operation)])
+        raise AssertionError((args, region))
+
+
+def fixture_instance_vcpus(config: appliance.RunConfig) -> dict[str, dict[str, int]]:
+    return {
+        config.sites[site]["region"]: {
+            config.raw["instance_type"]: 2,
+            config.raw["test_instance_type"]: 2,
+        }
+        for site in ("west", "east")
+    }
+
+
+class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
+    def test_success_is_read_only_redacted_deterministic_and_resolves_sso_role_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            aws = CapabilityAWS(config)
+            account_id, summary = appliance.aws_capability_quota_preflight(
+                config, aws, fixture_instance_vcpus(config), artifact_identity(pathlib.Path(temporary))
+            )
+            appliance.validate_aws_preflight_summary(summary, config, account_id)
+
+        self.assertEqual(account_id, "123456789012")
+        self.assertEqual(summary["actions"]["operator"], list(appliance.AWS_OPERATOR_ACTIONS))
+        self.assertEqual(
+            summary["actions"]["flow_log_delivery_role"],
+            list(appliance.AWS_FLOW_LOG_DELIVERY_ACTIONS),
+        )
+        self.assertEqual(set(summary["regions"]), {"us-west-2", "us-east-1"})
+        self.assertEqual(summary["regions"]["us-west-2"]["planned_instances"], 3)
+        self.assertEqual(summary["regions"]["us-west-2"]["quotas"]["standard-vcpus"]["required"], 6)
+        self.assertEqual(
+            summary["regions"]["us-west-2"]["quotas"]["standard-vcpus"]["quota_code"],
+            "L-1216C47A",
+        )
+        self.assertEqual(summary["regions"]["us-west-2"]["quotas"]["target-groups"]["required"], 1)
+        west_quotas = summary["regions"]["us-west-2"]["quotas"]
+        self.assertEqual(
+            west_quotas["gateway-load-balancers"],
+            {
+                "service": "elasticloadbalancing",
+                "quota_name": "gateway-load-balancers",
+                "quota_code": None,
+                "source": "elbv2:DescribeAccountLimits",
+                "limit": 100,
+                "used": 0,
+                "required": 1,
+                "available": 100,
+            },
+        )
+        self.assertEqual(
+            (west_quotas["listeners-per-gateway-load-balancer"]["limit"],
+             west_quotas["listeners-per-gateway-load-balancer"]["required"]),
+            (1, 1),
+        )
+        self.assertEqual(
+            (west_quotas["targets-per-gateway-load-balancer"]["limit"],
+             west_quotas["targets-per-gateway-load-balancer"]["required"]),
+            (300, 1),
+        )
+        self.assertEqual(
+            (west_quotas["flow-logs-per-resource"]["limit"],
+             west_quotas["flow-logs-per-resource"]["used"],
+             west_quotas["flow-logs-per-resource"]["required"]),
+            (10, 0, 1),
+        )
+        self.assertEqual(
+            (west_quotas["vpc-endpoint-services"]["limit"],
+             west_quotas["vpc-endpoint-services"]["used"],
+             west_quotas["vpc-endpoint-services"]["required"]),
+            (50, 0, 1),
+        )
+        self.assertEqual(summary["global_quotas"]["s3-artifact-buckets"]["required"], 1)
+        self.assertEqual(
+            summary["global_quotas"]["s3-artifact-buckets"]["quota_code"],
+            "L-DC2B2D3D",
+        )
+        serialized = json.dumps(summary, sort_keys=True)
+        self.assertNotIn(aws.role_arn, serialized)
+        self.assertNotIn("fixture-session", serialized)
+        self.assertEqual(appliance.redact(serialized), serialized)
+        get_role = next(args for args, _ in aws.calls if args[:2] == ["iam", "get-role"])
+        self.assertEqual(get_role[-1], aws.role_name)
+        pass_role_calls = [
+            args
+            for args, _ in aws.calls
+            if args[:2] == ["iam", "simulate-principal-policy"]
+            and args[args.index("--action-names") + 1 : args.index("--resource-arns")] == ["iam:PassRole"]
+        ]
+        self.assertEqual(len(pass_role_calls), 2)
+        expected_roles = appliance.simulation_pass_role_arns(config, account_id)
+        observed = {}
+        for call in pass_role_calls:
+            context_index = call.index("--context-entries")
+            resources = call[call.index("--resource-arns") + 1 : context_index]
+            context = {
+                entry["ContextKeyName"]: entry["ContextKeyValues"]
+                for entry in json.loads(call[context_index + 1])
+            }
+            observed[context["iam:PassedToService"][0]] = resources
+        self.assertEqual(observed["ec2.amazonaws.com"], sorted(expected_roles[:4]))
+        self.assertEqual(observed["vpc-flow-logs.amazonaws.com"], expected_roles[4:])
+        mutating_verbs = {
+            "create",
+            "delete",
+            "put",
+            "update",
+            "modify",
+            "attach",
+            "detach",
+            "associate",
+            "disassociate",
+            "run",
+            "terminate",
+            "reboot",
+            "send",
+            "cancel",
+        }
+        called_operations = {args[1] for args, _ in aws.calls}
+        self.assertFalse(any(operation.split("-", 1)[0] in mutating_verbs for operation in called_operations))
+        self.assertIn("servicequotas:GetServiceQuota", appliance.AWS_OPERATOR_ACTIONS)
+        self.assertNotIn("servicequotas:ListServiceQuotas", appliance.AWS_OPERATOR_ACTIONS)
+        self.assertFalse(any(args[:2] == ["service-quotas", "list-service-quotas"] for args, _ in aws.calls))
+        global_reads = [
+            (args, region)
+            for args, region in aws.calls
+            if args[:2] == ["service-quotas", "get-service-quota"]
+            and args[args.index("--quota-code") + 1] == "L-DC2B2D3D"
+        ]
+        self.assertEqual([region for _args, region in global_reads], ["us-east-1"])
+        self.assertEqual(
+            [region for args, region in aws.calls if args[:2] == ["s3api", "list-buckets"]],
+            ["us-east-1"],
+        )
+        self.assertEqual(
+            [region for args, region in aws.calls if args[:2] == ["elbv2", "describe-account-limits"]],
+            ["us-west-2", "us-east-1"],
+        )
+        runtime_simulations = [
+            args for args, _region in aws.calls if args[:2] == ["iam", "simulate-custom-policy"]
+        ]
+        self.assertEqual(len(runtime_simulations), 2)
+        for args in runtime_simulations:
+            policy = json.loads(args[args.index("--policy-input-list") + 1])
+            statement = policy["Statement"][0]
+            key_arn = args[args.index("--resource-arns") + 1]
+            context = {
+                entry["ContextKeyName"]: entry["ContextKeyValues"]
+                for entry in json.loads(args[args.index("--context-entries") + 1])
+            }
+            self.assertEqual(statement["Action"], "kms:Decrypt")
+            self.assertEqual(statement["Resource"], key_arn)
+            self.assertEqual(
+                statement["Condition"]["StringEquals"]["kms:ViaService"],
+                context["kms:ViaService"][0],
+            )
+            self.assertEqual(
+                statement["Condition"]["StringEquals"]["kms:EncryptionContext:PARAMETER_ARN"],
+                context["kms:EncryptionContext:PARAMETER_ARN"][0],
+            )
+
+    def test_quota_codes_account_limit_names_and_structural_defaults_are_independent_literals(self):
+        expected_regional = {
+            "cloudwatch-log-groups": ("logs", "L-C7B9AAAB"),
+            "elastic-ips": ("ec2", "L-0263D0A3"),
+            "gateway-load-balancer-endpoints-per-vpc": ("vpc", "L-29B6F2EB"),
+            "nat-gateways-per-availability-zone": ("vpc", "L-FE5A380F"),
+            "standard-vcpus": ("ec2", "L-1216C47A"),
+            "target-groups": ("elasticloadbalancing", "L-B22855CB"),
+            "vpcs": ("vpc", "L-F678F1CE"),
+        }
+        expected_global = {"s3-artifact-buckets": ("s3", "L-DC2B2D3D")}
+        self.assertEqual(
+            {gate: values[:2] for gate, values in appliance.AWS_REGIONAL_QUOTA_CONTRACT.items()},
+            expected_regional,
+        )
+        self.assertEqual(
+            {gate: values[:2] for gate, values in appliance.AWS_GLOBAL_QUOTA_CONTRACT.items()},
+            expected_global,
+        )
+        self.assertEqual(
+            appliance.AWS_REGIONAL_QUOTA_CONTRACT["gateway-load-balancer-endpoints-per-vpc"][2],
+            "Interface VPC endpoints per VPC",
+        )
+        self.assertEqual(
+            appliance.AWS_ELBV2_ACCOUNT_LIMIT_CONTRACT,
+            {
+                "gateway-load-balancers": "gateway-load-balancers",
+                "gateway-load-balancers-per-vpc": "gateway-load-balancers-per-vpc",
+                "geneve-target-groups": "geneve-target-groups",
+                "targets-per-availability-zone-per-gateway-load-balancer": (
+                    "targets-per-availability-zone-per-gateway-load-balancer"
+                ),
+            },
+        )
+        self.assertEqual(
+            appliance.AWS_STRUCTURAL_CAPACITY_CONTRACT,
+            {
+                "flow-logs-per-resource": (
+                    "ec2",
+                    "Flow logs per resource",
+                    10,
+                    "documented-default-lower-bound",
+                ),
+                "listeners-per-gateway-load-balancer": (
+                    "elasticloadbalancing",
+                    "Listeners per Gateway Load Balancer",
+                    1,
+                    "documented-structural-limit",
+                ),
+                "targets-per-gateway-load-balancer": (
+                    "elasticloadbalancing",
+                    "Targets per Gateway Load Balancer",
+                    300,
+                    "documented-structural-limit",
+                ),
+                "vpc-endpoint-services": (
+                    "ec2",
+                    "VPC endpoint services per Region",
+                    50,
+                    "documented-default-lower-bound",
+                ),
+            },
+        )
+
+    def test_elbv2_account_limits_require_each_exact_name_once_with_numeric_max(self):
+        names = (
+            "gateway-load-balancers",
+            "gateway-load-balancers-per-vpc",
+            "geneve-target-groups",
+            "targets-per-availability-zone-per-gateway-load-balancer",
+        )
+        baseline = {"Limits": [{"Name": name, "Max": str(index + 1)} for index, name in enumerate(names)]}
+
+        class LimitsAWS:
+            def __init__(self, response):
+                self.response = response
+                self.calls = []
+
+            def json(self, args, *, region=None):
+                self.calls.append((list(args), region))
+                return copy.deepcopy(self.response)
+
+        aws = LimitsAWS(baseline)
+        self.assertEqual(
+            appliance.regional_elbv2_account_limits(aws, "us-west-2"),
+            {
+                "gateway-load-balancers": 1,
+                "gateway-load-balancers-per-vpc": 2,
+                "geneve-target-groups": 3,
+                "targets-per-availability-zone-per-gateway-load-balancer": 4,
+            },
+        )
+        self.assertEqual(aws.calls, [(["elbv2", "describe-account-limits"], "us-west-2")])
+
+        malformed = (
+            [],
+            {"Limits": {}},
+            {"Limits": baseline["Limits"][:-1]},
+            {"Limits": [*baseline["Limits"], copy.deepcopy(baseline["Limits"][0])]},
+            {"Limits": [{**value, "Max": 1} if index == 0 else value for index, value in enumerate(baseline["Limits"])]},
+            {"Limits": [{**value, "Max": "1.0"} if index == 0 else value for index, value in enumerate(baseline["Limits"])]},
+            {"Limits": [{**value, "Name": None} if index == 0 else value for index, value in enumerate(baseline["Limits"])]},
+        )
+        for response in malformed:
+            with self.subTest(response=response):
+                with self.assertRaises(appliance.LifecycleError):
+                    appliance.regional_elbv2_account_limits(LimitsAWS(response), "us-west-2")
+
+    def test_code_based_quota_reads_reject_mismatched_metadata_and_name_api_failures(self):
+        contract = {
+            "fixture-gate": ("ec2", "L-1216C47A", "Running On-Demand Standard instances")
+        }
+        baseline = {
+            "ServiceCode": "ec2",
+            "QuotaCode": "L-1216C47A",
+            "QuotaArn": "arn:aws:servicequotas:us-west-2:123456789012:ec2/L-1216C47A",
+            "QuotaName": "Current AWS display name",
+            "Value": 100.0,
+            "GlobalQuota": False,
+        }
+
+        class QuotaAWS:
+            def __init__(self, quota):
+                self.quota = quota
+                self.calls = []
+
+            def json(self, args, *, region=None):
+                self.calls.append((list(args), region))
+                return {"Quota": copy.deepcopy(self.quota)}
+
+        aws = QuotaAWS(baseline)
+        values = appliance.service_quota_values(
+            aws,
+            "us-west-2",
+            contract,
+            "arn:aws:iam::123456789012:role/operator",
+            global_quotas=False,
+        )
+        self.assertEqual(values["fixture-gate"]["QuotaName"], "Current AWS display name")
+        self.assertEqual(
+            aws.calls,
+            [
+                (
+                    [
+                        "service-quotas",
+                        "get-service-quota",
+                        "--service-code",
+                        "ec2",
+                        "--quota-code",
+                        "L-1216C47A",
+                    ],
+                    "us-west-2",
+                )
+            ],
+        )
+        mutations = (
+            {**baseline, "ServiceCode": "vpc"},
+            {**baseline, "QuotaCode": "L-WRONG"},
+            {**baseline, "QuotaArn": "arn:aws:servicequotas:us-east-1:123456789012:ec2/L-1216C47A"},
+            {**baseline, "QuotaName": ""},
+            {**baseline, "Value": True},
+            {**baseline, "Value": float("nan")},
+            {**baseline, "GlobalQuota": True},
+            {key: value for key, value in baseline.items() if key != "GlobalQuota"},
+            [],
+        )
+        for quota in mutations:
+            with self.subTest(quota=quota):
+                with self.assertRaisesRegex(appliance.LifecycleError, "fixture-gate.*L-1216C47A"):
+                    appliance.service_quota_values(
+                        QuotaAWS(quota),
+                        "us-west-2",
+                        contract,
+                        "arn:aws:iam::123456789012:role/operator",
+                        global_quotas=False,
+                    )
+
+        class FailedQuotaAWS:
+            def json(self, args, *, region=None):
+                raise appliance.CommandError(args, 255, "NoSuchResourceException")
+
+        with self.assertRaisesRegex(appliance.LifecycleError, "fixture-gate.*L-1216C47A"):
+            appliance.service_quota_values(
+                FailedQuotaAWS(),
+                "us-west-2",
+                contract,
+                "arn:aws:iam::123456789012:role/operator",
+                global_quotas=False,
+            )
+
+    def test_global_quota_and_bucket_inventory_use_commercial_control_region(self):
+        class PartitionAWS:
+            def __init__(self):
+                self.calls = []
+
+            def json(self, args, *, region=None):
+                self.calls.append((list(args), region))
+                if args[:2] == ["service-quotas", "get-service-quota"]:
+                    service, code, name = appliance.AWS_GLOBAL_QUOTA_CONTRACT["s3-artifact-buckets"]
+                    return {
+                        "Quota": {
+                            "ServiceCode": service,
+                            "QuotaCode": code,
+                            "QuotaArn": (
+                                f"arn:aws:servicequotas:{region}:123456789012:"
+                                f"{service}/{code}"
+                            ),
+                            "QuotaName": name,
+                            "Value": 100,
+                            "GlobalQuota": True,
+                        }
+                    }
+                if args[:2] == ["s3api", "list-buckets"]:
+                    return {"Buckets": []}
+                raise AssertionError(args)
+
+        aws = PartitionAWS()
+        identity_arn = "arn:aws:iam::123456789012:role/operator"
+        appliance.global_service_quota_values(aws, identity_arn)
+        self.assertEqual(appliance.s3_general_purpose_bucket_count(aws, identity_arn), 0)
+        self.assertEqual([called_region for _args, called_region in aws.calls], ["us-east-1", "us-east-1"])
+        self.assertEqual(appliance.AWS_GLOBAL_QUOTA_CONTROL_REGIONS, {"aws": "us-east-1"})
+        self.assertEqual(appliance.AWS_PARTITION_DNS_SUFFIXES, {"aws": "amazonaws.com"})
+        for partition in ("aws-us-gov", "aws-cn"):
+            with self.subTest(partition=partition):
+                with self.assertRaisesRegex(appliance.LifecycleError, "commercial aws ARN partition"):
+                    appliance.aws_partition(
+                        f"arn:{partition}:iam::123456789012:role/operator"
+                    )
+
+    def test_run_config_rejects_every_noncommercial_aws_partition(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            cases = []
+            backend = config_document()
+            backend["backend"]["kms_key_arn"] = (
+                "arn:aws-cn:kms:us-west-2:123456789012:key/backend"
+            )
+            cases.append(backend)
+            operator = config_document()
+            operator["backend"]["operator_principal_arns"] = [
+                "arn:aws-us-gov:iam::123456789012:role/operator"
+            ]
+            cases.append(operator)
+            site = config_document()
+            site["sites"]["east"]["ssm_kms_key_arn"] = (
+                "arn:aws-cn:kms:us-east-1:123456789012:key/east"
+            )
+            cases.append(site)
+            for index, document in enumerate(cases):
+                with self.subTest(index=index):
+                    path = root / f"noncommercial-{index}.json"
+                    path.write_text(json.dumps(document))
+                    with self.assertRaisesRegex(appliance.LifecycleError, "commercial-partition"):
+                        appliance.RunConfig.load(path)
+
+            config = make_config(root / "commercial")
+
+            class NonCommercialCaller(CapabilityAWS):
+                def json(self, args, *, region=None):
+                    if args[:2] == ["sts", "get-caller-identity"]:
+                        return {
+                            "Account": "123456789012",
+                            "Arn": "arn:aws-cn:sts::123456789012:assumed-role/operator/session",
+                            "UserId": "fixture",
+                        }
+                    return super().json(args, region=region)
+
+            with self.assertRaisesRegex(appliance.LifecycleError, "commercial aws ARN partition"):
+                appliance.aws_capability_quota_preflight(
+                    config,
+                    NonCommercialCaller(config),
+                    fixture_instance_vcpus(config),
+                    artifact_identity(root),
+                )
+
+    def test_s3_bucket_inventory_paginates_and_rejects_malformed_or_repeated_pages(self):
+        class PagedAWS:
+            def __init__(self, pages):
+                self.pages = pages
+                self.calls = []
+
+            def json(self, args, *, region=None):
+                self.calls.append((list(args), region))
+                return copy.deepcopy(self.pages[len(self.calls) - 1])
+
+        identity_arn = "arn:aws:iam::123456789012:role/operator"
+        aws = PagedAWS(
+            [
+                {"Buckets": [{"Name": "one"}], "NextToken": "opaque+token/="},
+                {"Buckets": [{"Name": "two"}]},
+            ]
+        )
+        self.assertEqual(appliance.s3_general_purpose_bucket_count(aws, identity_arn), 2)
+        self.assertEqual(aws.calls[0][1], "us-east-1")
+        self.assertIn("--page-size", aws.calls[0][0])
+        self.assertIn("--max-items", aws.calls[0][0])
+        self.assertNotIn("--starting-token", aws.calls[0][0])
+        self.assertEqual(aws.calls[1][0][-2:], ["--starting-token", "opaque+token/="])
+
+        malformed_pages = (
+            [{"Buckets": [], "NextToken": ""}],
+            [{"Buckets": [], "ContinuationToken": "raw-service-token"}],
+            [{"Buckets": [{"Name": "one"}], "NextToken": "again"}, {"Buckets": [], "NextToken": "again"}],
+            [{"Buckets": [{"Name": "one"}], "NextToken": "next"}, {"Buckets": [{"Name": "one"}]}],
+            [{"Buckets": {}}],
+        )
+        for pages in malformed_pages:
+            with self.subTest(pages=pages):
+                with self.assertRaises(appliance.LifecycleError):
+                    appliance.s3_general_purpose_bucket_count(PagedAWS(pages), identity_arn)
+
+    def test_reviewed_action_resource_contract_groups_only_applicable_mandatory_resources(self):
+        self.assertEqual(
+            set(appliance.AWS_OPERATOR_ACTION_RESOURCE_CONTRACT),
+            set(appliance.AWS_OPERATOR_ACTIONS),
+        )
+        self.assertEqual(
+            appliance.AWS_OPERATOR_ACTION_RESOURCE_CONTRACT["elasticloadbalancing:CreateTargetGroup"],
+            ("target-group",),
+        )
+        self.assertEqual(
+            appliance.AWS_OPERATOR_ACTION_RESOURCE_CONTRACT["elasticloadbalancing:CreateListener"],
+            ("load-balancer",),
+        )
+        self.assertEqual(
+            appliance.AWS_OPERATOR_ACTION_RESOURCE_CONTRACT["elasticloadbalancing:AddTags"],
+            ("load-balancer", "listener", "target-group"),
+        )
+        self.assertEqual(
+            appliance.AWS_OPERATOR_ACTION_RESOURCE_CONTRACT["ec2:RunInstances"],
+            ("image", "subnet", "security-group", "instance", "volume", "network-interface"),
+        )
+        for action in (
+            "iam:AddRoleToInstanceProfile",
+            "iam:RemoveRoleFromInstanceProfile",
+        ):
+            self.assertEqual(
+                appliance.AWS_OPERATOR_ACTION_RESOURCE_CONTRACT[action],
+                ("instance-profile",),
+            )
+        self.assertEqual(
+            appliance.AWS_OPERATOR_ACTION_RESOURCE_CONTRACT["iam:SimulatePrincipalPolicy"],
+            ("policy-source",),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            artifact = artifact_identity(root)
+            batches = appliance.build_operator_simulation_batches(
+                config,
+                "123456789012",
+                artifact,
+                policy_source_arn="arn:aws:iam::123456789012:role/operator",
+            )
+
+            def west_batches(action):
+                matches = [
+                    batch
+                    for batch in batches
+                    if action in batch["actions"] and "west" in batch["name"]
+                ]
+                self.assertTrue(matches, action)
+                return matches
+
+            def west_batch(action):
+                matches = west_batches(action)
+                self.assertEqual(len(matches), 1, action)
+                return matches[0]
+
+            def west_resource_batch(action, expected_resources):
+                matches = [
+                    batch
+                    for batch in west_batches(action)
+                    if set(batch["resources"]) == set(expected_resources)
+                ]
+                self.assertEqual(len(matches), 1, (action, expected_resources))
+                return matches[0]
+
+            def context(batch):
+                return {
+                    entry["ContextKeyName"]: entry["ContextKeyValues"]
+                    for entry in batch["context"]
+                }
+
+            def assert_context_mode(batch, mode):
+                values = context(batch)
+                expected_tags = {
+                    "EnvelopeRun": config.run_id,
+                    "ExpiresAt": config.expires_at,
+                    "ManagedBy": "terraform",
+                    "Profile": "envelope-aws-appliance",
+                }
+                if mode not in {"regional", "request", "resource", "request-resource"}:
+                    self.fail(f"unknown context mode {mode}")
+                expected_keys = {"aws:RequestedRegion"}
+                if mode in {"request", "request-resource"}:
+                    expected_keys.add("aws:TagKeys")
+                    expected_keys.update(f"aws:RequestTag/{key}" for key in expected_tags)
+                if mode in {"resource", "request-resource"}:
+                    expected_keys.update(f"aws:ResourceTag/{key}" for key in expected_tags)
+                self.assertEqual(set(values), expected_keys)
+                self.assertEqual(values["aws:RequestedRegion"], ["us-west-2"])
+                if mode in {"request", "request-resource"}:
+                    self.assertEqual(values["aws:TagKeys"], sorted(expected_tags))
+                    for key, value in expected_tags.items():
+                        self.assertEqual(values[f"aws:RequestTag/{key}"], [value])
+                if mode in {"resource", "request-resource"}:
+                    for key, value in expected_tags.items():
+                        self.assertEqual(values[f"aws:ResourceTag/{key}"], [value])
+
+            target_group_batch = west_batch("elasticloadbalancing:CreateTargetGroup")
+            self.assertEqual(
+                target_group_batch["resources"],
+                (
+                    "arn:aws:elasticloadbalancing:us-west-2:123456789012:"
+                    "targetgroup/envelope-fixture-west-gwlb-tg/*",
+                ),
+            )
+            self.assertFalse(
+                any("loadbalancer/" in resource or "listener/" in resource for resource in target_group_batch["resources"])
+            )
+            assert_context_mode(target_group_batch, "request")
+            assert_context_mode(
+                west_batch("elasticloadbalancing:CreateLoadBalancer"),
+                "request",
+            )
+
+            subnet_arn = "arn:aws:ec2:us-west-2:123456789012:subnet/*"
+            vpc_arn = "arn:aws:ec2:us-west-2:123456789012:vpc/*"
+            self.assertEqual(len(west_batches("ec2:CreateSubnet")), 2)
+            assert_context_mode(
+                west_resource_batch("ec2:CreateSubnet", (subnet_arn,)),
+                "request",
+            )
+            assert_context_mode(
+                west_resource_batch("ec2:CreateSubnet", (vpc_arn,)),
+                "resource",
+            )
+
+            run_new_resources = (
+                "arn:aws:ec2:us-west-2:123456789012:instance/*",
+                "arn:aws:ec2:us-west-2:123456789012:volume/*",
+            )
+            run_existing_resources = (
+                "arn:aws:ec2:us-west-2:123456789012:security-group/*",
+                subnet_arn,
+            )
+            run_regional_resources = (
+                "arn:aws:ec2:us-west-2:123456789012:network-interface/*",
+                "arn:aws:ec2:us-west-2::image/ami-0123456789abcdef0",
+            )
+            self.assertEqual(len(west_batches("ec2:RunInstances")), 3)
+            assert_context_mode(
+                west_resource_batch("ec2:RunInstances", run_new_resources),
+                "request",
+            )
+            assert_context_mode(
+                west_resource_batch("ec2:RunInstances", run_existing_resources),
+                "resource",
+            )
+            assert_context_mode(
+                west_resource_batch("ec2:RunInstances", run_regional_resources),
+                "regional",
+            )
+
+            load_balancer_arn = (
+                "arn:aws:elasticloadbalancing:us-west-2:123456789012:"
+                "loadbalancer/gwy/envelope-fixture-west-gwlb/*"
+            )
+            self.assertEqual(len(west_batches("elasticloadbalancing:CreateListener")), 1)
+            assert_context_mode(
+                west_resource_batch(
+                    "elasticloadbalancing:CreateListener",
+                    (load_balancer_arn,),
+                ),
+                "request-resource",
+            )
+            self.assertEqual(
+                {resource.split(":", 5)[5].split("/", 1)[0] for resource in west_batch("ec2:AttachVolume")["resources"]},
+                {"instance", "volume"},
+            )
+            self.assertEqual(
+                {resource.split(":", 5)[5].split("/", 1)[0] for resource in west_batch("ec2:AssociateRouteTable")["resources"]},
+                {"route-table", "subnet"},
+            )
+            assert_context_mode(west_batch("ec2:CreateVpc"), "request")
+            assert_context_mode(west_batch("ec2:DeleteVpc"), "resource")
+            assert_context_mode(west_batch("ec2:CreateNetworkAclEntry"), "regional")
+            assert_context_mode(west_batch("ec2:CreateRoute"), "regional")
+
+            create_tag_paths = {
+                batch["name"].rsplit("-", 1)[1]: batch
+                for batch in batches
+                if batch["name"].startswith("ec2-west-create-tags-")
+            }
+            expected_create_tag_resources = {
+                "AllocateAddress": {"elastic-ip"},
+                "CreateFlowLogs": {"vpc-flow-log"},
+                "CreateInternetGateway": {"internet-gateway"},
+                "CreateNatGateway": {"natgateway"},
+                "CreateNetworkAcl": {"network-acl"},
+                "CreateNetworkInterface": {"network-interface"},
+                "CreateRouteTable": {"route-table"},
+                "CreateSecurityGroup": {"security-group"},
+                "CreateSubnet": {"subnet"},
+                "CreateVolume": {"volume"},
+                "CreateVpc": {"vpc"},
+                "CreateVpcEndpoint": {"vpc-endpoint"},
+                "CreateVpcEndpointServiceConfiguration": {"vpc-endpoint-service"},
+                "RunInstances": {"instance", "volume"},
+            }
+            self.assertEqual(set(create_tag_paths), set(expected_create_tag_resources))
+            for create_action, batch in create_tag_paths.items():
+                with self.subTest(create_action=create_action):
+                    values = context(batch)
+                    self.assertEqual(values["ec2:CreateAction"], [create_action])
+                    self.assertIn("aws:RequestTag/EnvelopeRun", values)
+                    self.assertNotIn("aws:ResourceTag/EnvelopeRun", values)
+                    self.assertEqual(
+                        {
+                            resource.split(":", 5)[5].split("/", 1)[0]
+                            for resource in batch["resources"]
+                        },
+                        expected_create_tag_resources[create_action],
+                    )
+            existing_ec2_tag_context = context(
+                next(batch for batch in batches if batch["name"] == "ec2-west-tag-existing")
+            )
+            self.assertIn("aws:RequestTag/EnvelopeRun", existing_ec2_tag_context)
+            self.assertIn("aws:ResourceTag/EnvelopeRun", existing_ec2_tag_context)
+            self.assertNotIn("ec2:CreateAction", existing_ec2_tag_context)
+            delete_tag_context = context(
+                next(batch for batch in batches if batch["name"] == "ec2-west-delete-tags")
+            )
+            self.assertIn("aws:ResourceTag/EnvelopeRun", delete_tag_context)
+            self.assertIn("aws:TagKeys", delete_tag_context)
+            self.assertNotIn("aws:RequestTag/EnvelopeRun", delete_tag_context)
+
+            for create_action, resource_prefix in {
+                "CreateListener": "listener/",
+                "CreateLoadBalancer": "loadbalancer/",
+                "CreateTargetGroup": "targetgroup/",
+            }.items():
+                with self.subTest(elbv2_create_action=create_action):
+                    tag_batch = next(
+                        batch
+                        for batch in batches
+                        if batch["name"] == f"elbv2-west-add-tags-{create_action}"
+                    )
+                    tag_context = context(tag_batch)
+                    self.assertEqual(
+                        tag_context["elasticloadbalancing:CreateAction"],
+                        [create_action],
+                    )
+                    self.assertIn("aws:RequestTag/EnvelopeRun", tag_context)
+                    self.assertNotIn("aws:ResourceTag/EnvelopeRun", tag_context)
+                    self.assertTrue(
+                        all(resource_prefix in value.split(":", 5)[5] for value in tag_batch["resources"])
+                    )
+            listener_remove_batch = next(
+                batch for batch in batches if batch["name"] == "elbv2-west-remove-tags"
+            )
+            self.assertTrue(any(":listener/gwy/" in value for value in listener_remove_batch["resources"]))
+            existing_elb_tag_context = context(
+                next(batch for batch in batches if batch["name"] == "elbv2-west-tag-existing")
+            )
+            self.assertIn("aws:RequestTag/EnvelopeRun", existing_elb_tag_context)
+            self.assertIn("aws:ResourceTag/EnvelopeRun", existing_elb_tag_context)
+            self.assertNotIn("elasticloadbalancing:CreateAction", existing_elb_tag_context)
+
+            self_simulation = next(batch for batch in batches if batch["name"] == "iam-policy-source")
+            self.assertEqual(self_simulation["actions"], ("iam:SimulatePrincipalPolicy",))
+            self.assertEqual(
+                self_simulation["resources"],
+                ("arn:aws:iam::123456789012:role/operator",),
+            )
+            profile_links = next(
+                batch
+                for batch in batches
+                if "iam:AddRoleToInstanceProfile" in batch["actions"]
+            )
+            self.assertIn("iam:RemoveRoleFromInstanceProfile", profile_links["actions"])
+            self.assertTrue(
+                all(":instance-profile/" in resource for resource in profile_links["resources"])
+            )
+            self.assertFalse(any(":role/" in resource for resource in profile_links["resources"]))
+
+            self.assertEqual(len(batches), 216)
+            self.assertLess(len(batches), 225)
+
+            class LeastPrivilegeAWS(CapabilityAWS):
+                def json(self, args, *, region=None):
+                    response = super().json(args, region=region)
+                    if args[:2] == ["iam", "simulate-principal-policy"]:
+                        for result in response["EvaluationResults"]:
+                            if result["EvalActionName"] == "elasticloadbalancing:CreateTargetGroup":
+                                for resource in result["ResourceSpecificResults"]:
+                                    resource["EvalResourceDecision"] = (
+                                        "allowed"
+                                        if ":targetgroup/" in resource["EvalResourceName"]
+                                        else "implicitDeny"
+                                    )
+                                result["EvalDecision"] = (
+                                    "allowed"
+                                    if all(
+                                        resource["EvalResourceDecision"] == "allowed"
+                                        for resource in result["ResourceSpecificResults"]
+                                    )
+                                    else "implicitDeny"
+                                )
+                    return response
+
+            appliance.simulate_operator_actions(
+                LeastPrivilegeAWS(config),
+                "arn:aws:iam::123456789012:role/operator",
+                config,
+                "123456789012",
+                artifact,
+            )
+
+            class MissingRunResourceAWS(CapabilityAWS):
+                def json(self, args, *, region=None):
+                    response = super().json(args, region=region)
+                    if args[:2] == ["iam", "simulate-principal-policy"]:
+                        for result in response["EvaluationResults"]:
+                            if result["EvalActionName"] == "ec2:RunInstances":
+                                result["ResourceSpecificResults"] = [
+                                    resource
+                                    for resource in result["ResourceSpecificResults"]
+                                    if ":volume/" not in resource["EvalResourceName"]
+                                ]
+                    return response
+
+            with self.assertRaisesRegex(appliance.LifecycleError, "RunInstances.*volume"):
+                appliance.simulate_operator_actions(
+                    MissingRunResourceAWS(config),
+                    "arn:aws:iam::123456789012:role/operator",
+                    config,
+                    "123456789012",
+                    artifact,
+                )
+
+    def test_mixed_create_rejects_policy_that_only_allows_fabricated_all_request_context(self):
+        class FabricatedAllRequestPolicyAWS(CapabilityAWS):
+            def json(self, args, *, region=None):
+                response = super().json(args, region=region)
+                if args[:2] != ["iam", "simulate-principal-policy"]:
+                    return response
+                resource_start = args.index("--resource-arns") + 1
+                context_start = (
+                    args.index("--context-entries")
+                    if "--context-entries" in args
+                    else len(args)
+                )
+                resources = args[resource_start:context_start]
+                resource_kinds = {
+                    resource.split(":", 5)[5].split("/", 1)[0]
+                    if resource.startswith("arn:")
+                    else resource
+                    for resource in resources
+                }
+                context = (
+                    {
+                        entry["ContextKeyName"]: entry["ContextKeyValues"]
+                        for entry in json.loads(args[context_start + 1])
+                    }
+                    if context_start < len(args)
+                    else {}
+                )
+                request_tags = {
+                    key for key in context if key.startswith("aws:RequestTag/")
+                }
+                resource_tags = {
+                    key for key in context if key.startswith("aws:ResourceTag/")
+                }
+                for result in response["EvaluationResults"]:
+                    if result["EvalActionName"] != "ec2:CreateSubnet":
+                        continue
+                    allowed = (
+                        resource_kinds == {"subnet", "vpc"}
+                        and bool(request_tags)
+                        and not resource_tags
+                    )
+                    decision = "allowed" if allowed else "implicitDeny"
+                    result["EvalDecision"] = decision
+                    for resource_result in result["ResourceSpecificResults"]:
+                        resource_result["EvalResourceDecision"] = decision
+                return response
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            with self.assertRaisesRegex(appliance.LifecycleError, "CreateSubnet"):
+                appliance.simulate_operator_actions(
+                    FabricatedAllRequestPolicyAWS(config),
+                    "arn:aws:iam::123456789012:role/operator",
+                    config,
+                    "123456789012",
+                    artifact_identity(root),
+                )
+
+    def test_operator_batch_builder_requires_an_exact_policy_source_arn(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            artifact = artifact_identity(root)
+            for policy_source_arn in (
+                "arn:aws:iam::123456789012:role/operator*",
+                "arn:aws:iam::210987654321:role/operator",
+                "arn:aws:sts::123456789012:assumed-role/operator/session",
+                "arn:aws:iam::123456789012:group/operators",
+            ):
+                with self.subTest(policy_source_arn=policy_source_arn):
+                    with self.assertRaisesRegex(
+                        appliance.LifecycleError,
+                        "exact resolved commercial policy source ARN",
+                    ):
+                        appliance.build_operator_simulation_batches(
+                            config,
+                            "123456789012",
+                            artifact,
+                            policy_source_arn=policy_source_arn,
+                        )
+
+    def test_exact_run_arn_region_tag_and_service_condition_policies_pass(self):
+        self.assertTrue(
+            {
+                "s3:GetBucketAcl",
+                "s3:GetBucketCORS",
+                "s3:GetBucketLogging",
+                "s3:GetBucketNotification",
+                "s3:GetBucketWebsite",
+                "s3:GetObjectAttributes",
+                "ec2:DescribeInstanceCreditSpecifications",
+                "ec2:DescribeIamInstanceProfileAssociations",
+                "ec2:DescribeSecurityGroupRules",
+                "ec2:DescribeVolumeAttribute",
+                "ec2:DescribeVolumesModifications",
+                "ec2:DescribeVpcEndpointServicePermissions",
+                "elasticloadbalancing:DescribeListenerAttributes",
+                "iam:ListRoleTags",
+                "iam:ListInstanceProfileTags",
+            }.issubset(appliance.AWS_OPERATOR_ACTIONS)
+        )
+
+        class ExactPolicyAWS:
+            def __init__(self, config, artifact):
+                self.config = config
+                self.artifact = artifact
+                self.calls = []
+
+            @staticmethod
+            def parsed(args):
+                action_start = args.index("--action-names") + 1
+                resource_start = args.index("--resource-arns")
+                context_start = args.index("--context-entries") if "--context-entries" in args else len(args)
+                actions = args[action_start:resource_start]
+                resources = args[resource_start + 1 : context_start]
+                entries = json.loads(args[context_start + 1]) if context_start < len(args) else []
+                context = {
+                    entry["ContextKeyName"]: entry["ContextKeyValues"]
+                    for entry in entries
+                }
+                return actions, resources, context
+
+            def json(self, args, *, region=None):
+                self.calls.append(list(args))
+                actions, resources, context = self.parsed(args)
+                resource_kinds = frozenset(
+                    resource.split(":", 5)[5].split("/", 1)[0]
+                    if resource.startswith("arn:")
+                    else resource
+                    for resource in resources
+                )
+                mixed_creation_contexts = {
+                    "ec2:CreateFlowLogs": {
+                        frozenset({"vpc-flow-log"}): "request",
+                        frozenset({"vpc"}): "resource",
+                    },
+                    "ec2:CreateNatGateway": {
+                        frozenset({"natgateway"}): "request",
+                        frozenset({"subnet", "elastic-ip"}): "resource",
+                    },
+                    "ec2:CreateNetworkAcl": {
+                        frozenset({"network-acl"}): "request",
+                        frozenset({"vpc"}): "resource",
+                    },
+                    "ec2:CreateNetworkInterface": {
+                        frozenset({"network-interface"}): "request",
+                        frozenset({"subnet", "security-group"}): "resource",
+                    },
+                    "ec2:CreateRouteTable": {
+                        frozenset({"route-table"}): "request",
+                        frozenset({"vpc"}): "resource",
+                    },
+                    "ec2:CreateSecurityGroup": {
+                        frozenset({"security-group"}): "request",
+                        frozenset({"vpc"}): "resource",
+                    },
+                    "ec2:CreateSubnet": {
+                        frozenset({"subnet"}): "request",
+                        frozenset({"vpc"}): "resource",
+                    },
+                    "ec2:CreateVpcEndpoint": {
+                        frozenset({"vpc-endpoint"}): "request",
+                        frozenset({"vpc", "subnet"}): "resource",
+                    },
+                    "ec2:RunInstances": {
+                        frozenset({"instance", "volume"}): "request",
+                        frozenset({"subnet", "security-group"}): "resource",
+                        frozenset({"image", "network-interface"}): "regional",
+                    },
+                    "elasticloadbalancing:CreateListener": {
+                        frozenset({"loadbalancer"}): "request-resource",
+                    },
+                }
+                results = []
+                for action in actions:
+                    allowed = True
+                    request_tag_keys = {
+                        key for key in context if key.startswith("aws:RequestTag/")
+                    }
+                    resource_tag_keys = {
+                        key for key in context if key.startswith("aws:ResourceTag/")
+                    }
+                    if action in mixed_creation_contexts:
+                        expected_mode = mixed_creation_contexts[action].get(resource_kinds)
+                        if expected_mode == "request":
+                            allowed = (
+                                bool(request_tag_keys)
+                                and not resource_tag_keys
+                                and "aws:TagKeys" in context
+                            )
+                        elif expected_mode == "resource":
+                            allowed = (
+                                bool(resource_tag_keys)
+                                and not request_tag_keys
+                                and "aws:TagKeys" not in context
+                            )
+                        elif expected_mode == "request-resource":
+                            allowed = (
+                                bool(request_tag_keys)
+                                and bool(resource_tag_keys)
+                                and "aws:TagKeys" in context
+                            )
+                        elif expected_mode == "regional":
+                            allowed = (
+                                not request_tag_keys
+                                and not resource_tag_keys
+                                and "aws:TagKeys" not in context
+                            )
+                        else:
+                            allowed = False
+                    elif action == "s3:PutObject":
+                        allowed = all(resource.startswith("arn:aws:s3:::") for resource in resources)
+                        if resources[0].startswith("arn:aws:s3:::operator-backend/"):
+                            allowed = allowed and context.get("s3:x-amz-server-side-encryption") == ["aws:kms"]
+                            allowed = allowed and context.get(
+                                "s3:x-amz-server-side-encryption-aws-kms-key-id"
+                            ) == [self.config.backend["kms_key_arn"]]
+                            if resources[0].endswith(f"/{self.config.manifest_key}"):
+                                allowed = allowed and context.get("s3:RequestObjectTag/EnvelopeRun") == [
+                                    self.config.run_id
+                                ]
+                                allowed = allowed and context.get("s3:RequestObjectTag/ExpiresAt") == [
+                                    self.config.expires_at
+                                ]
+                            else:
+                                allowed = allowed and "s3:RequestObjectTag/EnvelopeRun" not in context
+                    elif action in {"s3:ListBucket", "s3:ListBucketVersions"} and resources == [
+                        "arn:aws:s3:::operator-backend"
+                    ]:
+                        allowed = context.get("s3:prefix") in [
+                            [self.config.backend["state_key"]],
+                            [self.config.lock_key],
+                            [self.config.manifest_key],
+                        ]
+                    elif action == "s3:GetBucketAcl":
+                        allowed = resources == [
+                            "arn:aws:s3:::envelope-fixture-123456789012-us-west-2-artifact"
+                        ]
+                    elif action == "s3:CreateBucket":
+                        allowed = resources == [
+                            "arn:aws:s3:::envelope-fixture-123456789012-us-west-2-artifact"
+                        ] and context.get("s3:LocationConstraint") == ["us-west-2"]
+                    elif action == "ssm:PutParameter":
+                        requested_region = context.get("aws:RequestedRegion", [None])[0]
+                        allowed = resources == [
+                            f"arn:aws:ssm:{requested_region}:123456789012:parameter/envelope-fixture/tailscale-auth"
+                        ]
+                        if request_tag_keys:
+                            allowed = (
+                                allowed
+                                and not resource_tag_keys
+                                and context.get("aws:RequestTag/EnvelopeRun") == ["envelope-fixture"]
+                                and context.get("aws:RequestTag/ExpiresAt") == [self.config.expires_at]
+                            )
+                        else:
+                            allowed = allowed and bool(resource_tag_keys)
+                    elif action == "iam:PassRole":
+                        service = context.get("iam:PassedToService", [None])[0]
+                        allowed = service in {"ec2.amazonaws.com", "vpc-flow-logs.amazonaws.com"} and all(
+                            resource.startswith("arn:aws:iam::123456789012:role/envelope-fixture-")
+                            for resource in resources
+                        )
+                    elif action in {"kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey"}:
+                        via_service = context.get("kms:ViaService", [None])[0]
+                        allowed = isinstance(via_service, str) and (
+                            via_service.startswith("s3.")
+                            and context.get("kms:EncryptionContextKeys") == ["aws:s3:arn"]
+                            and context.get("kms:EncryptionContext:aws:s3:arn", [""])[0].startswith(
+                                "arn:aws:s3:::operator-backend/runs/envelope-fixture/"
+                            )
+                            or via_service.startswith("ssm.")
+                            and context.get("kms:EncryptionContextKeys") == ["PARAMETER_ARN"]
+                            and context.get("kms:EncryptionContext:PARAMETER_ARN", [""])[0].endswith(
+                                ":parameter/envelope-fixture/tailscale-auth"
+                            )
+                        )
+                    elif action == "logs:CreateLogGroup":
+                        requested_region = context.get("aws:RequestedRegion", [None])[0]
+                        allowed = resources == [
+                            f"arn:aws:logs:{requested_region}:123456789012:log-group:/aws/vpc-flow-logs/envelope-fixture/"
+                            + ("west" if requested_region == "us-west-2" else "east")
+                        ]
+                    elif action == "ec2:CreateVpc":
+                        tagged = (
+                            context.get("aws:RequestTag/EnvelopeRun") == ["envelope-fixture"]
+                            and context.get("aws:RequestTag/ExpiresAt") == [self.config.expires_at]
+                            and set(context.get("aws:TagKeys", [])) >= {"EnvelopeRun", "ExpiresAt"}
+                        )
+                        allowed = tagged
+                    elif action == "ec2:CreateTags":
+                        create_action = context.get("ec2:CreateAction")
+                        if create_action:
+                            allowed = (
+                                len(create_action) == 1
+                                and bool(request_tag_keys)
+                                and not resource_tag_keys
+                            )
+                        else:
+                            allowed = bool(request_tag_keys) and bool(resource_tag_keys)
+                    elif action == "ec2:DeleteTags":
+                        allowed = (
+                            bool(resource_tag_keys)
+                            and not request_tag_keys
+                            and "ec2:CreateAction" not in context
+                        )
+                    elif action == "elasticloadbalancing:AddTags":
+                        create_action = context.get("elasticloadbalancing:CreateAction")
+                        if create_action:
+                            expected_resource_type = {
+                                "CreateListener": "listener/",
+                                "CreateLoadBalancer": "loadbalancer/",
+                                "CreateTargetGroup": "targetgroup/",
+                            }.get(create_action[0] if len(create_action) == 1 else "")
+                            allowed = (
+                                expected_resource_type is not None
+                                and all(expected_resource_type in resource for resource in resources)
+                                and bool(request_tag_keys)
+                                and not resource_tag_keys
+                            )
+                        else:
+                            allowed = bool(request_tag_keys) and bool(resource_tag_keys)
+                    elif action == "elasticloadbalancing:RemoveTags":
+                        allowed = (
+                            bool(resource_tag_keys)
+                            and not request_tag_keys
+                            and any(":listener/gwy/" in resource for resource in resources)
+                            and "elasticloadbalancing:CreateAction" not in context
+                        )
+                    elif action == "iam:SimulatePrincipalPolicy":
+                        allowed = resources == ["arn:aws:iam::123456789012:role/operator"]
+                    elif action in {
+                        "iam:AddRoleToInstanceProfile",
+                        "iam:RemoveRoleFromInstanceProfile",
+                    }:
+                        allowed = all(":instance-profile/" in resource for resource in resources)
+                    creation_actions = {
+                        "ec2:AllocateAddress",
+                        "ec2:CreateInternetGateway",
+                        "ec2:CreateNetworkAclEntry",
+                        "ec2:CreateRoute",
+                        "ec2:CreateVolume",
+                        "ec2:CreateVpc",
+                        "ec2:CreateVpcEndpointServiceConfiguration",
+                        "elasticloadbalancing:CreateLoadBalancer",
+                        "elasticloadbalancing:CreateTargetGroup",
+                        "iam:CreateInstanceProfile",
+                        "iam:CreateRole",
+                        "logs:CreateLogGroup",
+                        "s3:CreateBucket",
+                    }
+                    existing_resource_actions = {
+                        "ec2:DeleteVpc",
+                        "ec2:ModifyVpcAttribute",
+                        "elasticloadbalancing:DeleteListener",
+                        "elasticloadbalancing:ModifyListenerAttributes",
+                        "iam:DeleteRole",
+                        "logs:DeleteLogGroup",
+                        "s3:DeleteBucket",
+                        "ssm:DeleteParameter",
+                    }
+                    if action in creation_actions:
+                        allowed = allowed and not resource_tag_keys
+                    if action in existing_resource_actions:
+                        allowed = (
+                            allowed
+                            and bool(resource_tag_keys)
+                            and not request_tag_keys
+                        )
+                    if action != "ec2:CreateTags":
+                        allowed = allowed and "ec2:CreateAction" not in context
+                    if action != "elasticloadbalancing:AddTags":
+                        allowed = (
+                            allowed
+                            and "elasticloadbalancing:CreateAction" not in context
+                        )
+                    if action in {
+                        "ec2:CreateVpc",
+                        "iam:CreateRole",
+                        "logs:CreateLogGroup",
+                    }:
+                        allowed = allowed and context.get("aws:RequestTag/EnvelopeRun") == ["envelope-fixture"]
+                        allowed = allowed and context.get("aws:RequestTag/ExpiresAt") == [self.config.expires_at]
+                        allowed = allowed and set(context.get("aws:TagKeys", [])) >= {
+                            "EnvelopeRun",
+                            "ExpiresAt",
+                        }
+                    results.append(
+                        {
+                            "EvalActionName": action,
+                            "EvalDecision": "allowed" if allowed else "implicitDeny",
+                            "ResourceSpecificResults": [
+                                {
+                                    "EvalResourceName": resource,
+                                    "EvalResourceDecision": "allowed" if allowed else "implicitDeny",
+                                }
+                                for resource in resources
+                            ],
+                        }
+                    )
+                return {"EvaluationResults": results, "IsTruncated": False}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            artifact = artifact_identity(root)
+            batches = appliance.build_operator_simulation_batches(
+                config,
+                "123456789012",
+                artifact,
+                policy_source_arn="arn:aws:iam::123456789012:role/operator",
+            )
+            by_name = {batch["name"]: batch for batch in batches}
+            artifact_object = by_name["s3-artifact-object"]
+            self.assertEqual(
+                artifact_object["resources"],
+                (
+                    "arn:aws:s3:::envelope-fixture-123456789012-us-west-2-artifact/"
+                    + f"artifacts/{artifact['revision']}/envelope-linux-amd64",
+                ),
+            )
+            west_context = {
+                entry["ContextKeyName"]: entry["ContextKeyValues"]
+                for entry in by_name["ssm-west-parameter"]["context"]
+            }
+            self.assertEqual(west_context["aws:RequestedRegion"], ["us-west-2"])
+            self.assertEqual(west_context["aws:ResourceTag/EnvelopeRun"], [config.run_id])
+            self.assertEqual(west_context["aws:ResourceTag/ExpiresAt"], [config.expires_at])
+            self.assertNotIn("aws:RequestTag/EnvelopeRun", west_context)
+            self.assertEqual(
+                by_name["ssm-west-parameter"]["resources"],
+                ("arn:aws:ssm:us-west-2:123456789012:parameter/envelope-fixture/tailscale-auth",),
+            )
+            create_parameter_context = {
+                entry["ContextKeyName"]: entry["ContextKeyValues"]
+                for entry in by_name["ssm-west-parameter-create"]["context"]
+            }
+            self.assertIn("aws:RequestTag/EnvelopeRun", create_parameter_context)
+            self.assertNotIn("aws:ResourceTag/EnvelopeRun", create_parameter_context)
+            update_parameter_context = {
+                entry["ContextKeyName"]: entry["ContextKeyValues"]
+                for entry in by_name["ssm-west-parameter-update"]["context"]
+            }
+            self.assertIn("aws:ResourceTag/EnvelopeRun", update_parameter_context)
+            self.assertNotIn("aws:RequestTag/EnvelopeRun", update_parameter_context)
+            backend_list_context = {
+                entry["ContextKeyName"]: entry["ContextKeyValues"]
+                for entry in by_name["s3-backend-list-state"]["context"]
+            }
+            self.assertEqual(backend_list_context["s3:prefix"], [config.backend["state_key"]])
+            state_put_context = {
+                entry["ContextKeyName"]: entry["ContextKeyValues"]
+                for entry in by_name["s3-backend-state-put"]["context"]
+            }
+            self.assertEqual(state_put_context["s3:x-amz-server-side-encryption"], ["aws:kms"])
+            self.assertEqual(
+                state_put_context["s3:x-amz-server-side-encryption-aws-kms-key-id"],
+                [config.backend["kms_key_arn"]],
+            )
+            self.assertNotIn("s3:RequestObjectTag/EnvelopeRun", state_put_context)
+            manifest_put_context = {
+                entry["ContextKeyName"]: entry["ContextKeyValues"]
+                for entry in by_name["s3-backend-manifest-put"]["context"]
+            }
+            self.assertEqual(manifest_put_context["s3:RequestObjectTag/EnvelopeRun"], [config.run_id])
+            self.assertEqual(manifest_put_context["s3:RequestObjectTag/ExpiresAt"], [config.expires_at])
+            kms_contexts = {
+                name: {
+                    entry["ContextKeyName"]: entry["ContextKeyValues"]
+                    for entry in by_name[name]["context"]
+                }
+                for name in ("kms-backend-s3-state", "kms-backend-s3-lock", "kms-backend-s3-manifest")
+            }
+            self.assertEqual(
+                {
+                    values["kms:EncryptionContext:aws:s3:arn"][0]
+                    for values in kms_contexts.values()
+                },
+                {
+                    f"arn:aws:s3:::{config.backend['bucket']}/{key}"
+                    for key in (config.backend["state_key"], config.lock_key, config.manifest_key)
+                },
+            )
+            self.assertTrue(
+                all(values["kms:EncryptionContextKeys"] == ["aws:s3:arn"] for values in kms_contexts.values())
+            )
+            quota_batches = [batch for name, batch in by_name.items() if name.startswith("service-quota-")]
+            self.assertEqual(
+                len(quota_batches),
+                2 * len(appliance.AWS_REGIONAL_QUOTA_CONTRACT) + len(appliance.AWS_GLOBAL_QUOTA_CONTRACT),
+            )
+            self.assertTrue(
+                all(
+                    len(batch["resources"]) == 1
+                    and batch["resources"][0].startswith("arn:aws:servicequotas:")
+                    and batch["resources"][0] != "*"
+                    for batch in quota_batches
+                )
+            )
+            api = ExactPolicyAWS(config, artifact)
+            appliance.simulate_operator_actions(
+                api,
+                "arn:aws:iam::123456789012:role/operator",
+                config,
+                "123456789012",
+                artifact,
+            )
+            self.assertEqual(len(api.calls), len(batches))
+            self.assertTrue(
+                all(
+                    call[call.index("--policy-source-arn") + 1]
+                    == "arn:aws:iam::123456789012:role/operator"
+                    for call in api.calls
+                )
+            )
+
+    def test_missing_operator_action_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            for decision in ("implicitDeny", "explicitDeny"):
+                with self.subTest(decision=decision):
+                    aws = CapabilityAWS(config)
+                    aws.denied_action = "ssm:SendCommand"
+                    aws.denied_decision = decision
+                    with self.assertRaisesRegex(appliance.LifecycleError, "ssm:SendCommand"):
+                        appliance.aws_capability_quota_preflight(
+                            config, aws, fixture_instance_vcpus(config), artifact_identity(pathlib.Path(temporary))
+                        )
+
+    def test_each_mandatory_simulation_resource_must_have_an_allowed_decision(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            artifact = artifact_identity(root)
+            send_batch = next(
+                batch
+                for batch in appliance.build_operator_simulation_batches(
+                    config,
+                    "123456789012",
+                    artifact,
+                    policy_source_arn="arn:aws:iam::123456789012:role/operator",
+                )
+                if batch["name"] == "ssm-west-send-command"
+            )
+            for decision in ("implicitDeny", "explicitDeny"):
+                with self.subTest(decision=decision):
+                    aws = CapabilityAWS(config)
+                    aws.denied_action = "ssm:SendCommand"
+                    aws.denied_decision = decision
+                    aws.denied_resource = send_batch["resources"][1]
+                    expected = (
+                        "explicitly denied ssm:SendCommand"
+                        if decision == "explicitDeny"
+                        else rf"ssm:SendCommand.*{re.escape(aws.denied_resource)}"
+                    )
+                    with self.assertRaisesRegex(
+                        appliance.LifecycleError,
+                        expected,
+                    ):
+                        appliance.aws_capability_quota_preflight(
+                            config,
+                            aws,
+                            fixture_instance_vcpus(config),
+                            artifact,
+                        )
+
+            class OmittedResourceAWS(CapabilityAWS):
+                def json(self, args, *, region=None):
+                    response = super().json(args, region=region)
+                    if args[:2] == ["iam", "simulate-principal-policy"]:
+                        for result in response["EvaluationResults"]:
+                            if result["EvalActionName"] == "ssm:SendCommand":
+                                result["ResourceSpecificResults"].pop()
+                    return response
+
+            with self.assertRaisesRegex(appliance.LifecycleError, "omitted mandatory resource"):
+                appliance.aws_capability_quota_preflight(
+                    config,
+                    OmittedResourceAWS(config),
+                    fixture_instance_vcpus(config),
+                    artifact,
+                )
+
+    def test_unresolved_policy_context_reports_the_exact_actionable_key(self):
+        class MissingContextAWS(CapabilityAWS):
+            def json(self, args, *, region=None):
+                response = super().json(args, region=region)
+                if args[:2] == ["iam", "simulate-principal-policy"]:
+                    for result in response["EvaluationResults"]:
+                        if result["EvalActionName"] == "ssm:SendCommand":
+                            result["EvalDecision"] = "implicitDeny"
+                            result["MissingContextValues"] = ["ssm:ResourceTag/Environment"]
+                return response
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            with self.assertRaisesRegex(
+                appliance.LifecycleError,
+                "ssm:SendCommand.*ssm:ResourceTag/Environment",
+            ):
+                appliance.aws_capability_quota_preflight(
+                    config,
+                    MissingContextAWS(config),
+                    fixture_instance_vcpus(config),
+                    artifact_identity(root),
+                )
+
+    def test_ssm_kms_key_policy_requires_effective_exact_operator_and_ssm_context_authorization(self):
+        class KeyPolicyAWS(CapabilityAWS):
+            def __init__(self, config, *, principal_mode="root", mutation=None):
+                super().__init__(config)
+                self.principal_mode = principal_mode
+                self.mutation = mutation
+
+            def json(self, args, *, region=None):
+                if args[:2] != ["kms", "get-key-policy"]:
+                    return super().json(args, region=region)
+                partition = self.role_arn.split(":", 2)[1]
+                principal = (
+                    self.role_arn
+                    if self.principal_mode == "direct"
+                    else f"arn:{partition}:iam::123456789012:root"
+                )
+                parameter_arn = (
+                    f"arn:{partition}:ssm:{region}:123456789012:"
+                    "parameter/envelope-fixture/tailscale-auth"
+                )
+                site = "west" if region == self.config.sites["west"]["region"] else "east"
+                runtime_role = f"arn:aws:iam::123456789012:role/envelope-fixture-{site}-appliance"
+                condition: dict = {
+                    "StringEquals": {
+                        "kms:ViaService": f"ssm.{region}.amazonaws.com",
+                        "kms:EncryptionContext:PARAMETER_ARN": parameter_arn,
+                    },
+                    "ForAllValues:StringEquals": {
+                        "kms:EncryptionContextKeys": ["PARAMETER_ARN"]
+                    },
+                }
+                if self.mutation == "wrong-via-service":
+                    condition["StringEquals"]["kms:ViaService"] = "ssm.eu-west-1.amazonaws.com"
+                elif self.mutation == "wrong-parameter":
+                    condition["StringEquals"]["kms:EncryptionContext:PARAMETER_ARN"] = parameter_arn + "/other"
+                elif self.mutation == "unsupported-condition":
+                    condition = {"NumericEquals": {"kms:EncryptionContext:PARAMETER_ARN": "1"}}
+                operator_allow = {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": self.role_arn},
+                    "Action": ["kms:Encrypt", "kms:Decrypt"],
+                    "Resource": "*",
+                    "Condition": copy.deepcopy(condition),
+                }
+                if self.principal_mode == "root":
+                    statements = [
+                        {
+                            **operator_allow,
+                            "Principal": {"AWS": principal},
+                        }
+                    ]
+                elif self.principal_mode == "operator-only":
+                    statements = [operator_allow]
+                elif self.principal_mode == "wildcard-runtime":
+                    runtime_condition = copy.deepcopy(condition)
+                    runtime_condition["ArnEquals"] = {"aws:PrincipalArn": runtime_role}
+                    if self.mutation == "arnlike-runtime":
+                        runtime_condition["ArnLike"] = runtime_condition.pop("ArnEquals")
+                    elif self.mutation == "wrong-runtime-role":
+                        runtime_condition["ArnEquals"]["aws:PrincipalArn"] = runtime_role.replace(
+                            f"-{site}-", "-wrong-"
+                        )
+                    elif self.mutation == "wrong-runtime-site":
+                        runtime_condition["StringEquals"]["kms:ViaService"] = (
+                            "ssm.us-east-2.amazonaws.com"
+                        )
+                    elif self.mutation == "wrong-runtime-parameter":
+                        runtime_condition["StringEquals"][
+                            "kms:EncryptionContext:PARAMETER_ARN"
+                        ] = parameter_arn + "/wrong"
+                    elif self.mutation == "broad-runtime-wildcard":
+                        runtime_condition.pop("ArnEquals")
+                    statements = [
+                        operator_allow,
+                        {
+                            "Effect": "Allow",
+                            "Principal": "*",
+                            "Action": "kms:Decrypt",
+                            "Resource": "*",
+                            "Condition": runtime_condition,
+                        },
+                    ]
+                else:
+                    raise AssertionError(self.principal_mode)
+                if self.mutation == "explicit-deny":
+                    statements.append({**copy.deepcopy(statements[0]), "Effect": "Deny"})
+                elif self.mutation == "runtime-explicit-deny":
+                    statements.append({**copy.deepcopy(statements[-1]), "Effect": "Deny"})
+                return {"Policy": json.dumps({"Version": "2012-10-17", "Statement": statements})}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            for principal_mode, mutation in (
+                ("root", None),
+                ("wildcard-runtime", None),
+                ("wildcard-runtime", "arnlike-runtime"),
+            ):
+                with self.subTest(principal_mode=principal_mode, mutation=mutation):
+                    appliance.aws_capability_quota_preflight(
+                        config,
+                        KeyPolicyAWS(
+                            config,
+                            principal_mode=principal_mode,
+                            mutation=mutation,
+                        ),
+                        fixture_instance_vcpus(config),
+                        artifact_identity(root),
+                    )
+            with self.assertRaisesRegex(appliance.LifecycleError, "future regional appliance role"):
+                appliance.aws_capability_quota_preflight(
+                    config,
+                    KeyPolicyAWS(config, principal_mode="operator-only"),
+                    fixture_instance_vcpus(config),
+                    artifact_identity(root),
+                )
+            for mutation, message in (
+                ("wrong-via-service", "ViaService"),
+                ("wrong-parameter", "PARAMETER_ARN"),
+                ("explicit-deny", "explicitly denies"),
+                ("unsupported-condition", "unsupported condition operator"),
+            ):
+                with self.subTest(mutation=mutation):
+                    with self.assertRaisesRegex(appliance.LifecycleError, message):
+                        appliance.aws_capability_quota_preflight(
+                            config,
+                            KeyPolicyAWS(config, mutation=mutation),
+                            fixture_instance_vcpus(config),
+                            artifact_identity(root),
+                        )
+            for mutation in (
+                "wrong-runtime-role",
+                "wrong-runtime-site",
+                "wrong-runtime-parameter",
+                "broad-runtime-wildcard",
+            ):
+                with self.subTest(mutation=mutation):
+                    with self.assertRaisesRegex(appliance.LifecycleError, "future regional appliance role"):
+                        appliance.aws_capability_quota_preflight(
+                            config,
+                            KeyPolicyAWS(
+                                config,
+                                principal_mode="wildcard-runtime",
+                                mutation=mutation,
+                            ),
+                            fixture_instance_vcpus(config),
+                            artifact_identity(root),
+                        )
+
+            with self.assertRaisesRegex(appliance.LifecycleError, "explicitly denies.*future"):
+                appliance.aws_capability_quota_preflight(
+                    config,
+                    KeyPolicyAWS(
+                        config,
+                        principal_mode="wildcard-runtime",
+                        mutation="runtime-explicit-deny",
+                    ),
+                    fixture_instance_vcpus(config),
+                    artifact_identity(root),
+                )
+
+            denied_runtime = KeyPolicyAWS(config)
+            denied_runtime.runtime_kms_decision = "implicitDeny"
+            with self.assertRaisesRegex(appliance.LifecycleError, "appliance-runtime-kms"):
+                appliance.aws_capability_quota_preflight(
+                    config,
+                    denied_runtime,
+                    fixture_instance_vcpus(config),
+                    artifact_identity(root),
+                )
+
+    def test_low_service_quota_account_limit_and_endpoint_service_headroom_fail_named(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            for gate, message in (("standard-vcpus", "too low"), ("s3-artifact-buckets", "too low")):
+                with self.subTest(gate=gate):
+                    aws = CapabilityAWS(config)
+                    aws.low_quota_gate = gate
+                    with self.assertRaisesRegex(appliance.LifecycleError, f"{gate}.*{message}"):
+                        appliance.aws_capability_quota_preflight(
+                            config, aws, fixture_instance_vcpus(config), artifact_identity(pathlib.Path(temporary))
+                        )
+            aws = CapabilityAWS(config)
+            aws.omitted_quota_gate = "target-groups"
+            with self.assertRaisesRegex(appliance.LifecycleError, "target-groups.*L-B22855CB"):
+                appliance.aws_capability_quota_preflight(
+                    config, aws, fixture_instance_vcpus(config), artifact_identity(pathlib.Path(temporary))
+                )
+            for gate in appliance.AWS_ELBV2_ACCOUNT_LIMIT_CONTRACT:
+                with self.subTest(account_limit=gate):
+                    aws = CapabilityAWS(config)
+                    aws.low_account_limit_gate = gate
+                    with self.assertRaisesRegex(appliance.LifecycleError, rf"{re.escape(gate)}.*too low"):
+                        appliance.aws_capability_quota_preflight(
+                            config,
+                            aws,
+                            fixture_instance_vcpus(config),
+                            artifact_identity(pathlib.Path(temporary)),
+                        )
+
+            class FullEndpointServiceAWS(CapabilityAWS):
+                def json(self, args, *, region=None):
+                    if args[:2] == ["ec2", "describe-vpc-endpoint-service-configurations"]:
+                        return {
+                            "ServiceConfigurations": [
+                                {"ServiceId": f"vpce-svc-{index:03d}", "ServiceState": "Available"}
+                                for index in range(50)
+                            ]
+                        }
+                    return super().json(args, region=region)
+
+            with self.assertRaisesRegex(appliance.LifecycleError, "vpc-endpoint-services.*too low"):
+                appliance.aws_capability_quota_preflight(
+                    config,
+                    FullEndpointServiceAWS(config),
+                    fixture_instance_vcpus(config),
+                    artifact_identity(pathlib.Path(temporary)),
+                )
+
+    def test_standard_vcpu_quota_subtracts_default_weight_of_current_on_demand_instances(self):
+        class UsageAWS(CapabilityAWS):
+            def json(self, args, *, region=None):
+                if args[:2] == ["ec2", "describe-instances"]:
+                    return {
+                        "Reservations": [
+                            {
+                                "Instances": [
+                                    {
+                                        "State": {"Name": "running"},
+                                        "InstanceType": "t3.medium",
+                                        "Placement": {"Tenancy": "default"},
+                                    },
+                                    {
+                                        "State": {"Name": "pending"},
+                                        "InstanceType": "c7g.large",
+                                        "Placement": {"Tenancy": "default"},
+                                    },
+                                    {
+                                        "State": {"Name": "running"},
+                                        "InstanceType": "t3.medium",
+                                        "InstanceLifecycle": "spot",
+                                        "Placement": {"Tenancy": "default"},
+                                    },
+                                    {
+                                        "State": {"Name": "running"},
+                                        "InstanceType": "p5.48xlarge",
+                                        "Placement": {"Tenancy": "default"},
+                                    },
+                                ]
+                            }
+                        ]
+                    }
+                if args[:2] == ["ec2", "describe-instance-types"]:
+                    defaults = {"t3.medium": 2, "c7g.large": 4}
+                    return {
+                        "InstanceTypes": [
+                            {"InstanceType": name, "VCpuInfo": {"DefaultVCpus": defaults[name]}}
+                            for name in args[args.index("--instance-types") + 1 :]
+                        ]
+                    }
+                if args[:2] == ["ec2", "describe-vpc-endpoint-service-configurations"]:
+                    return {
+                        "ServiceConfigurations": [
+                            {"ServiceId": "vpce-svc-one", "ServiceState": "Available"},
+                            {"ServiceId": "vpce-svc-two", "ServiceState": "Pending"},
+                            {"ServiceId": "vpce-svc-old", "ServiceState": "Deleted"},
+                        ]
+                    }
+                if args[:2] == ["elbv2", "describe-load-balancers"]:
+                    return {
+                        "LoadBalancers": [
+                            {"LoadBalancerArn": "arn:aws:elasticloadbalancing:fixture:gwlb-one", "Type": "gateway"},
+                            {"LoadBalancerArn": "arn:aws:elasticloadbalancing:fixture:gwlb-two", "Type": "gateway"},
+                            {"LoadBalancerArn": "arn:aws:elasticloadbalancing:fixture:alb", "Type": "application"},
+                        ]
+                    }
+                if args[:2] == ["elbv2", "describe-target-groups"]:
+                    return {
+                        "TargetGroups": [
+                            {
+                                "TargetGroupArn": "arn:aws:elasticloadbalancing:fixture:geneve-one",
+                                "Protocol": "GENEVE",
+                                "TargetType": "instance",
+                            },
+                            {
+                                "TargetGroupArn": "arn:aws:elasticloadbalancing:fixture:geneve-two",
+                                "Protocol": "GENEVE",
+                                "TargetType": "ip",
+                            },
+                            {
+                                "TargetGroupArn": "arn:aws:elasticloadbalancing:fixture:tcp",
+                                "Protocol": "TCP",
+                                "TargetType": "instance",
+                            },
+                            {
+                                "TargetGroupArn": "arn:aws:elasticloadbalancing:fixture:lambda",
+                                "TargetType": "lambda",
+                            },
+                        ]
+                    }
+                if args[:2] == ["s3api", "list-buckets"]:
+                    return {"Buckets": [{"Name": "one"}, {"Name": "two"}]}
+                return super().json(args, region=region)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            _, summary = appliance.aws_capability_quota_preflight(
+                config,
+                UsageAWS(config),
+                fixture_instance_vcpus(config),
+                artifact_identity(pathlib.Path(temporary)),
+            )
+        for value in summary["regions"].values():
+            self.assertEqual(value["quotas"]["standard-vcpus"]["used"], 6)
+            self.assertEqual(value["quotas"]["standard-vcpus"]["available"], 94)
+            self.assertEqual(value["quotas"]["gateway-load-balancers"]["used"], 2)
+            self.assertEqual(value["quotas"]["gateway-load-balancers"]["available"], 98)
+            self.assertEqual(value["quotas"]["geneve-target-groups"]["used"], 2)
+            self.assertEqual(value["quotas"]["target-groups"]["used"], 4)
+            self.assertEqual(value["quotas"]["vpc-endpoint-services"]["used"], 3)
+            self.assertEqual(value["quotas"]["vpc-endpoint-services"]["available"], 47)
+        self.assertEqual(summary["global_quotas"]["s3-artifact-buckets"]["used"], 2)
+
+    def test_malformed_or_duplicate_gwlb_geneve_and_endpoint_service_usage_fails_closed(self):
+        class MalformedUsageAWS(CapabilityAWS):
+            def __init__(self, config, mode):
+                super().__init__(config)
+                self.mode = mode
+
+            def json(self, args, *, region=None):
+                if args[:2] == ["elbv2", "describe-load-balancers"] and self.mode == "load-balancer":
+                    value = {"LoadBalancerArn": "arn:aws:elasticloadbalancing:fixture:duplicate", "Type": "gateway"}
+                    return {"LoadBalancers": [value, copy.deepcopy(value)]}
+                if args[:2] == ["elbv2", "describe-target-groups"] and self.mode == "target-group":
+                    return {
+                        "TargetGroups": [
+                            {
+                                "TargetGroupArn": "arn:aws:elasticloadbalancing:fixture:missing-protocol",
+                                "TargetType": "instance",
+                            }
+                        ]
+                    }
+                if args[:2] == ["ec2", "describe-vpc-endpoint-service-configurations"] and self.mode == "endpoint-service":
+                    return {
+                        "ServiceConfigurations": [
+                            {"ServiceId": "vpce-svc-fixture", "ServiceState": "Unknown"}
+                        ]
+                    }
+                return super().json(args, region=region)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            for mode, message in (
+                ("load-balancer", "gateway-load-balancers/current-usage"),
+                ("target-group", "target-groups/current-usage"),
+                ("endpoint-service", "vpc-endpoint-services/current-usage"),
+            ):
+                with self.subTest(mode=mode):
+                    with self.assertRaisesRegex(appliance.LifecycleError, message):
+                        appliance.aws_capability_quota_preflight(
+                            config,
+                            MalformedUsageAWS(config, mode),
+                            fixture_instance_vcpus(config),
+                            artifact_identity(root),
+                        )
+
+    def test_malformed_iam_and_quota_response_schemas_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            malformed_quota = CapabilityAWS(config)
+            malformed_quota.malformed_quota_schema = True
+            with self.assertRaisesRegex(appliance.LifecycleError, "mismatched or malformed quota"):
+                appliance.aws_capability_quota_preflight(
+                    config,
+                    malformed_quota,
+                    fixture_instance_vcpus(config),
+                    artifact_identity(pathlib.Path(temporary)),
+                )
+
+            malformed_simulation = CapabilityAWS(config)
+            original_json = malformed_simulation.json
+
+            def malformed(args, *, region=None):
+                if args[:2] == ["iam", "simulate-principal-policy"]:
+                    return {"EvaluationResults": {}}
+                return original_json(args, region=region)
+
+            malformed_simulation.json = malformed
+            with self.assertRaisesRegex(appliance.LifecycleError, "malformed result schema"):
+                appliance.aws_capability_quota_preflight(
+                    config,
+                    malformed_simulation,
+                    fixture_instance_vcpus(config),
+                    artifact_identity(pathlib.Path(temporary)),
+                )
+
+    def test_run_preflight_retains_summary_without_changing_two_value_api(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            artifact = artifact_identity(root)
+            summary = artifact.pop("aws_preflight")
+            with mock.patch.object(appliance, "validate_artifact", return_value=artifact), mock.patch.object(
+                appliance.BackendValidator, "validate"
+            ), mock.patch.object(
+                appliance, "validate_aws_metadata", return_value=fixture_instance_vcpus(config)
+            ), mock.patch.object(
+                appliance,
+                "aws_capability_quota_preflight",
+                return_value=("123456789012", summary),
+            ), mock.patch.object(appliance, "tailnet_preflight"):
+                selected, account_id = appliance.run_preflight(config, object(), object())
+            manifest = appliance.new_manifest(config, selected, account_id)
+            self.assertEqual(selected["aws_preflight"], summary)
+            self.assertEqual(manifest["aws_preflight"], summary)
+            self.assertIsNot(selected["aws_preflight"], manifest["aws_preflight"])
 
 
 class PolicyAndAdapterTest(unittest.TestCase):
@@ -727,6 +3175,118 @@ class PolicyAndAdapterTest(unittest.TestCase):
         )
         self.assertEqual(create["expirySeconds"], 1800)
 
+    def test_oauth_token_expiry_uses_injected_monotonic_clock_and_refresh_margin(self):
+        class Clock:
+            value = 0.0
+
+            def __call__(self):
+                return self.value
+
+        class RefreshHTTP:
+            def __init__(self):
+                self.token_requests = 0
+                self.authorizations = []
+
+            def request(self, method, url, *, headers=None, body=None):
+                path = urllib.parse.urlparse(url).path
+                if path.endswith("/oauth/token"):
+                    self.token_requests += 1
+                    return 200, json.dumps(
+                        {"access_token": f"bearer-{self.token_requests}", "expires_in": "100"}
+                    ).encode()
+                self.authorizations.append(headers["Authorization"])
+                return 200, b'{"devices":[]}'
+
+        clock = Clock()
+        transport = RefreshHTTP()
+        api = appliance.TailscaleAPI("fixture.example", "client", "fixture-secret", transport, clock=clock)
+        api.list_devices()
+        clock.value = 89
+        api.list_devices()
+        clock.value = 90
+        api.list_devices()
+        self.assertEqual(transport.token_requests, 2)
+        self.assertEqual(
+            transport.authorizations,
+            ["Bearer bearer-1", "Bearer bearer-1", "Bearer bearer-2"],
+        )
+        self.assertEqual(api._token_expires_at, 190)
+
+    def test_oauth_401_refreshes_and_retries_once_but_other_failures_do_not_retry_or_leak(self):
+        class RetryHTTP:
+            def __init__(self, statuses):
+                self.statuses = list(statuses)
+                self.token_requests = 0
+                self.api_requests = 0
+                self.authorizations = []
+                self.sensitive_body = "sensitive-response-body"
+
+            def request(self, method, url, *, headers=None, body=None):
+                if urllib.parse.urlparse(url).path.endswith("/oauth/token"):
+                    self.token_requests += 1
+                    return 200, json.dumps(
+                        {"access_token": f"private-bearer-{self.token_requests}", "expires_in": 3600}
+                    ).encode()
+                self.api_requests += 1
+                self.authorizations.append(headers["Authorization"])
+                status = self.statuses.pop(0)
+                return status, (
+                    b'{"devices":[]}'
+                    if status == 200
+                    else json.dumps({"message": self.sensitive_body}).encode()
+                )
+
+        recovered = RetryHTTP([401, 200])
+        api = appliance.TailscaleAPI("fixture.example", "client", "fixture-secret", recovered, clock=lambda: 0)
+        self.assertEqual(api.list_devices(), [])
+        self.assertEqual((recovered.token_requests, recovered.api_requests), (2, 2))
+        self.assertEqual(
+            recovered.authorizations,
+            ["Bearer private-bearer-1", "Bearer private-bearer-2"],
+        )
+
+        for statuses, expected_tokens, expected_api_calls in (([403], 1, 1), ([401, 401], 2, 2)):
+            with self.subTest(statuses=statuses):
+                failed = RetryHTTP(statuses)
+                candidate = appliance.TailscaleAPI(
+                    "fixture.example", "client", "fixture-secret", failed, clock=lambda: 0
+                )
+                with self.assertRaises(appliance.LifecycleError) as raised:
+                    candidate.list_devices()
+                rendered = str(raised.exception)
+                self.assertEqual((failed.token_requests, failed.api_requests), (expected_tokens, expected_api_calls))
+                self.assertNotIn(failed.sensitive_body, rendered)
+                self.assertNotIn("private-bearer", rendered)
+
+    def test_oauth_expiry_and_token_failure_schemas_fail_closed_without_response_body(self):
+        class TokenHTTP:
+            def __init__(self, status, payload):
+                self.status = status
+                self.payload = payload
+                self.requests = 0
+
+            def request(self, method, url, *, headers=None, body=None):
+                self.requests += 1
+                if not urllib.parse.urlparse(url).path.endswith("/oauth/token"):
+                    raise AssertionError("malformed OAuth metadata must fail before an API request")
+                return self.status, json.dumps(self.payload).encode()
+
+        for expires_in in (None, 0, -1, True, 1.5, "0", "1.5", 86401, "9999999999"):
+            with self.subTest(expires_in=expires_in):
+                transport = TokenHTTP(200, {"access_token": "private-bearer", "expires_in": expires_in})
+                api = appliance.TailscaleAPI(
+                    "fixture.example", "client", "fixture-secret", transport, clock=lambda: 0
+                )
+                with self.assertRaisesRegex(appliance.LifecycleError, "expires_in"):
+                    api.list_devices()
+                self.assertEqual(transport.requests, 1)
+
+        failed = TokenHTTP(500, {"message": "sensitive-token-response-body"})
+        api = appliance.TailscaleAPI("fixture.example", "client", "fixture-secret", failed, clock=lambda: 0)
+        with self.assertRaises(appliance.LifecycleError) as raised:
+            api.list_devices()
+        self.assertNotIn("sensitive-token-response-body", str(raised.exception))
+
     def test_delete_accepts_every_success_body_shape_and_bounds_failures(self):
         class DeleteHTTP:
             def __init__(self, status, body):
@@ -735,7 +3295,7 @@ class PolicyAndAdapterTest(unittest.TestCase):
 
             def request(self, method, url, *, headers=None, body=None):
                 if urllib.parse.urlparse(url).path.endswith("/oauth/token"):
-                    return 200, b'{"access_token":"fixture-bearer"}'
+                    return 200, b'{"access_token":"fixture-bearer","expires_in":3600}'
                 if method == "DELETE":
                     return self.status, self.body
                 raise AssertionError((method, url))
@@ -760,7 +3320,7 @@ class PolicyAndAdapterTest(unittest.TestCase):
                     else:
                         api.delete_device("device-fixture")
 
-        secret = "tskey-" + "auth-fixture123456789"
+        secret = "ts" + "key-" + "auth-fixture123456789"
         api = appliance.TailscaleAPI(
             "fixture.example",
             "client",
@@ -781,7 +3341,7 @@ class PolicyAndAdapterTest(unittest.TestCase):
             def request(self, method, url, *, headers=None, body=None):
                 path = urllib.parse.urlparse(url).path
                 if path.endswith("/oauth/token"):
-                    return 200, b'{"access_token":"fixture-bearer"}'
+                    return 200, b'{"access_token":"fixture-bearer","expires_in":3600}'
                 if path.endswith("/keys") and method == "GET":
                     return 200, json.dumps({"keys": self.keys}).encode()
                 if path.endswith("/devices") and method == "GET":
@@ -806,9 +3366,10 @@ class PolicyAndAdapterTest(unittest.TestCase):
 class SecurityAndBackendTest(unittest.TestCase):
     def test_redaction(self):
         aws_key = "AKIA" + "ABCDEFGHIJKLMNOP"
-        value = f"auth_key=fixture-value token: bearer-value access key {aws_key} tskey-auth-abc123"
+        tailscale_key = "ts" + "key-auth-abc123"
+        value = f"auth_key=fixture-value token: bearer-value access key {aws_key} {tailscale_key}"
         result = appliance.redact(value)
-        for prohibited in ("fixture-value", "bearer-value", aws_key, "tskey-auth-abc123"):
+        for prohibited in ("fixture-value", "bearer-value", aws_key, tailscale_key):
             self.assertNotIn(prohibited, result)
 
     def test_backend_requires_versioning_kms_public_block_and_unique_keys(self):
@@ -821,6 +3382,7 @@ class SecurityAndBackendTest(unittest.TestCase):
                 ("versioning", "Suspended"),
                 ("algorithm", "AES256"),
                 ("key", "arn:aws:kms:us-west-2:123456789012:key/wrong"),
+                ("bucket_key_enabled", True),
                 ("public", False),
                 ("policy_public", True),
                 ("key_enabled", False),
@@ -873,6 +3435,207 @@ class SecurityAndBackendTest(unittest.TestCase):
                     with self.assertRaisesRegex(appliance.LifecycleError, re.escape(action)):
                         appliance.BackendValidator(candidate).validate(config, require_empty=True)
 
+    def test_backend_policy_accepts_exact_prefix_encryption_tag_and_kms_conditions_with_root_delegation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            candidate = BackendAWS(config)
+            principal = config.backend["operator_principal_arns"][0]
+            partition, account_id = principal.split(":", 5)[1], principal.split(":", 5)[4]
+            root = f"arn:{partition}:iam::{account_id}:root"
+            bucket_arn = f"arn:{partition}:s3:::{config.backend['bucket']}"
+            object_arns = [
+                f"{bucket_arn}/{key}"
+                for key in (config.backend["state_key"], config.lock_key, config.manifest_key)
+            ]
+
+            bucket_allow = candidate.bucket_policy["Statement"][1]
+            bucket_allow["Principal"] = {"AWS": root}
+            conditional_s3_actions = {"s3:ListBucket", "s3:ListBucketVersions", "s3:PutObject", "s3:PutObjectTagging"}
+            bucket_allow["Action"] = [
+                action for action in bucket_allow["Action"] if action not in conditional_s3_actions
+            ]
+            candidate.bucket_policy["Statement"].extend(
+                [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"AWS": root},
+                        "Action": ["s3:ListBucket", "s3:ListBucketVersions"],
+                        "Resource": bucket_arn,
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:prefix": [
+                                    config.backend["state_key"],
+                                    config.lock_key,
+                                    config.manifest_key,
+                                ]
+                            }
+                        },
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"AWS": root},
+                        "Action": "s3:PutObject",
+                        "Resource": object_arns,
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:x-amz-server-side-encryption": "aws:kms",
+                                "s3:x-amz-server-side-encryption-aws-kms-key-id": config.backend["kms_key_arn"],
+                            }
+                        },
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"AWS": root},
+                        "Action": "s3:PutObjectTagging",
+                        "Resource": f"{bucket_arn}/{config.manifest_key}",
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:RequestObjectTag/EnvelopeRun": config.run_id,
+                                "s3:RequestObjectTag/ExpiresAt": config.expires_at,
+                            }
+                        },
+                    },
+                ]
+            )
+
+            key_allow = candidate.key_policy["Statement"][0]
+            key_allow["Principal"] = {"AWS": root}
+            key_allow["Action"] = ["kms:DescribeKey", "kms:GetKeyPolicy"]
+            candidate.key_policy["Statement"].append(
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": root},
+                    "Action": ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey"],
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "kms:ViaService": f"s3.{config.backend['region']}.amazonaws.com",
+                            "kms:EncryptionContext:aws:s3:arn": object_arns,
+                        },
+                        "ForAllValues:StringEquals": {
+                            "kms:EncryptionContextKeys": ["aws:s3:arn"]
+                        },
+                    },
+                }
+            )
+            appliance.BackendValidator(candidate).validate(config, require_empty=True)
+
+    def test_backend_policy_explicit_denies_override_matching_allows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            principal = config.backend["operator_principal_arns"][0]
+            bucket_arn = f"arn:aws:s3:::{config.backend['bucket']}"
+            state_arn = f"{bucket_arn}/{config.backend['state_key']}"
+
+            denied_s3 = BackendAWS(config)
+            denied_s3.bucket_policy["Statement"].append(
+                {
+                    "Effect": "Deny",
+                    "Principal": {"AWS": principal},
+                    "Action": "s3:PutObject",
+                    "Resource": state_arn,
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:x-amz-server-side-encryption": "aws:kms",
+                            "s3:x-amz-server-side-encryption-aws-kms-key-id": config.backend["kms_key_arn"],
+                        }
+                    },
+                }
+            )
+            with self.assertRaisesRegex(appliance.LifecycleError, "explicitly denies"):
+                appliance.BackendValidator(denied_s3).validate(config, require_empty=True)
+
+            denied_kms = BackendAWS(config)
+            denied_kms.key_policy["Statement"].append(
+                {
+                    "Effect": "Deny",
+                    "Principal": {"AWS": principal},
+                    "Action": "kms:Decrypt",
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "kms:ViaService": f"s3.{config.backend['region']}.amazonaws.com",
+                            "kms:EncryptionContext:aws:s3:arn": state_arn,
+                        }
+                    },
+                }
+            )
+            with self.assertRaisesRegex(appliance.LifecycleError, "explicitly denies"):
+                appliance.BackendValidator(denied_kms).validate(config, require_empty=True)
+
+    def test_backend_insecure_transport_deny_must_cover_each_real_operator_without_exemption(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            principal = config.backend["operator_principal_arns"][0]
+            exempted = BackendAWS(config)
+            exempted.bucket_policy["Statement"][0]["Condition"]["StringNotEquals"] = {
+                "aws:PrincipalArn": principal
+            }
+            with self.assertRaisesRegex(
+                appliance.LifecycleError,
+                rf"insecure transport.*{re.escape(principal)}",
+            ):
+                appliance.BackendValidator(exempted).validate(config, require_empty=True)
+
+    def test_backend_policy_rejects_wrong_or_unsupported_request_conditions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            principal = config.backend["operator_principal_arns"][0]
+            bucket_arn = f"arn:aws:s3:::{config.backend['bucket']}"
+
+            wrong_prefix = BackendAWS(config)
+            allow = wrong_prefix.bucket_policy["Statement"][1]
+            allow["Action"].remove("s3:ListBucket")
+            wrong_prefix.bucket_policy["Statement"].append(
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": principal},
+                    "Action": "s3:ListBucket",
+                    "Resource": bucket_arn,
+                    "Condition": {"StringEquals": {"s3:prefix": "unrelated/"}},
+                }
+            )
+            with self.assertRaisesRegex(appliance.LifecycleError, "s3:ListBucket"):
+                appliance.BackendValidator(wrong_prefix).validate(config, require_empty=True)
+
+            wrong_kms_context = BackendAWS(config)
+            key_allow = wrong_kms_context.key_policy["Statement"][0]
+            key_allow["Action"].remove("kms:GenerateDataKey")
+            wrong_kms_context.key_policy["Statement"].append(
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": principal},
+                    "Action": "kms:GenerateDataKey",
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "kms:ViaService": "s3.us-east-2.amazonaws.com",
+                            "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::other/*",
+                        }
+                    },
+                }
+            )
+            with self.assertRaisesRegex(appliance.LifecycleError, "kms:GenerateDataKey"):
+                appliance.BackendValidator(wrong_kms_context).validate(config, require_empty=True)
+
+            invalid_key_policy_resource = BackendAWS(config)
+            invalid_key_policy_resource.key_policy["Statement"][0]["Resource"] = config.backend["kms_key_arn"]
+            with self.assertRaisesRegex(appliance.LifecycleError, "backend KMS key policy omits"):
+                appliance.BackendValidator(invalid_key_policy_resource).validate(config, require_empty=True)
+
+            unsupported = BackendAWS(config)
+            unsupported.bucket_policy["Statement"].append(
+                {
+                    "Effect": "Deny",
+                    "Principal": {"AWS": principal},
+                    "Action": "s3:GetObject",
+                    "Resource": f"{bucket_arn}/{config.backend['state_key']}",
+                    "Condition": {"NumericEquals": {"s3:object-lock-remaining-retention-days": "1"}},
+                }
+            )
+            with self.assertRaisesRegex(appliance.LifecycleError, "unsupported condition operator"):
+                appliance.BackendValidator(unsupported).validate(config, require_empty=True)
+
     def test_backend_configuration_requires_encryption_and_lockfile(self):
         with tempfile.TemporaryDirectory() as temporary:
             text = appliance.backend_config_text(make_config(pathlib.Path(temporary)))
@@ -898,6 +3661,42 @@ class SecurityAndBackendTest(unittest.TestCase):
             appliance.validate_manifest(json.loads(serialized), config)
             self.assertEqual(set(manifest["terraform_variables"]), set(appliance.terraform_variables(config, artifact, manifest["ssm_parameters"])))
             self.assertEqual([value["created"] for value in manifest["ssm_parameters"]], [False, False])
+
+    def test_manifest_apply_timestamp_contract_rejects_missing_or_stale_claim_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            base = appliance.new_manifest(config, artifact_identity(root), "123456789012")
+
+            active = copy.deepcopy(base)
+            mark_manifest_apply_started(active)
+            active["phase"] = "apply_started"
+            appliance.validate_manifest(active, config)
+
+            applied = copy.deepcopy(base)
+            mark_manifest_applied(applied)
+            applied["phase"] = "ready"
+            appliance.validate_manifest(applied, config)
+
+            cases = {}
+            missing_applied_at = copy.deepcopy(applied)
+            missing_applied_at["saved_plan"].pop("applied_at")
+            cases["saved_plan.applied_at"] = missing_applied_at
+            stale_claim = copy.deepcopy(applied)
+            stale_claim["apply_claimed_at"] = "2026-08-20T12:00:00Z"
+            cases["stale active apply claim"] = stale_claim
+            misplaced = copy.deepcopy(applied)
+            misplaced["applied_at"] = misplaced["saved_plan"]["applied_at"]
+            cases["only under saved_plan"] = misplaced
+            active_without_claim = copy.deepcopy(active)
+            active_without_claim.pop("apply_claimed_at")
+            cases["apply_claimed_at"] = active_without_claim
+            invalid_timestamp = copy.deepcopy(applied)
+            invalid_timestamp["saved_plan"]["applied_at"] = "2026-08-20T12:00:00+00:00"
+            cases["canonical UTC"] = invalid_timestamp
+            for message, candidate in cases.items():
+                with self.subTest(message=message), self.assertRaisesRegex(appliance.LifecycleError, message):
+                    appliance.validate_manifest(candidate, config)
 
     def test_manifest_compare_and_swap_rejects_a_stale_lifecycle_writer(self):
         class AWS:
@@ -1021,24 +3820,36 @@ class SecurityAndBackendTest(unittest.TestCase):
         class UnusedAWS:
             pass
 
-        resources = [
-            {"arn": "arn:aws:ec2:us-west-2:123456789012:vpc/vpc-fixture", "region": "us-west-2"},
-            {"arn": "arn:aws:s3:::run-artifact-fixture", "region": "us-west-2"},
-            {"arn": "arn:aws:iam::123456789012:role/run-role", "region": "us-west-2"},
-            {"arn": "arn:aws:ec2:us-west-2:123456789012:subnet/subnet-fixture", "region": "us-west-2"},
-            {
-                "arn": "arn:aws:elasticloadbalancing:us-west-2:123456789012:loadbalancer/gwy/run/id",
-                "region": "us-west-2",
-            },
-            {
-                "arn": "arn:aws:ec2:us-west-2:123456789012:vpc-endpoint/vpce-fixture",
-                "region": "us-west-2",
-            },
-            {"arn": "arn:aws:ec2:us-west-2:123456789012:instance/i-fixture", "region": "us-west-2"},
-        ]
         order = []
         with tempfile.TemporaryDirectory() as temporary:
             config = make_config(pathlib.Path(temporary))
+            resources = [
+                {"arn": "arn:aws:ec2:us-west-2:123456789012:vpc/vpc-fixture", "region": "us-west-2"},
+                {"arn": "arn:aws:s3:::run-artifact-fixture", "region": "us-west-2"},
+                {"arn": "arn:aws:iam::123456789012:role/run-role", "region": "us-west-2"},
+                {"arn": "arn:aws:ec2:us-west-2:123456789012:subnet/subnet-fixture", "region": "us-west-2"},
+                {
+                    "arn": "arn:aws:elasticloadbalancing:us-west-2:123456789012:loadbalancer/gwy/run/id",
+                    "region": "us-west-2",
+                },
+                {
+                    "arn": "arn:aws:ec2:us-west-2:123456789012:vpc-endpoint/vpce-fixture",
+                    "region": "us-west-2",
+                },
+                {"arn": "arn:aws:ec2:us-west-2:123456789012:instance/i-fixture", "region": "us-west-2"},
+                owned_residual(
+                    config,
+                    "arn:aws:ec2:us-west-2:123456789012:vpc-flow-log/fl-fixture",
+                ),
+                owned_residual(
+                    config,
+                    "arn:aws:logs:us-west-2:123456789012:log-group:/aws/vpc-flow-logs/envelope-fixture/west:*",
+                ),
+                owned_residual(
+                    config,
+                    "arn:aws:ec2:us-west-2:123456789012:network-acl/acl-fixture",
+                ),
+            ]
             with mock.patch.object(
                 appliance,
                 "delete_owned_resource",
@@ -1054,7 +3865,18 @@ class SecurityAndBackendTest(unittest.TestCase):
                 )
         self.assertEqual(
             order,
-            ["instance", "vpc-endpoint", "load-balancer", "subnet", "role", "s3-bucket", "vpc"],
+            [
+                "instance",
+                "flow-log",
+                "vpc-endpoint",
+                "log-group",
+                "load-balancer",
+                "subnet",
+                "network-acl",
+                "role",
+                "s3-bucket",
+                "vpc",
+            ],
         )
         self.assertEqual(appliance.RESIDUAL_CLEANUP_TIMEOUT_SECONDS, 15 * 60)
         self.assertLessEqual(
@@ -1090,6 +3912,31 @@ class SecurityAndBackendTest(unittest.TestCase):
                 "arn:aws:ssm:us-west-2:123456789012:parameter/envelope-fixture/tailscale-auth",
                 "describe-parameters",
                 {"Parameters": [{"Name": "/envelope-fixture/tailscale-auth"}]},
+            ),
+            (
+                "arn:aws:ec2:us-west-2:123456789012:network-acl/acl-live",
+                "describe-network-acls",
+                {
+                    "NetworkAcls": [
+                        {
+                            "NetworkAclId": "acl-live",
+                            "VpcId": "vpc-live",
+                            "IsDefault": False,
+                            "Associations": [],
+                            "Tags": [],
+                        }
+                    ]
+                },
+            ),
+            (
+                "arn:aws:ec2:us-west-2:123456789012:vpc-flow-log/fl-live",
+                "describe-flow-logs",
+                {"FlowLogs": [{"FlowLogId": "fl-live", "FlowLogStatus": "ACTIVE", "Tags": []}]},
+            ),
+            (
+                "arn:aws:logs:us-west-2:123456789012:log-group:/aws/vpc-flow-logs/envelope-fixture/west:*",
+                "list-tags-for-resource",
+                {},
             ),
             (
                 "arn:aws:ec2:us-west-2:123456789012:instance/i-live",
@@ -1154,13 +4001,16 @@ class SecurityAndBackendTest(unittest.TestCase):
         )
 
         class DescribeAWS:
-            def __init__(self, operation, response):
+            def __init__(self, operation, response, tags=None):
                 self.operation = operation
                 self.response = response
+                self.tags = tags
                 self.calls = []
 
             def json(self, args, *, region=None):
                 self.calls.append((args, region))
+                if args[1] == "list-tags-for-resource" and self.tags is not None:
+                    return {"tags": self.tags}
                 self.assert_operation(args[1])
                 return self.response
 
@@ -1169,11 +4019,29 @@ class SecurityAndBackendTest(unittest.TestCase):
                     raise AssertionError((operation, self.operation))
 
         self.assertEqual(len(cases), len(appliance.RESIDUAL_DELETE_PRIORITY))
-        for arn, operation, response in cases:
-            with self.subTest(arn=arn):
-                aws = DescribeAWS(operation, response)
-                self.assertTrue(appliance.owned_resource_is_live(aws, {"arn": arn, "region": "us-west-2"}))
-                self.assertIn(appliance.owned_resource_kind(arn)[1], " ".join(aws.calls[0][0]))
+        self.assertEqual(
+            set(appliance.RESIDUAL_DELETE_PRIORITY),
+            set(appliance.OWNED_RESOURCE_ABSENT_MARKERS),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            for arn, operation, original_response in cases:
+                with self.subTest(arn=arn):
+                    kind, identifier = appliance.owned_resource_kind(arn)
+                    response = copy.deepcopy(original_response)
+                    resource = {"arn": arn, "region": "us-west-2"}
+                    tags = None
+                    if kind in appliance.OWNERSHIP_VERIFIED_RESOURCE_KINDS:
+                        resource = owned_residual(config, arn)
+                        if kind == "network-acl":
+                            response["NetworkAcls"][0]["Tags"] = owned_tag_list(config)
+                        elif kind == "flow-log":
+                            response["FlowLogs"][0]["Tags"] = owned_tag_list(config)
+                        else:
+                            tags = {tag["Key"]: tag["Value"] for tag in owned_tag_list(config)}
+                    aws = DescribeAWS(operation, response, tags)
+                    self.assertTrue(appliance.owned_resource_is_live(aws, resource))
+                    self.assertIn(identifier, " ".join(aws.calls[0][0]))
 
         volume = {"arn": "arn:aws:ec2:us-west-2:123456789012:volume/vol-live", "region": "us-west-2"}
         with self.assertRaisesRegex(appliance.LifecycleError, "exact requested identity"):
@@ -1186,6 +4054,296 @@ class SecurityAndBackendTest(unittest.TestCase):
         with self.assertRaises(appliance.CommandError):
             appliance.owned_resource_is_live(denied, volume)
 
+    def test_new_residual_arn_parsing_is_exact_and_log_group_variants_are_equivalent(self):
+        valid = {
+            "arn:aws:ec2:us-west-2:123456789012:network-acl/acl-fixture": ("network-acl", "acl-fixture"),
+            "arn:aws:ec2:us-west-2:123456789012:vpc-flow-log/fl-fixture": ("flow-log", "fl-fixture"),
+            "arn:aws:logs:us-west-2:123456789012:log-group:/aws/vpc-flow-logs/run/west": (
+                "log-group",
+                "/aws/vpc-flow-logs/run/west",
+            ),
+            "arn:aws:logs:us-west-2:123456789012:log-group:/aws/vpc-flow-logs/run/west:*": (
+                "log-group",
+                "/aws/vpc-flow-logs/run/west",
+            ),
+        }
+        for arn, expected in valid.items():
+            with self.subTest(arn=arn):
+                self.assertEqual(appliance.owned_resource_kind(arn), expected)
+
+        invalid = (
+            "arn:aws:ec2::123456789012:network-acl/acl-fixture",
+            "arn:aws:ec2:us-west-2:account:network-acl/acl-fixture",
+            "arn:aws:ec2:us-west-2:123456789012:network-acl/acl-fixture/extra",
+            "arn:aws:ec2:us-west-2:123456789012:vpc-flow-log/flow-fixture",
+            "arn:aws:ec2:us-west-2:123456789012:flow-log/fl-fixture",
+            "arn:aws:logs:us-west-2:123456789012:log-group:/aws/vpc-flow-logs/run/*/west",
+            "arn:aws:logs:us-west-2:123456789012:log-group:/aws/vpc-flow-logs/run/west:*:extra",
+            "arn:aws:logs:us-west-2:123456789012:log-stream:/aws/vpc-flow-logs/run/west",
+            "arn:aws:ec2:us-west-2:123456789012:network-firewall/unknown",
+        )
+        for arn in invalid:
+            with self.subTest(arn=arn), self.assertRaises(appliance.LifecycleError):
+                appliance.owned_resource_kind(arn)
+
+    def test_network_acl_cleanup_rejects_default_nonowned_conflicting_and_malformed_state(self):
+        class ACLAWS:
+            def __init__(self, response):
+                self.response = response
+                self.calls = []
+
+            def json(self, args, *, region=None):
+                self.calls.append((args, region))
+                if args[1] == "describe-network-acls":
+                    return self.response
+                raise AssertionError(args)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            resource = owned_residual(
+                config,
+                "arn:aws:ec2:us-west-2:123456789012:network-acl/acl-owned",
+            )
+            base = {
+                "NetworkAcls": [
+                    {
+                        "NetworkAclId": "acl-owned",
+                        "VpcId": "vpc-owned",
+                        "IsDefault": False,
+                        "Associations": [],
+                        "Tags": owned_tag_list(config),
+                    }
+                ]
+            }
+            cases = {}
+            default = copy.deepcopy(base)
+            default["NetworkAcls"][0]["IsDefault"] = True
+            cases["default"] = default
+            nonowned = copy.deepcopy(base)
+            nonowned["NetworkAcls"][0]["Tags"][0]["Value"] = "another-run"
+            cases["non-owned"] = nonowned
+            conflicting = copy.deepcopy(base)
+            conflicting["NetworkAcls"][0]["NetworkAclId"] = "acl-other"
+            cases["conflicting identity"] = conflicting
+            malformed = copy.deepcopy(base)
+            malformed["NetworkAcls"][0]["Associations"] = "invalid"
+            cases["malformed associations"] = malformed
+
+            for name, response in cases.items():
+                with self.subTest(name=name):
+                    aws = ACLAWS(response)
+                    with self.assertRaises(appliance.LifecycleError):
+                        appliance.delete_owned_resource(aws, resource)
+                    self.assertEqual([call[0][1] for call in aws.calls], ["describe-network-acls"])
+
+            wrong_region = dict(resource)
+            wrong_region["region"] = "us-east-1"
+            aws = ACLAWS(base)
+            with self.assertRaisesRegex(appliance.LifecycleError, "audit region"):
+                appliance.owned_resource_is_live(aws, wrong_region)
+            self.assertEqual(aws.calls, [])
+
+    def test_network_acl_cleanup_restores_exact_associations_before_deletion(self):
+        class ACLAWS:
+            def __init__(self, config):
+                self.config = config
+                self.calls = []
+
+            def json(self, args, *, region=None):
+                self.calls.append((args, region))
+                operation = args[1]
+                if operation == "describe-network-acls" and "--network-acl-ids" in args:
+                    return {
+                        "NetworkAcls": [
+                            {
+                                "NetworkAclId": "acl-owned",
+                                "VpcId": "vpc-owned",
+                                "IsDefault": False,
+                                "Associations": [
+                                    {
+                                        "NetworkAclAssociationId": "aclassoc-owned",
+                                        "NetworkAclId": "acl-owned",
+                                        "SubnetId": "subnet-owned",
+                                    }
+                                ],
+                                "Tags": owned_tag_list(self.config),
+                            }
+                        ]
+                    }
+                if operation == "describe-network-acls" and "--filters" in args:
+                    return {
+                        "NetworkAcls": [
+                            {"NetworkAclId": "acl-default", "VpcId": "vpc-owned", "IsDefault": True}
+                        ]
+                    }
+                if operation == "replace-network-acl-association":
+                    return {"NewAssociationId": "aclassoc-defaulted"}
+                if operation == "delete-network-acl":
+                    return {}
+                raise AssertionError(args)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            aws = ACLAWS(config)
+            resource = owned_residual(
+                config,
+                "arn:aws:ec2:us-west-2:123456789012:network-acl/acl-owned",
+            )
+            appliance.delete_owned_resource(aws, resource)
+
+        operations = [args[1] for args, _ in aws.calls]
+        self.assertEqual(
+            operations,
+            [
+                "describe-network-acls",
+                "describe-network-acls",
+                "replace-network-acl-association",
+                "delete-network-acl",
+            ],
+        )
+        replacement = aws.calls[2][0]
+        self.assertEqual(replacement[replacement.index("--association-id") + 1], "aclassoc-owned")
+        self.assertEqual(replacement[replacement.index("--network-acl-id") + 1], "acl-default")
+
+    def test_flow_log_and_log_group_deletion_use_exact_id_name_and_valid_schemas(self):
+        class FlowAWS:
+            def __init__(self, config, unsuccessful=None):
+                self.config = config
+                self.unsuccessful = [] if unsuccessful is None else unsuccessful
+                self.calls = []
+
+            def json(self, args, *, region=None):
+                self.calls.append((args, region))
+                if args[1] == "describe-flow-logs":
+                    return {
+                        "FlowLogs": [
+                            {
+                                "FlowLogId": "fl-owned",
+                                "FlowLogStatus": "ACTIVE",
+                                "Tags": owned_tag_list(self.config),
+                            }
+                        ]
+                    }
+                if args[1] == "delete-flow-logs":
+                    return {"Unsuccessful": self.unsuccessful}
+                raise AssertionError(args)
+
+        class LogsAWS:
+            def __init__(self, config, arn):
+                self.config = config
+                self.arn = arn
+                self.calls = []
+
+            def json(self, args, *, region=None):
+                self.calls.append((args, region))
+                if args[1] == "describe-log-groups":
+                    return {
+                        "logGroups": [
+                            {
+                                "logGroupName": "/aws/vpc-flow-logs/envelope-fixture/west",
+                                "arn": self.arn,
+                            },
+                            {"logGroupName": "/aws/vpc-flow-logs/envelope-fixture/west-prefix"},
+                        ]
+                    }
+                if args[1] == "list-tags-for-resource":
+                    return {"tags": {tag["Key"]: tag["Value"] for tag in owned_tag_list(self.config)}}
+                if args[1] == "delete-log-group":
+                    return {}
+                raise AssertionError(args)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            flow = owned_residual(
+                config,
+                "arn:aws:ec2:us-west-2:123456789012:vpc-flow-log/fl-owned",
+            )
+            flow_aws = FlowAWS(config)
+            appliance.delete_owned_resource(flow_aws, flow)
+            self.assertEqual([args[1] for args, _ in flow_aws.calls], ["describe-flow-logs", "delete-flow-logs"])
+            self.assertEqual(flow_aws.calls[1][0][-1], "fl-owned")
+
+            failed_flow = FlowAWS(
+                config,
+                [{"ResourceId": "fl-owned", "Error": {"Code": "InternalError"}}],
+            )
+            with self.assertRaisesRegex(appliance.LifecycleError, "unsuccessful exact ID"):
+                appliance.delete_owned_resource(failed_flow, flow)
+            absent_flow = FlowAWS(
+                config,
+                [
+                    {
+                        "ResourceId": "fl-owned",
+                        "Error": {"Code": "InvalidFlowLogId.NotFound"},
+                    }
+                ],
+            )
+            appliance.delete_owned_resource(absent_flow, flow)
+
+            for suffix in ("", ":*"):
+                arn = (
+                    "arn:aws:logs:us-west-2:123456789012:"
+                    f"log-group:/aws/vpc-flow-logs/envelope-fixture/west{suffix}"
+                )
+                with self.subTest(suffix=suffix):
+                    logs_aws = LogsAWS(config, arn)
+                    log_group = owned_residual(config, arn)
+                    appliance.delete_owned_resource(logs_aws, log_group)
+                    self.assertEqual(
+                        [args[1] for args, _ in logs_aws.calls],
+                        ["list-tags-for-resource", "delete-log-group"],
+                    )
+                    delete_args = logs_aws.calls[-1][0]
+                    self.assertEqual(delete_args[1], "delete-log-group")
+                    self.assertEqual(
+                        delete_args[delete_args.index("--log-group-name") + 1],
+                        "/aws/vpc-flow-logs/envelope-fixture/west",
+                    )
+                    tag_args = next(args for args, _ in logs_aws.calls if args[1] == "list-tags-for-resource")
+                    self.assertEqual(
+                        tag_args[-1],
+                        "arn:aws:logs:us-west-2:123456789012:log-group:/aws/vpc-flow-logs/envelope-fixture/west",
+                    )
+
+    def test_log_group_liveness_uses_only_the_exact_canonical_arn_and_tags(self):
+        class LogsAWS:
+            def __init__(self, tags):
+                self.tags = tags
+                self.calls = []
+
+            def json(self, args, *, region=None):
+                self.calls.append(args)
+                if args[1] != "list-tags-for-resource":
+                    raise AssertionError(args)
+                return {"tags": self.tags}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            resource = owned_residual(
+                config,
+                "arn:aws:logs:us-west-2:123456789012:log-group:/aws/vpc-flow-logs/envelope-fixture/west:*",
+            )
+            exact_tags = {tag["Key"]: tag["Value"] for tag in owned_tag_list(config)}
+            exact = LogsAWS(exact_tags)
+            self.assertTrue(appliance.owned_resource_is_live(exact, resource))
+            self.assertEqual(
+                exact.calls,
+                [
+                    [
+                        "logs",
+                        "list-tags-for-resource",
+                        "--resource-arn",
+                        "arn:aws:logs:us-west-2:123456789012:log-group:/aws/vpc-flow-logs/envelope-fixture/west",
+                    ]
+                ],
+            )
+            conflicting_tags = dict(exact_tags)
+            conflicting_tags["EnvelopeRun"] = "another-run"
+            with self.assertRaisesRegex(appliance.LifecycleError, "exact run/TTL identity"):
+                appliance.owned_resource_is_live(LogsAWS(conflicting_tags), resource)
+            with self.assertRaisesRegex(appliance.LifecycleError, "invalid tag schema"):
+                appliance.owned_resource_is_live(LogsAWS([]), resource)
+
     def test_tag_tombstones_are_filtered_before_cleanup_without_delete_retries(self):
         tombstones = [
             {"arn": "arn:aws:ec2:us-west-2:123456789012:instance/i-terminated", "region": "us-west-2"},
@@ -1195,6 +4353,18 @@ class SecurityAndBackendTest(unittest.TestCase):
             {"arn": "arn:aws:ec2:us-west-2:123456789012:vpc-endpoint/vpce-absent", "region": "us-west-2"},
             {
                 "arn": "arn:aws:ec2:us-west-2:123456789012:vpc-endpoint-service/vpce-svc-absent",
+                "region": "us-west-2",
+            },
+            {
+                "arn": "arn:aws:ec2:us-west-2:123456789012:network-acl/acl-absent",
+                "region": "us-west-2",
+            },
+            {
+                "arn": "arn:aws:ec2:us-west-2:123456789012:vpc-flow-log/fl-absent",
+                "region": "us-west-2",
+            },
+            {
+                "arn": "arn:aws:logs:us-west-2:123456789012:log-group:/aws/vpc-flow-logs/envelope-fixture/absent:*",
                 "region": "us-west-2",
             },
         ]
@@ -1240,6 +4410,14 @@ class SecurityAndBackendTest(unittest.TestCase):
                     raise appliance.CommandError(
                         args, 255, "InvalidVpcEndpointServiceId.NotFound: fixture tombstone"
                     )
+                if operation == "describe-network-acls":
+                    raise appliance.CommandError(args, 255, "InvalidNetworkAclID.NotFound: fixture tombstone")
+                if operation == "describe-flow-logs":
+                    return {"FlowLogs": []}
+                if operation == "describe-log-groups":
+                    return {"logGroups": []}
+                if operation == "list-tags-for-resource":
+                    raise appliance.CommandError(args, 255, "ResourceNotFoundException: fixture tombstone")
                 if operation.startswith(("delete", "terminate", "release")):
                     self.delete_calls.append(operation)
                     return {}
@@ -1595,6 +4773,8 @@ class SSMAndCleanupTest(unittest.TestCase):
             root = pathlib.Path(temporary)
             config = make_config(root)
             manifest = appliance.new_manifest(config, artifact_identity(root), "123456789012")
+            mark_manifest_applied(manifest)
+            manifest["phase"] = "readiness_started"
             store = appliance.ManifestStore(config, BackendAWS(config), root / "run")
             store.write(manifest, upload=False)
             identifiers = appliance.record_ready_devices(API(), store, manifest)
@@ -1795,6 +4975,174 @@ class SSMAndCleanupTest(unittest.TestCase):
                 if path.is_file():
                     self.assertNotIn("fixture-auth-material", path.read_text())
 
+    def test_prepare_distinguishes_only_exact_manifest_create_collisions(self):
+        class FailingAWS:
+            def __init__(self, stderr):
+                self.stderr = stderr
+                self.calls = []
+
+            def json(self, args, *, region=None):
+                self.calls.append((list(args), region))
+                raise appliance.CommandError(args, 255, self.stderr)
+
+        class UnusedTailscale:
+            def create_auth_key(self, *args):
+                raise AssertionError("manifest collision must fail before Tailnet mutation")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            artifact = artifact_identity(root)
+            collision = FailingAWS("PreconditionFailed: conditional request returned status code: 412")
+            with mock.patch.object(appliance, "run_preflight", return_value=(artifact, "123456789012")):
+                with self.assertRaises(appliance.ConcurrentLifecycleError):
+                    appliance.prepare(config, collision, UnusedTailscale(), root / "collision")
+            self.assertEqual(len(collision.calls), 1)
+            self.assertIn("--if-none-match", collision.calls[0][0])
+            collision.calls.clear()
+            with self.assertRaisesRegex(appliance.ConcurrentLifecycleError, "cleanup is not authorized"):
+                appliance.cleanup(
+                    config,
+                    collision,
+                    object(),
+                    object(),
+                    root / "collision",
+                    root / "terraform",
+                    recover=True,
+                    dry_run=False,
+                    skip_destroy=False,
+                )
+            self.assertEqual(collision.calls, [])
+
+            unrelated = FailingAWS("AccessDenied: fixture policy failure")
+            with mock.patch.object(appliance, "run_preflight", return_value=(artifact, "123456789012")):
+                with self.assertRaises(appliance.CommandError) as raised:
+                    appliance.prepare(config, unrelated, UnusedTailscale(), root / "unrelated")
+            self.assertNotIsInstance(raised.exception, appliance.ConcurrentLifecycleError)
+
+    def test_cross_host_cleanup_cannot_take_over_a_fresh_e2e_claim(self):
+        class SharedAWS:
+            def __init__(self):
+                self.remote = b""
+                self.etag = '"manifest-0"'
+                self.writes = []
+
+            def json(self, args, *, region=None):
+                operation = args[1]
+                if operation == "put-object":
+                    if "--if-none-match" in args and self.remote:
+                        raise appliance.CommandError(args, 255, "PreconditionFailed: status code: 412")
+                    if "--if-match" in args and args[args.index("--if-match") + 1] != self.etag:
+                        raise appliance.CommandError(args, 255, "PreconditionFailed: status code: 412")
+                    self.remote = pathlib.Path(args[args.index("--body") + 1]).read_bytes()
+                    self.writes.append(json.loads(self.remote))
+                    self.etag = f'"manifest-{len(self.writes)}"'
+                    return {"ETag": self.etag}
+                if operation == "get-object":
+                    pathlib.Path(args[-1]).write_bytes(self.remote)
+                    return {"ETag": self.etag}
+                raise AssertionError(args)
+
+            def object_exists(self, *args):
+                raise AssertionError("loser must stop before inspecting or destroying state")
+
+        class Unused:
+            def __getattr__(self, name):
+                raise AssertionError(f"loser must not call {name}")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            manifest = appliance.new_manifest(config, artifact_identity(root), "123456789012")
+            mark_manifest_applied(manifest)
+            manifest["phase"] = "e2e_running"
+            manifest["e2e"] = {
+                "claim_id": "123e4567-e89b-42d3-a456-426614174000",
+                "output_sha256": "e" * 64,
+                "started_at": "2026-08-20T12:00:00Z",
+            }
+            aws = SharedAWS()
+            winner = appliance.ManifestStore(config, aws, root / "winner")
+            winner.write(manifest, if_none_match=True)
+            winner_payload = bytes(aws.remote)
+            aws.writes.clear()
+
+            with self.assertRaisesRegex(appliance.LifecycleError, "active E2E claim"):
+                appliance.cleanup(
+                    config,
+                    aws,
+                    Unused(),
+                    Unused(),
+                    root / "loser",
+                    root / "terraform",
+                    recover=True,
+                    dry_run=False,
+                    skip_destroy=False,
+                )
+            self.assertEqual(aws.writes, [])
+            self.assertEqual(aws.remote, winner_payload)
+            self.assertEqual(json.loads(aws.remote)["phase"], "e2e_running")
+
+    def test_expired_e2e_orphan_is_cleanable_only_by_janitor_recovery(self):
+        class JanitorAWS:
+            def __init__(self, payload):
+                self.remote = payload
+                self.etag = '"manifest-0"'
+                self.phases = []
+
+            def json(self, args, *, region=None):
+                operation = args[1]
+                if operation == "get-object":
+                    pathlib.Path(args[-1]).write_bytes(self.remote)
+                    return {"ETag": self.etag}
+                if operation == "put-object":
+                    self.remote = pathlib.Path(args[args.index("--body") + 1]).read_bytes()
+                    self.phases.append(json.loads(self.remote)["phase"])
+                    self.etag = f'"manifest-{len(self.phases)}"'
+                    return {"ETag": self.etag}
+                if operation == "delete-parameter":
+                    return {}
+                if operation == "describe-parameters":
+                    return {"Parameters": []}
+                raise AssertionError(args)
+
+            def object_exists(self, *args):
+                return False
+
+        class UnusedRunner:
+            def run(self, *args, **kwargs):
+                raise AssertionError("state-free janitor must not invoke Terraform")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root, expired=True)
+            manifest = appliance.new_manifest(config, artifact_identity(root), "123456789012")
+            mark_manifest_applied(manifest)
+            manifest["phase"] = "e2e_running"
+            manifest["e2e"] = {
+                "claim_id": "123e4567-e89b-42d3-a456-426614174000",
+                "output_sha256": "e" * 64,
+                "started_at": "2026-08-19T12:00:00Z",
+            }
+            aws = JanitorAWS((json.dumps(manifest, separators=(",", ":")) + "\n").encode())
+            with mock.patch.object(appliance, "cleanup_tailnet_devices", return_value=[]), mock.patch.object(
+                appliance, "recover_auth_key_ids", return_value=[]
+            ), mock.patch.object(appliance, "audit_run_resources", return_value=[]):
+                result = appliance.cleanup(
+                    config,
+                    aws,
+                    object(),
+                    UnusedRunner(),
+                    root / "janitor",
+                    root / "terraform",
+                    recover=True,
+                    dry_run=False,
+                    skip_destroy=True,
+                    janitor=True,
+                )
+            self.assertEqual(aws.phases, ["cleanup_started", "secrets_only_cleanup_complete"])
+            self.assertFalse(result["state_exists"])
+
     def test_runner_loss_recovery_dry_run_preserves_shared_backend(self):
         class RecoveryAWS:
             def __init__(self, remote):
@@ -1855,6 +5203,7 @@ class SSMAndCleanupTest(unittest.TestCase):
             def __init__(self, config):
                 self.config = config
                 self.terminated = False
+                self.deleted_new_residuals = set()
                 self.deleted_parameters = []
                 self.backend_version_reads = 0
                 self.remote = b""
@@ -1884,20 +5233,80 @@ class SSMAndCleanupTest(unittest.TestCase):
                             {"Instances": [{"InstanceId": "i-residual", "State": {"Name": "running"}}]}
                         ]
                     }
+                if operation == "describe-network-acls":
+                    return {
+                        "NetworkAcls": [
+                            {
+                                "NetworkAclId": "acl-residual",
+                                "VpcId": "vpc-residual",
+                                "IsDefault": False,
+                                "Associations": [],
+                                "Tags": owned_tag_list(inner.config),
+                            }
+                        ]
+                    }
+                if operation == "describe-flow-logs":
+                    return {
+                        "FlowLogs": [
+                            {
+                                "FlowLogId": "fl-residual",
+                                "FlowLogStatus": "ACTIVE",
+                                "Tags": owned_tag_list(inner.config),
+                            }
+                        ]
+                    }
+                if operation == "describe-log-groups":
+                    return {
+                        "logGroups": [
+                            {
+                                "logGroupName": "/aws/vpc-flow-logs/envelope-fixture/west",
+                                "arn": "arn:aws:logs:us-west-2:123456789012:log-group:/aws/vpc-flow-logs/envelope-fixture/west:*",
+                            }
+                        ]
+                    }
+                if operation == "list-tags-for-resource":
+                    return {"tags": {tag["Key"]: tag["Value"] for tag in owned_tag_list(inner.config)}}
                 if operation == "terminate-instances":
                     inner.terminated = True
                     return {}
+                if operation == "delete-network-acl":
+                    inner.deleted_new_residuals.add("network-acl")
+                    return {}
+                if operation == "delete-flow-logs":
+                    inner.deleted_new_residuals.add("flow-log")
+                    return {"Unsuccessful": []}
+                if operation == "delete-log-group":
+                    inner.deleted_new_residuals.add("log-group")
+                    return {}
                 if operation == "get-resources":
-                    if region == inner.config.sites["west"]["region"] and not inner.terminated:
+                    if region == inner.config.sites["west"]["region"]:
+                        resources = []
+                        if not inner.terminated:
+                            resources.append(
+                                "arn:aws:ec2:us-west-2:123456789012:instance/i-residual"
+                            )
+                        if "network-acl" not in inner.deleted_new_residuals:
+                            resources.append(
+                                "arn:aws:ec2:us-west-2:123456789012:network-acl/acl-residual"
+                            )
+                        if "flow-log" not in inner.deleted_new_residuals:
+                            resources.append(
+                                "arn:aws:ec2:us-west-2:123456789012:vpc-flow-log/fl-residual"
+                            )
+                        if "log-group" not in inner.deleted_new_residuals:
+                            resources.append(
+                                "arn:aws:logs:us-west-2:123456789012:log-group:/aws/vpc-flow-logs/envelope-fixture/west:*"
+                            )
                         return {
                             "ResourceTagMappingList": [
                                 {
-                                    "ResourceARN": "arn:aws:ec2:us-west-2:123456789012:instance/i-residual",
+                                    "ResourceARN": arn,
                                     "Tags": [
                                         {"Key": "EnvelopeRun", "Value": inner.config.run_id},
                                         {"Key": "ExpiresAt", "Value": inner.config.expires_at},
                                     ],
                                 }
+                                for arn in resources
                             ]
                         }
                     return {"ResourceTagMappingList": []}
@@ -1941,7 +5350,9 @@ class SSMAndCleanupTest(unittest.TestCase):
             manifest = appliance.new_manifest(config, artifact_identity(root), "123456789012")
             manifest["tailnet"]["auth_key_id"] = "run-key"
             manifest["tailnet"]["nodes_expected"] = True
-            manifest["phase"] = "apply_started"
+            mark_manifest_apply_started(manifest)
+            manifest.pop("apply_claimed_at")
+            manifest["phase"] = "apply_failed"
             store = appliance.ManifestStore(config, aws, root / "run")
             store.write(manifest)
             with mock.patch.object(
@@ -1963,6 +5374,10 @@ class SSMAndCleanupTest(unittest.TestCase):
             self.assertEqual(api.revoked, ["run-key"])
             self.assertEqual(len(aws.deleted_parameters), 2)
             self.assertTrue(aws.terminated)
+            self.assertEqual(
+                aws.deleted_new_residuals,
+                {"network-acl", "flow-log", "log-group"},
+            )
             self.assertEqual(aws.backend_version_reads, 0)
             self.assertTrue(store.path.exists())
             self.assertEqual(store.load_local()["phase"], "cleanup_incomplete")
@@ -2022,6 +5437,7 @@ class SSMAndCleanupTest(unittest.TestCase):
                     if phase != "preflight_complete":
                         manifest["tailnet"]["auth_key_id"] = "key-fixture-id"
                     if phase == "apply_started":
+                        mark_manifest_apply_started(manifest)
                         manifest["tailnet"]["nodes_expected"] = True
                     payload = (json.dumps(manifest, separators=(",", ":")) + "\n").encode()
                     run_dir = root / f"recover-{phase}"
@@ -2092,6 +5508,7 @@ class SSMAndCleanupTest(unittest.TestCase):
             config = make_config(root)
             manifest = appliance.new_manifest(config, artifact_identity(root), "123456789012")
             manifest["tailnet"]["auth_key_id"] = "old-key-id"
+            mark_manifest_applied(manifest)
             manifest["phase"] = "ready"
 
             failing_aws = RotationAWS(True)
@@ -2173,6 +5590,7 @@ class SSMAndCleanupTest(unittest.TestCase):
             config = make_config(root)
             manifest = appliance.new_manifest(config, artifact_identity(root), "123456789012")
             manifest["tailnet"]["auth_key_id"] = "old-key-id"
+            mark_manifest_applied(manifest)
             manifest["phase"] = "ready"
             for region in ("us-west-2", "us-east-1"):
                 with self.subTest(region=region):
@@ -2603,7 +6021,245 @@ cat "$RULES_DIR/$table"
                     self.assertIn("timed out", failed.stderr)
 
 
+class DeploymentOutputTest(unittest.TestCase):
+    def test_parses_deterministic_role_aware_workloads_and_preserves_existing_maps(self):
+        document = deployment_document()
+        instances, target_groups, workloads = appliance.deployment_values(document)
+
+        self.assertEqual(instances, {"west": "i-appliance-west", "east": "i-appliance-east"})
+        self.assertEqual(
+            target_groups,
+            {
+                "west": "arn:aws:elasticloadbalancing:us-west-2:123456789012:targetgroup/west/fixture",
+                "east": "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/east/fixture",
+            },
+        )
+        self.assertEqual(list(workloads), ["west", "east"])
+        self.assertEqual(list(workloads["west"]), ["initiator", "responder"])
+        self.assertEqual(workloads["west"]["initiator"]["region"], "us-west-2")
+        self.assertEqual(workloads["east"]["responder"]["availability_zone"], "us-east-1b")
+        self.assertEqual(workloads["east"]["responder"]["private_ip"], "10.20.2.10")
+        self.assertEqual(workloads["east"]["responder"]["instance_id"], "i-workload-east-responder")
+
+        bare = {
+            name: value["value"]
+            for name, value in document.items()
+        }
+        self.assertEqual(appliance.deployment_values(bare), (instances, target_groups, workloads))
+
+    def test_explicit_regions_and_configured_az_identity_must_agree(self):
+        document = deployment_document()
+        for site, region in (("west", "us-west-2"), ("east", "us-east-1")):
+            document["workload_instances"]["value"][site]["region"] = region
+            for role in ("initiator", "responder"):
+                document["workload_instances"]["value"][site][role]["region"] = region
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            _, _, workloads = appliance.deployment_values(document, expected_sites=config.sites)
+            self.assertEqual(workloads["west"]["responder"]["region"], "us-west-2")
+
+            document["workload_instances"]["value"]["west"]["initiator"][
+                "availability_zone"
+            ] = "us-west-2c"
+            with self.assertRaisesRegex(appliance.LifecycleError, "unexpected AZ identity"):
+                appliance.deployment_values(document, expected_sites=config.sites)
+
+            swapped = deployment_document()
+            west = swapped["workload_instances"]["value"]["west"]
+            west["initiator"], west["responder"] = west["responder"], west["initiator"]
+            with self.assertRaisesRegex(appliance.LifecycleError, "configured role or AZ"):
+                appliance.deployment_values(swapped, expected_sites=config.sites)
+
+    def test_malformed_missing_and_duplicate_workload_output_fails_closed(self):
+        def missing_output(document):
+            document.pop("workload_instances")
+
+        def missing_site(document):
+            document["workload_instances"]["value"].pop("east")
+
+        def missing_role(document):
+            document["workload_instances"]["value"]["west"].pop("responder")
+
+        def missing_identity_field(document):
+            document["workload_instances"]["value"]["west"]["initiator"].pop("private_ip")
+
+        def unsupported_identity_field(document):
+            document["workload_instances"]["value"]["west"]["initiator"]["credential"] = "prohibited"
+
+        def contradictory_region(document):
+            document["workload_instances"]["value"]["west"]["initiator"]["region"] = "us-east-1"
+
+        def duplicate_instance(document):
+            document["workload_instances"]["value"]["east"]["responder"][
+                "instance_id"
+            ] = "i-workload-west-initiator"
+
+        def duplicate_private_ip(document):
+            initiator = document["workload_instances"]["value"]["east"]["initiator"]
+            responder = document["workload_instances"]["value"]["east"]["responder"]
+            responder["private_ip"] = initiator["private_ip"]
+            responder["cidr"] = initiator["cidr"]
+
+        def duplicate_role_az(document):
+            initiator = document["workload_instances"]["value"]["west"]["initiator"]
+            responder = document["workload_instances"]["value"]["west"]["responder"]
+            responder["az_key"] = initiator["az_key"]
+            responder["availability_zone"] = initiator["availability_zone"]
+
+        def duplicate_site_region(document):
+            for role, suffix in (("initiator", "a"), ("responder", "b")):
+                document["workload_instances"]["value"]["east"][role][
+                    "availability_zone"
+                ] = f"us-west-2{suffix}"
+
+        cases = {
+            "missing output": missing_output,
+            "missing site": missing_site,
+            "missing role": missing_role,
+            "missing identity field": missing_identity_field,
+            "unsupported identity field": unsupported_identity_field,
+            "contradictory region": contradictory_region,
+            "duplicate instance": duplicate_instance,
+            "duplicate private IP": duplicate_private_ip,
+            "duplicate role AZ": duplicate_role_az,
+            "duplicate site region": duplicate_site_region,
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                document = deployment_document()
+                mutate(document)
+                with self.assertRaises(appliance.LifecycleError):
+                    appliance.deployment_values(document)
+
+    def test_duplicate_json_roles_and_secret_bearing_values_are_not_exposed(self):
+        duplicate = '{"west":{"initiator":{},"initiator":{}}}'
+        with self.assertRaisesRegex(appliance.LifecycleError, "duplicate object key"):
+            appliance.parse_deployment_json(duplicate)
+
+        secret = "ts" + "key-auth-fixture-sensitive"
+        document = deployment_document()
+        document["workload_instances"]["value"]["west"]["initiator"]["availability_zone"] = secret
+        with self.assertRaises(appliance.LifecycleError) as raised:
+            appliance.deployment_values(document)
+        self.assertNotIn(secret, str(raised.exception))
+
+
 class ReadinessTest(unittest.TestCase):
+    def test_deployment_wait_requires_two_appliances_four_workloads_and_two_targets(self):
+        class FakeAWS:
+            def __init__(self):
+                self.online = []
+                self.readiness_commands = []
+                self.targets = []
+
+            def json(inner, args, *, region=None):
+                operation = args[1]
+                if operation == "describe-instance-information":
+                    instance_id = args[-1].rsplit("=", 1)[1]
+                    inner.online.append((region, instance_id))
+                    return {"InstanceInformationList": [{"PingStatus": "Online"}]}
+                if operation == "send-command":
+                    instance_id = args[args.index("--instance-ids") + 1]
+                    inner.readiness_commands.append((region, instance_id))
+                    return {"Command": {"CommandId": f"command-{instance_id}"}}
+                if operation == "get-command-invocation":
+                    return {"Status": "Success"}
+                if operation == "describe-target-health":
+                    inner.targets.append((region, args[-1]))
+                    return {"TargetHealthDescriptions": [{"TargetHealth": {"State": "healthy"}}]}
+                raise AssertionError(args)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            aws = FakeAWS()
+            appliance.wait_deployment(
+                config,
+                aws,
+                deployment_document(),
+                timeout_seconds=5,
+                sleep=lambda _: None,
+            )
+
+        self.assertEqual(
+            aws.online,
+            [
+                ("us-west-2", "i-appliance-west"),
+                ("us-east-1", "i-appliance-east"),
+                ("us-west-2", "i-workload-west-initiator"),
+                ("us-west-2", "i-workload-west-responder"),
+                ("us-east-1", "i-workload-east-initiator"),
+                ("us-east-1", "i-workload-east-responder"),
+            ],
+        )
+        self.assertEqual(
+            aws.readiness_commands,
+            [("us-west-2", "i-appliance-west"), ("us-east-1", "i-appliance-east")],
+        )
+        self.assertEqual([region for region, _ in aws.targets], ["us-west-2", "us-east-1"])
+
+    def test_failure_collects_nested_bounded_diagnostics_for_all_six_nodes(self):
+        secret = "fixture-readiness-secret"
+
+        class FakeAWS:
+            def json(self, args, *, region=None):
+                if args[1] == "describe-target-health":
+                    return {
+                        "TargetHealthDescriptions": [
+                            {
+                                "Target": {"Id": "i-target"},
+                                "TargetHealth": {
+                                    "State": "unhealthy",
+                                    "Description": f"token: {secret}",
+                                },
+                            }
+                        ]
+                    }
+                raise AssertionError(args)
+
+        collected = []
+
+        def diagnostics(_aws, site, instance_id, *, commands=None, sleep=time.sleep):
+            collected.append((site["region"], instance_id, commands))
+            return {
+                "command_id": f"diagnostic-{len(collected)}",
+                "status": "Success",
+                "stdout": "",
+                "stderr": "",
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            evidence = root / "diagnostics.json"
+            with mock.patch.object(
+                appliance,
+                "wait_for_instance",
+                side_effect=appliance.LifecycleError(f"auth_key={secret}"),
+            ), mock.patch.object(appliance, "collect_diagnostics", side_effect=diagnostics):
+                with self.assertRaises(appliance.LifecycleError) as raised:
+                    appliance.wait_deployment(
+                        config,
+                        FakeAWS(),
+                        deployment_document(),
+                        timeout_seconds=5,
+                        evidence_path=evidence,
+                        sleep=lambda _: None,
+                    )
+
+            serialized = evidence.read_text()
+            payload = json.loads(serialized)
+            self.assertEqual(len(collected), 6)
+            self.assertTrue(all(commands is None for _, _, commands in collected[:2]))
+            self.assertTrue(
+                all(commands == appliance.WORKLOAD_DIAGNOSTIC_COMMANDS for _, _, commands in collected[2:])
+            )
+            self.assertEqual(set(payload["workloads"]), {"west", "east"})
+            self.assertEqual(set(payload["workloads"]["west"]), {"initiator", "responder"})
+            self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o600)
+            self.assertNotIn(secret, serialized)
+            self.assertNotIn(secret, str(raised.exception))
+
     def test_ssm_and_target_waits_require_success_and_single_healthy_target(self):
         class FakeAWS:
             def json(self, args, *, region=None):
@@ -2717,6 +6373,40 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(aws.payload["executionTimeout"], ["90"])
         self.assertNotIn("fixture-sensitive-value", result["stdout"])
         self.assertIn("[REDACTED]", result["stdout"])
+
+    def test_workload_diagnostics_cancel_and_confirm_stop_after_local_timeout(self):
+        class FakeAWS:
+            def __init__(self):
+                self.payload = None
+                self.cancelled = []
+
+            def json(self, args, *, region=None):
+                operation = args[1]
+                if operation == "send-command":
+                    self.payload = json.loads(args[args.index("--parameters") + 1])
+                    return {"Command": {"CommandId": "diagnostic-workload"}}
+                if operation == "cancel-command":
+                    self.cancelled.append(args[args.index("--command-id") + 1])
+                    return {}
+                if operation == "get-command-invocation":
+                    return {"Status": "Cancelled"}
+                raise AssertionError(args)
+
+        aws = FakeAWS()
+        with mock.patch.object(appliance.time, "monotonic", side_effect=[0, 121, 121, 121]):
+            result = appliance.collect_diagnostics(
+                aws,
+                {"region": "us-west-2"},
+                "i-workload-west-initiator",
+                commands=appliance.WORKLOAD_DIAGNOSTIC_COMMANDS,
+                sleep=lambda _: None,
+            )
+
+        self.assertEqual(aws.payload["commands"], appliance.WORKLOAD_DIAGNOSTIC_COMMANDS)
+        self.assertEqual(aws.payload["executionTimeout"], ["90"])
+        self.assertEqual(aws.cancelled, ["diagnostic-workload"])
+        self.assertEqual(result["status"], "TimedOut")
+        self.assertIn("stopped with Cancelled", result["stderr"])
 
 
 if __name__ == "__main__":

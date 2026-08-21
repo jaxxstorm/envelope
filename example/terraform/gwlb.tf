@@ -107,7 +107,7 @@ resource "aws_vpc_endpoint_service" "east" {
 }
 
 resource "aws_vpc_endpoint" "west" {
-  for_each = var.west_azs
+  for_each = toset([local.west_initiator_az_key])
 
   vpc_id            = aws_vpc.west.id
   service_name      = aws_vpc_endpoint_service.west.service_name
@@ -118,7 +118,7 @@ resource "aws_vpc_endpoint" "west" {
 
 resource "aws_vpc_endpoint" "east" {
   provider = aws.east
-  for_each = var.east_azs
+  for_each = toset([local.east_initiator_az_key])
 
   vpc_id            = aws_vpc.east.id
   service_name      = aws_vpc_endpoint_service.east.service_name
@@ -127,21 +127,32 @@ resource "aws_vpc_endpoint" "east" {
   tags              = { Name = "${var.name}-east-gwlbe-${each.key}", Site = "east", ZoneKey = each.key }
 }
 
-resource "aws_route" "workload_to_remote_west" {
-  for_each = local.west_remote_workload_routes
-
-  route_table_id         = aws_route_table.workload_west[each.value.az_key].id
-  destination_cidr_block = each.value.cidr
-  vpc_endpoint_id        = aws_vpc_endpoint.west[each.value.az_key].id
+resource "aws_route" "initiator_to_responder_west" {
+  route_table_id         = aws_route_table.workload_west[local.west_initiator_az_key].id
+  destination_cidr_block = local.east_responder_cidr
+  vpc_endpoint_id        = aws_vpc_endpoint.west[local.west_initiator_az_key].id
 }
 
-resource "aws_route" "workload_to_remote_east" {
+resource "aws_route" "initiator_to_responder_east" {
   provider = aws.east
-  for_each = local.east_remote_workload_routes
 
-  route_table_id         = aws_route_table.workload_east[each.value.az_key].id
-  destination_cidr_block = each.value.cidr
-  vpc_endpoint_id        = aws_vpc_endpoint.east[each.value.az_key].id
+  route_table_id         = aws_route_table.workload_east[local.east_initiator_az_key].id
+  destination_cidr_block = local.west_responder_cidr
+  vpc_endpoint_id        = aws_vpc_endpoint.east[local.east_initiator_az_key].id
+}
+
+resource "aws_route" "responder_return_west" {
+  route_table_id         = aws_route_table.workload_west[local.west_responder_az_key].id
+  destination_cidr_block = local.east_initiator_cidr
+  network_interface_id   = aws_instance.envelope_west.primary_network_interface_id
+}
+
+resource "aws_route" "responder_return_east" {
+  provider = aws.east
+
+  route_table_id         = aws_route_table.workload_east[local.east_responder_az_key].id
+  destination_cidr_block = local.west_initiator_cidr
+  network_interface_id   = aws_instance.envelope_east.primary_network_interface_id
 }
 
 output "gwlb_arns" {
@@ -157,18 +168,4 @@ output "gwlb_endpoint_ids" {
     west = { for key, endpoint in aws_vpc_endpoint.west : key => endpoint.id }
     east = { for key, endpoint in aws_vpc_endpoint.east : key => endpoint.id }
   }
-}
-locals {
-  west_remote_workload_routes = merge([
-    for az_key in sort(keys(var.west_azs)) : {
-      for cidr in var.envelope_remote_tailnet_cidrs["west"] :
-      "${az_key}:${cidr}" => { az_key = az_key, cidr = cidr }
-    }
-  ]...)
-  east_remote_workload_routes = merge([
-    for az_key in sort(keys(var.east_azs)) : {
-      for cidr in var.envelope_remote_tailnet_cidrs["east"] :
-      "${az_key}:${cidr}" => { az_key = az_key, cidr = cidr }
-    }
-  ]...)
 }

@@ -32,7 +32,7 @@ resource "terraform_data" "input_validation" {
         toset(var.envelope_remote_tailnet_cidrs["west"]) == toset(values(var.east_workload_subnet_cidrs)),
         toset(var.envelope_remote_tailnet_cidrs["east"]) == toset(values(var.west_workload_subnet_cidrs)),
       ])
-      error_message = "Local return/delivery roles must be a disjoint exact partition of local workload subnets, and remote roles must equal the opposite workload subnet set."
+      error_message = "Each site's singleton initiator and responder CIDRs must be a disjoint exact partition of its two workload subnets, and remote roles must equal the opposite workload subnet set."
     }
 
     precondition {
@@ -392,6 +392,197 @@ resource "aws_route_table_association" "gwlb_east" {
   route_table_id = aws_route_table.gwlb_east[each.key].id
 }
 
+resource "aws_network_acl" "appliance_west" {
+  vpc_id     = aws_vpc.west.id
+  subnet_ids = [aws_subnet.appliance_west.id]
+
+  ingress {
+    protocol   = "-1"
+    rule_no    = 100
+    action     = "allow"
+    cidr_block = local.west_responder_cidr
+    from_port  = 0
+    to_port    = 0
+  }
+
+  ingress {
+    protocol   = "-1"
+    rule_no    = 200
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 0
+    to_port    = 0
+  }
+
+  egress {
+    protocol   = "-1"
+    rule_no    = 100
+    action     = "deny"
+    cidr_block = local.west_initiator_cidr
+    from_port  = 0
+    to_port    = 0
+  }
+
+  egress {
+    protocol   = "-1"
+    rule_no    = 110
+    action     = "allow"
+    cidr_block = local.west_responder_cidr
+    from_port  = 0
+    to_port    = 0
+  }
+
+  egress {
+    protocol   = "-1"
+    rule_no    = 200
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 0
+    to_port    = 0
+  }
+
+  tags = { Name = "${var.name}-west-appliance", Site = "west", Role = "appliance-bypass-guard" }
+}
+
+resource "aws_network_acl" "appliance_east" {
+  provider = aws.east
+
+  vpc_id     = aws_vpc.east.id
+  subnet_ids = [aws_subnet.appliance_east.id]
+
+  ingress {
+    protocol   = "-1"
+    rule_no    = 100
+    action     = "allow"
+    cidr_block = local.east_responder_cidr
+    from_port  = 0
+    to_port    = 0
+  }
+
+  ingress {
+    protocol   = "-1"
+    rule_no    = 200
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 0
+    to_port    = 0
+  }
+
+  egress {
+    protocol   = "-1"
+    rule_no    = 100
+    action     = "deny"
+    cidr_block = local.east_initiator_cidr
+    from_port  = 0
+    to_port    = 0
+  }
+
+  egress {
+    protocol   = "-1"
+    rule_no    = 110
+    action     = "allow"
+    cidr_block = local.east_responder_cidr
+    from_port  = 0
+    to_port    = 0
+  }
+
+  egress {
+    protocol   = "-1"
+    rule_no    = 200
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 0
+    to_port    = 0
+  }
+
+  tags = { Name = "${var.name}-east-appliance", Site = "east", Role = "appliance-bypass-guard" }
+}
+
+locals {
+  flow_log_format = join(" ", [
+    "$${version}",
+    "$${account-id}",
+    "$${interface-id}",
+    "$${srcaddr}",
+    "$${dstaddr}",
+    "$${srcport}",
+    "$${dstport}",
+    "$${protocol}",
+    "$${packets}",
+    "$${bytes}",
+    "$${start}",
+    "$${end}",
+    "$${action}",
+    "$${log-status}",
+    "$${vpc-id}",
+    "$${subnet-id}",
+    "$${instance-id}",
+    "$${region}",
+    "$${az-id}",
+    "$${flow-direction}",
+    "$${traffic-path}",
+    "$${pkt-srcaddr}",
+    "$${pkt-dstaddr}",
+  ])
+}
+
+resource "aws_cloudwatch_log_group" "flow_west" {
+  name              = "/aws/vpc-flow-logs/${var.name}/west"
+  retention_in_days = 7
+  tags              = { Name = "${var.name}-west-flow-logs", Site = "west", Role = "flow-logs" }
+}
+
+resource "aws_cloudwatch_log_group" "flow_east" {
+  provider = aws.east
+
+  name              = "/aws/vpc-flow-logs/${var.name}/east"
+  retention_in_days = 7
+  tags              = { Name = "${var.name}-east-flow-logs", Site = "east", Role = "flow-logs" }
+}
+
+resource "aws_flow_log" "west" {
+  vpc_id                   = aws_vpc.west.id
+  traffic_type             = "ALL"
+  log_destination_type     = "cloud-watch-logs"
+  log_destination          = aws_cloudwatch_log_group.flow_west.arn
+  iam_role_arn             = aws_iam_role.flow_logs.arn
+  max_aggregation_interval = 60
+  log_format               = local.flow_log_format
+  tags                     = { Name = "${var.name}-west-flow-logs", Site = "west", Role = "flow-logs" }
+
+  depends_on = [aws_iam_role_policy.flow_logs]
+}
+
+resource "aws_flow_log" "east" {
+  provider = aws.east
+
+  vpc_id                   = aws_vpc.east.id
+  traffic_type             = "ALL"
+  log_destination_type     = "cloud-watch-logs"
+  log_destination          = aws_cloudwatch_log_group.flow_east.arn
+  iam_role_arn             = aws_iam_role.flow_logs.arn
+  max_aggregation_interval = 60
+  log_format               = local.flow_log_format
+  tags                     = { Name = "${var.name}-east-flow-logs", Site = "east", Role = "flow-logs" }
+
+  depends_on = [aws_iam_role_policy.flow_logs]
+}
+
 output "vpc_ids" {
   value = { west = aws_vpc.west.id, east = aws_vpc.east.id }
+}
+
+output "flow_log_evidence" {
+  value = {
+    west = {
+      flow_log_id   = aws_flow_log.west.id
+      log_group_arn = aws_cloudwatch_log_group.flow_west.arn
+      region        = var.west_region
+    }
+    east = {
+      flow_log_id   = aws_flow_log.east.id
+      log_group_arn = aws_cloudwatch_log_group.flow_east.arn
+      region        = var.east_region
+    }
+  }
 }

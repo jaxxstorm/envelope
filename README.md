@@ -243,13 +243,15 @@ Verify the deterministic sanitized AWS-wire-shaped fixtures independently of the
 python3 scripts/verify_geneve_fixtures.py
 ```
 
-## End-to-End Harnesses
+## Component and Integration Harnesses
 
-Datapath harness:
+Local fake-TUN component wire smoke test:
 
 ```bash
-sudo ./scripts/e2e.sh
+sudo ./scripts/component_wire_smoke.sh
 ```
+
+This loopback harness injects a synthetic GWLB-shaped packet into a local Envelope process and observes one TUN return. It does not use AWS, a Tailnet, real GWLB endpoints, or two regions and is not full E2E acceptance.
 
 Synthetic routing smoke test:
 
@@ -273,6 +275,8 @@ For both directional lanes, the harness injects an AWS-valid, cookie-bearing GEN
 ## AWS Appliance Deployment
 
 The reproducible two-region appliance example, protected runner workflow, cost profile, readiness gates, and ownership-safe rollback are documented in [`docs/aws-appliance-runbook.md`](docs/aws-appliance-runbook.md). It accepts only run-scoped SSM SecureString ARNs; no Tailscale key value is a Terraform input.
+
+The real, billable two-region directional-lane acceptance procedure is documented separately in [`docs/aws-two-region-e2e-runbook.md`](docs/aws-two-region-e2e-runbook.md). It is restricted to the `_lbr_sandbox` Tailnet and must run only from an approved protected environment; the local component smoke test above is not a substitute.
 
 ## Benchmark Task
 

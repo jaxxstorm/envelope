@@ -56,6 +56,14 @@ resource "aws_security_group" "envelope_west" {
     cidr_blocks = [var.west_vpc_cidr]
   }
 
+  ingress {
+    description = "Forward local responder returns"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = [local.west_responder_cidr]
+  }
+
   egress {
     description = "Required SSM, S3, package, and Tailnet egress through NAT"
     from_port   = 0
@@ -88,6 +96,14 @@ resource "aws_security_group" "envelope_east" {
     to_port     = 9090
     protocol    = "tcp"
     cidr_blocks = [var.east_vpc_cidr]
+  }
+
+  ingress {
+    description = "Forward local responder returns"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = [local.east_responder_cidr]
   }
 
   egress {
@@ -209,33 +225,23 @@ resource "aws_instance" "envelope_east" {
   }
 }
 
-resource "aws_security_group" "test_west" {
-  name        = "${var.name}-west-test"
-  description = "Run-owned west workload probes"
+resource "aws_security_group" "workload_west" {
+  for_each = local.west_workloads
+
+  name        = "${var.name}-west-${each.key}"
+  description = "Run-owned west ${each.key} workload"
   vpc_id      = aws_vpc.west.id
 
-  ingress {
-    description = "ICMP acceptance from east"
-    from_port   = -1
-    to_port     = -1
-    protocol    = "icmp"
-    cidr_blocks = [var.east_vpc_cidr]
-  }
+  dynamic "ingress" {
+    for_each = each.key == "responder" ? local.workload_probe_ingress : {}
 
-  ingress {
-    description = "TCP acceptance from east"
-    from_port   = 5201
-    to_port     = 5201
-    protocol    = "tcp"
-    cidr_blocks = [var.east_vpc_cidr]
-  }
-
-  ingress {
-    description = "UDP acceptance from east"
-    from_port   = 5201
-    to_port     = 5201
-    protocol    = "udp"
-    cidr_blocks = [var.east_vpc_cidr]
+    content {
+      description = "${ingress.value.description} from paired east initiator"
+      from_port   = ingress.value.from_port
+      to_port     = ingress.value.to_port
+      protocol    = ingress.value.protocol
+      cidr_blocks = [local.east_initiator_cidr]
+    }
   }
 
   egress {
@@ -246,38 +252,27 @@ resource "aws_security_group" "test_west" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = { Name = "${var.name}-west-test", Site = "west", Role = "test" }
+  tags = { Name = "${var.name}-west-${each.key}", Site = "west", Role = each.key }
 }
 
-resource "aws_security_group" "test_east" {
+resource "aws_security_group" "workload_east" {
   provider = aws.east
+  for_each = local.east_workloads
 
-  name        = "${var.name}-east-test"
-  description = "Run-owned east workload probes"
+  name        = "${var.name}-east-${each.key}"
+  description = "Run-owned east ${each.key} workload"
   vpc_id      = aws_vpc.east.id
 
-  ingress {
-    description = "ICMP acceptance from west"
-    from_port   = -1
-    to_port     = -1
-    protocol    = "icmp"
-    cidr_blocks = [var.west_vpc_cidr]
-  }
+  dynamic "ingress" {
+    for_each = each.key == "responder" ? local.workload_probe_ingress : {}
 
-  ingress {
-    description = "TCP acceptance from west"
-    from_port   = 5201
-    to_port     = 5201
-    protocol    = "tcp"
-    cidr_blocks = [var.west_vpc_cidr]
-  }
-
-  ingress {
-    description = "UDP acceptance from west"
-    from_port   = 5201
-    to_port     = 5201
-    protocol    = "udp"
-    cidr_blocks = [var.west_vpc_cidr]
+    content {
+      description = "${ingress.value.description} from paired west initiator"
+      from_port   = ingress.value.from_port
+      to_port     = ingress.value.to_port
+      protocol    = ingress.value.protocol
+      cidr_blocks = [local.west_initiator_cidr]
+    }
   }
 
   egress {
@@ -288,24 +283,28 @@ resource "aws_security_group" "test_east" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = { Name = "${var.name}-east-test", Site = "east", Role = "test" }
+  tags = { Name = "${var.name}-east-${each.key}", Site = "east", Role = each.key }
 }
 
 locals {
-  workload_user_data = base64encode(<<-EOT
-    #!/usr/bin/env bash
-    set -euo pipefail
-    dnf install -y iperf3 jq
-    systemctl enable --now amazon-ssm-agent
-  EOT
+  workload_bootstrap = templatefile("${path.module}/cloud-init/workload.sh.tftpl", {
+    agent_base64 = base64encode(file("${path.module}/cloud-init/envelope-e2e-agent.py"))
+  })
+  workload_user_data              = base64gzip(local.workload_bootstrap)
+  workload_user_data_base64_bytes = length(local.workload_user_data)
+  workload_user_data_raw_bytes = floor(local.workload_user_data_base64_bytes * 3 / 4) - (
+    endswith(local.workload_user_data, "==") ? 2 :
+    endswith(local.workload_user_data, "=") ? 1 : 0
   )
 }
 
-resource "aws_instance" "test_west" {
+resource "aws_instance" "workload_west" {
+  for_each = local.west_workloads
+
   ami                         = var.west_ami_id
   instance_type               = var.test_instance_type
-  subnet_id                   = aws_subnet.workload_west[local.west_primary_key].id
-  vpc_security_group_ids      = [aws_security_group.test_west.id]
+  subnet_id                   = aws_subnet.workload_west[each.value.az_key].id
+  vpc_security_group_ids      = [aws_security_group.workload_west[each.key].id]
   iam_instance_profile        = aws_iam_instance_profile.workload_west.name
   associate_public_ip_address = false
   user_data_base64            = local.workload_user_data
@@ -323,25 +322,34 @@ resource "aws_instance" "test_west" {
     http_put_response_hop_limit = 1
   }
 
-  tags = { Name = "${var.name}-west-test", Site = "west", Role = "test", ZoneKey = local.west_primary_key }
+  tags        = { Name = "${var.name}-west-${each.key}", Site = "west", Role = each.key, ZoneKey = each.value.az_key }
+  volume_tags = { Name = "${var.name}-west-${each.key}", Site = "west", Role = each.key, ZoneKey = each.value.az_key }
 
   depends_on = [aws_iam_role_policy.workload_runtime_west, aws_route.workload_default_west]
 
   lifecycle {
     precondition {
       condition     = data.aws_ami.west.architecture == local.ec2_architecture && contains(data.aws_ec2_instance_type.west_test.supported_architectures, local.ec2_architecture)
-      error_message = "The west test AMI or instance type is incompatible with the reviewed architecture."
+      error_message = "The west workload AMI or instance type is incompatible with the reviewed architecture."
+    }
+    precondition {
+      condition = (
+        local.workload_user_data_raw_bytes <= local.ec2_user_data_raw_limit_bytes &&
+        local.workload_user_data_base64_bytes <= local.ec2_user_data_base64_limit_bytes
+      )
+      error_message = "The gzip-compressed workload bootstrap exceeds EC2's 16 KiB raw or base64-encoded user-data limit."
     }
   }
 }
 
-resource "aws_instance" "test_east" {
+resource "aws_instance" "workload_east" {
   provider = aws.east
+  for_each = local.east_workloads
 
   ami                         = var.east_ami_id
   instance_type               = var.test_instance_type
-  subnet_id                   = aws_subnet.workload_east[local.east_primary_key].id
-  vpc_security_group_ids      = [aws_security_group.test_east.id]
+  subnet_id                   = aws_subnet.workload_east[each.value.az_key].id
+  vpc_security_group_ids      = [aws_security_group.workload_east[each.key].id]
   iam_instance_profile        = aws_iam_instance_profile.workload_east.name
   associate_public_ip_address = false
   user_data_base64            = local.workload_user_data
@@ -359,14 +367,22 @@ resource "aws_instance" "test_east" {
     http_put_response_hop_limit = 1
   }
 
-  tags = { Name = "${var.name}-east-test", Site = "east", Role = "test", ZoneKey = local.east_primary_key }
+  tags        = { Name = "${var.name}-east-${each.key}", Site = "east", Role = each.key, ZoneKey = each.value.az_key }
+  volume_tags = { Name = "${var.name}-east-${each.key}", Site = "east", Role = each.key, ZoneKey = each.value.az_key }
 
   depends_on = [aws_iam_role_policy.workload_runtime_east, aws_route.workload_default_east]
 
   lifecycle {
     precondition {
       condition     = data.aws_ami.east.architecture == local.ec2_architecture && contains(data.aws_ec2_instance_type.east_test.supported_architectures, local.ec2_architecture)
-      error_message = "The east test AMI or instance type is incompatible with the reviewed architecture."
+      error_message = "The east workload AMI or instance type is incompatible with the reviewed architecture."
+    }
+    precondition {
+      condition = (
+        local.workload_user_data_raw_bytes <= local.ec2_user_data_raw_limit_bytes &&
+        local.workload_user_data_base64_bytes <= local.ec2_user_data_base64_limit_bytes
+      )
+      error_message = "The gzip-compressed workload bootstrap exceeds EC2's 16 KiB raw or base64-encoded user-data limit."
     }
   }
 }
@@ -375,12 +391,31 @@ output "instance_ids" {
   value = { west = aws_instance.envelope_west.id, east = aws_instance.envelope_east.id }
 }
 
-output "test_instance_ids" {
-  value = { west = aws_instance.test_west.id, east = aws_instance.test_east.id }
-}
-
-output "test_instance_private_ips" {
-  value = { west = aws_instance.test_west.private_ip, east = aws_instance.test_east.private_ip }
+output "workload_instances" {
+  value = {
+    west = {
+      for role, workload in local.west_workloads : role => {
+        instance_id       = aws_instance.workload_west[role].id
+        private_ip        = aws_instance.workload_west[role].private_ip
+        az_key            = workload.az_key
+        availability_zone = var.west_azs[workload.az_key]
+        subnet_id         = aws_subnet.workload_west[workload.az_key].id
+        cidr              = workload.cidr
+        route_table_id    = aws_route_table.workload_west[workload.az_key].id
+      }
+    }
+    east = {
+      for role, workload in local.east_workloads : role => {
+        instance_id       = aws_instance.workload_east[role].id
+        private_ip        = aws_instance.workload_east[role].private_ip
+        az_key            = workload.az_key
+        availability_zone = var.east_azs[workload.az_key]
+        subnet_id         = aws_subnet.workload_east[workload.az_key].id
+        cidr              = workload.cidr
+        route_table_id    = aws_route_table.workload_east[workload.az_key].id
+      }
+    }
+  }
 }
 
 output "envelope_runtime_config" {
@@ -414,9 +449,14 @@ output "envelope_runtime_config" {
   }
 }
 
+output "e2e_load_profile" {
+  description = "Immutable load and transport thresholds embedded verbatim in the reviewed saved plan"
+  value       = var.e2e_load_profile
+}
+
 output "cost_profile" {
   value = {
-    profile                    = "single-flow-owner-acceptance"
+    profile                    = "directional-lane-acceptance"
     estimated_fixed_hourly_usd = var.estimated_fixed_hourly_usd
     approved_max_hourly_usd    = var.approved_max_fixed_hourly_usd
     expires_at                 = var.expires_at
@@ -425,12 +465,17 @@ output "cost_profile" {
       nat_gateways           = 2
       elastic_ips            = 2
       gateway_load_balancers = 2
-      gwlbe_endpoints        = length(var.west_azs) + length(var.east_azs)
+      gwlbe_endpoints        = length(aws_vpc_endpoint.west) + length(aws_vpc_endpoint.east)
+      semantic_lane_routes   = 4
       appliance_instances    = 2
-      workload_instances     = 2
+      workload_instances     = 4
       artifact_buckets       = 1
+      network_acls           = 2
+      vpc_flow_logs          = 2
+      cloudwatch_log_groups  = 2
+      flow_log_iam_roles     = 1
       regional_targets       = { west = 1, east = 1 }
     }
-    excludes = "data processing, transfer, storage, requests, and taxes"
+    excludes = "data processing, transfer, log ingestion and storage, requests, and taxes"
   }
 }

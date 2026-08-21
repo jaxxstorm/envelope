@@ -8,6 +8,57 @@ locals {
     }]
   })
 
+  flow_log_assume_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Action    = "sts:AssumeRole"
+      Principal = { Service = "vpc-flow-logs.amazonaws.com" }
+      Condition = {
+        ArnLike = {
+          "aws:SourceArn" = "arn:aws:ec2:*:${data.aws_caller_identity.current.account_id}:vpc-flow-log/*"
+        }
+        StringEquals = {
+          "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+        }
+      }
+    }]
+  })
+
+  flow_log_delivery_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "CreateExactRegionalFlowLogGroups"
+        Effect = "Allow"
+        Action = ["logs:CreateLogGroup"]
+        Resource = [
+          aws_cloudwatch_log_group.flow_west.arn,
+          aws_cloudwatch_log_group.flow_east.arn,
+        ]
+      },
+      {
+        Sid    = "WriteExactRegionalFlowLogGroups"
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogStream",
+          "logs:DescribeLogStreams",
+          "logs:PutLogEvents",
+        ]
+        Resource = [
+          "${aws_cloudwatch_log_group.flow_west.arn}:*",
+          "${aws_cloudwatch_log_group.flow_east.arn}:*",
+        ]
+      },
+      {
+        Sid      = "DiscoverFlowLogGroups"
+        Effect   = "Allow"
+        Action   = ["logs:DescribeLogGroups"]
+        Resource = ["*"]
+      },
+    ]
+  })
+
   regional_ssm_core_actions = [
     "ec2messages:AcknowledgeMessage",
     "ec2messages:DeleteMessage",
@@ -215,6 +266,18 @@ resource "aws_iam_role_policy" "workload_runtime_east" {
   name   = "${var.name}-east-runtime"
   role   = aws_iam_role.workload_east.id
   policy = local.workload_runtime_policy_east
+}
+
+resource "aws_iam_role" "flow_logs" {
+  name               = "${var.name}-flow-logs"
+  assume_role_policy = local.flow_log_assume_policy
+  tags               = { Name = "${var.name}-flow-logs", Role = "flow-logs" }
+}
+
+resource "aws_iam_role_policy" "flow_logs" {
+  name   = "${var.name}-flow-logs"
+  role   = aws_iam_role.flow_logs.id
+  policy = local.flow_log_delivery_policy
 }
 
 output "appliance_runtime_policy_json" {

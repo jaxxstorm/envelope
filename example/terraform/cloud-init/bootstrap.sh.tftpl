@@ -8,7 +8,7 @@ readonly expected_sha256='${artifact_sha256}'
 
 systemctl disable --now envelope.service >/dev/null 2>&1 || true
 
-dnf install -y jq nftables iptables-legacy iptables-services
+dnf install -y iptables-legacy iptables-services jq nftables tcpdump
 systemctl disable --now firewalld.service nftables.service >/dev/null 2>&1 || true
 
 if command -v alternatives >/dev/null 2>&1; then

@@ -21,4 +21,4 @@ pid=$!
 trap 'kill ${pid} >/dev/null 2>&1 || true' EXIT
 
 sleep 1
-python3 ./scripts/e2e.py
+python3 ./scripts/component_wire_smoke.py
