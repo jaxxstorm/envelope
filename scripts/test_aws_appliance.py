@@ -2118,7 +2118,7 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
             set(appliance.AWS_OPERATOR_ACTION_RESOURCE_CONTRACT),
             set(appliance.AWS_OPERATOR_ACTIONS),
         )
-        self.assertEqual(len(appliance.AWS_OPERATOR_ACTIONS), 203)
+        self.assertEqual(len(appliance.AWS_OPERATOR_ACTIONS), 202)
         self.assertEqual(
             appliance.AWS_OPERATOR_ACTION_RESOURCE_CONTRACT["elasticloadbalancing:CreateTargetGroup"],
             ("target-group",),
@@ -2129,12 +2129,10 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
         )
         self.assertEqual(
             appliance.AWS_OPERATOR_ACTION_RESOURCE_CONTRACT["elasticloadbalancing:AddTags"],
-            ("*", "load-balancer", "target-group"),
+            ("*",),
         )
-        self.assertEqual(
-            appliance.AWS_OPERATOR_ACTION_RESOURCE_CONTRACT["elasticloadbalancing:RemoveTags"],
-            ("*", "load-balancer", "target-group"),
-        )
+        self.assertNotIn("elasticloadbalancing:RemoveTags", appliance.AWS_OPERATOR_ACTIONS)
+        self.assertIn("elasticloadbalancing:DescribeTags", appliance.AWS_OPERATOR_ACTIONS)
         self.assertEqual(
             appliance.AWS_OPERATOR_ACTION_RESOURCE_CONTRACT["ec2:RunInstances"],
             ("image", "subnet", "security-group", "instance", "volume", "network-interface"),
@@ -2169,7 +2167,7 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
             expected_simulated_actions = set(appliance.AWS_OPERATOR_ACTIONS)
             expected_simulated_actions.remove("ec2:RunInstances")
             self.assertEqual(simulated_actions, expected_simulated_actions)
-            self.assertEqual(len(simulated_actions), 202)
+            self.assertEqual(len(simulated_actions), 201)
             self.assertNotIn("ec2:RunInstances", simulated_actions)
 
             def west_batches(action):
@@ -2239,6 +2237,10 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
                 for key, value in (extra_context or {}).items():
                     self.assertEqual(values[key], value)
 
+            load_balancer_arn = (
+                "arn:aws:elasticloadbalancing:us-west-2:123456789012:"
+                "loadbalancer/gwy/envelope-fixture-west-gwlb/*"
+            )
             target_group_batch = west_batch("elasticloadbalancing:CreateTargetGroup")
             self.assertEqual(
                 target_group_batch["resources"],
@@ -2251,10 +2253,9 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
                 any("loadbalancer/" in resource or "listener/" in resource for resource in target_group_batch["resources"])
             )
             assert_context_mode(target_group_batch, "request")
-            assert_context_mode(
-                west_batch("elasticloadbalancing:CreateLoadBalancer"),
-                "request",
-            )
+            create_load_balancer_batch = west_batch("elasticloadbalancing:CreateLoadBalancer")
+            self.assertEqual(create_load_balancer_batch["resources"], (load_balancer_arn,))
+            assert_context_mode(create_load_balancer_batch, "request")
 
             subnet_arn = "arn:aws:ec2:us-west-2:123456789012:subnet/*"
             vpc_arn = "arn:aws:ec2:us-west-2:123456789012:vpc/*"
@@ -2268,10 +2269,6 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
                 "resource",
             )
 
-            load_balancer_arn = (
-                "arn:aws:elasticloadbalancing:us-west-2:123456789012:"
-                "loadbalancer/gwy/envelope-fixture-west-gwlb/*"
-            )
             self.assertEqual(len(west_batches("elasticloadbalancing:CreateListener")), 1)
             assert_context_mode(
                 west_resource_batch(
@@ -2343,8 +2340,8 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
 
             expected_elb_create_tag_resources = {
                 "CreateListener": ("*",),
-                "CreateLoadBalancer": (load_balancer_arn,),
-                "CreateTargetGroup": target_group_batch["resources"],
+                "CreateLoadBalancer": ("*",),
+                "CreateTargetGroup": ("*",),
             }
             for create_action, expected_resources in expected_elb_create_tag_resources.items():
                 with self.subTest(elbv2_create_action=create_action):
@@ -2362,68 +2359,22 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
                         },
                     )
 
-            scoped_tag_resources = {
-                load_balancer_arn,
-                target_group_batch["resources"][0],
-            }
-            existing_elb_tag_batch = next(
-                batch for batch in batches if batch["name"] == "elbv2-west-tag-existing"
-            )
-            self.assertEqual(set(existing_elb_tag_batch["resources"]), scoped_tag_resources)
-            self.assertNotIn("*", existing_elb_tag_batch["resources"])
-            assert_context_mode(existing_elb_tag_batch, "request-resource")
-
-            listener_tag_batch = next(
-                batch for batch in batches if batch["name"] == "elbv2-west-tag-listener"
-            )
-            self.assertEqual(listener_tag_batch["resources"], ("*",))
-            assert_context_mode(listener_tag_batch, "request")
-
-            scoped_remove_batch = next(
-                batch for batch in batches if batch["name"] == "elbv2-west-remove-tags"
-            )
-            self.assertEqual(set(scoped_remove_batch["resources"]), scoped_tag_resources)
-            self.assertNotIn("*", scoped_remove_batch["resources"])
-            assert_context_mode(scoped_remove_batch, "resource-tag-keys")
-
-            listener_remove_batch = next(
-                batch
-                for batch in batches
-                if batch["name"] == "elbv2-west-remove-tags-listener"
-            )
-            self.assertEqual(listener_remove_batch["resources"], ("*",))
-            assert_context_mode(listener_remove_batch, "tag-keys")
-
             west_elb_tag_batches = [
                 batch
                 for batch in batches
                 if "west" in batch["name"]
-                and set(batch["actions"]).intersection(
-                    {
-                        "elasticloadbalancing:AddTags",
-                        "elasticloadbalancing:RemoveTags",
-                    }
-                )
+                and "elasticloadbalancing:AddTags" in batch["actions"]
             ]
             self.assertEqual(
-                {
-                    batch["name"]
-                    for batch in west_elb_tag_batches
-                    if batch["resources"] == ("*",)
-                },
+                {batch["name"] for batch in west_elb_tag_batches},
                 {
                     "elbv2-west-add-tags-CreateListener",
-                    "elbv2-west-tag-listener",
-                    "elbv2-west-remove-tags-listener",
+                    "elbv2-west-add-tags-CreateLoadBalancer",
+                    "elbv2-west-add-tags-CreateTargetGroup",
                 },
             )
-            self.assertFalse(
-                any(
-                    ":listener/" in resource
-                    for batch in west_elb_tag_batches
-                    for resource in batch["resources"]
-                )
-            )
+            self.assertTrue(all(batch["resources"] == ("*",) for batch in west_elb_tag_batches))
+            self.assertFalse(any("tag-existing" in batch["name"] for batch in west_elb_tag_batches))
 
             self_simulation = next(batch for batch in batches if batch["name"] == "iam-policy-source")
             self.assertEqual(self_simulation["actions"], ("iam:SimulatePrincipalPolicy",))
@@ -2442,7 +2393,7 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
             )
             self.assertFalse(any(":role/" in resource for resource in profile_links["resources"]))
 
-            self.assertEqual(len(batches), 216)
+            self.assertEqual(len(batches), 208)
             self.assertLess(len(batches), 225)
 
             class LeastPrivilegeAWS(CapabilityAWS):
@@ -2777,56 +2728,12 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
                         )
                     elif action == "elasticloadbalancing:AddTags":
                         create_action = context.get("elasticloadbalancing:CreateAction")
-                        if create_action:
-                            expected_resource_type = {
-                                "CreateListener": "*",
-                                "CreateLoadBalancer": "loadbalancer/",
-                                "CreateTargetGroup": "targetgroup/",
-                            }.get(create_action[0] if len(create_action) == 1 else "")
-                            resource_matches = (
-                                resources == ["*"]
-                                if expected_resource_type == "*"
-                                else expected_resource_type is not None
-                                and all(expected_resource_type in resource for resource in resources)
-                            )
-                            allowed = (
-                                resource_matches
-                                and bool(request_tag_keys)
-                                and not resource_tag_keys
-                            )
-                        elif resources == ["*"]:
-                            allowed = bool(request_tag_keys) and not resource_tag_keys
-                        else:
-                            allowed = (
-                                bool(request_tag_keys)
-                                and bool(resource_tag_keys)
-                                and "*" not in resources
-                                and all(
-                                    ":loadbalancer/" in resource or ":targetgroup/" in resource
-                                    for resource in resources
-                                )
-                            )
-                    elif action == "elasticloadbalancing:RemoveTags":
-                        if resources == ["*"]:
-                            allowed = (
-                                not resource_tag_keys
-                                and not request_tag_keys
-                                and "aws:TagKeys" in context
-                            )
-                        else:
-                            allowed = (
-                                bool(resource_tag_keys)
-                                and not request_tag_keys
-                                and "aws:TagKeys" in context
-                                and "*" not in resources
-                                and all(
-                                    ":loadbalancer/" in resource or ":targetgroup/" in resource
-                                    for resource in resources
-                                )
-                            )
                         allowed = (
-                            allowed
-                            and "elasticloadbalancing:CreateAction" not in context
+                            create_action
+                            in (["CreateListener"], ["CreateLoadBalancer"], ["CreateTargetGroup"])
+                            and resources == ["*"]
+                            and bool(request_tag_keys)
+                            and not resource_tag_keys
                         )
                     elif action == "iam:SimulatePrincipalPolicy":
                         allowed = resources == ["arn:aws:iam::123456789012:role/operator"]
