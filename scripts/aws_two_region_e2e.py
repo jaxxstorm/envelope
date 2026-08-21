@@ -6388,6 +6388,7 @@ if (
 ):
     raise SystemExit(3)
 '''
+WORKLOAD_SOURCE_ROUTE_JQ = 'length == 1 and ((.[0].from // .[0].prefsrc // .[0].src) == $source)'
 
 
 @dataclasses.dataclass
@@ -6729,15 +6730,33 @@ printf '{{"accepted_route_peer":{json.dumps(expected_peer)},"accepted_routes":{a
         timeout_seconds: int,
     ) -> dict[str, Any]:
         command = f"""set -euo pipefail
+failed_check=unknown
+report_failure() {{
+  status=$?
+  trap - EXIT
+  if (( status != 0 )); then
+    printf '{{"exit_code":%d,"failed_check":"%s","success":false}}\\n' "$status" "$failed_check" >&2
+  fi
+  exit "$status"
+}}
+trap report_failure EXIT
+failed_check=cloud-init
 timeout 120 cloud-init status --wait >/dev/null
+failed_check=services-active
 for unit in amazon-ssm-agent.service envelope-e2e-agent-tcp.service envelope-e2e-agent-udp.service; do
   systemctl is-active --quiet "$unit"
 done
+failed_check=tools-present
 for tool in ping iperf3 python3 ip ss timeout jq; do command -v "$tool" >/dev/null; done
+failed_check=source-address
 ip -j address show | jq -e --arg source {shlex.quote(target.private_ip)} 'any(.[]?.addr_info[]?; .local == $source)' >/dev/null
-ip -j route get {shlex.quote(peer.private_ip)} from {shlex.quote(target.private_ip)} | jq -e --arg source {shlex.quote(target.private_ip)} 'length == 1 and ((.[0].prefsrc // .[0].src) == $source)' >/dev/null
+failed_check=source-route
+ip -j route get {shlex.quote(peer.private_ip)} from {shlex.quote(target.private_ip)} | jq -e --arg source {shlex.quote(target.private_ip)} {shlex.quote(WORKLOAD_SOURCE_ROUTE_JQ)} >/dev/null
+failed_check=tcp-listener
 ss -H -ltn 'sport = :5201' | grep -q .
+failed_check=udp-listener
 ss -H -lun 'sport = :5201' | grep -q .
+failed_check=complete
 printf '{{"cloud_init_complete":true,"host_network_preflight":true,"links_ready":true,"private_ip":"{target.private_ip}","ssm_active":true,"success":true,"tcp_listener_ready":true,"tools_ready":true,"udp_listener_ready":true}}\\n'"""
         return self._execute_json(
             target,

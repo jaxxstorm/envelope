@@ -1520,8 +1520,22 @@ class CaptureControllerTest(unittest.TestCase):
             "for unit in amazon-ssm-agent.service envelope-e2e-agent-tcp.service envelope-e2e-agent-udp.service",
             workload.commands[0],
         )
+        self.assertIn("failed_check=source-route", workload.commands[0])
+        self.assertIn(".[0].from // .[0].prefsrc // .[0].src", workload.commands[0])
         for command in (appliance, workload):
             subprocess.run(["bash", "-n", "-c", command.commands[0]], check=True, capture_output=True, text=True)
+
+    def test_workload_source_route_filter_accepts_al2023_from_field(self) -> None:
+        route = json.dumps([{"dst": "198.51.100.20", "from": "192.0.2.10", "gateway": "192.0.2.1"}])
+
+        result = subprocess.run(
+            ["jq", "-e", "--arg", "source", "192.0.2.10", e2e.WORKLOAD_SOURCE_ROUTE_JQ],
+            input=route,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_emergency_return_rule_accepts_concurrent_reconciliation(self) -> None:
         fake = self.FakeSSM()
