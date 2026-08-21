@@ -1809,6 +1809,51 @@ def _capture_matches_flow(frame: Mapping[str, Any], flow: FlowRecord, *, reverse
     )
 
 
+def summarize_source_workload_capture(
+    source_site: Site,
+    flows: Sequence[FlowRecord],
+    capture: Mapping[str, Any],
+    *,
+    interface: str,
+    raw_deleted: bool,
+) -> dict[str, Any]:
+    """Reduce an initiator-side ICMP capture to bounded first-hop evidence."""
+
+    icmp_flows = [flow for flow in flows if flow.protocol == "icmp" and flow.source.site == source_site]
+    frames = capture.get("frames")
+    if (
+        len(icmp_flows) != 1
+        or capture.get("success") is not True
+        or not isinstance(capture.get("file_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", str(capture.get("file_sha256"))) is None
+        or not isinstance(frames, list)
+        or capture.get("frame_count") != len(frames)
+        or re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", interface) is None
+        or not raw_deleted
+    ):
+        raise WireAssertionError("source workload capture summary or raw capture deletion is invalid")
+    flow = icmp_flows[0]
+    requests = sum(
+        1 for frame in frames if isinstance(frame, Mapping) and _capture_matches_flow(frame, flow, reverse=False)
+    )
+    replies = sum(
+        1 for frame in frames if isinstance(frame, Mapping) and _capture_matches_flow(frame, flow, reverse=True)
+    )
+    return {
+        "source_site": source_site,
+        "role": "initiator",
+        "interface": interface,
+        "flow_id": flow.flow_id,
+        "file_sha256": capture["file_sha256"],
+        "frame_count": capture["frame_count"],
+        "request_packets": requests,
+        "reply_packets": replies,
+        "request_observed": requests > 0,
+        "reply_observed": replies > 0,
+        "raw_pcap_deleted": True,
+    }
+
+
 def assert_directional_wire_captures(
     source_site: Site,
     flows: Sequence[FlowRecord],
@@ -6388,7 +6433,9 @@ if (
 ):
     raise SystemExit(3)
 '''
-WORKLOAD_SOURCE_ROUTE_JQ = 'length == 1 and ((.[0].from // .[0].prefsrc // .[0].src) == $source)'
+WORKLOAD_SOURCE_ROUTE_JQ = (
+    'length == 1 and ((.[0].from // .[0].prefsrc // .[0].src) == $source) and (.[0].dev == $interface)'
+)
 
 
 @dataclasses.dataclass
@@ -6403,6 +6450,11 @@ class DirectionalCaptureHandle:
     command_ids: dict[Site, str]
     paths: dict[Site, dict[str, str]]
     pid_paths: dict[Site, dict[str, str]]
+    source_target: SSMTarget | None = None
+    source_command_id: str | None = None
+    source_path: str | None = None
+    source_pid_path: str | None = None
+    source_interface: str | None = None
     stopped: bool = False
     raw_deleted: bool = False
 
@@ -6435,6 +6487,7 @@ class AwsLiveOperations:
         self.flow_windows: dict[str, dict[str, int]] = {}
         self.capture_cleanup_events: list[dict[str, Any]] = []
         self.capture_assertion_events: list[dict[str, Any]] = []
+        self.capture_diagnostic_events: list[dict[str, Any]] = []
         self.agent_sha256 = hashlib.sha256(REMOTE_AGENT_SOURCE.encode("utf-8")).hexdigest()
         self.wire_inspector_sha256 = hashlib.sha256(WIRE_INSPECTOR_SOURCE.encode("utf-8")).hexdigest()
 
@@ -6578,7 +6631,7 @@ class AwsLiveOperations:
         )
         self._execute(target, command, timeout_seconds=60, comment="Envelope E2E install bounded agent")
 
-    def _install_wire_inspector(self, target: ApplianceTarget) -> None:
+    def _install_wire_inspector(self, target: RemoteTarget) -> None:
         encoded = base64.b64encode(gzip.compress(WIRE_INSPECTOR_SOURCE.encode("utf-8"), mtime=0)).decode("ascii")
         temporary = WIRE_INSPECTOR_PATH + ".tmp"
         command = (
@@ -6727,6 +6780,7 @@ printf '{{"accepted_route_peer":{json.dumps(expected_peer)},"accepted_routes":{a
         target: SSMTarget,
         peer: SSMTarget,
         *,
+        interface: str,
         timeout_seconds: int,
     ) -> dict[str, Any]:
         command = f"""set -euo pipefail
@@ -6747,11 +6801,11 @@ for unit in amazon-ssm-agent.service envelope-e2e-agent-tcp.service envelope-e2e
   systemctl is-active --quiet "$unit"
 done
 failed_check=tools-present
-for tool in ping iperf3 python3 ip ss timeout jq; do command -v "$tool" >/dev/null; done
+for tool in ping iperf3 python3 ip ss timeout jq tcpdump sha256sum gzip base64; do command -v "$tool" >/dev/null; done
 failed_check=source-address
 ip -j address show | jq -e --arg source {shlex.quote(target.private_ip)} 'any(.[]?.addr_info[]?; .local == $source)' >/dev/null
 failed_check=source-route
-ip -j route get {shlex.quote(peer.private_ip)} from {shlex.quote(target.private_ip)} | jq -e --arg source {shlex.quote(target.private_ip)} {shlex.quote(WORKLOAD_SOURCE_ROUTE_JQ)} >/dev/null
+ip -j route get {shlex.quote(peer.private_ip)} from {shlex.quote(target.private_ip)} | jq -e --arg source {shlex.quote(target.private_ip)} --arg interface {shlex.quote(interface)} {shlex.quote(WORKLOAD_SOURCE_ROUTE_JQ)} >/dev/null
 failed_check=tcp-listener
 ss -H -ltn 'sport = :5201' | grep -q .
 failed_check=udp-listener
@@ -7009,10 +7063,12 @@ printf '{{"cloud_init_complete":true,"host_network_preflight":true,"links_ready"
             )
             for target in workload_targets:
                 self._install_agent(target)
+                self._install_wire_inspector(target)
                 peer_target = deployment.workloads.target(_opposite(site), _opposite_workload_role(target.role))
                 result = self._workload_readiness_details(
                     target,
                     peer_target,
+                    interface=deployment.runtime(site).underlay_interface,
                     timeout_seconds=min(180, max(30, int(deadline - self.monotonic()))),
                 )
                 result.update(self.workload_flow_identities[f"{site}-{target.role}"])
@@ -7154,8 +7210,10 @@ exit 1"""
         *,
         timeout_seconds: int,
     ) -> DirectionalCaptureHandle:
-        if {flow.source.site for flow in flows} != {source_site}:
+        source_targets = {flow.source for flow in flows}
+        if {flow.source.site for flow in flows} != {source_site} or len(source_targets) != 1:
             raise WireAssertionError("capture flows do not belong to one direction")
+        source_target = next(iter(source_targets))
         command_ids: dict[Site, str] = {}
         paths: dict[Site, dict[str, str]] = {}
         pid_paths: dict[Site, dict[str, str]] = {}
@@ -7231,6 +7289,47 @@ exit 1"""
                 )
                 if ready.get("capture_ready") is not True:
                     raise WireAssertionError(f"{site} capture controller did not become ready")
+            source_interface = deployment.runtime(source_site).underlay_interface
+            source_path = f"/run/envelope-e2e-capture/{tag}-{source_site}-source-icmp.pcap"
+            source_pid_path = source_path + ".pid"
+            source_filter = (
+                f"icmp and host {flows[0].source.private_ip} and host {flows[0].destination.private_ip}"
+            )
+            source_commands = [
+                "set -euo pipefail",
+                "install -d -m 0700 /run/envelope-e2e-capture",
+                f"rm -f {shlex.quote(source_path)} {shlex.quote(source_pid_path)}",
+                f"timeout --signal=TERM --kill-after=2 {duration}s tcpdump -U -n -i {shlex.quote(source_interface)} "
+                f"-s 512 -c 8 -w {shlex.quote(source_path)} {shlex.quote(source_filter)} >/dev/null 2>&1 &",
+                "capture_pid=$!",
+                f"printf '%s\\n' \"$capture_pid\" > {shlex.quote(source_pid_path)}",
+                "capture_status=0",
+                "wait \"$capture_pid\" || capture_status=$?",
+                "case \"$capture_status\" in 0|124|143) ;; *) exit \"$capture_status\" ;; esac",
+            ]
+            handle.source_target = source_target
+            handle.source_path = source_path
+            handle.source_pid_path = source_pid_path
+            handle.source_interface = source_interface
+            handle.source_command_id = self.ssm.send(
+                SSMCommand(
+                    source_target,
+                    ("\n".join(source_commands),),
+                    timeout_seconds=duration + 15,
+                    comment=f"Envelope E2E {source_site} source workload capture",
+                ),
+                timeout_seconds=10,
+            )
+            source_ready = self._execute_json(
+                source_target,
+                f"set -euo pipefail; test -f {shlex.quote(source_path)}; "
+                f"test -s {shlex.quote(source_pid_path)}; read -r capture_pid < {shlex.quote(source_pid_path)}; "
+                "kill -0 \"$capture_pid\"; printf '{\"capture_ready\":true,\"success\":true}\\n'",
+                timeout_seconds=max(10, min(30, timeout_seconds // 4)),
+                comment="Envelope E2E capture readiness",
+            )
+            if source_ready.get("capture_ready") is not True:
+                raise WireAssertionError(f"{source_site} source workload capture did not become ready")
             return handle
         except BaseException:
             try:
@@ -7249,6 +7348,7 @@ exit 1"""
         if handle.stopped:
             raise WireAssertionError("directional capture handle was already stopped")
         summaries: dict[Site, dict[str, Any]] = {site: {} for site in SITES}
+        source_summary: dict[str, Any] | None = None
         errors: list[str] = []
         try:
             for site in SITES:
@@ -7267,6 +7367,15 @@ exit 1"""
                     timeout_seconds=20,
                     comment="Envelope E2E stop bounded captures",
                 )
+            if handle.source_target is not None and handle.source_pid_path is not None:
+                self._execute(
+                    handle.source_target,
+                    f"set -u; if test -s {shlex.quote(handle.source_pid_path)}; then "
+                    f"read -r capture_pid < {shlex.quote(handle.source_pid_path)}; "
+                    "kill -TERM \"$capture_pid\" 2>/dev/null || true; fi",
+                    timeout_seconds=20,
+                    comment="Envelope E2E stop source workload capture",
+                )
             for site, command_id in handle.command_ids.items():
                 try:
                     result = self.ssm.wait(deployment.appliance(site), command_id, timeout_seconds=30)
@@ -7274,6 +7383,15 @@ exit 1"""
                         errors.append(f"{site} capture command ended {result.status}")
                 except Exception as error:
                     errors.append(f"{site} capture wait failed: {_sanitize_string(str(error))}")
+            if handle.source_target is not None and handle.source_command_id is not None:
+                try:
+                    result = self.ssm.wait(handle.source_target, handle.source_command_id, timeout_seconds=30)
+                    if not result.succeeded:
+                        errors.append(f"{handle.source_site} source workload capture command ended {result.status}")
+                except Exception as error:
+                    errors.append(
+                        f"{handle.source_site} source workload capture wait failed: {_sanitize_string(str(error))}"
+                    )
             if inspect and not errors:
                 for site in SITES:
                     if errors:
@@ -7287,6 +7405,14 @@ exit 1"""
                                 f"{site} {logical} capture inspection failed: {_sanitize_string(str(error))}"
                             )
                             break
+                if not errors and handle.source_target is not None and handle.source_path is not None:
+                    try:
+                        source_summary = self._inspect_capture_summary(handle.source_target, handle.source_path)
+                    except Exception as error:
+                        errors.append(
+                            f"{handle.source_site} source workload capture inspection failed: "
+                            f"{_sanitize_string(str(error))}"
+                        )
         finally:
             for site in SITES:
                 if site not in handle.paths:
@@ -7308,6 +7434,28 @@ exit 1"""
                         errors.append(f"{site} did not prove raw capture deletion")
                 except Exception as error:
                     errors.append(f"{site} raw capture deletion failed: {_sanitize_string(str(error))}")
+            if (
+                handle.source_target is not None
+                and handle.source_path is not None
+                and handle.source_pid_path is not None
+            ):
+                try:
+                    deleted = self._execute_json(
+                        handle.source_target,
+                        f"set -euo pipefail; rm -f {shlex.quote(handle.source_path)} "
+                        f"{shlex.quote(handle.source_pid_path)}; ! test -e {shlex.quote(handle.source_path)}; "
+                        f"! test -e {shlex.quote(handle.source_pid_path)}; "
+                        "printf '{\"deleted\":true,\"success\":true}\\n'",
+                        timeout_seconds=30,
+                        comment="Envelope E2E delete raw captures",
+                    )
+                    if deleted.get("deleted") is not True:
+                        errors.append(f"{handle.source_site} did not prove source workload raw capture deletion")
+                except Exception as error:
+                    errors.append(
+                        f"{handle.source_site} source workload raw capture deletion failed: "
+                        f"{_sanitize_string(str(error))}"
+                    )
             handle.stopped = True
             handle.raw_deleted = not any("delet" in error for error in errors)
             self.capture_cleanup_events.append(
@@ -7315,14 +7463,20 @@ exit 1"""
                     "source_site": handle.source_site,
                     "stopped": True,
                     "raw_pcaps_deleted": handle.raw_deleted,
+                    "source_workload_pcap_deleted": handle.raw_deleted,
                     "error_count": len(errors),
                 }
             )
         if errors:
             raise WireAssertionError("; ".join(errors))
-        return {"captures": summaries, "raw_deleted": handle.raw_deleted}
+        return {
+            "captures": summaries,
+            "source_capture": source_summary,
+            "source_interface": handle.source_interface,
+            "raw_deleted": handle.raw_deleted,
+        }
 
-    def _inspect_capture_summary(self, target: ApplianceTarget, path: str) -> dict[str, Any]:
+    def _inspect_capture_summary(self, target: RemoteTarget, path: str) -> dict[str, Any]:
         result = self._execute(
             target,
             f"set -euo pipefail; {shlex.quote(WIRE_INSPECTOR_PATH)} {shlex.quote(path)} | gzip -n -9 | base64 -w0",
@@ -7538,6 +7692,7 @@ exit 1"""
         primary_error: BaseException | None = None
         capture_result: dict[str, Any] | None = None
         capture_error: BaseException | None = None
+        source_diagnostic: dict[str, Any] | None = None
         try:
             handle = self._start_directional_captures(
                 deployment,
@@ -7578,20 +7733,41 @@ exit 1"""
         wire: dict[str, Any] | None = None
         if capture_result is not None and capture_error is None:
             try:
+                source_capture = capture_result.get("source_capture")
+                source_interface = capture_result.get("source_interface")
+                if not isinstance(source_capture, Mapping) or not isinstance(source_interface, str):
+                    raise WireAssertionError("cold direction produced no source workload capture summary")
+                source_diagnostic = summarize_source_workload_capture(
+                    source_site,
+                    flows,
+                    source_capture,
+                    interface=source_interface,
+                    raw_deleted=capture_result.get("raw_deleted") is True,
+                )
+                self.capture_diagnostic_events.append(source_diagnostic)
                 wire = assert_directional_wire_captures(
                     source_site,
                     flows,
                     cast(Mapping[str, Any], capture_result["captures"]),
                     raw_deleted=capture_result.get("raw_deleted") is True,
                 )
+                wire["source_workload"] = source_diagnostic
                 self.capture_assertion_events.append(wire)
             except BaseException as error:
                 capture_error = error
         if primary_error is not None:
             if capture_error is not None:
+                source_detail = ""
+                if source_diagnostic is not None:
+                    source_detail = (
+                        "; source workload capture observed "
+                        f"{source_diagnostic['request_packets']} ICMP request packet(s) and "
+                        f"{source_diagnostic['reply_packets']} reply packet(s)"
+                    )
                 raise WireAssertionError(
                     f"cold direction failed: {_sanitize_string(str(primary_error))}; "
                     f"capture cleanup/assertion also failed: {_sanitize_string(str(capture_error))}"
+                    f"{source_detail}"
                 ) from primary_error
             raise primary_error
         if capture_error is not None:
@@ -9042,6 +9218,7 @@ exit 1"""
             "target_health": {},
             "capture_cleanup": list(self.capture_cleanup_events),
             "capture_assertions": list(self.capture_assertion_events),
+            "capture_diagnostics": list(self.capture_diagnostic_events),
         }
         for site in SITES:
             appliance = deployment.appliance(site)

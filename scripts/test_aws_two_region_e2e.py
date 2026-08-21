@@ -1314,6 +1314,19 @@ class PacketCaptureAssertionTest(unittest.TestCase):
                 raw_deleted=True,
             )
 
+        source_capture = icmp_capture_fixture(flow)[flow.source.site]["envelope0"]
+        source_summary = e2e.summarize_source_workload_capture(
+            "west", [flow], source_capture, interface="ens5", raw_deleted=True
+        )
+        self.assertEqual(source_summary["request_packets"], 1)
+        self.assertEqual(source_summary["reply_packets"], 1)
+        self.assertTrue(source_summary["raw_pcap_deleted"])
+
+        with self.assertRaisesRegex(e2e.WireAssertionError, "deletion"):
+            e2e.summarize_source_workload_capture(
+                "west", [flow], source_capture, interface="ens5", raw_deleted=False
+            )
+
     def test_parser_rejects_bad_ipv4_udp_lengths_checksums_and_vni(self) -> None:
         captures = directional_capture_fixture(self.flow)
         # Reconstruct one valid outer frame from the fixture inputs for byte-level mutations.
@@ -1450,7 +1463,9 @@ class CaptureControllerTest(unittest.TestCase):
         result = operations._finish_directional_captures(deployment, handle, inspect=True)
 
         self.assertTrue(result["raw_deleted"])
-        self.assertEqual(len(fake.sent), 2)
+        self.assertIsNotNone(result["source_capture"])
+        self.assertEqual(result["source_interface"], "ens5")
+        self.assertEqual(len(fake.sent), 3)
         for site_paths in handle.paths.values():
             for path in site_paths.values():
                 self.assertRegex(
@@ -1458,11 +1473,19 @@ class CaptureControllerTest(unittest.TestCase):
                     r"^/run/envelope-e2e-capture/[a-z0-9-]{1,80}-(west|east)-(underlay|envelope0|tailscale0)\.pcap$",
                 )
                 self.assertNotIn("..", pathlib.PurePosixPath(path).parts)
+        self.assertRegex(
+            str(handle.source_path),
+            r"^/run/envelope-e2e-capture/[a-z0-9-]{1,80}-west-source-icmp\.pcap$",
+        )
         for command in fake.sent:
             rendered = command.commands[0]
-            self.assertEqual(rendered.count("tcpdump"), 3)
-            self.assertEqual(rendered.count("-c 48"), 3)
-            self.assertEqual(rendered.count("timeout --signal=TERM --kill-after=2 60s tcpdump"), 3)
+            expected_count = 1 if "source workload capture" in command.comment else 3
+            self.assertEqual(rendered.count("tcpdump"), expected_count)
+            self.assertEqual(rendered.count("-c 8"), 1 if expected_count == 1 else 0)
+            self.assertEqual(rendered.count("-c 48"), 0 if expected_count == 1 else 3)
+            self.assertEqual(
+                rendered.count("timeout --signal=TERM --kill-after=2 60s tcpdump"), expected_count
+            )
             self.assertNotIn("watchdog_pid", rendered)
             self.assertNotIn('kill -INT "$capture_pid"', rendered)
             self.assertLessEqual(command.timeout_seconds, 315)
@@ -1471,8 +1494,27 @@ class CaptureControllerTest(unittest.TestCase):
                 subprocess.run(["bash", "-n", "-c", rendered], check=True, capture_output=True, text=True)
         self.assertEqual(
             sum(command.comment == "Envelope E2E delete raw captures" for command in fake.executed),
-            2,
+            3,
         )
+
+    def test_cold_failure_reports_source_workload_packet_counts(self) -> None:
+        fake = self.FakeSSM()
+        operations, deployment, flows = self.fixture(fake)
+
+        with (
+            mock.patch.object(operations, "_restart_envelope", return_value={"west": 101, "east": 202}),
+            mock.patch.object(operations, "_metric_snapshots", return_value={}),
+            mock.patch.object(operations, "_run_icmp_probe", side_effect=e2e.ProbeError("fixture timeout")),
+        ):
+            with self.assertRaisesRegex(
+                e2e.WireAssertionError,
+                r"source workload capture observed 0 ICMP request packet\(s\) and 0 reply packet\(s\)",
+            ):
+                operations.run_cold_direction(deployment, "west", flows, timeout_seconds=60)
+
+        self.assertEqual(len(operations.capture_diagnostic_events), 1)
+        self.assertEqual(operations.capture_diagnostic_events[0]["interface"], "ens5")
+        self.assertEqual(operations.capture_diagnostic_events[0]["request_packets"], 0)
 
     def test_wire_inspector_installer_creates_parent_directory_before_writing(self) -> None:
         fake = self.FakeSSM()
@@ -1512,6 +1554,7 @@ class CaptureControllerTest(unittest.TestCase):
         operations._workload_readiness_details(
             deployment.workloads.west.initiator,
             deployment.workloads.east.responder,
+            interface="ens5",
             timeout_seconds=60,
         )
 
@@ -1523,14 +1566,28 @@ class CaptureControllerTest(unittest.TestCase):
         )
         self.assertIn("failed_check=source-route", workload.commands[0])
         self.assertIn(".[0].from // .[0].prefsrc // .[0].src", workload.commands[0])
+        self.assertIn(".[0].dev == $interface", workload.commands[0])
+        self.assertIn("tcpdump sha256sum gzip base64", workload.commands[0])
         for command in (appliance, workload):
             subprocess.run(["bash", "-n", "-c", command.commands[0]], check=True, capture_output=True, text=True)
 
     def test_workload_source_route_filter_accepts_al2023_from_field(self) -> None:
-        route = json.dumps([{"dst": "198.51.100.20", "from": "192.0.2.10", "gateway": "192.0.2.1"}])
+        route = json.dumps(
+            [{"dst": "198.51.100.20", "from": "192.0.2.10", "gateway": "192.0.2.1", "dev": "ens5"}]
+        )
 
         result = subprocess.run(
-            ["jq", "-e", "--arg", "source", "192.0.2.10", e2e.WORKLOAD_SOURCE_ROUTE_JQ],
+            [
+                "jq",
+                "-e",
+                "--arg",
+                "source",
+                "192.0.2.10",
+                "--arg",
+                "interface",
+                "ens5",
+                e2e.WORKLOAD_SOURCE_ROUTE_JQ,
+            ],
             input=route,
             capture_output=True,
             text=True,
@@ -1561,7 +1618,7 @@ class CaptureControllerTest(unittest.TestCase):
         self.assertTrue(handle.raw_deleted)
         self.assertEqual(
             sum(command.comment == "Envelope E2E delete raw captures" for command in fake.executed),
-            2,
+            3,
         )
 
     def test_summary_parse_failure_still_deletes_every_raw_capture(self) -> None:
@@ -1576,7 +1633,7 @@ class CaptureControllerTest(unittest.TestCase):
         self.assertTrue(handle.raw_deleted)
         self.assertEqual(
             sum(command.comment == "Envelope E2E delete raw captures" for command in fake.executed),
-            2,
+            3,
         )
 
     def test_flow_id_cannot_escape_capture_directory(self) -> None:
