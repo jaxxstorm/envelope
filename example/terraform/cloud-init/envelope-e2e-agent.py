@@ -12,10 +12,10 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Sequence
-from typing import Any, Literal, TypeAlias, cast
+from typing import Any, Literal, cast
 
 
-ProtocolName: TypeAlias = Literal["tcp", "udp"]
+ProtocolName = Literal["tcp", "udp"]
 
 MAX_FRAME_BYTES = 4096
 MAX_MESSAGES = 100_000

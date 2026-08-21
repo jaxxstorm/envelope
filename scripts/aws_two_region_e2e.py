@@ -6608,6 +6608,7 @@ jq -e --argjson advertised {shlex.quote(advertised_json)} '
 {route_checks}
 for iface in {shlex.quote(runtime.underlay_interface)} {shlex.quote(runtime.tailscale_iface)} {shlex.quote(runtime.tun_name)}; do
   ip -j link show dev "$iface" | jq -e 'length == 1 and .[0].operstate != "DOWN" and .[0].mtu >= 1280' >/dev/null
+done
 [[ $(sysctl -n net.ipv4.ip_forward) == 1 ]]
 [[ $(sysctl -n net.ipv6.conf.all.forwarding) == 1 ]]
 for iface in {shlex.quote(runtime.underlay_interface)} {shlex.quote(runtime.tailscale_iface)} {shlex.quote(runtime.tun_name)}; do

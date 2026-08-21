@@ -1395,6 +1395,8 @@ class CaptureControllerTest(unittest.TestCase):
                 output = base64.b64encode(gzip.compress(payload, mtime=0)).decode()
             elif command.comment == "Envelope E2E delete raw captures":
                 output = '{"deleted":true,"success":true}\n'
+            elif command.comment == "Envelope E2E explicit appliance readiness":
+                output = '{"pid":123,"success":true}\n'
             else:
                 output = ""
             return e2e.SSMResult(command.target, f"execute-{len(self.executed)}", "Success", 0, stdout=output)
@@ -1471,6 +1473,17 @@ class CaptureControllerTest(unittest.TestCase):
         self.assertIn(temporary_write, rendered)
         self.assertLess(rendered.index(directory_install), rendered.index(temporary_write))
         subprocess.run(["bash", "-n", "-c", rendered], check=True, capture_output=True, text=True)
+
+    def test_appliance_readiness_command_has_balanced_shell_syntax(self) -> None:
+        fake = self.FakeSSM()
+        operations, deployment, _flows = self.fixture(fake)
+
+        result = operations._appliance_readiness_details(deployment, "west", timeout_seconds=60)
+
+        self.assertEqual(result["pid"], 123)
+        command = fake.executed[-1]
+        self.assertEqual(command.comment, "Envelope E2E explicit appliance readiness")
+        subprocess.run(["bash", "-n", "-c", command.commands[0]], check=True, capture_output=True, text=True)
 
     def test_inspector_failure_still_deletes_every_raw_capture(self) -> None:
         fake = self.FakeSSM(fail_inspection=True)
@@ -4430,6 +4443,9 @@ def start_agent_server(protocol: str, messages: int) -> tuple[threading.Thread, 
 
 
 class WorkloadAgentProtocolTest(unittest.TestCase):
+    def test_agent_typing_is_compatible_with_al2023_python(self) -> None:
+        self.assertNotIn("TypeAlias", AGENT_PATH.read_text())
+
     def _server_result(self, thread: threading.Thread, completed: queue.Queue[object]) -> dict[str, Any]:
         result = completed.get(timeout=4)
         thread.join(timeout=1)
