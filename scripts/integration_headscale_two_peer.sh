@@ -5,7 +5,7 @@ HEADSCALE_IMAGE='headscale/headscale:0.25.1@sha256:a7a8ae9616bb964a3eed8101ebb02
 TAILSCALE_IMAGE='tailscale/tailscale:v1.80.3@sha256:af6026ed3e5892c5d4966962618a09685198111507df16803b2aec7066046582'
 PLATFORM=${ENVELOPE_INTEGRATION_PLATFORM:-linux/amd64}
 
-for command in docker go python3 awk; do
+for command in docker go python3; do
   if ! command -v "$command" >/dev/null 2>&1; then
     printf 'missing required tool: %s\n' "$command" >&2
     exit 77
@@ -19,12 +19,16 @@ fi
 run_id="$$-$(date +%s)"
 network="envelope-headscale-$run_id"
 headscale="envelope-headscale-control-$run_id"
-site_a="envelope-headscale-a-$run_id"
-site_b="envelope-headscale-b-$run_id"
+target_a="envelope-target-a-$run_id"
+target_b="envelope-target-b-$run_id"
+ingress_a1="envelope-ingress-a1-$run_id"
+ingress_a2="envelope-ingress-a2-$run_id"
+ingress_b1="envelope-ingress-b1-$run_id"
+ingress_b2="envelope-ingress-b2-$run_id"
 work_dir=$(mktemp -d)
 
 cleanup() {
-  docker rm -f "$site_a" "$site_b" "$headscale" >/dev/null 2>&1 || true
+  docker rm -f "$target_a" "$target_b" "$ingress_a1" "$ingress_a2" "$ingress_b1" "$ingress_b2" "$headscale" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
   rm -rf "$work_dir"
 }
@@ -96,22 +100,20 @@ cat >"$work_dir/acl.hujson" <<'HUJSON'
 }
 HUJSON
 
-cat >"$work_dir/setup-site.sh" <<'SH'
+cat >"$work_dir/setup-target.sh" <<'SH'
 #!/bin/sh
 set -eu
 
-delivery_cidr=$1
-delivery_ip=$2
-delivery_gateway=$3
+local_cidr=$1
+remote_cidr=$2
+local_ip=$3
 
-apk add --no-cache curl iproute2 iptables nftables python3 >/dev/null
+apk add --no-cache curl iproute2 iptables nftables python3 tcpdump >/dev/null
 mkdir -p /usr/bin /usr/sbin
 ln -sf /usr/local/bin/tailscale /usr/bin/tailscale
-ln -sf "$(command -v ip)" /usr/sbin/ip
-ln -sf "$(command -v iptables)" /usr/sbin/iptables
-ln -sf "$(command -v ip6tables)" /usr/sbin/ip6tables
-ln -sf "$(command -v iptables-save)" /usr/sbin/iptables-save
-ln -sf "$(command -v ip6tables-save)" /usr/sbin/ip6tables-save
+for binary in ip iptables ip6tables iptables-save ip6tables-save; do
+  ln -sf "$(command -v "$binary")" "/usr/sbin/$binary"
+done
 nft_path=$(command -v nft)
 if [ "$nft_path" != /usr/sbin/nft ]; then
   ln -sf "$nft_path" /usr/sbin/nft
@@ -123,10 +125,11 @@ ip link set workload-peer netns workload
 ip link set workload0 up
 ip -n workload link set lo up
 ip -n workload link set workload-peer up
-ip addr add "$delivery_gateway/32" dev workload0
-ip -n workload addr add "$delivery_ip/32" dev workload-peer
-ip route add "$delivery_cidr" dev workload0
-ip -n workload route add default via "$delivery_gateway" dev workload-peer onlink
+ip addr add 198.18.0.1/30 dev workload0
+ip -n workload addr add 198.18.0.2/30 dev workload-peer
+ip -n workload addr add "$local_ip/32" dev lo
+ip -n workload route add default via 198.18.0.1 dev workload-peer
+ip route add "$local_cidr" dev workload0
 
 ip netns add gwlb
 ip link add gwlb0 type veth peer name gwlb-peer
@@ -136,12 +139,15 @@ ip -n gwlb link set lo up
 ip -n gwlb link set gwlb-peer up
 ip addr add 192.0.2.1/30 dev gwlb0
 ip -n gwlb addr add 192.0.2.2/30 dev gwlb-peer
+ip rule add priority 100 iif workload0 to "$remote_cidr" table 101
+ip route add table 101 "$remote_cidr" via 192.0.2.2 dev gwlb0
 
 sysctl -q -w net.ipv4.ip_forward=1
 sysctl -q -w net.ipv6.conf.all.forwarding=1
 sysctl -q -w net.ipv4.conf.all.rp_filter=0
 sysctl -q -w net.ipv4.conf.default.rp_filter=0
 sysctl -q -w net.ipv4.conf.workload0.rp_filter=0
+sysctl -q -w net.ipv4.conf.gwlb0.rp_filter=0
 sysctl -q -w net.ipv4.conf.tailscale0.rp_filter=0
 nft flush ruleset
 
@@ -155,7 +161,7 @@ for binary in /usr/sbin/iptables /usr/sbin/ip6tables; do
   if [ "$binary" = /usr/sbin/ip6tables ]; then
     mss=1220
   fi
-  for path in 'workload0 tailscale0' 'tailscale0 workload0' 'envelope0 tailscale0' 'tailscale0 envelope0'; do
+  for path in 'envelope0 workload0' 'envelope0 tailscale0'; do
     set -- $path
     "$binary" -A ENVELOPE-FORWARD -i "$1" -o "$2" -j ACCEPT
     "$binary" -t mangle -A ENVELOPE-MSS -i "$1" -o "$2" -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss"
@@ -163,329 +169,312 @@ for binary in /usr/sbin/iptables /usr/sbin/ip6tables; do
   "$binary" -t mangle -A ENVELOPE-MSS -j RETURN
 done
 SH
-chmod 0755 "$work_dir/setup-site.sh"
+chmod 0755 "$work_dir/setup-target.sh"
 
-cat >"$work_dir/udp-responder.py" <<'PY'
-import pathlib
-import socket
-import sys
+cat >"$work_dir/setup-ingress.sh" <<'SH'
+#!/bin/sh
+set -eu
 
-address, port, marker = sys.argv[1], int(sys.argv[2]), sys.argv[3].encode()
-ready = pathlib.Path("/tmp/responder-ready-" + sys.argv[2])
-completed = pathlib.Path("/tmp/responder-completed-" + sys.argv[2])
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind((address, port))
-ready.write_text("ready")
-data, peer = sock.recvfrom(4096)
-if data != marker:
-    raise SystemExit("unexpected cold payload")
-sock.sendto(b"reply:" + data, peer)
-sock.close()
-completed.write_text(repr(peer))
-PY
+local_cidr=$1
 
-cat >"$work_dir/geneve-lane.py" <<'PY'
+apk add --no-cache iproute2 python3 >/dev/null
+mkdir -p /usr/bin /usr/sbin
+ln -sf /usr/local/bin/tailscale /usr/bin/tailscale
+ln -sf "$(command -v ip)" /usr/sbin/ip
+
+ip netns add gwlb
+ip link add gwlb0 type veth peer name gwlb-peer
+ip link set gwlb-peer netns gwlb
+ip link set gwlb0 up
+ip -n gwlb link set lo up
+ip -n gwlb link set gwlb-peer up
+ip addr add 198.19.0.1/30 dev gwlb0
+ip -n gwlb addr add 198.19.0.2/30 dev gwlb-peer
+ip route add "$local_cidr" via 198.19.0.2 dev gwlb0
+sysctl -q -w net.ipv4.ip_forward=1
+sysctl -q -w net.ipv4.conf.all.rp_filter=0
+sysctl -q -w net.ipv4.conf.default.rp_filter=0
+sysctl -q -w net.ipv4.conf.gwlb0.rp_filter=0
+sysctl -q -w net.ipv4.conf.tailscale0.rp_filter=0
+SH
+chmod 0755 "$work_dir/setup-ingress.sh"
+
+cat >"$work_dir/gwlb-wrap.py" <<'PY'
 import ipaddress
 import socket
 import struct
 import sys
 
-outer_local = "192.0.2.2"
-outer_envelope = "192.0.2.1"
-source_ip, destination_ip = sys.argv[1], sys.argv[2]
-source_port, destination_port = int(sys.argv[3]), int(sys.argv[4])
-flow_port = int(sys.argv[5])
-marker = sys.argv[6].encode()
-
-def checksum(data):
-    if len(data) % 2:
-        data += b"\x00"
-    total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
-    while total >> 16:
-        total = (total & 0xffff) + (total >> 16)
-    return (~total) & 0xffff
-
-udp = struct.pack("!HHHH", source_port, destination_port, 8 + len(marker), 0) + marker
-header = struct.pack(
-    "!BBHHHBBH4s4s",
-    0x45,
-    0,
-    20 + len(udp),
-    0x4242,
-    0x4000,
-    64,
-    socket.IPPROTO_UDP,
-    0,
-    ipaddress.IPv4Address(source_ip).packed,
-    ipaddress.IPv4Address(destination_ip).packed,
-)
-header = header[:10] + struct.pack("!H", checksum(header)) + header[12:]
-options = bytes.fromhex("01080301a1b2c3d4")
-geneve = bytes.fromhex("0200080000000000") + options + header + udp
-
-listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-listener.bind((outer_local, 6081))
-listener.settimeout(20)
+interface, destination_cidr, target = sys.argv[1:]
+destination_network = ipaddress.ip_network(destination_cidr)
+cookie = bytes.fromhex("01080301a1b2c3d4")
+capture = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800))
+capture.bind((interface, 0))
 sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sender.bind((outer_local, flow_port))
-sender.sendto(geneve, (outer_envelope, 6081))
-sender.close()
 
-returned, peer = listener.recvfrom(65535)
-if peer != (outer_envelope, flow_port):
-    raise SystemExit("wrong mapped outer peer: %r" % (peer,))
-if len(returned) < 44 or returned[:8] != geneve[:8] or returned[8:16] != options:
-    raise SystemExit("GENEVE header/options were not preserved")
-inner = returned[16:]
-ihl = (inner[0] & 0x0f) * 4
-if inner[0] >> 4 != 4 or inner[9] != socket.IPPROTO_UDP:
-    raise SystemExit("mapped return is not IPv4 UDP")
-if str(ipaddress.IPv4Address(inner[12:16])) != destination_ip or str(ipaddress.IPv4Address(inner[16:20])) != source_ip:
-    raise SystemExit("mapped return addresses are not reversed")
-returned_source, returned_destination, length, _ = struct.unpack("!HHHH", inner[ihl:ihl + 8])
-payload = inner[ihl + 8:ihl + length]
-if (returned_source, returned_destination) != (destination_port, source_port):
-    raise SystemExit("mapped return ports are not reversed")
-if payload != b"reply:" + marker:
-    raise SystemExit("mapped return payload mismatch")
-listener.settimeout(1)
-try:
-    duplicate, duplicate_peer = listener.recvfrom(65535)
-    raise SystemExit("duplicate mapped return from %r (%d bytes)" % (duplicate_peer, len(duplicate)))
-except socket.timeout:
-    pass
-listener.close()
-print("correlated mapped return ok")
+while True:
+    frame = capture.recv(65535)
+    if len(frame) < 14 + 20 or frame[12:14] != b"\x08\x00":
+        continue
+    inner = frame[14:]
+    if inner[0] >> 4 != 4:
+        continue
+    length = struct.unpack("!H", inner[2:4])[0]
+    if length < 20 or length > len(inner):
+        continue
+    inner = inner[:length]
+    if ipaddress.ip_address(inner[16:20]) not in destination_network:
+        continue
+    geneve = bytes.fromhex("0200080000000000") + cookie + inner
+    sender.sendto(geneve, (target, 6081))
+PY
+
+cat >"$work_dir/probe.py" <<'PY'
+import pathlib
+import socket
+import sys
+
+mode, role, address, peer, port, marker = sys.argv[1:]
+port = int(port)
+marker = marker.encode()
+ready = pathlib.Path("/tmp/ready-" + mode + "-" + str(port))
+result = pathlib.Path("/tmp/result-" + mode + "-" + str(port))
+
+if mode == "udp":
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(15)
+    sock.bind((address, port if role == "server" else 0))
+    if role == "server":
+        ready.touch()
+        data, source = sock.recvfrom(4096)
+        if data != marker:
+            raise SystemExit("unexpected UDP payload")
+        sock.sendto(b"reply:" + data, source)
+        result.write_text(source[0])
+    else:
+        sock.sendto(marker, (peer, port))
+        data, source = sock.recvfrom(4096)
+        if data != b"reply:" + marker or source[0] != peer:
+            raise SystemExit("UDP reply did not preserve the remote source")
+        result.write_text(source[0])
+elif mode == "tcp":
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(15)
+    if role == "server":
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((address, port))
+        sock.listen(1)
+        ready.touch()
+        conn, source = sock.accept()
+        data = conn.recv(4096)
+        if data != marker:
+            raise SystemExit("unexpected TCP payload")
+        conn.sendall(b"reply:" + data)
+        conn.close()
+        result.write_text(source[0])
+    else:
+        sock.connect((peer, port))
+        sock.sendall(marker)
+        if sock.recv(4096) != b"reply:" + marker:
+            raise SystemExit("unexpected TCP reply")
+        result.write_text(peer)
+else:
+    raise SystemExit("unknown probe mode")
 PY
 
 docker network create "$network" >/dev/null
-docker run -d \
-  --platform "$PLATFORM" \
-  --name "$headscale" \
-  --network "$network" \
-  --network-alias headscale \
+docker run -d --platform "$PLATFORM" --name "$headscale" --network "$network" --network-alias headscale \
   -v "$work_dir/headscale.yaml:/etc/headscale/config.yaml:ro" \
   -v "$work_dir/acl.hujson:/etc/headscale/acl.hujson:ro" \
   -v "$work_dir/headscale-state:/var/lib/headscale" \
   "$HEADSCALE_IMAGE" serve >/dev/null
 
-headscale_ready=false
 for _ in $(seq 1 60); do
-  if docker exec "$headscale" headscale users list >/dev/null 2>&1; then
-    headscale_ready=true
-    break
-  fi
+  if docker exec "$headscale" headscale users list >/dev/null 2>&1; then break; fi
   sleep 0.5
 done
-if [[ "$headscale_ready" != true ]]; then
-  docker logs "$headscale" >&2
-  printf '%s\n' 'Headscale did not become ready' >&2
-  exit 1
-fi
+docker exec "$headscale" headscale users list >/dev/null
 docker exec "$headscale" headscale users create integration >/dev/null
 
 create_key() {
-  local raw
-  raw=$(docker exec "$headscale" headscale --output json preauthkeys create --user integration --expiration 1h)
-  python3 -c 'import json,sys; value=json.load(sys.stdin); print(value["key"])' <<<"$raw"
+  docker exec "$headscale" headscale --output json preauthkeys create --user integration --expiration 1h | python3 -c 'import json,sys; print(json.load(sys.stdin)["key"])'
 }
-create_key >"$work_dir/key-a"
-create_key >"$work_dir/key-b"
-chmod 0600 "$work_dir/key-a" "$work_dir/key-b"
+for node in target-a target-b ingress-a1 ingress-a2 ingress-b1 ingress-b2; do
+  create_key >"$work_dir/key-$node"
+  chmod 0600 "$work_dir/key-$node"
+done
 
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o "$work_dir/envelope" ./cmd/envelope
 
-start_site() {
-  local name=$1
-  local key_file=$2
-  local routes=$3
-  docker run -d \
-    --platform "$PLATFORM" \
-    --name "$name" \
-    --hostname "$name" \
-    --network "$network" \
-    --privileged \
-    --device=/dev/net/tun \
-    -e TS_AUTHKEY=file:/run/secrets/authkey \
-    -e TS_AUTH_ONCE=true \
-    -e TS_STATE_DIR=/var/lib/tailscale \
-    -e TS_USERSPACE=false \
-    -e TS_ACCEPT_DNS=false \
-    -e TS_DEBUG_FIREWALL_MODE=iptables \
-    -e TS_DEBUG_USE_DERP_HTTP=true \
-    -e TS_ROUTES="$routes" \
-    -e 'TS_EXTRA_ARGS=--login-server=http://headscale:8080 --accept-routes --snat-subnet-routes=false --netfilter-mode=off' \
-    -v "$key_file:/run/secrets/authkey:ro" \
+start_node() {
+  local name=$1 key=$2 routes=$3
+  docker run -d --platform "$PLATFORM" --name "$name" --hostname "$name" --network "$network" --network-alias "$name" \
+    --privileged --device=/dev/net/tun \
+    -e TS_AUTHKEY=file:/run/secrets/authkey -e TS_AUTH_ONCE=true -e TS_STATE_DIR=/var/lib/tailscale \
+    -e TS_USERSPACE=false -e TS_ACCEPT_DNS=false -e TS_DEBUG_FIREWALL_MODE=iptables -e TS_DEBUG_USE_DERP_HTTP=true \
+    -e TS_ROUTES="$routes" -e 'TS_EXTRA_ARGS=--login-server=http://headscale:8080 --accept-routes --snat-subnet-routes=false --netfilter-mode=off' \
+    -v "$key:/run/secrets/authkey:ro" \
+    -v "$work_dir/setup-target.sh:/run/envelope-test/setup-target.sh:ro" \
+    -v "$work_dir/setup-ingress.sh:/run/envelope-test/setup-ingress.sh:ro" \
+    -v "$work_dir/gwlb-wrap.py:/run/envelope-test/gwlb-wrap.py:ro" \
+    -v "$work_dir/probe.py:/run/envelope-test/probe.py:ro" \
     -v "$work_dir/envelope:/usr/local/bin/envelope:ro" \
-    -v "$work_dir/setup-site.sh:/run/envelope-test/setup-site.sh:ro" \
-    -v "$work_dir/udp-responder.py:/run/envelope-test/udp-responder.py:ro" \
-    -v "$work_dir/geneve-lane.py:/run/envelope-test/geneve-lane.py:ro" \
     "$TAILSCALE_IMAGE" >/dev/null
 }
 
-start_site "$site_a" "$work_dir/key-a" '10.10.0.0/24,10.11.0.0/24'
-start_site "$site_b" "$work_dir/key-b" '10.20.0.0/24,10.21.0.0/24'
+start_node "$target_a" "$work_dir/key-target-a" ''
+start_node "$target_b" "$work_dir/key-target-b" ''
+start_node "$ingress_a1" "$work_dir/key-ingress-a1" '10.10.0.0/24'
+start_node "$ingress_a2" "$work_dir/key-ingress-a2" '10.10.0.0/24'
+start_node "$ingress_b1" "$work_dir/key-ingress-b1" '10.20.0.0/24'
+start_node "$ingress_b2" "$work_dir/key-ingress-b2" '10.20.0.0/24'
 
 wait_running() {
-  local site=$1
+  local node=$1
   for _ in $(seq 1 120); do
-    if docker exec "$site" tailscale status --json 2>/dev/null | grep -Eq '"BackendState"[[:space:]]*:[[:space:]]*"Running"'; then
-      return
-    fi
+    if docker exec "$node" tailscale status --json 2>/dev/null | grep -Eq '"BackendState"[[:space:]]*:[[:space:]]*"Running"'; then return; fi
     sleep 0.5
   done
-  docker logs "$site" >&2
-  printf 'tailscaled did not become Running on %s\n' "$site" >&2
+  docker logs "$node" >&2
+  printf 'tailscaled did not become Running on %s\n' "$node" >&2
   exit 1
 }
-wait_running "$site_a"
-wait_running "$site_b"
+for node in "$target_a" "$target_b" "$ingress_a1" "$ingress_a2" "$ingress_b1" "$ingress_b2"; do wait_running "$node"; done
 
 routes_ready=false
 for _ in $(seq 1 120); do
   route_json=$(docker exec "$headscale" headscale --output json routes list)
-  route_ids=$(python3 -c 'import json,sys; routes=json.load(sys.stdin); expected={"10.10.0.0/24","10.11.0.0/24","10.20.0.0/24","10.21.0.0/24"}; found={r["prefix"] for r in routes}; print(" ".join(str(r["id"]) for r in routes)) if expected <= found else None' <<<"$route_json")
+  route_ids=$(python3 -c 'import json,sys; routes=json.load(sys.stdin); expected={"10.10.0.0/24":2,"10.20.0.0/24":2}; found={}; [found.__setitem__(r["prefix"], found.get(r["prefix"], 0)+1) for r in routes]; print(" ".join(str(r["id"]) for r in routes)) if all(found.get(prefix, 0) == count for prefix, count in expected.items()) else None' <<<"$route_json")
   if [[ -n "$route_ids" ]]; then
-    for route_id in $route_ids; do
-      docker exec "$headscale" headscale routes enable --route "$route_id" >/dev/null
-    done
+    for route_id in $route_ids; do docker exec "$headscale" headscale routes enable --route "$route_id" >/dev/null; done
     routes_ready=true
     break
   fi
   sleep 0.5
 done
 if [[ "$routes_ready" != true ]]; then
-  printf '%s\n' 'Headscale did not observe all advertised routes' >&2
+  printf '%s\n' 'Headscale did not observe two ingress advertisements for each site CIDR' >&2
   exit 1
 fi
 
-docker exec "$site_a" /run/envelope-test/setup-site.sh '10.11.0.0/24' '10.11.0.10' '198.18.255.1'
-docker exec "$site_b" /run/envelope-test/setup-site.sh '10.20.0.0/24' '10.20.0.10' '198.18.255.1'
+docker exec "$target_a" /run/envelope-test/setup-target.sh '10.10.0.0/24' '10.20.0.0/24' '10.10.0.10'
+docker exec "$target_b" /run/envelope-test/setup-target.sh '10.20.0.0/24' '10.10.0.0/24' '10.20.0.10'
+docker exec "$ingress_a1" /run/envelope-test/setup-ingress.sh '10.10.0.0/24'
+docker exec "$ingress_a2" /run/envelope-test/setup-ingress.sh '10.10.0.0/24'
+docker exec "$ingress_b1" /run/envelope-test/setup-ingress.sh '10.20.0.0/24'
+docker exec "$ingress_b2" /run/envelope-test/setup-ingress.sh '10.20.0.0/24'
 
-wait_healthy_status() {
-  local site=$1
-  for _ in $(seq 1 60); do
-    if docker exec "$site" tailscale status --json 2>/dev/null | python3 -c 'import json,sys; raise SystemExit(1 if json.load(sys.stdin).get("Health") else 0)'; then
-      return
-    fi
-    sleep 0.5
-  done
-  printf 'tailscaled health did not clear on %s\n' "$site" >&2
-  docker exec "$site" tailscale status --json >&2 || true
-  exit 1
-}
-wait_healthy_status "$site_a"
-wait_healthy_status "$site_b"
-
-wait_peer_path() {
-  local site=$1
-  local peer_ip=$2
-  for _ in $(seq 1 60); do
-    if docker exec "$site" tailscale ping --c 1 --timeout=2s --until-direct=false "$peer_ip" >/dev/null 2>&1; then
-      return
-    fi
-    sleep 0.5
-  done
-  printf 'Tailscale path from %s to %s did not become ready\n' "$site" "$peer_ip" >&2
-  docker exec "$site" tailscale ping --c 1 --timeout=5s --until-direct=false "$peer_ip" >&2 || true
-  exit 1
-}
-wait_peer_path "$site_a" '100.64.0.2'
-wait_peer_path "$site_b" '100.64.0.1'
+docker exec -d "$target_a" ip netns exec gwlb python3 /run/envelope-test/gwlb-wrap.py gwlb-peer '10.20.0.0/24' 192.0.2.1
+docker exec -d "$target_b" ip netns exec gwlb python3 /run/envelope-test/gwlb-wrap.py gwlb-peer '10.10.0.0/24' 192.0.2.1
+docker exec -d "$ingress_a1" ip netns exec gwlb python3 /run/envelope-test/gwlb-wrap.py gwlb-peer '10.10.0.0/24' "$target_a"
+docker exec -d "$ingress_a2" ip netns exec gwlb python3 /run/envelope-test/gwlb-wrap.py gwlb-peer '10.10.0.0/24' "$target_a"
+docker exec -d "$ingress_b1" ip netns exec gwlb python3 /run/envelope-test/gwlb-wrap.py gwlb-peer '10.20.0.0/24' "$target_b"
+docker exec -d "$ingress_b2" ip netns exec gwlb python3 /run/envelope-test/gwlb-wrap.py gwlb-peer '10.20.0.0/24' "$target_b"
 
 start_envelope() {
-  local site=$1
-  local return_cidrs=$2
-  local delivery_cidrs=$3
-  local remote_cidrs=$4
-  docker exec "$site" sh -c "nohup /usr/local/bin/envelope \\
-    --udp-bind=192.0.2.1:6081 \\
-    --metrics-addr=127.0.0.1:9090 \\
-    --tun-name=envelope0 \\
-    --tun-mtu=1280 \\
-    --routing-mode=manage \\
-    --underlay-interface=workload0 \\
-    --tailscale-iface=tailscale0 \\
-    --gwlb-return-cidrs=$return_cidrs \\
-    --local-delivery-cidrs=$delivery_cidrs \\
-    --remote-tailnet-cidrs=$remote_cidrs \\
-    >/tmp/envelope.log 2>&1 & echo \$! >/tmp/envelope.pid"
+  local target=$1 local_cidr=$2 remote_cidr=$3
+  docker exec "$target" sh -c "nohup /usr/local/bin/envelope --udp-bind=:6081 --metrics-addr=127.0.0.1:9090 --tun-name=envelope0 --tun-mtu=1280 --routing-mode=manage --underlay-interface=workload0 --tailscale-iface=tailscale0 --local-site-cidrs=$local_cidr --remote-site-cidrs=$remote_cidr >/tmp/envelope.log 2>&1 & echo \$! >/tmp/envelope.pid"
 }
-
-start_envelope "$site_a" '10.10.0.0/24' '10.11.0.0/24' '10.20.0.0/24,10.21.0.0/24'
-start_envelope "$site_b" '10.21.0.0/24' '10.20.0.0/24' '10.10.0.0/24,10.11.0.0/24'
+start_envelope "$target_a" '10.10.0.0/24' '10.20.0.0/24'
+start_envelope "$target_b" '10.20.0.0/24' '10.10.0.0/24'
 
 wait_healthy() {
-  local site=$1
+  local target=$1
   for _ in $(seq 1 120); do
-    if docker exec "$site" curl -fsS http://127.0.0.1:9090/healthz >/dev/null 2>&1; then
-      return
-    fi
+    if docker exec "$target" curl -fsS http://127.0.0.1:9090/healthz >/dev/null 2>&1; then return; fi
     sleep 0.5
   done
-  printf 'Envelope did not become healthy on %s\n' "$site" >&2
-  docker exec "$site" sh -c 'cat /tmp/envelope.log; curl -s http://127.0.0.1:9090/debug/routing || true' >&2
+  docker logs "$target" >&2
+  docker exec "$target" sh -c 'cat /tmp/envelope.log; ip rule show; ip route show table all; tailscale status --json' >&2 || true
+  printf 'Envelope did not become healthy on %s\n' "$target" >&2
   exit 1
 }
-wait_healthy "$site_a"
-wait_healthy "$site_b"
+wait_healthy "$target_a"
+wait_healthy "$target_b"
 
-tun_reads() {
-  local site=$1
-  docker exec "$site" curl -fsS http://127.0.0.1:9090/metrics | awk '$1 == "tun_rx_packets" {print int($2)}'
+assert_post_inspection_rule() {
+  local target=$1 cidr=$2
+  docker exec "$target" ip -j -details -4 rule show | python3 -c '
+import json, sys
+cidr = sys.argv[1]
+for rule in json.load(sys.stdin):
+    destination = rule.get("dst", "")
+    if "/" not in destination and "dstlen" in rule:
+        destination += "/" + str(rule["dstlen"])
+    if (rule.get("priority") == 100 and rule.get("iif") == "envelope0" and
+            destination == cidr and str(rule.get("table")) in {"254", "main"} and
+            str(rule.get("protocol")) in {"186", "bgp"}):
+        raise SystemExit(0)
+raise SystemExit("missing owned envelope0-to-main post-inspection rule for " + cidr)
+' "$cidr"
 }
+assert_post_inspection_rule "$target_a" '10.10.0.0/24'
+assert_post_inspection_rule "$target_b" '10.20.0.0/24'
 
-run_lane() {
-  local initiator=$1
-  local responder=$2
-  local source_ip=$3
-  local destination_ip=$4
-  local source_port=$5
-  local destination_port=$6
-  local flow_port=$7
-  local marker=$8
-  local peer_ip=$9
-  local initiator_before responder_before initiator_after responder_after
-
-  docker exec "$initiator" tailscale ping --c 1 --timeout=5s --until-direct=false "$peer_ip" >/dev/null
-  docker exec "$responder" rm -f "/tmp/responder-ready-$destination_port" "/tmp/responder-completed-$destination_port"
-  docker exec -d "$responder" ip netns exec workload python3 /run/envelope-test/udp-responder.py "$destination_ip" "$destination_port" "$marker"
-  for _ in $(seq 1 40); do
-    if docker exec "$responder" test -f "/tmp/responder-ready-$destination_port"; then
-      break
-    fi
-    sleep 0.1
-  done
-  docker exec "$responder" test -f "/tmp/responder-ready-$destination_port"
-
-  initiator_before=$(tun_reads "$initiator")
-  responder_before=$(tun_reads "$responder")
-  if ! docker exec "$initiator" ip netns exec gwlb python3 /run/envelope-test/geneve-lane.py \
-    "$source_ip" "$destination_ip" "$source_port" "$destination_port" "$flow_port" "$marker"; then
-    for site in "$initiator" "$responder"; do
-      docker logs "$site" >&2 || true
-      docker exec "$site" sh -c 'cat /tmp/envelope.log; ls -l /tmp/responder-* 2>/dev/null || true; ip -details rule show; ip route show table 52; ip -s link; iptables -L -v -n; curl -s http://127.0.0.1:9090/debug/routing; curl -s http://127.0.0.1:9090/metrics | grep -E "^(geneve_|tun_|gwlb_|drops |routing_ready)"' >&2 || true
-    done
-    return 1
-  fi
-  initiator_after=$(tun_reads "$initiator")
-  responder_after=$(tun_reads "$responder")
-  if [[ "$initiator_after" -ne $((initiator_before + 1)) ]]; then
-    printf 'initiator TUN reads changed from %s to %s, want exactly one mapped return\n' "$initiator_before" "$initiator_after" >&2
+# Target ingress from envelope0 has no GWLBE next hop; only workloads and ingress
+# routers use their distinct pre-inspection GWLBE domain.
+docker exec "$target_a" ip route get 10.10.0.10 from 10.20.0.10 iif envelope0 | grep -q 'dev workload0'
+docker exec "$target_a" ip route get 10.20.0.10 from 10.10.0.10 iif envelope0 | grep -q 'dev tailscale0'
+docker exec "$target_b" ip route get 10.20.0.10 from 10.10.0.10 iif envelope0 | grep -q 'dev workload0'
+docker exec "$target_b" ip route get 10.10.0.10 from 10.20.0.10 iif envelope0 | grep -q 'dev tailscale0'
+for ingress in "$ingress_a1" "$ingress_a2"; do docker exec "$ingress" ip route get 10.10.0.10 | grep -q 'dev gwlb0'; done
+for ingress in "$ingress_b1" "$ingress_b2"; do docker exec "$ingress" ip route get 10.20.0.10 | grep -q 'dev gwlb0'; done
+for target in "$target_a" "$target_b"; do
+  if docker exec "$target" tailscale status --json | python3 -c 'import json,sys; local={"10.10.0.0/24","10.20.0.0/24"}; self=json.load(sys.stdin)["Self"]; raise SystemExit(bool(local.intersection(self.get("AllowedIPs", []))))'; then
+    printf 'target %s unexpectedly advertises a site route\n' "$target" >&2
     exit 1
   fi
-  if [[ "$responder_after" -ne "$responder_before" ]]; then
-    printf 'cold responder traffic entered Envelope: %s -> %s\n' "$responder_before" "$responder_after" >&2
-    exit 1
-  fi
-}
-
-run_lane "$site_a" "$site_b" '10.10.0.10' '10.20.0.10' 40000 20000 19000 'lane-a' '100.64.0.2'
-run_lane "$site_b" "$site_a" '10.21.0.10' '10.11.0.10' 40001 20001 19001 'lane-b' '100.64.0.1'
-
-for site in "$site_a" "$site_b"; do
-  docker exec "$site" kill "$(docker exec "$site" cat /tmp/envelope.pid)"
 done
 
-printf '%s\n' 'headscale two-peer directional GENEVE integration ok'
+wait_ready() {
+  local target=$1 mode=$2 port=$3
+  for _ in $(seq 1 100); do
+    if docker exec "$target" test -f "/tmp/ready-$mode-$port"; then return; fi
+    sleep 0.1
+  done
+  printf '%s server did not become ready on %s\n' "$mode" "$target" >&2
+  exit 1
+}
+
+run_bidirectional() {
+  local mode=$1 port_a=$2 port_b=$3
+  docker exec "$target_a" rm -f "/tmp/ready-$mode-$port_a" "/tmp/result-$mode-$port_a"
+  docker exec "$target_b" rm -f "/tmp/ready-$mode-$port_b" "/tmp/result-$mode-$port_b"
+  docker exec -d "$target_a" ip netns exec workload python3 /run/envelope-test/probe.py "$mode" server 10.10.0.10 10.20.0.10 "$port_a" "a-to-b-$mode"
+  docker exec -d "$target_b" ip netns exec workload python3 /run/envelope-test/probe.py "$mode" server 10.20.0.10 10.10.0.10 "$port_b" "b-to-a-$mode"
+  wait_ready "$target_a" "$mode" "$port_a"
+  wait_ready "$target_b" "$mode" "$port_b"
+  docker exec -d "$target_a" ip netns exec workload python3 /run/envelope-test/probe.py "$mode" client 10.10.0.10 10.20.0.10 "$port_b" "a-to-b-$mode"
+  docker exec -d "$target_b" ip netns exec workload python3 /run/envelope-test/probe.py "$mode" client 10.20.0.10 10.10.0.10 "$port_a" "b-to-a-$mode"
+  for _ in $(seq 1 150); do
+    if docker exec "$target_a" test -f "/tmp/result-$mode-$port_a" && docker exec "$target_b" test -f "/tmp/result-$mode-$port_b"; then break; fi
+    sleep 0.1
+  done
+  docker exec "$target_a" test -f "/tmp/result-$mode-$port_a"
+  docker exec "$target_b" test -f "/tmp/result-$mode-$port_b"
+  [[ $(docker exec "$target_a" cat "/tmp/result-$mode-$port_a") == 10.20.0.10 ]]
+  [[ $(docker exec "$target_b" cat "/tmp/result-$mode-$port_b") == 10.10.0.10 ]]
+}
+
+run_bidirectional udp 21001 21002
+
+docker exec -d "$target_a" ip netns exec workload tcpdump -U -i workload-peer -c 1 -w /tmp/mss-a.pcap 'tcp and dst port 22001'
+docker exec -d "$target_b" ip netns exec workload tcpdump -U -i workload-peer -c 1 -w /tmp/mss-b.pcap 'tcp and dst port 22002'
+run_bidirectional tcp 22001 22002
+for target in "$target_a" "$target_b"; do
+  for _ in $(seq 1 50); do
+    if docker exec "$target" test -s /tmp/mss-a.pcap 2>/dev/null || docker exec "$target" test -s /tmp/mss-b.pcap 2>/dev/null; then break; fi
+    sleep 0.1
+  done
+done
+docker exec "$target_a" ip netns exec workload tcpdump -nn -vv -r /tmp/mss-a.pcap | grep -q 'mss 1240'
+docker exec "$target_b" ip netns exec workload tcpdump -nn -vv -r /tmp/mss-b.pcap | grep -q 'mss 1240'
+
+docker exec "$target_a" ip netns exec workload ping -c 1 -W 10 -I 10.10.0.10 10.20.0.10 >/dev/null &
+ping_a=$!
+docker exec "$target_b" ip netns exec workload ping -c 1 -W 10 -I 10.20.0.10 10.10.0.10 >/dev/null &
+ping_b=$!
+wait "$ping_a"
+wait "$ping_b"
+
+printf '%s\n' 'headscale symmetric two-site TCP/UDP/ICMP integration ok'

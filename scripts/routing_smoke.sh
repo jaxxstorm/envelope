@@ -40,7 +40,7 @@ fi
 
 printf '%s\n' 'synthetic routing smoke only: no Tailscale control/data plane'
 go test -tags=integration ./internal/routing \
-  -run '^TestRoutingNamespace(DirectionalRoles|IPv6SourceSpecificRouteRejection)$' \
+  -run '^TestRoutingNamespace(SymmetricTargetRoutes|IPv6SourceSpecificRouteRejection)$' \
   -count=1 \
   -v
 printf '%s\n' 'synthetic routing smoke ok'

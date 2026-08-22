@@ -39,10 +39,8 @@ var (
 )
 
 var forwardingDirections = [][2]string{
-	{"underlay", "tailscale"},
-	{"tailscale", "underlay"},
+	{"envelope", "underlay"},
 	{"envelope", "tailscale"},
-	{"tailscale", "envelope"},
 }
 
 type Manager interface {
@@ -61,9 +59,8 @@ type Status struct {
 	EnvelopeInterface  string   `json:"envelope_interface"`
 	TailscaleInterface string   `json:"tailscale_interface"`
 	UnderlayInterface  string   `json:"underlay_interface"`
-	GWLBReturnCIDRs    []string `json:"gwlb_return_cidrs"`
-	LocalDeliveryCIDRs []string `json:"local_delivery_cidrs"`
-	RemoteTailnetCIDRs []string `json:"remote_tailnet_cidrs"`
+	LocalSiteCIDRs     []string `json:"local_site_cidrs"`
+	RemoteSiteCIDRs    []string `json:"remote_site_cidrs"`
 	RoutingTableID     int      `json:"routing_table_id"`
 	RulePriority       int      `json:"rule_priority"`
 	OwnerProtocol      int      `json:"owner_protocol"`
@@ -107,6 +104,7 @@ type policyRule struct {
 	Input                string
 	Table                int
 	Action               string
+	Protocol             int
 	Mark                 uint32
 	Mask                 uint32
 	HasMark              bool
@@ -179,12 +177,6 @@ type targetRoute struct {
 	cidr   string
 }
 
-type managedChange struct {
-	kind     string
-	target   targetRoute
-	wasOwned bool
-}
-
 type reasonError struct {
 	reason string
 	err    error
@@ -204,8 +196,6 @@ type manager struct {
 	reason         atomic.Value
 	mu             sync.Mutex
 	hostLock       routingLock
-	ownedRules     map[string]targetRoute
-	ownedRoutes    map[string]targetRoute
 	seenRemote     map[string]bool
 }
 
@@ -250,8 +240,6 @@ func newManager(cfg *config.Config, log *zap.Logger, metricSet *metrics.Metrics,
 		op:             op,
 		reconcileEvery: interval,
 		routingMode:    mode,
-		ownedRules:     make(map[string]targetRoute),
-		ownedRoutes:    make(map[string]targetRoute),
 		seenRemote:     make(map[string]bool),
 	}
 	mgr.reason.Store("not_checked")
@@ -282,9 +270,8 @@ func (m *manager) Status() Status {
 		EnvelopeInterface:  m.cfg.TunName,
 		TailscaleInterface: m.cfg.TailscaleIface,
 		UnderlayInterface:  m.cfg.UnderlayIface,
-		GWLBReturnCIDRs:    m.cfg.EffectiveGWLBReturnCIDRs(),
-		LocalDeliveryCIDRs: m.cfg.EffectiveLocalDeliveryCIDRs(),
-		RemoteTailnetCIDRs: m.cfg.EffectiveRemoteTailnetCIDRs(),
+		LocalSiteCIDRs:     m.cfg.EffectiveLocalSiteCIDRs(),
+		RemoteSiteCIDRs:    m.cfg.EffectiveRemoteSiteCIDRs(),
 		RoutingTableID:     m.cfg.RoutingTableID,
 		RulePriority:       m.cfg.RoutingRulePriority,
 		OwnerProtocol:      ownerProtocol,
@@ -308,8 +295,9 @@ func (m *manager) Initialize(ctx context.Context) error {
 		}
 		m.hostLock = lock
 		if err := m.reconcile(ctx, true); err != nil {
-			_ = m.releaseLock()
-			return fmt.Errorf("initialize managed routing: %w", err)
+			cleanupErr := m.cleanupManaged()
+			releaseErr := m.releaseLock()
+			return fmt.Errorf("initialize managed routing: %w", errors.Join(err, cleanupErr, releaseErr))
 		}
 		return nil
 	default:
@@ -388,228 +376,65 @@ func (m *manager) releaseLock() error {
 func (m *manager) cleanupManaged() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupObjectTimeout)
+	defer cancel()
 	var errs []error
-	for _, key := range sortedTargetKeys(m.ownedRules) {
-		target := m.ownedRules[key]
-		if err := m.cleanupRule(target); err != nil {
-			errs = append(errs, err)
-			m.metrics.RoutingOwnershipDecisions.WithLabelValues(metrics.RoutingOwnershipCleanupFailure).Inc()
+	for _, target := range buildTargets(m.cfg.EffectiveLocalSiteCIDRs()) {
+		state, err := m.op.RuleState(ctx, target.family, m.cfg.RoutingRulePriority, m.cfg.TunName, target.cidr, mainRouteTable, ownerProtocol)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("inspect managed post-inspection rule for %s: %w", target.cidr, err))
 			continue
 		}
-		delete(m.ownedRules, key)
-		m.metrics.RoutingOwnershipDecisions.WithLabelValues(metrics.RoutingOwnershipRemoved).Inc()
-	}
-	for _, key := range sortedTargetKeys(m.ownedRoutes) {
-		target := m.ownedRoutes[key]
-		if err := m.cleanupRoute(target); err != nil {
-			errs = append(errs, err)
-			m.metrics.RoutingOwnershipDecisions.WithLabelValues(metrics.RoutingOwnershipCleanupFailure).Inc()
-			continue
+		switch state {
+		case stateOwned:
+			if err := m.op.DeleteRule(ctx, target.family, m.cfg.RoutingRulePriority, m.cfg.TunName, target.cidr, mainRouteTable, ownerProtocol); err != nil {
+				errs = append(errs, fmt.Errorf("delete managed post-inspection rule for %s: %w", target.cidr, err))
+			}
+		case stateConflict:
+			errs = append(errs, fmt.Errorf("managed post-inspection rule for %s is conflicted; refusing to delete it", target.cidr))
 		}
-		delete(m.ownedRoutes, key)
-		m.metrics.RoutingOwnershipDecisions.WithLabelValues(metrics.RoutingOwnershipRemoved).Inc()
 	}
-	if err := errors.Join(errs...); err != nil {
-		return fail(metrics.RoutingFailureReasonOwnership, "clean up owned routing state: %v", err)
-	}
-	return nil
-}
-
-func (m *manager) cleanupRule(target targetRoute) error {
-	ctx, cancel := context.WithTimeout(context.Background(), cleanupObjectTimeout)
-	defer cancel()
-	state, err := m.op.RuleState(ctx, target.family, m.cfg.RoutingRulePriority, m.cfg.TailscaleIface, target.cidr, m.cfg.RoutingTableID, ownerProtocol)
-	if err != nil {
-		return fmt.Errorf("inspect owned rule %s: %w", target.cidr, err)
-	}
-	if state == stateAbsent || state == stateOperator {
-		return nil
-	}
-	err = m.op.DeleteRule(ctx, target.family, m.cfg.RoutingRulePriority, m.cfg.TailscaleIface, target.cidr, m.cfg.RoutingTableID, ownerProtocol)
-	state, rereadErr := m.op.RuleState(ctx, target.family, m.cfg.RoutingRulePriority, m.cfg.TailscaleIface, target.cidr, m.cfg.RoutingTableID, ownerProtocol)
-	if rereadErr == nil && (state == stateAbsent || state == stateOperator) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("delete owned rule %s: %w", target.cidr, err)
-	}
-	return fmt.Errorf("delete owned rule %s did not remove exact protocol-%d object: state=%d err=%v", target.cidr, ownerProtocol, state, rereadErr)
-}
-
-func (m *manager) cleanupRoute(target targetRoute) error {
-	ctx, cancel := context.WithTimeout(context.Background(), cleanupObjectTimeout)
-	defer cancel()
-	state, err := m.op.RouteState(ctx, target.family, m.cfg.RoutingTableID, target.cidr, m.cfg.TunName, ownerProtocol)
-	if err != nil {
-		return fmt.Errorf("inspect owned route %s: %w", target.cidr, err)
-	}
-	if state == stateAbsent || state == stateOperator {
-		return nil
-	}
-	err = m.op.DeleteRoute(ctx, target.family, m.cfg.RoutingTableID, target.cidr, m.cfg.TunName, ownerProtocol)
-	state, rereadErr := m.op.RouteState(ctx, target.family, m.cfg.RoutingTableID, target.cidr, m.cfg.TunName, ownerProtocol)
-	if rereadErr == nil && (state == stateAbsent || state == stateOperator) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("delete owned route %s: %w", target.cidr, err)
-	}
-	return fmt.Errorf("delete owned route %s did not remove exact protocol-%d object: state=%d err=%v", target.cidr, ownerProtocol, state, rereadErr)
+	return errors.Join(errs...)
 }
 
 func (m *manager) ensureManaged(ctx context.Context, initial bool) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.metrics.RoutingApplyAttempts.Inc()
+	if err := m.ensurePostInspectionRules(ctx); err != nil {
+		m.metrics.RoutingApplyFailures.Inc()
+		return false, err
+	}
 	if err := m.verifyPrerequisites(ctx); err != nil {
 		m.metrics.RoutingApplyFailures.Inc()
 		return false, err
 	}
 
-	targets := buildTargets(m.cfg.EffectiveGWLBReturnCIDRs())
-	changed := false
-	var transaction []managedChange
-	for _, target := range targets {
-		added, change, err := m.ensureRoute(ctx, target)
-		if added {
-			changed = true
-			transaction = append(transaction, change)
-		}
+	if err := m.verifyTargetRoutes(ctx); err != nil {
+		m.metrics.RoutingApplyFailures.Inc()
+		return false, err
+	}
+	return false, nil
+}
+
+func (m *manager) ensurePostInspectionRules(ctx context.Context) error {
+	for _, target := range buildTargets(m.cfg.EffectiveLocalSiteCIDRs()) {
+		state, err := m.op.RuleState(ctx, target.family, m.cfg.RoutingRulePriority, m.cfg.TunName, target.cidr, mainRouteTable, ownerProtocol)
 		if err != nil {
-			return changed, m.applyFailure(transaction, err)
+			return fail(metrics.RoutingFailureReasonOwnership, "inspect post-inspection rule for %s: %v", target.cidr, err)
 		}
-	}
-	for _, target := range targets {
-		added, change, err := m.ensureRule(ctx, target)
-		if added {
-			changed = true
-			transaction = append(transaction, change)
-		}
-		if err != nil {
-			return changed, m.applyFailure(transaction, err)
-		}
-	}
-	if err := m.verifyReturnRoutes(ctx); err != nil {
-		return changed, m.applyFailure(transaction, err)
-	}
-	if changed && !initial {
-		m.metrics.RoutingDriftRepairs.Inc()
-	}
-	return changed, nil
-}
-
-func (m *manager) ensureRoute(ctx context.Context, target targetRoute) (bool, managedChange, error) {
-	key := targetKey(target)
-	state, err := m.op.RouteState(ctx, target.family, m.cfg.RoutingTableID, target.cidr, m.cfg.TunName, ownerProtocol)
-	if err != nil {
-		return false, managedChange{}, fmt.Errorf("inspect route for %s: %w", target.cidr, err)
-	}
-	switch state {
-	case stateConflict:
-		return false, managedChange{}, fail(metrics.RoutingFailureReasonOwnership, "conflicting route state for %s", target.cidr)
-	case stateOperator:
-		delete(m.ownedRoutes, key)
-		m.metrics.RoutingOwnershipDecisions.WithLabelValues(metrics.RoutingOwnershipPreserved).Inc()
-		return false, managedChange{}, nil
-	case stateOwned:
-		if _, ours := m.ownedRoutes[key]; !ours {
-			m.metrics.RoutingOwnershipDecisions.WithLabelValues(metrics.RoutingOwnershipPreserved).Inc()
-		}
-		return false, managedChange{}, nil
-	}
-	_, wasOwned := m.ownedRoutes[key]
-	addErr := m.op.AddRoute(ctx, target.family, m.cfg.RoutingTableID, target.cidr, m.cfg.TunName, ownerProtocol)
-	state, rereadErr := m.op.RouteState(ctx, target.family, m.cfg.RoutingTableID, target.cidr, m.cfg.TunName, ownerProtocol)
-	if addErr != nil {
-		if rereadErr == nil && state != stateAbsent {
-			return false, managedChange{}, fail(metrics.RoutingFailureReasonOwnership, "ambiguous failed route add for %s observed state=%d; preserving unclaimed state: %v", target.cidr, state, addErr)
-		}
-		return false, managedChange{}, fmt.Errorf("add marked route for %s: %w (reread: %v)", target.cidr, addErr, rereadErr)
-	}
-	change := managedChange{kind: "route", target: target, wasOwned: wasOwned}
-	m.ownedRoutes[key] = target
-	m.metrics.RoutingOwnershipDecisions.WithLabelValues(metrics.RoutingOwnershipCreated).Inc()
-	if rereadErr == nil && state == stateOwned {
-		return true, change, nil
-	}
-	return true, change, fmt.Errorf("marked route for %s could not be verified after successful add: state=%d err=%v", target.cidr, state, rereadErr)
-}
-
-func (m *manager) ensureRule(ctx context.Context, target targetRoute) (bool, managedChange, error) {
-	key := targetKey(target)
-	state, err := m.op.RuleState(ctx, target.family, m.cfg.RoutingRulePriority, m.cfg.TailscaleIface, target.cidr, m.cfg.RoutingTableID, ownerProtocol)
-	if err != nil {
-		return false, managedChange{}, fmt.Errorf("inspect rule for %s: %w", target.cidr, err)
-	}
-	switch state {
-	case stateConflict:
-		return false, managedChange{}, fail(metrics.RoutingFailureReasonOwnership, "conflicting rule state for %s", target.cidr)
-	case stateOperator:
-		delete(m.ownedRules, key)
-		m.metrics.RoutingOwnershipDecisions.WithLabelValues(metrics.RoutingOwnershipPreserved).Inc()
-		return false, managedChange{}, nil
-	case stateOwned:
-		if _, ours := m.ownedRules[key]; !ours {
-			m.metrics.RoutingOwnershipDecisions.WithLabelValues(metrics.RoutingOwnershipPreserved).Inc()
-		}
-		return false, managedChange{}, nil
-	}
-	_, wasOwned := m.ownedRules[key]
-	addErr := m.op.AddRule(ctx, target.family, m.cfg.RoutingRulePriority, m.cfg.TailscaleIface, target.cidr, m.cfg.RoutingTableID, ownerProtocol)
-	state, rereadErr := m.op.RuleState(ctx, target.family, m.cfg.RoutingRulePriority, m.cfg.TailscaleIface, target.cidr, m.cfg.RoutingTableID, ownerProtocol)
-	if addErr != nil {
-		if rereadErr == nil && state != stateAbsent {
-			return false, managedChange{}, fail(metrics.RoutingFailureReasonOwnership, "ambiguous failed rule add for %s observed state=%d; preserving unclaimed state: %v", target.cidr, state, addErr)
-		}
-		return false, managedChange{}, fmt.Errorf("add marked rule for %s: %w (reread: %v)", target.cidr, addErr, rereadErr)
-	}
-	change := managedChange{kind: "rule", target: target, wasOwned: wasOwned}
-	m.ownedRules[key] = target
-	m.metrics.RoutingOwnershipDecisions.WithLabelValues(metrics.RoutingOwnershipCreated).Inc()
-	if rereadErr == nil && state == stateOwned {
-		return true, change, nil
-	}
-	return true, change, fmt.Errorf("marked rule for %s could not be verified after successful add: state=%d err=%v", target.cidr, state, rereadErr)
-}
-
-func (m *manager) applyFailure(transaction []managedChange, cause error) error {
-	m.metrics.RoutingApplyFailures.Inc()
-	rollbackErr := m.rollback(transaction)
-	if rollbackErr != nil {
-		return fail(metrics.RoutingFailureReasonOwnership, "%v; rollback failed: %v", cause, rollbackErr)
-	}
-	var categorized *reasonError
-	if errors.As(cause, &categorized) {
-		return cause
-	}
-	return fail(metrics.RoutingFailureReasonApply, "%v", cause)
-}
-
-func (m *manager) rollback(transaction []managedChange) error {
-	var errs []error
-	for i := len(transaction) - 1; i >= 0; i-- {
-		change := transaction[i]
-		key := targetKey(change.target)
-		var err error
-		if change.kind == "rule" {
-			err = m.cleanupRule(change.target)
-			if err == nil && !change.wasOwned {
-				delete(m.ownedRules, key)
+		switch state {
+		case stateAbsent:
+			if err := m.op.AddRule(ctx, target.family, m.cfg.RoutingRulePriority, m.cfg.TunName, target.cidr, mainRouteTable, ownerProtocol); err != nil {
+				return fail(metrics.RoutingFailureReasonOwnership, "add post-inspection rule for %s: %v", target.cidr, err)
 			}
-		} else {
-			err = m.cleanupRoute(change.target)
-			if err == nil && !change.wasOwned {
-				delete(m.ownedRoutes, key)
-			}
+		case stateOwned, stateOperator:
+			// An exact operator rule already meets the contract and is never claimed.
+		case stateConflict:
+			return fail(metrics.RoutingFailureReasonOwnership, "post-inspection rule for %s conflicts with an existing policy rule", target.cidr)
 		}
-		if err != nil {
-			errs = append(errs, err)
-			m.metrics.RoutingOwnershipDecisions.WithLabelValues(metrics.RoutingOwnershipCleanupFailure).Inc()
-			continue
-		}
-		m.metrics.RoutingOwnershipDecisions.WithLabelValues(metrics.RoutingOwnershipRolledBack).Inc()
 	}
-	return errors.Join(errs...)
+	return nil
 }
 
 func (m *manager) verify(ctx context.Context) error {
@@ -618,7 +443,7 @@ func (m *manager) verify(ctx context.Context) error {
 	if err := m.verifyPrerequisites(ctx); err != nil {
 		return err
 	}
-	return m.verifyReturnRoutes(ctx)
+	return m.verifyTargetRoutes(ctx)
 }
 
 func (m *manager) verifyPrerequisites(ctx context.Context) error {
@@ -638,13 +463,6 @@ func (m *manager) verifyPrerequisites(ctx context.Context) error {
 		return err
 	}
 	if err := m.validateTailscaleFIB(ctx); err != nil {
-		return err
-	}
-	audit := newPolicyAuditor(ctx, m.op)
-	if err := m.verifyLocalDeliveryRoutes(ctx, audit); err != nil {
-		return err
-	}
-	if err := m.verifyRemoteRoutes(ctx, audit); err != nil {
 		return err
 	}
 	for _, address := range servingPeers {
@@ -686,15 +504,8 @@ func (m *manager) validateTailscaleStatus(status tailscaleStatus) ([]string, err
 	if status.Self == nil || !status.Self.Online || status.Self.Expired {
 		return nil, fail(metrics.RoutingFailureReasonBackend, "tailscaled self status is offline, missing, or expired")
 	}
-	approved := append(append([]string(nil), status.Self.AllowedIPs...), status.Self.PrimaryRoutes...)
-	for _, cidr := range append(m.cfg.EffectiveGWLBReturnCIDRs(), m.cfg.EffectiveLocalDeliveryCIDRs()...) {
-		if !routeSetCovers(approved, cidr) {
-			return nil, fail(metrics.RoutingFailureReasonRouteUnapproved, "local Tailnet route %s is not approved", cidr)
-		}
-	}
-
 	serving := make(map[string]struct{})
-	for _, cidr := range m.cfg.EffectiveRemoteTailnetCIDRs() {
+	for _, cidr := range m.cfg.EffectiveRemoteSiteCIDRs() {
 		found := false
 		for _, peer := range status.Peer {
 			if peer == nil || !peer.Online || peer.Expired || !peer.InNetworkMap || !peer.InMagicSock || !peer.InEngine || !routeSetCovers(peer.PrimaryRoutes, cidr) {
@@ -798,20 +609,28 @@ func (m *manager) checkRPFilter() error {
 }
 
 func (m *manager) validateTailscaleFIB(ctx context.Context) error {
-	local := append(m.cfg.EffectiveGWLBReturnCIDRs(), m.cfg.EffectiveLocalDeliveryCIDRs()...)
+	local := m.cfg.EffectiveLocalSiteCIDRs()
+	audit := newPolicyAuditor(ctx, m.op)
 	for _, family := range []string{"-4", "-6"} {
 		routes, err := m.op.Routes(ctx, family, config.TailscaleRouteTableID)
 		if err != nil {
 			return fail(metrics.RoutingFailureReasonRouteUnaccepted, "read Tailscale table %d: %v", config.TailscaleRouteTableID, err)
 		}
-		for _, route := range routes {
-			for _, cidr := range local {
-				if prefixesOverlap(route.Prefix, cidr) {
-					return fail(metrics.RoutingFailureReasonDeliveryRoute, "Tailscale FIB entry %s type %s intersects local role %s", route.Prefix, normalizedRouteType(route.Type), cidr)
+		for _, target := range buildTargets(local) {
+			if target.family != family {
+				continue
+			}
+			for _, route := range routes {
+				if !prefixesOverlap(route.Prefix, target.cidr) {
+					continue
 				}
+				if err := m.validatePostInspectionRule(audit, target); err != nil {
+					return err
+				}
+				break
 			}
 		}
-		for _, target := range buildTargets(m.cfg.EffectiveRemoteTailnetCIDRs()) {
+		for _, target := range buildTargets(m.cfg.EffectiveRemoteSiteCIDRs()) {
 			if target.family != family {
 				continue
 			}
@@ -830,37 +649,87 @@ func (m *manager) validateTailscaleFIB(ctx context.Context) error {
 	return nil
 }
 
-func (m *manager) verifyReturnRoutes(ctx context.Context) error {
+func (m *manager) validatePostInspectionRule(audit *policyAuditor, target targetRoute) error {
+	rules, err := audit.policyRules(target.family)
+	if err != nil {
+		return fail(metrics.RoutingFailureReasonDeliveryRoute, "read policy rules for local site %s: %v", target.cidr, err)
+	}
+	var explicit *policyRule
+	for index := range rules {
+		if !m.isPostInspectionRule(rules[index], target) {
+			continue
+		}
+		if explicit != nil {
+			return fail(metrics.RoutingFailureReasonDeliveryRoute, "local site %s has duplicate post-inspection policy rules", target.cidr)
+		}
+		explicit = &rules[index]
+	}
+	if explicit == nil {
+		return fail(metrics.RoutingFailureReasonDeliveryRoute, "Tailscale FIB overlaps local site %s without an explicit post-inspection rule", target.cidr)
+	}
+
+	// No earlier matching rule may resolve part of the local prefix before the
+	// explicit envelope-to-main rule. This keeps the table-52 exception scoped
+	// to the post-inspection path rather than merely observing a correct lookup.
+	for _, rule := range rules {
+		if rule.Priority > explicit.Priority {
+			break
+		}
+		if m.isPostInspectionRule(rule, target) || !policyRuleMayMatch(rule, targetRoute{family: target.family}, target, m.cfg.TunName) {
+			continue
+		}
+		if rule.Unsupported {
+			return fail(metrics.RoutingFailureReasonDeliveryRoute, "policy rule priority %d can precede post-inspection delivery for %s with unsupported selectors", rule.Priority, target.cidr)
+		}
+		switch normalizedRuleAction(rule) {
+		case "nop":
+			continue
+		case "blackhole", "unreachable", "prohibit":
+			return fail(metrics.RoutingFailureReasonDeliveryRoute, "policy rule priority %d terminates post-inspection delivery for %s", rule.Priority, target.cidr)
+		case "lookup":
+		default:
+			return fail(metrics.RoutingFailureReasonDeliveryRoute, "policy rule priority %d has unprovable action %q before post-inspection delivery for %s", rule.Priority, rule.Action, target.cidr)
+		}
+		if rule.Table == 0 {
+			return fail(metrics.RoutingFailureReasonDeliveryRoute, "policy rule priority %d has no table before post-inspection delivery for %s", rule.Priority, target.cidr)
+		}
+		routes, err := audit.routes(target.family, rule.Table)
+		if err != nil {
+			return fail(metrics.RoutingFailureReasonDeliveryRoute, "read policy table %d before post-inspection delivery for %s: %v", rule.Table, target.cidr, err)
+		}
+		if route, ok := firstRelevantSourceSpecificRoute(routes, targetRoute{family: target.family}, target); ok {
+			return fail(metrics.RoutingFailureReasonDeliveryRoute, "policy rule priority %d table %d has source-specific route %s before post-inspection delivery for %s", rule.Priority, rule.Table, route.Prefix, target.cidr)
+		}
+		if route, ok := firstShadowingRoute(routes, target.cidr, rule.SuppressPrefixLength); ok {
+			return fail(metrics.RoutingFailureReasonDeliveryRoute, "policy rule priority %d table %d route %s wins before the explicit post-inspection rule for %s", rule.Priority, rule.Table, route.Prefix, target.cidr)
+		}
+	}
+	if err := audit.auditPath(targetRoute{family: target.family}, target, m.cfg.TunName, m.cfg.UnderlayIface, mainRouteTable, metrics.RoutingFailureReasonDeliveryRoute); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *manager) isPostInspectionRule(rule policyRule, target targetRoute) bool {
+	return rule.Priority == m.cfg.RoutingRulePriority &&
+		rule.Input == m.cfg.TunName &&
+		rule.Destination == target.cidr &&
+		rule.Table == mainRouteTable &&
+		normalizedRuleAction(rule) == "lookup" &&
+		!rule.Unsupported && !rule.Invert && !rule.HasMark &&
+		rule.SuppressPrefixLength == -1 &&
+		policyRulePrefix(rule.Source, rule.Family) == familyDefaultPrefix(rule.Family)
+}
+
+func (m *manager) verifyTargetRoutes(ctx context.Context) error {
 	audit := newPolicyAuditor(ctx, m.op)
-	for _, target := range buildTargets(m.cfg.EffectiveGWLBReturnCIDRs()) {
-		state, err := m.op.RuleState(ctx, target.family, m.cfg.RoutingRulePriority, m.cfg.TailscaleIface, target.cidr, m.cfg.RoutingTableID, ownerProtocol)
-		if err != nil || state == stateAbsent || state == stateConflict {
-			return fail(metrics.RoutingFailureReasonReturnRoute, "required exact return rule invalid for %s: state=%d err=%v", target.cidr, state, err)
-		}
-		state, err = m.op.RouteState(ctx, target.family, m.cfg.RoutingTableID, target.cidr, m.cfg.TunName, ownerProtocol)
-		if err != nil || state == stateAbsent || state == stateConflict {
-			return fail(metrics.RoutingFailureReasonReturnRoute, "required exact return route invalid for %s: state=%d err=%v", target.cidr, state, err)
-		}
-		if err := m.verifyRoleLookups(ctx, audit, target, buildTargets(m.cfg.EffectiveRemoteTailnetCIDRs()), m.cfg.TailscaleIface, m.cfg.TunName, m.cfg.RoutingTableID, metrics.RoutingFailureReasonReturnRoute); err != nil {
+	for _, target := range buildTargets(m.cfg.EffectiveLocalSiteCIDRs()) {
+		if err := m.verifyRoleLookups(ctx, audit, target, buildTargets(m.cfg.EffectiveRemoteSiteCIDRs()), m.cfg.TunName, m.cfg.UnderlayIface, mainRouteTable, metrics.RoutingFailureReasonDeliveryRoute); err != nil {
 			return err
 		}
 	}
-	return nil
-}
-
-func (m *manager) verifyLocalDeliveryRoutes(ctx context.Context, audit *policyAuditor) error {
-	for _, target := range buildTargets(m.cfg.EffectiveLocalDeliveryCIDRs()) {
-		if err := m.verifyRoleLookups(ctx, audit, target, buildTargets(m.cfg.EffectiveRemoteTailnetCIDRs()), m.cfg.TailscaleIface, m.cfg.UnderlayIface, mainRouteTable, metrics.RoutingFailureReasonDeliveryRoute); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (m *manager) verifyRemoteRoutes(ctx context.Context, audit *policyAuditor) error {
-	sources := buildTargets(append(m.cfg.EffectiveGWLBReturnCIDRs(), m.cfg.EffectiveLocalDeliveryCIDRs()...))
-	for _, target := range buildTargets(m.cfg.EffectiveRemoteTailnetCIDRs()) {
-		if err := m.verifyRoleLookups(ctx, audit, target, sources, m.cfg.TunName, m.cfg.TailscaleIface, config.TailscaleRouteTableID, metrics.RoutingFailureReasonRouteUnaccepted); err != nil {
+	for _, target := range buildTargets(m.cfg.EffectiveRemoteSiteCIDRs()) {
+		if err := m.verifyRoleLookups(ctx, audit, target, buildTargets(m.cfg.EffectiveLocalSiteCIDRs()), m.cfg.TunName, m.cfg.TailscaleIface, config.TailscaleRouteTableID, metrics.RoutingFailureReasonRouteUnaccepted); err != nil {
 			return err
 		}
 	}
@@ -1140,7 +1009,11 @@ func normalizedRuleAction(rule policyRule) string {
 
 func selectExpectedRoute(routes []routeEntry, source, destination targetRoute, expectedDevice string, expectedTable, suppressPrefixLength int) (routeEntry, error) {
 	bestBits := -1
-	var best []routeEntry
+	var relevant []struct {
+		route  routeEntry
+		prefix netip.Prefix
+		covers bool
+	}
 	sourcePrefix := source.cidr
 	if sourcePrefix == "" {
 		sourcePrefix = familyDefaultPrefix(destination.family)
@@ -1157,27 +1030,36 @@ func selectExpectedRoute(routes []routeEntry, source, destination targetRoute, e
 			}
 			continue
 		}
-		if normalizedRouteType(route.Type) != "unicast" {
-			return routeEntry{}, fmt.Errorf("intersecting route %s has terminal type %s", route.Prefix, normalizedRouteType(route.Type))
-		}
-		if route.Table != expectedTable || route.Device != expectedDevice {
-			return routeEntry{}, fmt.Errorf("intersecting route %s selects dev=%s table=%d, want dev=%s table=%d", route.Prefix, route.Device, route.Table, expectedDevice, expectedTable)
-		}
-		if !prefixCovers(route.Prefix, destination.cidr) {
-			// A more-specific route is safe only because every path selector above is identical.
-			continue
-		}
-		if prefix.Bits() > bestBits {
+		covers := prefixCovers(route.Prefix, destination.cidr)
+		relevant = append(relevant, struct {
+			route  routeEntry
+			prefix netip.Prefix
+			covers bool
+		}{route: route, prefix: prefix, covers: covers})
+		if covers && prefix.Bits() > bestBits {
 			bestBits = prefix.Bits()
-			best = []routeEntry{route}
-		} else if prefix.Bits() == bestBits {
-			best = append(best, route)
 		}
 	}
-	if len(best) == 0 {
+	if bestBits < 0 {
 		return routeEntry{}, fmt.Errorf("table %d has no route covering %s", expectedTable, destination.cidr)
 	}
-	return best[0], nil
+	var selected routeEntry
+	for _, candidate := range relevant {
+		// Less-specific routes cannot win while the full-prefix route exists.
+		if candidate.prefix.Bits() < bestBits {
+			continue
+		}
+		if normalizedRouteType(candidate.route.Type) != "unicast" {
+			return routeEntry{}, fmt.Errorf("intersecting route %s has terminal type %s", candidate.route.Prefix, normalizedRouteType(candidate.route.Type))
+		}
+		if candidate.route.Table != expectedTable || candidate.route.Device != expectedDevice {
+			return routeEntry{}, fmt.Errorf("intersecting route %s selects dev=%s table=%d, want dev=%s table=%d", candidate.route.Prefix, candidate.route.Device, candidate.route.Table, expectedDevice, expectedTable)
+		}
+		if candidate.covers && candidate.prefix.Bits() == bestBits {
+			selected = candidate.route
+		}
+	}
+	return selected, nil
 }
 
 func firstShadowingRoute(routes []routeEntry, destination string, suppressPrefixLength int) (routeEntry, bool) {
@@ -1298,17 +1180,6 @@ func normalizedRouteType(routeType string) string {
 		return "throw"
 	}
 	return routeType
-}
-
-func targetKey(target targetRoute) string { return target.family + "|" + target.cidr }
-
-func sortedTargetKeys(targets map[string]targetRoute) []string {
-	keys := make([]string, 0, len(targets))
-	for key := range targets {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 func fail(reason, format string, args ...any) error {

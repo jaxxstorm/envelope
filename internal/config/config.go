@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -20,9 +21,11 @@ const (
 	RoutingModeVerify     RoutingMode = "verify"
 	TailscaleRouteTableID             = 52
 	maxIPv4UDPPayloadSize             = 65507
+	configVersion                     = 2
 )
 
 type Config struct {
+	ConfigVersion            int                        `name:"config-version" help:"Symmetric target configuration version" default:"2" env:"ENVELOPE_CONFIG_VERSION"`
 	UDPBind                  string                     `help:"UDP bind address for GENEVE" default:":6081" env:"ENVELOPE_UDP_BIND"`
 	VNI                      *uint32                    `help:"GENEVE VNI; the AWS GWLB profile requires 0" env:"ENVELOPE_VNI"`
 	TunName                  string                     `help:"TUN device name" default:"envelope0" env:"ENVELOPE_TUN_NAME"`
@@ -30,29 +33,38 @@ type Config struct {
 	TailscaleIface           string                     `help:"Tailscale interface name used for host routing checks" default:"tailscale0" env:"ENVELOPE_TAILSCALE_IFACE"`
 	UnderlayIface            string                     `name:"underlay-interface" help:"Appliance underlay interface used for host routing checks" env:"ENVELOPE_UNDERLAY_INTERFACE"`
 	RoutingMode              RoutingMode                `help:"Routing integration mode" default:"off" enum:"off,manage,verify" env:"ENVELOPE_ROUTING_MODE"`
-	GWLBReturnCIDRs          []string                   `name:"gwlb-return-cidrs" help:"Local initiator CIDRs whose Tailnet returns enter Envelope" sep:"," env:"ENVELOPE_GWLB_RETURN_CIDRS"`
-	LocalDeliveryCIDRs       []string                   `name:"local-delivery-cidrs" help:"Local responder CIDRs delivered without entering Envelope" sep:"," env:"ENVELOPE_LOCAL_DELIVERY_CIDRS"`
-	RemoteTailnetCIDRs       []string                   `name:"remote-tailnet-cidrs" help:"Remote CIDRs that must route through Tailscale" sep:"," env:"ENVELOPE_REMOTE_TAILNET_CIDRS"`
+	LocalSiteCIDRs           []string                   `name:"local-site-cidrs" help:"Local site CIDRs delivered through the post-inspection VPC path" sep:"," env:"ENVELOPE_LOCAL_SITE_CIDRS"`
+	RemoteSiteCIDRs          []string                   `name:"remote-site-cidrs" help:"Remote site CIDRs forwarded through Tailscale" sep:"," env:"ENVELOPE_REMOTE_SITE_CIDRS"`
 	RoutingTableID           int                        `help:"Linux routing table ID used for policy routes" default:"100" env:"ENVELOPE_ROUTING_TABLE_ID"`
 	RoutingRulePriority      int                        `help:"Linux rule priority used for policy routes" default:"100" env:"ENVELOPE_ROUTING_RULE_PRIORITY"`
 	MetricsAddr              string                     `help:"Metrics/health bind address" default:":9090" env:"ENVELOPE_METRICS_ADDR"`
 	LogLevel                 string                     `help:"Log level" default:"info" enum:"debug,info,warn,error" env:"ENVELOPE_LOG_LEVEL"`
-	FlowCapacity             int                        `help:"Maximum GWLB return contexts" default:"65536" env:"ENVELOPE_FLOW_CAPACITY"`
-	TCPFlowTimeout           time.Duration              `help:"TCP return-context idle timeout" default:"350s" env:"ENVELOPE_TCP_FLOW_TIMEOUT"`
-	UDPFlowTimeout           time.Duration              `help:"UDP return-context idle timeout" default:"120s" env:"ENVELOPE_UDP_FLOW_TIMEOUT"`
-	OtherFlowTimeout         time.Duration              `help:"Non-TCP/UDP return-context idle timeout" default:"120s" env:"ENVELOPE_OTHER_FLOW_TIMEOUT"`
+	GWLBReturnCIDRs          []string                   `kong:"-"`
+	LocalDeliveryCIDRs       []string                   `kong:"-"`
+	RemoteTailnetCIDRs       []string                   `kong:"-"`
+	FlowCapacity             int                        `kong:"-"`
+	TCPFlowTimeout           time.Duration              `kong:"-"`
+	UDPFlowTimeout           time.Duration              `kong:"-"`
+	OtherFlowTimeout         time.Duration              `kong:"-"`
 	PersistentErrorThreshold int                        `help:"Consecutive component errors before readiness fails" default:"3" env:"ENVELOPE_PERSISTENT_ERROR_THRESHOLD"`
 	GeneveOptionsMaxBytes    int                        `help:"Max total GENEVE options size in bytes" default:"252" env:"ENVELOPE_GENEVE_OPTIONS_MAX_BYTES"`
 	GeneveTLVParse           bool                       `help:"Enable allowlisted GENEVE TLV value logging" default:"false" env:"ENVELOPE_GENEVE_TLV_PARSE"`
 	GeneveTLVAllowlist       []string                   `help:"GENEVE TLV value-log allowlist as class:seven-bit-type (hex or decimal), comma-separated" sep:"," env:"ENVELOPE_GENEVE_TLV_ALLOWLIST"`
-	gwlbReturnCIDRs          []string                   `kong:"-"`
-	localDeliveryCIDRs       []string                   `kong:"-"`
-	remoteTailnetCIDRs       []string                   `kong:"-"`
+	localSiteCIDRs           []string                   `kong:"-"`
+	remoteSiteCIDRs          []string                   `kong:"-"`
 	tlvAllowlist             map[geneve.TLVKey]struct{} `kong:"-"`
 }
 
 func Parse(args []string) (*Config, error) {
-	cfg := &Config{}
+	if err := rejectLegacyEnvironmentVariables(); err != nil {
+		return nil, err
+	}
+	cfg := &Config{
+		FlowCapacity:     65536,
+		TCPFlowTimeout:   350 * time.Second,
+		UDPFlowTimeout:   120 * time.Second,
+		OtherFlowTimeout: 120 * time.Second,
+	}
 	parser, err := kong.New(cfg, kong.Name("envelope"), kong.Description("Envelope GENEVE <-> TUN datapath"))
 	if err != nil {
 		return nil, err
@@ -68,15 +80,17 @@ func Parse(args []string) (*Config, error) {
 
 func (c *Config) Validate() error {
 	var errs []error
+	if c.ConfigVersion != configVersion {
+		errs = append(errs, fmt.Errorf("unsupported config version %d; expected %d", c.ConfigVersion, configVersion))
+	}
 	if c.RoutingMode == "" {
 		c.RoutingMode = RoutingModeOff
 	}
 	if c.RoutingMode != RoutingModeOff && c.RoutingMode != RoutingModeManage && c.RoutingMode != RoutingModeVerify {
 		errs = append(errs, fmt.Errorf("unsupported routing mode %q", c.RoutingMode))
 	}
-	c.gwlbReturnCIDRs = nil
-	c.localDeliveryCIDRs = nil
-	c.remoteTailnetCIDRs = nil
+	c.localSiteCIDRs = nil
+	c.remoteSiteCIDRs = nil
 	if c.UDPBind == "" {
 		errs = append(errs, errors.New("udp bind address is required"))
 	} else if err := validateAWSUDPBind(c.UDPBind); err != nil {
@@ -131,9 +145,8 @@ func (c *Config) Validate() error {
 		configured []string
 		effective  *[]string
 	}{
-		{name: "gwlb-return-cidrs", configured: c.GWLBReturnCIDRs, effective: &c.gwlbReturnCIDRs},
-		{name: "local-delivery-cidrs", configured: c.LocalDeliveryCIDRs, effective: &c.localDeliveryCIDRs},
-		{name: "remote-tailnet-cidrs", configured: c.RemoteTailnetCIDRs, effective: &c.remoteTailnetCIDRs},
+		{name: "local-site-cidrs", configured: c.LocalSiteCIDRs, effective: &c.localSiteCIDRs},
+		{name: "remote-site-cidrs", configured: c.RemoteSiteCIDRs, effective: &c.remoteSiteCIDRs},
 	}
 	rolesValid := true
 	for _, role := range roles {
@@ -171,8 +184,11 @@ func (c *Config) Validate() error {
 			errs = append(errs, errors.New("underlay interface is required when routing mode is enabled"))
 		}
 	}
-	if c.RoutingMode == RoutingModeManage && len(c.gwlbReturnCIDRs) == 0 {
-		errs = append(errs, errors.New("gwlb return cidrs are required when routing mode is manage"))
+	if c.RoutingMode != RoutingModeOff && len(c.localSiteCIDRs) == 0 {
+		errs = append(errs, errors.New("local site cidrs are required when routing mode is enabled"))
+	}
+	if c.RoutingMode != RoutingModeOff && len(c.remoteSiteCIDRs) == 0 {
+		errs = append(errs, errors.New("remote site cidrs are required when routing mode is enabled"))
 	}
 	if len(c.GeneveTLVAllowlist) > 0 {
 		allow, err := parseTLVAllowlist(c.GeneveTLVAllowlist)
@@ -204,16 +220,24 @@ func (c *Config) HasTLVAllowlist() bool {
 	return len(c.tlvAllowlist) > 0
 }
 
+func (c *Config) EffectiveLocalSiteCIDRs() []string {
+	return cloneStrings(c.localSiteCIDRs)
+}
+
+func (c *Config) EffectiveRemoteSiteCIDRs() []string {
+	return cloneStrings(c.remoteSiteCIDRs)
+}
+
 func (c *Config) EffectiveGWLBReturnCIDRs() []string {
-	return cloneStrings(c.gwlbReturnCIDRs)
+	return cloneStrings(c.GWLBReturnCIDRs)
 }
 
 func (c *Config) EffectiveLocalDeliveryCIDRs() []string {
-	return cloneStrings(c.localDeliveryCIDRs)
+	return cloneStrings(c.LocalDeliveryCIDRs)
 }
 
 func (c *Config) EffectiveRemoteTailnetCIDRs() []string {
-	return cloneStrings(c.remoteTailnetCIDRs)
+	return cloneStrings(c.RemoteTailnetCIDRs)
 }
 
 func (c *Config) MaxUDPPacketSize() int {
@@ -320,6 +344,23 @@ func cloneStrings(values []string) []string {
 	out := make([]string, len(values))
 	copy(out, values)
 	return out
+}
+
+func rejectLegacyEnvironmentVariables() error {
+	for _, name := range []string{
+		"ENVELOPE_GWLB_RETURN_CIDRS",
+		"ENVELOPE_LOCAL_DELIVERY_CIDRS",
+		"ENVELOPE_REMOTE_TAILNET_CIDRS",
+		"ENVELOPE_FLOW_CAPACITY",
+		"ENVELOPE_TCP_FLOW_TIMEOUT",
+		"ENVELOPE_UDP_FLOW_TIMEOUT",
+		"ENVELOPE_OTHER_FLOW_TIMEOUT",
+	} {
+		if _, set := os.LookupEnv(name); set {
+			return fmt.Errorf("legacy environment variable %s is not supported", name)
+		}
+	}
+	return nil
 }
 
 func parseTLVAllowlist(entries []string) (map[geneve.TLVKey]struct{}, error) {

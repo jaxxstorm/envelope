@@ -50,6 +50,35 @@ def verify_privilege_contract(text: str, units: dict[str, str]) -> None:
             raise RuntimeError(f"unprivileged ExecStartPre contains mutation path: {prohibited}")
     host_unit = units["envelope-host-network.service"]
     service_unit = units["envelope.service"]
+    required_environment = (
+        "ENVELOPE_CONFIG_VERSION=${config_version}",
+        "ENVELOPE_LOCAL_SITE_CIDRS=${local_site_cidrs}",
+        "ENVELOPE_REMOTE_SITE_CIDRS=${remote_site_cidrs}",
+    )
+    legacy_environment = (
+        "ENVELOPE_GWLB_RETURN_CIDRS",
+        "ENVELOPE_LOCAL_DELIVERY_CIDRS",
+        "ENVELOPE_REMOTE_TAILNET_CIDRS",
+        "ENVELOPE_TCP_FLOW_TIMEOUT",
+        "ENVELOPE_UDP_FLOW_TIMEOUT",
+        "ENVELOPE_OTHER_FLOW_TIMEOUT",
+    )
+    if any(value not in text for value in required_environment):
+        raise RuntimeError("site environment must use the v2 symmetric site contract")
+    if any(value in text for value in legacy_environment):
+        raise RuntimeError("site environment must not render legacy return-context settings")
+    for required in ('"$envelope $underlay"', '"$envelope $tailscale"'):
+        if required not in host:
+            raise RuntimeError(f"host-network script omits symmetric forwarding path: {required}")
+    for prohibited in ('"$underlay $tailscale"', '"$tailscale $underlay"', '"$tailscale $envelope"'):
+        if prohibited in host:
+            raise RuntimeError(f"host-network script retains directional forwarding path: {prohibited}")
+    if "(.Self.AllowedIPs // [])" in preflight:
+        raise RuntimeError("target preflight must not require ingress-router route advertisements")
+    if 'route get "$cidr" iif \'${tun_name}\'' not in preflight:
+        raise RuntimeError("target preflight must verify local-site post-inspection delivery")
+    if 'route show table 52 "$cidr"' not in preflight:
+        raise RuntimeError("target preflight must verify remote-site Tailscale delivery")
     required_host = (
         "User=root",
         "Before=envelope.service",
@@ -57,8 +86,8 @@ def verify_privilege_contract(text: str, units: dict[str, str]) -> None:
         "RuntimeDirectory=envelope-host-network",
         "RuntimeDirectoryMode=0700",
         "ReadWritePaths=/run/envelope-host-network",
-        "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW",
-        "AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW",
+        "CapabilityBoundingSet=CAP_NET_ADMIN",
+        "AmbientCapabilities=CAP_NET_ADMIN",
     )
     if any(value not in host_unit for value in required_host):
         raise RuntimeError("host-network mutations must run in the ordered root oneshot")
@@ -71,8 +100,8 @@ def verify_privilege_contract(text: str, units: dict[str, str]) -> None:
         "Group=envelope",
         "ExecStartPre=!/usr/local/sbin/envelope-preflight",
         "ExecStart=/usr/local/bin/envelope",
-        "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW",
-        "AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW",
+        "CapabilityBoundingSet=CAP_NET_ADMIN",
+        "AmbientCapabilities=CAP_NET_ADMIN",
         "ProtectKernelTunables=yes",
         "Requires=envelope-host-network.service",
     )
@@ -80,6 +109,8 @@ def verify_privilege_contract(text: str, units: dict[str, str]) -> None:
         raise RuntimeError("Envelope unit does not separate root preflight from the unprivileged main process")
     if re.search(r"^User=root$", service_unit, re.MULTILINE):
         raise RuntimeError("Envelope main process must not run as root")
+    if "CAP_NET_RAW" in host_unit or "CAP_NET_RAW" in service_unit:
+        raise RuntimeError("symmetric target services must not grant CAP_NET_RAW")
 
 
 def main() -> int:

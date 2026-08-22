@@ -64,6 +64,8 @@ PROTOCOLS: tuple[ProtocolName, ...] = ("icmp", "tcp", "udp")
 TRANSPORT_PROTOCOLS: tuple[Literal["tcp", "udp"], ...] = ("tcp", "udp")
 EVIDENCE_SCHEMA = 1
 LIVE_EVIDENCE_SCHEMA = 2
+SYMMETRIC_EVIDENCE_SCHEMA = 3
+SYMMETRIC_EVIDENCE_KIND = "aws-symmetric-gwlb-ha-v2"
 LIVE_EVIDENCE_KIND = "aws-two-region-live"
 
 EXIT_OK = 0
@@ -2710,6 +2712,171 @@ def scan_evidence(document: Any) -> list[str]:
     return findings
 
 
+@dataclasses.dataclass(frozen=True)
+class SymmetricFleetMember:
+    """A run-owned target or ingress router from the protected v2 output."""
+
+    site: Site
+    role: Literal["target", "ingress-router"]
+    region: str
+    az_key: str
+    instance_id: str
+    target_group_arn: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.site not in SITES or self.role not in {"target", "ingress-router"}:
+            raise DeploymentError("symmetric fleet member site or role is invalid")
+        if not _REGION_RE.fullmatch(self.region) or not re.fullmatch(r"[a-z][a-z0-9-]{0,15}", self.az_key):
+            raise DeploymentError("symmetric fleet member region or AZ key is invalid")
+        if not _INSTANCE_ID_RE.fullmatch(self.instance_id):
+            raise DeploymentError("symmetric fleet member instance ID is invalid")
+        if self.role == "target":
+            if not isinstance(self.target_group_arn, str) or _TARGET_GROUP_ARN_RE.fullmatch(self.target_group_arn) is None:
+                raise DeploymentError("symmetric target has no valid regional target group")
+        elif self.target_group_arn is not None:
+            raise DeploymentError("ingress routers must not be GWLB targets")
+
+    def as_dict(self) -> dict[str, str]:
+        value = {"region": self.region, "az_key": self.az_key, "instance_id": self.instance_id}
+        if self.target_group_arn is not None:
+            value["target_group_arn"] = self.target_group_arn
+        return value
+
+
+@dataclasses.dataclass(frozen=True)
+class SymmetricSiteTopology:
+    site: Site
+    region: str
+    local_site_cidrs: tuple[str, ...]
+    remote_site_cidrs: tuple[str, ...]
+    target_fleet: tuple[SymmetricFleetMember, ...]
+    ingress_router_fleet: tuple[SymmetricFleetMember, ...]
+
+    def __post_init__(self) -> None:
+        if self.site not in SITES or not _REGION_RE.fullmatch(self.region):
+            raise DeploymentError("symmetric site identity is invalid")
+        for name in ("local_site_cidrs", "remote_site_cidrs"):
+            values = getattr(self, name)
+            if not values or len(set(values)) != len(values):
+                raise DeploymentError(f"{self.site} {name} must be a non-empty unique CIDR list")
+            try:
+                networks = [ipaddress.ip_network(value, strict=True) for value in values]
+            except ValueError as error:
+                raise DeploymentError(f"{self.site} {name} contains an invalid CIDR") from error
+            if any(network.version != 4 for network in networks):
+                raise DeploymentError(f"{self.site} {name} must contain IPv4 CIDRs")
+        local = [ipaddress.ip_network(value) for value in self.local_site_cidrs]
+        remote = [ipaddress.ip_network(value) for value in self.remote_site_cidrs]
+        if any(left.overlaps(right) for left in local for right in remote):
+            raise DeploymentError(f"{self.site} local and remote site CIDRs overlap")
+        if len(self.target_fleet) < 2 or len(self.ingress_router_fleet) < 2:
+            raise DeploymentError(f"{self.site} requires at least two targets and two ingress routers")
+        for fleet, role in ((self.target_fleet, "target"), (self.ingress_router_fleet, "ingress-router")):
+            if any(member.site != self.site or member.region != self.region or member.role != role for member in fleet):
+                raise DeploymentError(f"{self.site} {role} fleet contains a foreign member")
+            if len({member.instance_id for member in fleet}) != len(fleet) or len({member.az_key for member in fleet}) < 2:
+                raise DeploymentError(f"{self.site} {role} fleet must have distinct members across two AZs")
+
+
+@dataclasses.dataclass(frozen=True)
+class SymmetricTopologyV2:
+    run_id: str
+    west: SymmetricSiteTopology
+    east: SymmetricSiteTopology
+
+    def __post_init__(self) -> None:
+        if not _RUN_ID_RE.fullmatch(self.run_id):
+            raise DeploymentError("symmetric topology run ID is invalid")
+        if set(self.west.remote_site_cidrs) != set(self.east.local_site_cidrs) or set(self.east.remote_site_cidrs) != set(self.west.local_site_cidrs):
+            raise DeploymentError("symmetric remote site CIDRs must exactly equal the peer local site CIDRs")
+        identities = [member.instance_id for site in (self.west, self.east) for member in (*site.target_fleet, *site.ingress_router_fleet)]
+        if len(identities) != len(set(identities)):
+            raise DeploymentError("symmetric target and ingress-router identities must be globally unique")
+
+    def site(self, name: Site) -> SymmetricSiteTopology:
+        return self.west if name == "west" else self.east
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "config_version": 2,
+            "run_id": self.run_id,
+            "sites": {
+                site: {
+                    "region": value.region,
+                    "local_site_cidrs": list(value.local_site_cidrs),
+                    "remote_site_cidrs": list(value.remote_site_cidrs),
+                    "target_fleet": [member.as_dict() for member in value.target_fleet],
+                    "ingress_router_fleet": [member.as_dict() for member in value.ingress_router_fleet],
+                }
+                for site, value in (("west", self.west), ("east", self.east))
+            },
+        }
+
+
+def parse_symmetric_topology_v2(value: Any) -> SymmetricTopologyV2:
+    """Parse only the v2 fleet contract; directional outputs are intentionally rejected."""
+
+    document = _mapping(value, "symmetric topology")
+    _exact_keys(document, {"config_version", "run_id", "sites"}, "symmetric topology")
+    if document["config_version"] != 2:
+        raise DeploymentError("symmetric topology config_version must be 2")
+    sites = _mapping(document["sites"], "symmetric topology.sites")
+    _exact_keys(sites, set(SITES), "symmetric topology.sites")
+
+    def parse_site(site: Site) -> SymmetricSiteTopology:
+        item = _mapping(sites[site], f"symmetric topology.sites.{site}")
+        _exact_keys(item, {"region", "local_site_cidrs", "remote_site_cidrs", "target_fleet", "ingress_router_fleet"}, f"symmetric topology.sites.{site}")
+
+        def fleet(name: str, role: Literal["target", "ingress-router"]) -> tuple[SymmetricFleetMember, ...]:
+            members = item[name]
+            if not isinstance(members, list):
+                raise DeploymentError(f"symmetric topology.sites.{site}.{name} must be a list")
+            expected = {"region", "az_key", "instance_id", "target_group_arn"} if role == "target" else {"region", "az_key", "instance_id"}
+            parsed: list[SymmetricFleetMember] = []
+            for index, member in enumerate(members):
+                member_value = _mapping(member, f"symmetric topology.sites.{site}.{name}[{index}]")
+                _exact_keys(member_value, expected, f"symmetric topology.sites.{site}.{name}[{index}]")
+                parsed.append(SymmetricFleetMember(site, role, str(member_value["region"]), str(member_value["az_key"]), str(member_value["instance_id"]), str(member_value["target_group_arn"]) if role == "target" else None))
+            return tuple(parsed)
+
+        local, remote = item["local_site_cidrs"], item["remote_site_cidrs"]
+        if not all(isinstance(candidate, list) and all(isinstance(cidr, str) for cidr in candidate) for candidate in (local, remote)):
+            raise DeploymentError(f"symmetric topology.sites.{site} CIDRs must be string lists")
+        return SymmetricSiteTopology(site, str(item["region"]), tuple(local), tuple(remote), fleet("target_fleet", "target"), fleet("ingress_router_fleet", "ingress-router"))
+
+    return SymmetricTopologyV2(str(document["run_id"]), parse_site("west"), parse_site("east"))
+
+
+def validate_symmetric_preflight(topology: SymmetricTopologyV2, readiness: Any) -> dict[str, Any]:
+    """Fail closed unless every route domain, target, and route advertiser is ready."""
+
+    document = _mapping(readiness, "symmetric readiness")
+    _exact_keys(document, {"sites", "tailnet_policy_valid"}, "symmetric readiness")
+    if document["tailnet_policy_valid"] is not True:
+        raise ReadinessError("symmetric Tailnet policy validation did not pass")
+    sites = _mapping(document["sites"], "symmetric readiness.sites")
+    _exact_keys(sites, set(SITES), "symmetric readiness.sites")
+    result: dict[str, Any] = {"config_version": 2, "tailnet_policy_valid": True, "sites": {}}
+    for name in SITES:
+        expected = topology.site(name)
+        site = _mapping(sites[name], f"symmetric readiness.sites.{name}")
+        _exact_keys(site, {"route_domains", "targets", "ingress_routers"}, f"symmetric readiness.sites.{name}")
+        domains = _mapping(site["route_domains"], f"symmetric readiness.sites.{name}.route_domains")
+        _exact_keys(domains, {"workload", "ingress_router", "target"}, f"symmetric readiness.sites.{name}.route_domains")
+        if any(domains[domain] is not True for domain in domains):
+            raise ReadinessError(f"{name} route-domain validation is incomplete")
+        targets = _mapping(site["targets"], f"symmetric readiness.sites.{name}.targets")
+        routers = _mapping(site["ingress_routers"], f"symmetric readiness.sites.{name}.ingress_routers")
+        if set(targets) != {member.instance_id for member in expected.target_fleet} or set(routers) != {member.instance_id for member in expected.ingress_router_fleet}:
+            raise ReadinessError(f"{name} readiness fleet identities differ from the protected topology")
+        if any(targets[member.instance_id] is not True for member in expected.target_fleet):
+            raise ReadinessError(f"{name} has an unhealthy Envelope target")
+        if any(routers[member.instance_id] is not True for member in expected.ingress_router_fleet):
+            raise ReadinessError(f"{name} has an unready ingress router")
+        result["sites"][name] = {"route_domains": dict(domains), "targets": dict(targets), "ingress_routers": dict(routers)}
+    return result
+
+
 _EVIDENCE_KEYS = {
     "schema",
     "run_id",
@@ -3031,11 +3198,126 @@ def _normalize_safe_evidence(document: Mapping[str, Any]) -> dict[str, Any]:
     return cast(dict[str, Any], normalized)
 
 
+_SYMMETRIC_EVIDENCE_KEYS = {
+    "schema",
+    "kind",
+    "run_id",
+    "generated_at",
+    "topology",
+    "preflight",
+    "traversals",
+    "recoveries",
+    "transport",
+    "health_transitions",
+    "residual_audit",
+}
+
+
+def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
+    """Validate a redacted v2 HA evidence bundle without accepting raw captures."""
+
+    findings = scan_evidence(document)
+    if findings:
+        raise EvidenceError("unsafe evidence rejected: " + "; ".join(findings))
+    if not isinstance(document, Mapping) or set(document) != _SYMMETRIC_EVIDENCE_KEYS:
+        raise EvidenceError("symmetric evidence has missing or unsupported top-level keys")
+    if document.get("schema") != SYMMETRIC_EVIDENCE_SCHEMA or document.get("kind") != SYMMETRIC_EVIDENCE_KIND:
+        raise EvidenceError("symmetric evidence schema or kind is invalid")
+    _validate_generated_at(document.get("generated_at"))
+    try:
+        topology = parse_symmetric_topology_v2(document.get("topology"))
+    except DeploymentError as error:
+        raise EvidenceError(f"symmetric evidence topology is invalid: {error}") from None
+    if document.get("run_id") != topology.run_id:
+        raise EvidenceError("symmetric evidence run ID does not match its topology")
+    try:
+        validate_symmetric_preflight(topology, document.get("preflight"))
+    except (DeploymentError, ReadinessError) as error:
+        raise EvidenceError(f"symmetric evidence preflight is invalid: {error}") from None
+
+    traversals = document.get("traversals")
+    if not isinstance(traversals, list) or len(traversals) != 2:
+        raise EvidenceError("symmetric evidence requires exactly two directional traversal records")
+    expected_directions = {("west", "east"), ("east", "west")}
+    observed_directions: set[tuple[str, str]] = set()
+    for item in traversals:
+        if not isinstance(item, Mapping) or set(item) != {"source_site", "destination_site", "gwlbe_id", "target_id", "ingress_router_id", "protocols", "source_preserved"}:
+            raise EvidenceError("symmetric traversal has the wrong shape")
+        source, destination = item.get("source_site"), item.get("destination_site")
+        if (source, destination) not in expected_directions or (source, destination) in observed_directions:
+            raise EvidenceError("symmetric traversal direction is invalid or duplicated")
+        source_site = topology.site(cast(Site, source))
+        destination_site = topology.site(cast(Site, destination))
+        target_ids = {member.instance_id for member in source_site.target_fleet}
+        router_ids = {member.instance_id for member in destination_site.ingress_router_fleet}
+        if (
+            not isinstance(item.get("gwlbe_id"), str)
+            or not _VPCE_ID_RE.fullmatch(cast(str, item["gwlbe_id"]))
+            or item.get("target_id") not in target_ids
+            or item.get("ingress_router_id") not in router_ids
+            or item.get("protocols") != list(PROTOCOLS)
+            or item.get("source_preserved") is not True
+        ):
+            raise EvidenceError("symmetric traversal lacks exact GWLB target, ingress router, or protocol proof")
+        observed_directions.add((cast(str, source), cast(str, destination)))
+    if observed_directions != expected_directions:
+        raise EvidenceError("symmetric evidence is not bidirectional")
+
+    recoveries = document.get("recoveries")
+    if not isinstance(recoveries, list) or len(recoveries) != 2:
+        raise EvidenceError("symmetric evidence requires target and ingress-router recovery records")
+    expected_recovery_kinds = {"target", "ingress-router"}
+    seen_kinds: set[str] = set()
+    for item in recoveries:
+        if not isinstance(item, Mapping) or set(item) != {"kind", "site", "failed_id", "alternate_id", "new_flow_succeeded", "recovery_duration_ms"}:
+            raise EvidenceError("symmetric recovery has the wrong shape")
+        kind, site = item.get("kind"), item.get("site")
+        if kind not in expected_recovery_kinds or kind in seen_kinds or site not in SITES:
+            raise EvidenceError("symmetric recovery kind or site is invalid")
+        fleet = topology.site(cast(Site, site)).target_fleet if kind == "target" else topology.site(cast(Site, site)).ingress_router_fleet
+        identifiers = {member.instance_id for member in fleet}
+        duration = item.get("recovery_duration_ms")
+        if item.get("failed_id") not in identifiers or item.get("alternate_id") not in identifiers or item["failed_id"] == item["alternate_id"] or item.get("new_flow_succeeded") is not True or isinstance(duration, bool) or not isinstance(duration, int) or not 1 <= duration <= 7_200_000:
+            raise EvidenceError("symmetric recovery does not prove bounded alternate-path new-flow recovery")
+        seen_kinds.add(cast(str, kind))
+    if seen_kinds != expected_recovery_kinds:
+        raise EvidenceError("symmetric evidence omits a recovery class")
+
+    transport = document.get("transport")
+    if not isinstance(transport, Mapping) or set(transport) != {"established_tcp_outcome", "udp_sent", "udp_received", "udp_loss_percent"}:
+        raise EvidenceError("symmetric evidence transport has the wrong shape")
+    sent, received, loss = transport.get("udp_sent"), transport.get("udp_received"), transport.get("udp_loss_percent")
+    if transport.get("established_tcp_outcome") not in {"resumed", "interrupted", "failed"} or isinstance(sent, bool) or not isinstance(sent, int) or sent < 1 or isinstance(received, bool) or not isinstance(received, int) or not 0 <= received <= sent or isinstance(loss, bool) or not isinstance(loss, (int, float)) or not math.isfinite(loss) or not math.isclose(float(loss), (sent - received) * 100.0 / sent, abs_tol=1e-9):
+        raise EvidenceError("symmetric evidence transport outcome or UDP loss is invalid")
+    transitions = document.get("health_transitions")
+    if not isinstance(transitions, list) or len(transitions) < 2:
+        raise EvidenceError("symmetric evidence requires target and ingress-router health transitions")
+    kinds = set()
+    for item in transitions:
+        kind = item.get("kind") if isinstance(item, Mapping) else None
+        identifiers = {
+            member.instance_id
+            for site in (topology.west, topology.east)
+            for member in (site.target_fleet if kind == "target" else site.ingress_router_fleet)
+        }
+        if not isinstance(item, Mapping) or set(item) != {"kind", "member_id", "states"} or kind not in expected_recovery_kinds or item.get("member_id") not in identifiers or item.get("states") != ["healthy", "unavailable", "healthy"]:
+            raise EvidenceError("symmetric health transition is invalid")
+        kinds.add(cast(str, item["kind"]))
+    if kinds != expected_recovery_kinds:
+        raise EvidenceError("symmetric evidence omits a health transition class")
+    audit = document.get("residual_audit")
+    if not isinstance(audit, Mapping) or set(audit) != {"passed", "owned_resources_remaining"} or audit.get("passed") is not True or audit.get("owned_resources_remaining") != 0:
+        raise EvidenceError("symmetric evidence residual audit did not pass")
+    return _normalize_safe_evidence(document)
+
+
 def validate_evidence(document: Any) -> dict[str, Any]:
     """Validate and return a detached schema-1 core or schema-2 live document."""
 
     if not isinstance(document, Mapping) or not all(isinstance(key, str) for key in document):
         raise EvidenceError("evidence must be a JSON object")
+    if document.get("kind") == SYMMETRIC_EVIDENCE_KIND or document.get("schema") == SYMMETRIC_EVIDENCE_SCHEMA:
+        return validate_symmetric_evidence(document)
     if document.get("kind") == LIVE_EVIDENCE_KIND or document.get("schema") == LIVE_EVIDENCE_SCHEMA:
         _validate_live_evidence(document)
         return _normalize_safe_evidence(document)
@@ -3128,6 +3410,169 @@ def load_evidence(path: pathlib.Path | str) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError) as error:
         raise EvidenceError(f"cannot read evidence {source}: {error}") from error
     return validate_evidence(document)
+
+
+class SymmetricLifecycleAdapter(Protocol):
+    """Small, injectable boundary for destructive v2 lifecycle operations."""
+
+    def owned(self, member: SymmetricFleetMember, run_id: str) -> bool: ...
+
+    def command(self, member: SymmetricFleetMember, command: str) -> Mapping[str, Any]: ...
+
+    def deregister(self, member: SymmetricFleetMember) -> Mapping[str, Any]: ...
+
+    def target_health(self, member: SymmetricFleetMember) -> str: ...
+
+    def replace(self, member: SymmetricFleetMember) -> SymmetricFleetMember: ...
+
+
+class SymmetricLifecycle:
+    """Ownership-safe lifecycle controller. Dry runs never invoke its adapter."""
+
+    def __init__(
+        self,
+        topology: SymmetricTopologyV2,
+        adapter: SymmetricLifecycleAdapter,
+        *,
+        dry_run: bool = True,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.topology = topology
+        self.adapter = adapter
+        self.dry_run = dry_run
+        self.monotonic = monotonic
+
+    def _authorize(self, member: SymmetricFleetMember, role: Literal["target", "ingress-router"]) -> None:
+        fleet = self.topology.site(member.site).target_fleet if role == "target" else self.topology.site(member.site).ingress_router_fleet
+        if member.role != role or member not in fleet:
+            raise ResilienceError("lifecycle operation is not authorized for a protected fleet member")
+        if not self.dry_run and not self.adapter.owned(member, self.topology.run_id):
+            raise ResilienceError("lifecycle operation is not authorized for a run-owned fleet member")
+
+    def _planned(self, operation: str, member: SymmetricFleetMember) -> dict[str, Any]:
+        return {"operation": operation, "member_id": member.instance_id, "dry_run": True, "mutated": False}
+
+    def quiesce_target(self, member: SymmetricFleetMember) -> dict[str, Any]:
+        self._authorize(member, "target")
+        if self.dry_run:
+            return self._planned("target-quiesce", member)
+        self.adapter.command(member, "systemctl stop envelope.service")
+        return {"operation": "target-quiesce", "member_id": member.instance_id, "dry_run": False, "mutated": True, "health": self.adapter.target_health(member)}
+
+    def drain_target(self, member: SymmetricFleetMember) -> dict[str, Any]:
+        self._authorize(member, "target")
+        if self.dry_run:
+            return self._planned("target-drain", member)
+        self.adapter.deregister(member)
+        observed = self.observe_target_drain(member, timeout_seconds=180)
+        return {"operation": "target-drain", "member_id": member.instance_id, "dry_run": False, "mutated": True, **observed}
+
+    def observe_target_drain(
+        self,
+        member: SymmetricFleetMember,
+        *,
+        timeout_seconds: float,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> dict[str, Any]:
+        self._authorize(member, "target")
+        if self.dry_run:
+            return {"health": "not-observed", "recovery_duration_ms": 0, "dry_run": True}
+        if timeout_seconds <= 0 or timeout_seconds > 7200:
+            raise ResilienceError("target drain timeout must be within one bounded acceptance run")
+        started = self.monotonic()
+        deadline = started + timeout_seconds
+        while self.monotonic() <= deadline:
+            health = self.adapter.target_health(member)
+            if health in {"draining", "unused", "unhealthy"}:
+                return {"health": health, "drain_duration_ms": max(1, int((self.monotonic() - started) * 1000))}
+            remaining = deadline - self.monotonic()
+            if remaining > 0:
+                sleep(min(1.0, remaining))
+        raise ResilienceError("target deregistration did not enter a drain-safe health state")
+
+    def restart_target_process(self, member: SymmetricFleetMember) -> dict[str, Any]:
+        self._authorize(member, "target")
+        if self.dry_run:
+            return self._planned("target-process-restart", member)
+        started = self.monotonic()
+        self.adapter.command(member, "systemctl restart envelope.service")
+        health = self.adapter.target_health(member)
+        if health != "healthy":
+            raise ResilienceError("target process restart did not restore healthy target state")
+        return {"operation": "target-process-restart", "member_id": member.instance_id, "dry_run": False, "mutated": True, "health": health, "recovery_duration_ms": max(1, int((self.monotonic() - started) * 1000))}
+
+    def replace_target_instance(self, member: SymmetricFleetMember) -> dict[str, Any]:
+        self._authorize(member, "target")
+        if self.dry_run:
+            return self._planned("target-instance-replacement", member)
+        quiesced = False
+        try:
+            self.quiesce_target(member)
+            quiesced = True
+            self.drain_target(member)
+            replacement = self.adapter.replace(member)
+            if (
+                replacement.role != "target"
+                or replacement.site != member.site
+                or replacement.region != member.region
+                or not self.adapter.owned(replacement, self.topology.run_id)
+            ):
+                raise ResilienceError("target replacement is not a run-owned member of the same target fleet")
+            if replacement.instance_id == member.instance_id or self.adapter.target_health(replacement) != "healthy":
+                raise ResilienceError("target replacement did not produce a distinct healthy target")
+            return {"operation": "target-instance-replacement", "member_id": member.instance_id, "replacement_id": replacement.instance_id, "dry_run": False, "mutated": True, "health": "healthy"}
+        except BaseException:
+            if quiesced:
+                try:
+                    self.adapter.command(member, "systemctl start envelope.service")
+                except Exception:
+                    pass
+            raise
+
+    def fail_ingress_router(self, member: SymmetricFleetMember, *, graceful: bool) -> dict[str, Any]:
+        self._authorize(member, "ingress-router")
+        operation = "ingress-router-graceful-failure" if graceful else "ingress-router-abrupt-failure"
+        if self.dry_run:
+            return self._planned(operation, member)
+        command = "tailscale set --advertise-routes= && systemctl stop tailscaled.service" if graceful else "systemctl kill --kill-who=main tailscaled.service"
+        self.adapter.command(member, command)
+        return {"operation": operation, "member_id": member.instance_id, "dry_run": False, "mutated": True, "health": "unavailable"}
+
+    def probe_identities(
+        self,
+        source_site: Site,
+        target_id: str,
+        ingress_router_id: str,
+    ) -> dict[str, str]:
+        """Bind a probe to a source target and the peer's selected ingress router."""
+
+        destination_site = _opposite(source_site)
+        targets = {member.instance_id for member in self.topology.site(source_site).target_fleet}
+        routers = {member.instance_id for member in self.topology.site(destination_site).ingress_router_fleet}
+        if target_id not in targets or ingress_router_id not in routers:
+            raise ProbeError("probe identities are not members of the selected symmetric paths")
+        return {"source_site": source_site, "destination_site": destination_site, "target_id": target_id, "ingress_router_id": ingress_router_id}
+
+    def observe_new_flow_recovery(
+        self,
+        probe: Callable[[], bool],
+        *,
+        timeout_seconds: float,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> int:
+        """Measure recovery without claiming continuity; the caller owns the probe payload."""
+
+        if timeout_seconds <= 0 or timeout_seconds > 7200:
+            raise ResilienceError("recovery timeout must be within one bounded acceptance run")
+        started = self.monotonic()
+        deadline = started + timeout_seconds
+        while self.monotonic() <= deadline:
+            if probe():
+                return max(1, int((self.monotonic() - started) * 1000))
+            remaining = deadline - self.monotonic()
+            if remaining > 0:
+                sleep(min(1.0, remaining))
+        raise ResilienceError("new-flow recovery did not complete within its bounded timeout")
 
 
 def verify_live_evidence(document: Any) -> dict[str, Any]:
@@ -9555,6 +10000,95 @@ RUN_ALL_STAGES = (
     "full-e2e",
     "protected-cleanup",
 )
+
+
+@dataclasses.dataclass(frozen=True)
+class _LifecycleRemoteTarget:
+    site: Site
+    role: str
+    region: str
+    instance_id: str
+
+
+class AwsSymmetricLifecycleAdapter:
+    """AWS/SSM adapter for ``SymmetricLifecycle``; replacement remains explicitly supplied."""
+
+    def __init__(
+        self,
+        operations: "AwsLiveOperations",
+        *,
+        replace_target: Callable[[SymmetricFleetMember], SymmetricFleetMember] | None = None,
+    ) -> None:
+        self.operations = operations
+        self.replace_target = replace_target
+
+    def owned(self, member: SymmetricFleetMember, run_id: str) -> bool:
+        response = self.operations.aws.json(
+            ["ec2", "describe-instances", "--instance-ids", member.instance_id], region=member.region
+        )
+        instances = self.operations._instances(response)
+        value = instances.get(member.instance_id)
+        if value is None:
+            return False
+        tags = self.operations._tags(value)
+        expected_role = "target" if member.role == "target" else "tailnet-ingress"
+        return (
+            value.get("State", {}).get("Name") == "running"
+            and tags.get("EnvelopeRun") == run_id
+            and tags.get("Site") == member.site
+            and tags.get("Role") == expected_role
+        )
+
+    def command(self, member: SymmetricFleetMember, command: str) -> Mapping[str, Any]:
+        target = cast(RemoteTarget, _LifecycleRemoteTarget(member.site, member.role, member.region, member.instance_id))
+        result = self.operations._execute(
+            target,
+            command,
+            timeout_seconds=90,
+            comment="Envelope symmetric HA lifecycle",
+        )
+        return result.summary()
+
+    def deregister(self, member: SymmetricFleetMember) -> Mapping[str, Any]:
+        if member.target_group_arn is None:
+            raise ResilienceError("only a GWLB target can be deregistered")
+        return self.operations.aws.json(
+            [
+                "elbv2",
+                "deregister-targets",
+                "--target-group-arn",
+                member.target_group_arn,
+                "--targets",
+                f"Id={member.instance_id}",
+            ],
+            region=member.region,
+        )
+
+    def target_health(self, member: SymmetricFleetMember) -> str:
+        if member.target_group_arn is None:
+            return "unavailable"
+        response = self.operations.aws.json(
+            ["elbv2", "describe-target-health", "--target-group-arn", member.target_group_arn],
+            region=member.region,
+        )
+        descriptions = response.get("TargetHealthDescriptions")
+        matches = [
+            value
+            for value in descriptions or []
+            if isinstance(value, Mapping)
+            and isinstance(value.get("Target"), Mapping)
+            and value["Target"].get("Id") == member.instance_id
+            and isinstance(value.get("TargetHealth"), Mapping)
+        ]
+        if len(matches) != 1:
+            return "unavailable"
+        state = matches[0]["TargetHealth"].get("State")
+        return state if isinstance(state, str) else "unavailable"
+
+    def replace(self, member: SymmetricFleetMember) -> SymmetricFleetMember:
+        if self.replace_target is None:
+            raise ResilienceError("target replacement has no explicit run-owned replacement authority")
+        return self.replace_target(member)
 
 
 class RunAllOperations(Protocol):

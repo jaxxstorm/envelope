@@ -6,14 +6,10 @@ import (
 	"testing"
 )
 
-func TestFlowKeyParsing(t *testing.T) {
+func TestInnerPacketValidation(t *testing.T) {
 	ipv4 := innerIPv4UDP([4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, 53, 0x1234)
-	key, err := flowKeyFromPacket(ipv4)
-	if err != nil {
-		t.Fatalf("IPv4 parse: %v", err)
-	}
-	if key.proto != 17 || key.srcPort != 53 || key.dstPort != 0x1234 || key.ipFamily != 4 {
-		t.Fatalf("unexpected IPv4 key: %+v", key)
+	if err := validateInnerPacket(ipv4); err != nil {
+		t.Fatalf("validate IPv4: %v", err)
 	}
 
 	ipv6 := make([]byte, 48)
@@ -25,12 +21,8 @@ func TestFlowKeyParsing(t *testing.T) {
 	binary.BigEndian.PutUint16(ipv6[40:42], 1234)
 	binary.BigEndian.PutUint16(ipv6[42:44], 443)
 	binary.BigEndian.PutUint16(ipv6[44:46], 8)
-	key, err = flowKeyFromPacket(ipv6)
-	if err != nil {
-		t.Fatalf("IPv6 parse: %v", err)
-	}
-	if key.proto != 17 || key.srcPort != 1234 || key.dstPort != 443 || key.ipFamily != 6 {
-		t.Fatalf("unexpected IPv6 key: %+v", key)
+	if err := validateInnerPacket(ipv6); err != nil {
+		t.Fatalf("validate IPv6: %v", err)
 	}
 }
 
@@ -83,17 +75,17 @@ func TestUnsupportedInnerPacketMatrix(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := flowKeyFromPacket(tc.packet); !errors.Is(err, tc.wantErr) {
+			if err := validateInnerPacket(tc.packet); !errors.Is(err, tc.wantErr) {
 				t.Fatalf("got %v, want %v", err, tc.wantErr)
 			}
 		})
 	}
 }
 
-func FuzzFlowKeyFromPacket(f *testing.F) {
+func FuzzValidateInnerPacket(f *testing.F) {
 	f.Add(innerIPv4UDP([4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, 1234, 443))
 	f.Add([]byte{0x60})
 	f.Fuzz(func(t *testing.T, packet []byte) {
-		_, _ = flowKeyFromPacket(packet)
+		_ = validateInnerPacket(packet)
 	})
 }

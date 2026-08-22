@@ -83,10 +83,10 @@ wait_running "$site_b"
 
 configure_site() {
   local peer=$1
-  local return_cidr=$2
-  local return_ip=$3
-  local delivery_cidr=$4
-  local delivery_ip=$5
+  local local_cidrs=$2
+  local first_local_ip=$3
+  local second_local_cidr=$4
+  local second_local_ip=$5
   local remote_cidrs=$6
 
   docker exec "$peer" ip netns add workload
@@ -96,10 +96,10 @@ configure_site() {
   docker exec "$peer" ip -n workload link set lo up
   docker exec "$peer" ip -n workload link set workload-peer up
   docker exec "$peer" ip addr add 198.18.255.1/32 dev workload0
-  docker exec "$peer" ip -n workload addr add "$return_ip/32" dev workload-peer
-  docker exec "$peer" ip -n workload addr add "$delivery_ip/32" dev workload-peer
-  docker exec "$peer" ip route add "$return_cidr" dev workload0
-  docker exec "$peer" ip route add "$delivery_cidr" dev workload0
+  docker exec "$peer" ip -n workload addr add "$first_local_ip/32" dev workload-peer
+  docker exec "$peer" ip -n workload addr add "$second_local_ip/32" dev workload-peer
+  docker exec "$peer" ip route add "$local_cidrs" dev workload0
+  docker exec "$peer" ip route add "$second_local_cidr" dev workload0
   docker exec "$peer" ip -n workload route add default via 198.18.255.1 dev workload-peer onlink
   docker exec "$peer" sysctl -q -w net.ipv4.ip_forward=1
   docker exec "$peer" sysctl -q -w net.ipv6.conf.all.forwarding=1
@@ -116,7 +116,7 @@ configure_site() {
     docker exec "$peer" "$binary" -I FORWARD 1 -j ENVELOPE-FORWARD
     docker exec "$peer" "$binary" -t mangle -N ENVELOPE-MSS
     docker exec "$peer" "$binary" -t mangle -I FORWARD 1 -j ENVELOPE-MSS
-    for path in "workload0 tailscale0" "tailscale0 workload0" "envelope0 tailscale0" "tailscale0 envelope0"; do
+    for path in "envelope0 workload0" "envelope0 tailscale0"; do
       read -r input output <<<"$path"
       docker exec "$peer" "$binary" -A ENVELOPE-FORWARD -i "$input" -o "$output" -j ACCEPT
       mss=1240
@@ -136,9 +136,8 @@ configure_site() {
     --routing-mode=manage \
     --underlay-interface=workload0 \
     --tailscale-iface=tailscale0 \
-    --gwlb-return-cidrs="$return_cidr" \
-    --local-delivery-cidrs="$delivery_cidr" \
-    --remote-tailnet-cidrs="$remote_cidrs"
+    --local-site-cidrs="$local_cidrs,$second_local_cidr" \
+    --remote-site-cidrs="$remote_cidrs"
 }
 
 configure_site "$site_a" "10.10.0.0/24" "10.10.0.1" "10.11.0.0/24" "10.11.0.1" "10.20.0.0/24,10.21.0.0/24"
@@ -158,11 +157,6 @@ wait_healthy() {
 }
 wait_healthy "$site_a"
 wait_healthy "$site_b"
-
-tun_reads() {
-  local peer=$1
-  docker exec "$peer" sh -c "curl -fsS http://127.0.0.1:9090/metrics | awk '\$1 ~ /^tun_rx_packets(_total)?\$/ {print int(\$2)}'"
-}
 
 send_and_receive() {
   local source_peer=$1
@@ -187,28 +181,9 @@ send_and_receive() {
   exit 1
 }
 
-# Lane A: A initiates to B's local-delivery prefix. B's Envelope TUN must not
-# observe the cold packet; the response role enters A's Envelope exactly once.
-b_before=$(tun_reads "$site_b")
-send_and_receive "$site_a" 10.10.0.1 "$site_b" 10.20.0.1 19000 lane_a
-b_after=$(tun_reads "$site_b")
-[[ "$b_after" -eq "$b_before" ]]
-a_before=$(tun_reads "$site_a")
-docker exec "$site_b" ip netns exec workload python3 -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('10.20.0.1',0)); s.sendto(b'return_a',('10.10.0.1',19001)); s.close()"
-sleep 1
-a_after=$(tun_reads "$site_a")
-[[ "$a_after" -eq $((a_before + 1)) ]]
-
-# Lane B reverses the directional roles and proves the same behavior on the
-# other authenticated peer.
-a_before=$(tun_reads "$site_a")
-send_and_receive "$site_b" 10.21.0.1 "$site_a" 10.11.0.1 19002 lane_b
-a_after=$(tun_reads "$site_a")
-[[ "$a_after" -eq "$a_before" ]]
-b_before=$(tun_reads "$site_b")
-docker exec "$site_a" ip netns exec workload python3 -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('10.11.0.1',0)); s.sendto(b'return_b',('10.21.0.1',19003)); s.close()"
-sleep 1
-b_after=$(tun_reads "$site_b")
-[[ "$b_after" -eq $((b_before + 1)) ]]
+# The SaaS test is only a route compatibility check. The secretless Headscale
+# harness validates the GWLBE/GWLB and independent ingress-router topology.
+send_and_receive "$site_a" 10.10.0.1 "$site_b" 10.20.0.1 19000 site_a_to_b
+send_and_receive "$site_b" 10.21.0.1 "$site_a" 10.11.0.1 19002 site_b_to_a
 
 printf '%s\n' "optional Tailscale SaaS route compatibility integration ok"

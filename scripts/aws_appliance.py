@@ -35,7 +35,6 @@ import urllib.request
 from typing import Any, Callable, Iterable, Protocol
 
 from inspect_artifact import inspect as inspect_artifact
-from validate_appliance_plan import validate as validate_saved_plan
 
 
 SCHEMA = 2
@@ -1101,7 +1100,7 @@ def validate_tailnet_policy(
     tag: str,
     tag_owners: Iterable[str],
     advertised_routes: Iterable[str],
-    lane_cidrs: dict[str, list[str]],
+    site_cidrs: dict[str, list[str]],
     snat_subnet_routes: bool,
 ) -> None:
     errors: list[str] = []
@@ -1127,8 +1126,8 @@ def validate_tailnet_policy(
     if not isinstance(grants, list):
         grants = []
     for source_site, destination_site in (("west", "east"), ("east", "west")):
-        for source in lane_cidrs[source_site]:
-            for destination in lane_cidrs[destination_site]:
+        for source in site_cidrs[source_site]:
+            for destination in site_cidrs[destination_site]:
                 allowed = False
                 for grant in grants:
                     if not isinstance(grant, dict):
@@ -1237,7 +1236,7 @@ class RunConfig:
             "tailscale_version",
             "tags",
             "backend",
-            "sites",
+            "symmetric_topology",
             "tailnet",
             "envelope",
             "cost",
@@ -1265,11 +1264,14 @@ class RunConfig:
             enforce_approval_time=enforce_future_expiry,
         )
         backend = raw.get("backend")
-        sites = raw.get("sites")
+        topology = raw.get("symmetric_topology")
+        sites = topology.get("sites") if isinstance(topology, dict) else None
         tailnet = raw.get("tailnet")
         architecture = str(raw.get("architecture", ""))
-        if not isinstance(backend, dict) or not isinstance(sites, dict) or not isinstance(tailnet, dict):
-            raise LifecycleError("backend, sites, and tailnet objects are required")
+        if not isinstance(backend, dict) or not isinstance(topology, dict) or not isinstance(sites, dict) or not isinstance(tailnet, dict):
+            raise LifecycleError("backend, symmetric_topology, and tailnet objects are required")
+        if set(topology) != {"version", "sites"} or topology.get("version") != 2:
+            raise LifecycleError("symmetric_topology must be version 2 with exactly version and sites")
         backend_keys = {"bucket", "region", "kms_key_arn", "state_key", "operator_principal_arns"}
         if set(backend) - backend_keys:
             raise LifecycleError(f"backend has unsupported fields: {sorted(set(backend) - backend_keys)}")
@@ -1313,20 +1315,22 @@ class RunConfig:
                 "ami_id",
                 "ssm_kms_key_arn",
                 "azs",
-                "appliance_az_key",
                 "vpc_cidr",
-                "public_subnet_cidr",
-                "appliance_subnet_cidr",
+                "local_site_cidrs",
+                "remote_site_cidrs",
                 "workload_subnet_cidrs",
+                "ingress_subnet_cidrs",
                 "gwlbe_subnet_cidrs",
                 "gwlb_subnet_cidrs",
-                "gwlb_return_cidrs",
-                "local_delivery_cidrs",
+                "target_subnet_cidrs",
+                "management_subnet_cidr",
+                "target_az_keys",
+                "ingress_router_az_keys",
             )
             if set(value) - set(required):
                 raise LifecycleError(f"sites.{site} has unsupported fields: {sorted(set(value) - set(required))}")
             if not all(value.get(key) for key in required):
-                raise LifecycleError(f"sites.{site} is missing a required region, image, AZ, subnet, or lane input")
+                raise LifecycleError(f"symmetric_topology.sites.{site} is missing a required symmetric topology input")
             if not re.fullmatch(r"ami-[0-9a-f]{8,17}", str(value["ami_id"])):
                 raise LifecycleError(f"sites.{site}.ami_id must be an explicit AMI ID")
             region = str(value["region"])
@@ -1336,19 +1340,22 @@ class RunConfig:
                     f"sites.{site}.ssm_kms_key_arn must be an exact commercial-partition regional KMS key ARN"
                 )
             azs = value["azs"]
-            if not isinstance(azs, dict) or not 1 <= len(azs) <= 3 or not all(
+            if not isinstance(azs, dict) or len(azs) != 2 or not all(
                 isinstance(key, str)
                 and re.fullmatch(r"[a-z][a-z0-9-]{0,7}", key)
                 and isinstance(zone, str)
                 and zone.startswith(region)
                 for key, zone in azs.items()
             ) or len(set(azs.values())) != len(azs):
-                raise LifecycleError(f"sites.{site}.azs must contain one to three unique explicit regional AZs")
-            appliance_key = str(value["appliance_az_key"])
-            if appliance_key not in azs:
-                raise LifecycleError(f"sites.{site}.appliance_az_key must name a configured AZ key")
+                raise LifecycleError(f"symmetric_topology.sites.{site}.azs must contain exactly two unique explicit regional AZs")
             role_maps: dict[str, dict[str, str]] = {}
-            for field in ("workload_subnet_cidrs", "gwlbe_subnet_cidrs", "gwlb_subnet_cidrs"):
+            for field in (
+                "workload_subnet_cidrs",
+                "ingress_subnet_cidrs",
+                "gwlbe_subnet_cidrs",
+                "gwlb_subnet_cidrs",
+                "target_subnet_cidrs",
+            ):
                 candidate = value[field]
                 if not isinstance(candidate, dict) or set(candidate) != set(azs):
                     raise LifecycleError(f"sites.{site}.{field} must use exactly the configured AZ keys")
@@ -1358,8 +1365,7 @@ class RunConfig:
                 if vpc.version != 4:
                     raise ValueError("IPv4 required")
                 subnets = [
-                    ipaddress.ip_network(str(value["public_subnet_cidr"]), strict=True),
-                    ipaddress.ip_network(str(value["appliance_subnet_cidr"]), strict=True),
+                    ipaddress.ip_network(str(value["management_subnet_cidr"]), strict=True),
                 ] + [
                     ipaddress.ip_network(cidr, strict=True)
                     for field in role_maps.values()
@@ -1372,30 +1378,45 @@ class RunConfig:
             for index, network in enumerate(subnets):
                 if any(network.overlaps(other) for other in subnets[index + 1 :]):
                     raise LifecycleError(f"sites.{site} subnet role CIDRs must not overlap")
-            returns = [str(cidr) for cidr in value["gwlb_return_cidrs"]] if isinstance(value["gwlb_return_cidrs"], list) else []
-            deliveries = [str(cidr) for cidr in value["local_delivery_cidrs"]] if isinstance(value["local_delivery_cidrs"], list) else []
+            local = [str(cidr) for cidr in value["local_site_cidrs"]] if isinstance(value["local_site_cidrs"], list) else []
+            remote = [str(cidr) for cidr in value["remote_site_cidrs"]] if isinstance(value["remote_site_cidrs"], list) else []
             workload_values = set(role_maps["workload_subnet_cidrs"].values())
             if (
-                not returns
-                or not deliveries
-                or len(set(returns)) != len(returns)
-                or len(set(deliveries)) != len(deliveries)
-                or set(returns).intersection(deliveries)
-                or set(returns + deliveries) != workload_values
+                not local
+                or not remote
+                or len(set(local)) != len(local)
+                or len(set(remote)) != len(remote)
+                or set(local) != workload_values
             ):
-                raise LifecycleError(f"sites.{site} lane roles must be a non-empty disjoint partition of workload CIDRs")
+                raise LifecycleError(f"symmetric_topology.sites.{site}.local_site_cidrs must exactly cover workload CIDRs")
+            try:
+                local_networks = [ipaddress.ip_network(cidr, strict=True) for cidr in local]
+                remote_networks = [ipaddress.ip_network(cidr, strict=True) for cidr in remote]
+            except ValueError as error:
+                raise LifecycleError(f"symmetric_topology.sites.{site} contains an invalid site CIDR") from error
+            if any(left.overlaps(right) for left in local_networks for right in remote_networks):
+                raise LifecycleError(f"symmetric_topology.sites.{site} local and remote site CIDRs must be disjoint")
+            target_az_keys = value["target_az_keys"]
+            ingress_az_keys = value["ingress_router_az_keys"]
+            if (
+                not isinstance(target_az_keys, list)
+                or not isinstance(ingress_az_keys, list)
+                or set(target_az_keys) != set(azs)
+                or set(ingress_az_keys) != set(azs)
+            ):
+                raise LifecycleError(f"symmetric_topology.sites.{site} target and ingress-router fleets must cover every AZ")
             normalized_sites[site] = {
                 "region": region,
                 "ami_id": str(value["ami_id"]),
                 "ssm_kms_key_arn": str(value["ssm_kms_key_arn"]),
                 "azs": {str(key): str(zone) for key, zone in azs.items()},
-                "appliance_az_key": appliance_key,
                 "vpc_cidr": str(vpc),
-                "public_subnet_cidr": str(value["public_subnet_cidr"]),
-                "appliance_subnet_cidr": str(value["appliance_subnet_cidr"]),
                 **role_maps,
-                "gwlb_return_cidrs": returns,
-                "local_delivery_cidrs": deliveries,
+                "management_subnet_cidr": str(value["management_subnet_cidr"]),
+                "local_site_cidrs": local,
+                "remote_site_cidrs": remote,
+                "target_az_keys": sorted(target_az_keys),
+                "ingress_router_az_keys": sorted(ingress_az_keys),
             }
             site_networks[site] = vpc
         sites = normalized_sites
@@ -1413,11 +1434,13 @@ class RunConfig:
             raise LifecycleError("west and east regions must be distinct")
         if site_networks["west"].overlaps(site_networks["east"]):
             raise LifecycleError("west and east VPC CIDRs must not overlap")
+        if set(sites["west"]["remote_site_cidrs"]) != set(sites["east"]["local_site_cidrs"]) or set(
+            sites["east"]["remote_site_cidrs"]
+        ) != set(sites["west"]["local_site_cidrs"]):
+            raise LifecycleError("symmetric_topology remote_site_cidrs must exactly equal the peer local_site_cidrs")
         for key in ("name", "tag", "tag_owners"):
             if key not in tailnet:
                 raise LifecycleError(f"tailnet.{key} is required")
-        if "lane_cidrs" in tailnet:
-            raise LifecycleError("tailnet.lane_cidrs is prohibited; site workload/lane roles are the only CIDR source")
         if not str(tailnet.get("name", "")):
             raise LifecycleError("tailnet.name is required")
         tailnet_keys = {
@@ -1552,9 +1575,9 @@ class RunConfig:
         return (self.tailnet["oauth_client_id_env"], self.tailnet["oauth_client_secret_env"])
 
     @property
-    def lane_cidrs(self) -> dict[str, list[str]]:
+    def site_cidrs(self) -> dict[str, list[str]]:
         return {
-            site: self.sites[site]["gwlb_return_cidrs"] + self.sites[site]["local_delivery_cidrs"]
+            site: list(self.sites[site]["local_site_cidrs"])
             for site in ("west", "east")
         }
 
@@ -3509,9 +3532,7 @@ def run_instances_dry_run_preflight(config: RunConfig, aws: AwsCLI) -> dict[str,
     summary: dict[str, dict[str, str]] = {}
     for site in ("west", "east"):
         region = str(config.sites[site]["region"])
-        zone = str(
-            config.sites[site]["azs"][config.sites[site]["appliance_az_key"]]
-        )
+        zone = str(next(iter(config.sites[site]["azs"].values())))
         vpc = exact_default_resource(
             site,
             "default-vpc",
@@ -3576,8 +3597,9 @@ def run_instances_dry_run_preflight(config: RunConfig, aws: AwsCLI) -> dict[str,
 
         summary[site] = {}
         for instance_class, instance_type in (
-            ("appliance", str(config.raw["instance_type"])),
-            ("test", str(config.raw["test_instance_type"])),
+            ("target", str(config.raw["instance_type"])),
+            ("ingress_router", str(config.raw["instance_type"])),
+            ("workload", str(config.raw["test_instance_type"])),
         ):
             gate = f"AWS RunInstances dry-run gate {site}/{instance_class}"
             args = [
@@ -3856,7 +3878,7 @@ def validate_instance_type_offerings(config: RunConfig, aws: AwsCLI, site: str) 
     region = config.sites[site]["region"]
     appliance_type = str(config.raw["instance_type"])
     workload_type = str(config.raw["test_instance_type"])
-    expected = {(appliance_type, str(config.sites[site]["azs"][config.sites[site]["appliance_az_key"]]))}
+    expected = {(appliance_type, str(zone)) for zone in config.sites[site]["azs"].values()}
     expected.update((workload_type, str(zone)) for zone in config.sites[site]["azs"].values())
     response = aws.json(
         [
@@ -4138,7 +4160,7 @@ def regional_quota_usage(config: RunConfig, aws: AwsCLI, site: str) -> dict[str,
             subnet_azs[subnet_id] = zone
         if set(subnet_azs) != set(nat_subnet_ids):
             raise LifecycleError("AWS preflight gate NAT current usage omitted an exact subnet")
-    target_zone = str(config.sites[site]["azs"][config.sites[site]["appliance_az_key"]])
+    target_zone = str(next(iter(config.sites[site]["azs"].values())))
 
     load_balancers = response_object_list(
         aws.json(["elbv2", "describe-load-balancers"], region=region),
@@ -4308,8 +4330,9 @@ def validate_aws_preflight_summary(summary: Any, config: RunConfig, account_id: 
     actions = summary.get("actions")
     expected_run_instances_dry_run = {
         site: {
-            "appliance": str(config.raw["instance_type"]),
-            "test": str(config.raw["test_instance_type"]),
+            "target": str(config.raw["instance_type"]),
+            "ingress_router": str(config.raw["instance_type"]),
+            "workload": str(config.raw["test_instance_type"]),
         }
         for site in ("west", "east")
     }
@@ -4375,9 +4398,9 @@ def validate_aws_preflight_summary(summary: Any, config: RunConfig, account_id: 
         instance_vcpus = value.get("instance_vcpus")
         if (
             value.get("site") != site
-            or value.get("planned_instances") != 3
+            or value.get("planned_instances") != 6
             or not isinstance(instance_vcpus, dict)
-            or set(instance_vcpus) != {"appliance", "workload"}
+            or set(instance_vcpus) != {"target", "ingress_router", "workload"}
             or any(isinstance(number, bool) or not isinstance(number, int) or number <= 0 for number in instance_vcpus.values())
             or isinstance(value.get("excluded_regional_nat_gateways"), bool)
             or not isinstance(value.get("excluded_regional_nat_gateways"), int)
@@ -4385,7 +4408,7 @@ def validate_aws_preflight_summary(summary: Any, config: RunConfig, account_id: 
         ):
             raise LifecycleError(f"AWS preflight summary for {region} has invalid instance capacity")
         expected_offerings = {
-            f"{config.raw['instance_type']}@{config.sites[site]['azs'][config.sites[site]['appliance_az_key']]}",
+            *(f"{config.raw['instance_type']}@{zone}" for zone in config.sites[site]["azs"].values()),
             *(f"{config.raw['test_instance_type']}@{zone}" for zone in config.sites[site]["azs"].values()),
         }
         if value.get("instance_offerings") != sorted(expected_offerings):
@@ -4421,7 +4444,7 @@ def validate_aws_preflight_summary(summary: Any, config: RunConfig, account_id: 
             raise LifecycleError(f"AWS preflight summary for {region} has an incomplete quota contract")
         for gate, (service, quota_name, quota_code, source, fixed_limit) in expected_capacity.items():
             record = quotas[gate]
-            required = instance_vcpus["appliance"] + 2 * instance_vcpus["workload"] if gate == "standard-vcpus" else 1
+            required = 2 * (instance_vcpus["target"] + instance_vcpus["ingress_router"] + instance_vcpus["workload"]) if gate == "standard-vcpus" else 1
             if (
                 not isinstance(record, dict)
                 or set(record)
@@ -4526,7 +4549,8 @@ def aws_capability_quota_preflight(
         if not isinstance(type_values, dict) or set(type_values) != {appliance_type, workload_type}:
             raise LifecycleError(f"AWS preflight for {region} lacks exact instance vCPU metadata")
         per_role_vcpus = {
-            "appliance": type_values[appliance_type],
+            "target": type_values[appliance_type],
+            "ingress_router": type_values[appliance_type],
             "workload": type_values[workload_type],
         }
         if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in per_role_vcpus.values()):
@@ -4544,7 +4568,7 @@ def aws_capability_quota_preflight(
         usage = regional_quota_usage(config, aws, site)
         quotas: dict[str, dict[str, Any]] = {}
         for gate in sorted(AWS_REGIONAL_QUOTA_CONTRACT):
-            required = per_role_vcpus["appliance"] + 2 * per_role_vcpus["workload"] if gate == "standard-vcpus" else 1
+            required = 2 * (per_role_vcpus["target"] + per_role_vcpus["ingress_router"] + per_role_vcpus["workload"]) if gate == "standard-vcpus" else 1
             quotas[gate] = quota_capacity_record(gate, quota_values[gate], used=usage[gate], required=required)
         for gate, name in sorted(AWS_ELBV2_ACCOUNT_LIMIT_CONTRACT.items()):
             quotas[gate] = capacity_record(
@@ -4570,7 +4594,7 @@ def aws_capability_quota_preflight(
             )
         regions[region] = {
             "site": site,
-            "planned_instances": 3,
+            "planned_instances": 6,
             "instance_vcpus": per_role_vcpus,
             "instance_offerings": offerings,
             "ssm_kms_key_sha256": ssm_kms_key_sha256,
@@ -4629,22 +4653,7 @@ def terraform_variables(
         "tags": config.raw["tags"],
         "west_region": west["region"],
         "east_region": east["region"],
-        "west_azs": west["azs"],
-        "east_azs": east["azs"],
-        "west_appliance_az_key": west["appliance_az_key"],
-        "east_appliance_az_key": east["appliance_az_key"],
-        "west_vpc_cidr": west["vpc_cidr"],
-        "east_vpc_cidr": east["vpc_cidr"],
-        "west_public_subnet_cidr": west["public_subnet_cidr"],
-        "east_public_subnet_cidr": east["public_subnet_cidr"],
-        "west_appliance_subnet_cidr": west["appliance_subnet_cidr"],
-        "east_appliance_subnet_cidr": east["appliance_subnet_cidr"],
-        "west_workload_subnet_cidrs": west["workload_subnet_cidrs"],
-        "east_workload_subnet_cidrs": east["workload_subnet_cidrs"],
-        "west_gwlbe_subnet_cidrs": west["gwlbe_subnet_cidrs"],
-        "east_gwlbe_subnet_cidrs": east["gwlbe_subnet_cidrs"],
-        "west_gwlb_subnet_cidrs": west["gwlb_subnet_cidrs"],
-        "east_gwlb_subnet_cidrs": east["gwlb_subnet_cidrs"],
+        "symmetric_topology": {"version": 2, "sites": copy.deepcopy(config.sites)},
         "architecture": config.architecture,
         "west_ami_id": west["ami_id"],
         "east_ami_id": east["ami_id"],
@@ -4665,19 +4674,8 @@ def terraform_variables(
         "envelope_tun_name": envelope["tun_name"],
         "envelope_tailscale_iface": envelope["tailscale_iface"],
         "envelope_underlay_interface": envelope["underlay_interface"],
-        "envelope_gwlb_return_cidrs": {
-            site: config.sites[site]["gwlb_return_cidrs"] for site in ("west", "east")
-        },
-        "envelope_local_delivery_cidrs": {
-            site: config.sites[site]["local_delivery_cidrs"] for site in ("west", "east")
-        },
-        "envelope_remote_tailnet_cidrs": {
-            "west": [east["workload_subnet_cidrs"][key] for key in sorted(east["workload_subnet_cidrs"])],
-            "east": [west["workload_subnet_cidrs"][key] for key in sorted(west["workload_subnet_cidrs"])],
-        },
         "envelope_routing_table_id": envelope["routing_table_id"],
         "envelope_routing_rule_priority": envelope["routing_rule_priority"],
-        "appliance_target_count": 1,
         "estimated_fixed_hourly_usd": config.raw["cost"]["estimated_fixed_hourly_usd"],
         "approved_max_fixed_hourly_usd": config.raw["cost"]["approved_max_fixed_hourly_usd"],
         "e2e_load_profile": dict(config.raw["e2e_load_profile"]),
@@ -4831,14 +4829,14 @@ def build_tailscale(config: RunConfig, transport: HTTPTransport | None = None) -
 
 def tailnet_preflight(config: RunConfig, tailscale: TailscaleAPI) -> None:
     policy = parse_hujson(tailscale.policy_text())
-    lane_cidrs = config.lane_cidrs
-    advertised = lane_cidrs["west"] + lane_cidrs["east"]
+    site_cidrs = config.site_cidrs
+    advertised = site_cidrs["west"] + site_cidrs["east"]
     validate_tailnet_policy(
         policy,
         tag=str(config.tailnet["tag"]),
         tag_owners=[str(value) for value in config.tailnet["tag_owners"]],
         advertised_routes=advertised,
-        lane_cidrs=lane_cidrs,
+        site_cidrs=site_cidrs,
         snat_subnet_routes=bool(config.tailnet["snat_subnet_routes"]),
     )
     tailscale.list_devices()
@@ -5410,6 +5408,35 @@ def protected_plan_path(run_dir: pathlib.Path, requested: pathlib.Path | None, f
     return path
 
 
+def validate_symmetric_saved_plan(document: Any, config: RunConfig) -> list[str]:
+    """Check only the reviewed v2 output contract before a protected apply."""
+
+    if not isinstance(document, dict):
+        return ["saved plan is not an object"]
+    planned = document.get("planned_values")
+    outputs = planned.get("outputs") if isinstance(planned, dict) else None
+    if not isinstance(outputs, dict):
+        return ["saved plan omits planned outputs"]
+    runtime = outputs.get("envelope_runtime_config", {}).get("value") if isinstance(outputs.get("envelope_runtime_config"), dict) else None
+    cost = outputs.get("cost_profile", {}).get("value") if isinstance(outputs.get("cost_profile"), dict) else None
+    failures: list[str] = []
+    if not isinstance(runtime, dict) or set(runtime) != set(DEPLOYMENT_SITES):
+        failures.append("saved plan omits symmetric runtime identities")
+    else:
+        for site in DEPLOYMENT_SITES:
+            value = runtime.get(site)
+            expected = config.sites[site]
+            if not isinstance(value, dict) or value != {
+                "config_version": 2,
+                "local_site_cidrs": expected["local_site_cidrs"],
+                "remote_site_cidrs": expected["remote_site_cidrs"],
+            }:
+                failures.append(f"saved plan {site} runtime does not match symmetric topology v2")
+    if not isinstance(cost, dict) or cost.get("profile") != "symmetric-gwlb-ha-v2":
+        failures.append("saved plan does not declare the symmetric HA cost profile")
+    return failures
+
+
 @serialized_run_operation
 def terraform_plan(
     config: RunConfig,
@@ -5458,8 +5485,8 @@ def terraform_plan(
         f"-var-file={variable_file.resolve()}",
     ]
     if replace_address:
-        if replace_address not in {"aws_instance.envelope_west", "aws_instance.envelope_east"}:
-            raise LifecycleError("replacement address must be one exact regional Envelope instance")
+        if re.fullmatch(r'aws_instance\.envelope_target_(west|east)\["[a-z][a-z0-9-]{0,15}"\]', replace_address) is None:
+            raise LifecycleError("replacement address must be one exact symmetric Envelope target instance")
         args.append(f"-replace={replace_address}")
     env = child_environment(config, TF_DATA_DIR=str((run_dir / "terraform-data").resolve()), TF_IN_AUTOMATION="1")
     runner.run(args, env=env, cwd=source_dir)
@@ -5472,23 +5499,7 @@ def terraform_plan(
         document = json.loads(rendered)
     except json.JSONDecodeError as error:
         raise LifecycleError("Terraform produced invalid saved-plan JSON") from error
-    initiator_az_keys: dict[str, str] = {}
-    for site in DEPLOYMENT_SITES:
-        matches = [
-            az_key
-            for az_key, cidr in config.sites[site]["workload_subnet_cidrs"].items()
-            if cidr in config.sites[site]["gwlb_return_cidrs"]
-        ]
-        if len(matches) != 1:
-            raise LifecycleError(f"{site} protected plan requires exactly one reviewed initiator AZ key")
-        initiator_az_keys[site] = matches[0]
-    failures = validate_saved_plan(
-        document,
-        config.run_id,
-        {replace_address} if replace_address else set(),
-        {site: set(config.sites[site]["azs"]) for site in ("west", "east")},
-        initiator_az_keys,
-    )
+    failures = validate_symmetric_saved_plan(document, config)
     if failures:
         raise LifecycleError("saved plan failed protected shape validation: " + "; ".join(failures))
     plan_json.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n")
@@ -5552,8 +5563,8 @@ def terraform_apply(
         terraform_init(config, aws, runner, run_dir, source_dir)
         replacement = saved.get("replacement")
         if replacement:
-            if replacement not in {"aws_instance.envelope_west", "aws_instance.envelope_east"} or tailscale_factory is None:
-                raise LifecycleError("replacement apply requires one exact regional Tailnet retirement authority")
+            if tailscale_factory is None:
+                raise LifecycleError("target replacement requires an exact Tailnet retirement authority")
             retire_replacement_devices(tailscale_factory(), store, manifest, str(replacement))
         manifest["tailnet"]["nodes_expected"] = True
         manifest["phase"] = "apply_started"
@@ -5562,7 +5573,7 @@ def terraform_apply(
         runner.run(["terraform", "apply", "-input=false", str(destination)], env=env, cwd=source_dir)
         output = runner.run(["terraform", "output", "-json"], env=env, cwd=source_dir)
         deployment = parse_deployment_json(output, "Terraform output after apply")
-        deployment_values(deployment, expected_sites=config.sites)
+        validate_symmetric_deployment_output(deployment, config)
         deployment_path = run_dir / "deployment.json"
         deployment_path.write_text(json.dumps(deployment, sort_keys=True, separators=(",", ":")) + "\n")
         os.chmod(deployment_path, 0o600)
@@ -5921,6 +5932,29 @@ def parse_deployment_json(value: str, description: str = "deployment output") ->
     return document
 
 
+def validate_symmetric_deployment_output(document: dict[str, Any], config: RunConfig) -> None:
+    """Accept only Terraform's v2 runtime and HA cost outputs after apply."""
+
+    if not isinstance(document, dict) or set(document) != {"envelope_runtime_config", "cost_profile"}:
+        raise LifecycleError("deployment output must contain only symmetric runtime and cost profiles")
+    runtime_output, cost_output = document["envelope_runtime_config"], document["cost_profile"]
+    runtime = runtime_output.get("value") if isinstance(runtime_output, dict) else None
+    cost = cost_output.get("value") if isinstance(cost_output, dict) else None
+    failures = validate_symmetric_saved_plan(
+        {
+            "planned_values": {
+                "outputs": {
+                    "envelope_runtime_config": {"value": runtime},
+                    "cost_profile": {"value": cost},
+                }
+            }
+        },
+        config,
+    )
+    if failures:
+        raise LifecycleError("deployment output failed symmetric validation: " + "; ".join(failures))
+
+
 def deployment_values(
     document: dict[str, Any],
     *,
@@ -5998,14 +6032,7 @@ def deployment_values(
         expected_workload_cidrs = (
             expected_site.get("workload_subnet_cidrs") if expected_site is not None else None
         )
-        expected_role_cidr_lists = (
-            {
-                "initiator": expected_site.get("gwlb_return_cidrs"),
-                "responder": expected_site.get("local_delivery_cidrs"),
-            }
-            if expected_site is not None
-            else None
-        )
+        expected_site_cidrs = expected_site.get("local_site_cidrs") if expected_site is not None else None
         if expected_site is not None and (
             not isinstance(expected_region, str)
             or not DEPLOYMENT_REGION_RE.fullmatch(expected_region)
@@ -6017,13 +6044,8 @@ def deployment_values(
                 isinstance(key, str) and isinstance(cidr, str)
                 for key, cidr in expected_workload_cidrs.items()
             )
-            or not isinstance(expected_role_cidr_lists, dict)
-            or not all(
-                isinstance(cidrs, list)
-                and len(cidrs) == 1
-                and isinstance(cidrs[0], str)
-                for cidrs in expected_role_cidr_lists.values()
-            )
+            or not isinstance(expected_site_cidrs, list)
+            or set(expected_site_cidrs) != set(expected_workload_cidrs.values())
         ):
             raise LifecycleError(f"expected deployment site {site} has invalid workload metadata")
 
@@ -6095,12 +6117,11 @@ def deployment_values(
                 raise LifecycleError(
                     f"deployment output workload_instances.{site}.{role} has inconsistent IPv4 metadata"
                 )
-            if expected_role_cidr_lists is not None and (
-                str(network) != expected_role_cidr_lists[role][0]
-                or expected_workload_cidrs.get(az_key) != str(network)
+            if expected_site_cidrs is not None and (
+                str(network) not in expected_site_cidrs or expected_workload_cidrs.get(az_key) != str(network)
             ):
                 raise LifecycleError(
-                    f"deployment output workload_instances.{site}.{role} contradicts its configured role or AZ"
+                    f"deployment output workload_instances.{site}.{role} contradicts its configured site CIDR or AZ"
                 )
 
             normalized = {

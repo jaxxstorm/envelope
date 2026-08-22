@@ -58,6 +58,9 @@ jobs:
           python3 scripts/test_aws_two_region_e2e.py
           python3 scripts/test_terraform_contract.py
           python3 scripts/test_artifacts.py
+          python3 scripts/test_docs.py
+          python3 scripts/test_ingress_router_readiness.py
+          python3 scripts/test_symmetric_gwlb_ha.py
 
   terraform:
     name: Terraform 1.10.5

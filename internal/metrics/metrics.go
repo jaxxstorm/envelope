@@ -29,9 +29,7 @@ const (
 	UnsupportedReasonTransportTruncated = "transport_truncated"
 
 	LivenessComponentReceive  = "receive"
-	LivenessComponentTunRead  = "tun_read"
 	LivenessComponentTunWrite = "tun_write"
-	LivenessComponentSend     = "send"
 
 	RoutingFailureReasonInterface        = "interface"
 	RoutingFailureReasonBackend          = "backend"
@@ -59,30 +57,20 @@ const (
 	MTUDropFamilyIPv6                    = "ipv6"
 	MTUDropFamilyUnknown                 = "unknown"
 	MTUDropDirectionIngress              = "ingress"
-	MTUDropDirectionEgress               = "egress"
 )
 
 type Metrics struct {
 	GeneveRxPackets               prometheus.Counter
 	GeneveRxBytes                 prometheus.Counter
-	GeneveTxPackets               prometheus.Counter
-	GeneveTxBytes                 prometheus.Counter
 	DecapErrors                   prometheus.Counter
-	EncapErrors                   prometheus.Counter
 	TunRxPackets                  prometheus.Counter
 	TunTxPackets                  prometheus.Counter
 	Drops                         prometheus.Counter
 	GeneveOptionsValidationErrors *prometheus.CounterVec
 	GWLBProfileRejections         *prometheus.CounterVec
 	GWLBReceiveDrops              *prometheus.CounterVec
-	GWLBSendFailures              prometheus.Counter
-	GWLBMissingContexts           prometheus.Counter
-	GWLBConflictedContexts        prometheus.Counter
-	GWLBPossibleLoops             prometheus.Counter
 	GWLBUnsupportedInner          *prometheus.CounterVec
-	GWLBContextExpirations        prometheus.Counter
-	GWLBContextEvictions          prometheus.Counter
-	GWLBContextCollisions         prometheus.Counter
+	SymmetricUnexpectedEgress     prometheus.Counter
 	DatapathComponentHealthy      *prometheus.GaugeVec
 	DatapathLivenessTransitions   *prometheus.CounterVec
 	MTUDrops                      *prometheus.CounterVec
@@ -101,10 +89,7 @@ func New(reg prometheus.Registerer) *Metrics {
 	m := &Metrics{
 		GeneveRxPackets: prometheus.NewCounter(prometheus.CounterOpts{Name: "geneve_rx_packets", Help: "GENEVE packets received"}),
 		GeneveRxBytes:   prometheus.NewCounter(prometheus.CounterOpts{Name: "geneve_rx_bytes", Help: "GENEVE bytes received"}),
-		GeneveTxPackets: prometheus.NewCounter(prometheus.CounterOpts{Name: "geneve_tx_packets", Help: "GENEVE packets sent"}),
-		GeneveTxBytes:   prometheus.NewCounter(prometheus.CounterOpts{Name: "geneve_tx_bytes", Help: "GENEVE bytes sent"}),
 		DecapErrors:     prometheus.NewCounter(prometheus.CounterOpts{Name: "decap_errors", Help: "GENEVE decapsulation errors"}),
-		EncapErrors:     prometheus.NewCounter(prometheus.CounterOpts{Name: "encap_errors", Help: "GENEVE encapsulation errors"}),
 		TunRxPackets:    prometheus.NewCounter(prometheus.CounterOpts{Name: "tun_rx_packets", Help: "TUN packets read"}),
 		TunTxPackets:    prometheus.NewCounter(prometheus.CounterOpts{Name: "tun_tx_packets", Help: "TUN packets written"}),
 		Drops:           prometheus.NewCounter(prometheus.CounterOpts{Name: "drops", Help: "Packets dropped"}),
@@ -120,17 +105,11 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "gwlb_receive_drops_total",
 			Help: "Packets dropped at the receive boundary by reason",
 		}, []string{"reason"}),
-		GWLBSendFailures:       prometheus.NewCounter(prometheus.CounterOpts{Name: "gwlb_send_failures_total", Help: "AWS-compliant packet send failures"}),
-		GWLBMissingContexts:    prometheus.NewCounter(prometheus.CounterOpts{Name: "gwlb_missing_contexts_total", Help: "Return packets dropped without a live context"}),
-		GWLBConflictedContexts: prometheus.NewCounter(prometheus.CounterOpts{Name: "gwlb_conflicted_contexts_total", Help: "Return packets dropped for conflicted contexts"}),
-		GWLBPossibleLoops:      prometheus.NewCounter(prometheus.CounterOpts{Name: "gwlb_possible_loops_total", Help: "Forward-orientation TUN packets dropped as possible loops"}),
 		GWLBUnsupportedInner: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gwlb_unsupported_inner_total",
 			Help: "Unsupported inner packets by reason",
 		}, []string{"reason"}),
-		GWLBContextExpirations: prometheus.NewCounter(prometheus.CounterOpts{Name: "gwlb_context_expirations_total", Help: "Expired GWLB return contexts"}),
-		GWLBContextEvictions:   prometheus.NewCounter(prometheus.CounterOpts{Name: "gwlb_context_evictions_total", Help: "Capacity-evicted GWLB return contexts"}),
-		GWLBContextCollisions:  prometheus.NewCounter(prometheus.CounterOpts{Name: "gwlb_context_collisions_total", Help: "Conflicting GWLB return identities observed"}),
+		SymmetricUnexpectedEgress: prometheus.NewCounter(prometheus.CounterOpts{Name: "symmetric_unexpected_egress_total", Help: "Unexpected TUN egress packets dropped in symmetric mode"}),
 		DatapathComponentHealthy: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "datapath_component_healthy",
 			Help: "Whether a persistent-error-tracked datapath component is healthy",
@@ -159,24 +138,15 @@ func New(reg prometheus.Registerer) *Metrics {
 	reg.MustRegister(
 		m.GeneveRxPackets,
 		m.GeneveRxBytes,
-		m.GeneveTxPackets,
-		m.GeneveTxBytes,
 		m.DecapErrors,
-		m.EncapErrors,
 		m.TunRxPackets,
 		m.TunTxPackets,
 		m.Drops,
 		m.GeneveOptionsValidationErrors,
 		m.GWLBProfileRejections,
 		m.GWLBReceiveDrops,
-		m.GWLBSendFailures,
-		m.GWLBMissingContexts,
-		m.GWLBConflictedContexts,
-		m.GWLBPossibleLoops,
 		m.GWLBUnsupportedInner,
-		m.GWLBContextExpirations,
-		m.GWLBContextEvictions,
-		m.GWLBContextCollisions,
+		m.SymmetricUnexpectedEgress,
 		m.DatapathComponentHealthy,
 		m.DatapathLivenessTransitions,
 		m.MTUDrops,
@@ -226,18 +196,14 @@ func New(reg prometheus.Registerer) *Metrics {
 	}
 	for _, component := range []string{
 		LivenessComponentReceive,
-		LivenessComponentTunRead,
 		LivenessComponentTunWrite,
-		LivenessComponentSend,
 	} {
 		m.DatapathComponentHealthy.WithLabelValues(component).Set(1)
 		m.DatapathLivenessTransitions.WithLabelValues(component, "healthy")
 		m.DatapathLivenessTransitions.WithLabelValues(component, "unhealthy")
 	}
 	for _, family := range []string{MTUDropFamilyIPv4, MTUDropFamilyIPv6, MTUDropFamilyUnknown} {
-		for _, direction := range []string{MTUDropDirectionIngress, MTUDropDirectionEgress} {
-			m.MTUDrops.WithLabelValues(family, direction)
-		}
+		m.MTUDrops.WithLabelValues(family, MTUDropDirectionIngress)
 	}
 	for _, reason := range []string{
 		RoutingFailureReasonInterface,

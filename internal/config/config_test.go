@@ -3,7 +3,6 @@ package config
 import (
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/jaxxstorm/envelope/internal/geneve"
 )
@@ -42,14 +41,8 @@ func TestParseAndValidate(t *testing.T) {
 	if cfg.TunMTU != 1280 {
 		t.Fatalf("expected default tun mtu 1280, got %d", cfg.TunMTU)
 	}
-	if cfg.FlowCapacity != 65536 {
-		t.Fatalf("expected default flow capacity 65536, got %d", cfg.FlowCapacity)
-	}
-	if cfg.TCPFlowTimeout != 350*time.Second {
-		t.Fatalf("expected default TCP timeout 350s, got %s", cfg.TCPFlowTimeout)
-	}
-	if cfg.UDPFlowTimeout != 120*time.Second || cfg.OtherFlowTimeout != 120*time.Second {
-		t.Fatalf("expected default UDP/other timeout 120s, got %s/%s", cfg.UDPFlowTimeout, cfg.OtherFlowTimeout)
+	if cfg.ConfigVersion != 2 {
+		t.Fatalf("expected default config version 2, got %d", cfg.ConfigVersion)
 	}
 	if cfg.PersistentErrorThreshold != 3 {
 		t.Fatalf("expected default persistent error threshold 3, got %d", cfg.PersistentErrorThreshold)
@@ -82,10 +75,6 @@ func TestAWSProfileConfiguration(t *testing.T) {
 		{"--udp-bind=:6080", "--metrics-addr=:9090"},
 		{"--udp-bind=[::1]:6081", "--metrics-addr=:9090"},
 		{"--udp-bind=:6081", "--metrics-addr=:9090", "--vni=1"},
-		{"--udp-bind=:6081", "--metrics-addr=:9090", "--flow-capacity=0"},
-		{"--udp-bind=:6081", "--metrics-addr=:9090", "--tcp-flow-timeout=0s"},
-		{"--udp-bind=:6081", "--metrics-addr=:9090", "--udp-flow-timeout=0s"},
-		{"--udp-bind=:6081", "--metrics-addr=:9090", "--other-flow-timeout=0s"},
 		{"--udp-bind=:6081", "--metrics-addr=:9090", "--persistent-error-threshold=0"},
 	}
 	for _, args := range invalid {
@@ -157,7 +146,7 @@ func TestInvalidGeneveOptionConfig(t *testing.T) {
 	}
 }
 
-func TestRoutingDirectionalRoleConfiguration(t *testing.T) {
+func TestRoutingSymmetricRoleConfiguration(t *testing.T) {
 	_, err := Parse([]string{
 		"--udp-bind=:6081",
 		"--metrics-addr=:9090",
@@ -165,7 +154,16 @@ func TestRoutingDirectionalRoleConfiguration(t *testing.T) {
 		"--underlay-interface=eth0",
 	})
 	if err == nil {
-		t.Fatalf("expected error when manage mode has no GWLB return cidrs")
+		t.Fatalf("expected error when manage mode has no site cidrs")
+	}
+	_, err = Parse([]string{
+		"--udp-bind=:6081",
+		"--metrics-addr=:9090",
+		"--routing-mode=verify",
+		"--underlay-interface=eth0",
+	})
+	if err == nil {
+		t.Fatalf("expected error when verify mode has no site cidrs")
 	}
 
 	cfg, err := Parse([]string{
@@ -173,9 +171,8 @@ func TestRoutingDirectionalRoleConfiguration(t *testing.T) {
 		"--metrics-addr=:9090",
 		"--routing-mode=manage",
 		"--underlay-interface=eth0",
-		"--gwlb-return-cidrs=172.16.0.0/16,10.0.0.0/8",
-		"--local-delivery-cidrs=192.168.0.0/16",
-		"--remote-tailnet-cidrs=100.96.0.0/11",
+		"--local-site-cidrs=172.16.1.42/16,10.0.0.0/8",
+		"--remote-site-cidrs=192.168.0.0/16,100.96.0.0/11",
 		"--routing-table-id=123",
 		"--routing-rule-priority=321",
 	})
@@ -185,47 +182,41 @@ func TestRoutingDirectionalRoleConfiguration(t *testing.T) {
 	if cfg.RoutingMode != RoutingModeManage {
 		t.Fatalf("expected manage mode, got %q", cfg.RoutingMode)
 	}
-	if got := cfg.EffectiveGWLBReturnCIDRs(); len(got) != 2 {
-		t.Fatalf("expected 2 GWLB return cidrs, got %d", len(got))
+	if got := cfg.EffectiveLocalSiteCIDRs(); len(got) != 2 || got[0] != "172.16.0.0/16" {
+		t.Fatalf("unexpected local site cidrs: %v", got)
 	}
-	if got := cfg.EffectiveLocalDeliveryCIDRs(); len(got) != 1 || got[0] != "192.168.0.0/16" {
-		t.Fatalf("unexpected local delivery cidrs: %v", got)
-	}
-	if got := cfg.EffectiveRemoteTailnetCIDRs(); len(got) != 1 || got[0] != "100.96.0.0/11" {
-		t.Fatalf("unexpected remote tailnet cidrs: %v", got)
+	if got := cfg.EffectiveRemoteSiteCIDRs(); len(got) != 2 || got[0] != "192.168.0.0/16" {
+		t.Fatalf("unexpected remote site cidrs: %v", got)
 	}
 	if cfg.UnderlayIface != "eth0" {
 		t.Fatalf("unexpected underlay interface %q", cfg.UnderlayIface)
 	}
 }
 
-func TestRoutingRoleEnvironmentInputs(t *testing.T) {
+func TestRoutingSiteEnvironmentInputs(t *testing.T) {
 	t.Setenv("ENVELOPE_ROUTING_MODE", "manage")
 	t.Setenv("ENVELOPE_UNDERLAY_INTERFACE", "eth0")
-	t.Setenv("ENVELOPE_GWLB_RETURN_CIDRS", "10.0.0.0/24")
-	t.Setenv("ENVELOPE_LOCAL_DELIVERY_CIDRS", "10.0.1.0/24")
-	t.Setenv("ENVELOPE_REMOTE_TAILNET_CIDRS", "10.0.2.0/24")
+	t.Setenv("ENVELOPE_LOCAL_SITE_CIDRS", "10.0.0.0/24")
+	t.Setenv("ENVELOPE_REMOTE_SITE_CIDRS", "10.0.1.0/24")
 	cfg, err := Parse(nil)
 	if err != nil {
 		t.Fatalf("parse environment inputs: %v", err)
 	}
-	if len(cfg.EffectiveGWLBReturnCIDRs()) != 1 || len(cfg.EffectiveLocalDeliveryCIDRs()) != 1 || len(cfg.EffectiveRemoteTailnetCIDRs()) != 1 {
-		t.Fatalf("directional role environment inputs were not independent")
+	if len(cfg.EffectiveLocalSiteCIDRs()) != 1 || len(cfg.EffectiveRemoteSiteCIDRs()) != 1 {
+		t.Fatalf("site environment inputs were not independent")
 	}
 }
 
-func TestRoutingCIDRRolesMustBePairwiseDisjoint(t *testing.T) {
+func TestRoutingSiteCIDRsMustBePairwiseDisjoint(t *testing.T) {
 	tests := []struct {
 		name  string
 		flags []string
 		left  string
 		right string
 	}{
-		{name: "return covers delivery", flags: []string{"--gwlb-return-cidrs=10.0.0.0/8", "--local-delivery-cidrs=10.1.0.0/16"}, left: "10.0.0.0/8", right: "10.1.0.0/16"},
-		{name: "delivery covers remote", flags: []string{"--local-delivery-cidrs=10.0.0.0/8", "--remote-tailnet-cidrs=10.1.0.0/16"}, left: "10.0.0.0/8", right: "10.1.0.0/16"},
-		{name: "remote covers return", flags: []string{"--remote-tailnet-cidrs=10.0.0.0/8", "--gwlb-return-cidrs=10.1.0.0/16"}, left: "10.0.0.0/8", right: "10.1.0.0/16"},
-		{name: "same role overlap", flags: []string{"--gwlb-return-cidrs=10.0.0.0/8,10.1.0.0/16"}, left: "10.0.0.0/8", right: "10.1.0.0/16"},
-		{name: "exact duplicate", flags: []string{"--remote-tailnet-cidrs=2001:db8::/48,2001:db8::/48"}, left: "2001:db8::/48", right: "2001:db8::/48"},
+		{name: "local covers remote", flags: []string{"--local-site-cidrs=10.0.0.0/8", "--remote-site-cidrs=10.1.0.0/16"}, left: "10.0.0.0/8", right: "10.1.0.0/16"},
+		{name: "same local role overlap", flags: []string{"--local-site-cidrs=10.0.0.0/8,10.1.0.0/16"}, left: "10.0.0.0/8", right: "10.1.0.0/16"},
+		{name: "exact remote duplicate", flags: []string{"--remote-site-cidrs=2001:db8::/48,2001:db8::/48"}, left: "2001:db8::/48", right: "2001:db8::/48"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -283,10 +274,54 @@ func TestInvalidRoutingConfig(t *testing.T) {
 		"--metrics-addr=:9090",
 		"--routing-mode=manage",
 		"--underlay-interface=eth0",
-		"--gwlb-return-cidrs=not-a-cidr",
+		"--local-site-cidrs=not-a-cidr",
+		"--remote-site-cidrs=10.0.0.0/24",
 	})
 	if err == nil {
-		t.Fatalf("expected error for invalid GWLB return cidr")
+		t.Fatalf("expected error for invalid local site cidr")
+	}
+}
+
+func TestLegacyConfigurationIsRejected(t *testing.T) {
+	for _, flag := range []string{
+		"--gwlb-return-cidrs=10.0.0.0/24",
+		"--local-delivery-cidrs=10.0.0.0/24",
+		"--remote-tailnet-cidrs=10.0.0.0/24",
+		"--flow-capacity=1",
+		"--tcp-flow-timeout=1s",
+		"--udp-flow-timeout=1s",
+		"--other-flow-timeout=1s",
+	} {
+		t.Run(flag, func(t *testing.T) {
+			if _, err := Parse([]string{flag}); err == nil {
+				t.Fatalf("legacy flag %q was accepted", flag)
+			}
+		})
+	}
+
+	for _, name := range []string{
+		"ENVELOPE_GWLB_RETURN_CIDRS",
+		"ENVELOPE_LOCAL_DELIVERY_CIDRS",
+		"ENVELOPE_REMOTE_TAILNET_CIDRS",
+		"ENVELOPE_FLOW_CAPACITY",
+		"ENVELOPE_TCP_FLOW_TIMEOUT",
+		"ENVELOPE_UDP_FLOW_TIMEOUT",
+		"ENVELOPE_OTHER_FLOW_TIMEOUT",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(name, "legacy")
+			_, err := Parse(nil)
+			if err == nil || !strings.Contains(err.Error(), name) {
+				t.Fatalf("legacy environment variable %q was not rejected: %v", name, err)
+			}
+		})
+	}
+}
+
+func TestConfigVersionMustBeTwo(t *testing.T) {
+	_, err := Parse([]string{"--config-version=1"})
+	if err == nil || !strings.Contains(err.Error(), "config version") {
+		t.Fatalf("unsupported config version was not rejected: %v", err)
 	}
 }
 

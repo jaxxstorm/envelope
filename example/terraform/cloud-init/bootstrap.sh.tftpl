@@ -85,10 +85,8 @@ path_mss() {
 }
 
 directions=(
-  "$underlay $tailscale"
-  "$tailscale $underlay"
+  "$envelope $underlay"
   "$envelope $tailscale"
-  "$tailscale $envelope"
 )
 
 for family in 4 6; do
@@ -142,8 +140,8 @@ ExecStart=/usr/local/sbin/envelope-host-network
 RemainAfterExit=yes
 RuntimeDirectory=envelope-host-network
 RuntimeDirectoryMode=0700
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
@@ -157,6 +155,7 @@ WantedBy=multi-user.target
 HOST_UNIT
 
 cat >/etc/envelope/site.env <<'SITE_ENV'
+ENVELOPE_CONFIG_VERSION=${config_version}
 ENVELOPE_UDP_BIND=0.0.0.0:6081
 ENVELOPE_VNI=0
 ENVELOPE_TUN_NAME=${tun_name}
@@ -164,16 +163,12 @@ ENVELOPE_TUN_MTU=1280
 ENVELOPE_TAILSCALE_IFACE=${tailscale_iface}
 ENVELOPE_UNDERLAY_INTERFACE=${underlay_iface}
 ENVELOPE_ROUTING_MODE=${routing_mode}
-ENVELOPE_GWLB_RETURN_CIDRS=${gwlb_return_cidrs}
-ENVELOPE_LOCAL_DELIVERY_CIDRS=${local_delivery_cidrs}
-ENVELOPE_REMOTE_TAILNET_CIDRS=${remote_tailnet_cidrs}
+ENVELOPE_LOCAL_SITE_CIDRS=${local_site_cidrs}
+ENVELOPE_REMOTE_SITE_CIDRS=${remote_site_cidrs}
 ENVELOPE_ROUTING_TABLE_ID=${routing_table_id}
 ENVELOPE_ROUTING_RULE_PRIORITY=${routing_rule_priority}
 ENVELOPE_METRICS_ADDR=0.0.0.0:9090
 ENVELOPE_LOG_LEVEL=info
-ENVELOPE_TCP_FLOW_TIMEOUT=350s
-ENVELOPE_UDP_FLOW_TIMEOUT=120s
-ENVELOPE_OTHER_FLOW_TIMEOUT=120s
 SITE_ENV
 chmod 0644 /etc/envelope/site.env
 
@@ -182,8 +177,8 @@ cat >/usr/local/sbin/envelope-preflight <<'PREFLIGHT'
 set -euo pipefail
 
 readonly expected_version='${tailscale_version}'
-readonly remote_cidrs='${remote_tailnet_cidrs}'
-readonly local_cidrs='${gwlb_return_cidrs},${local_delivery_cidrs}'
+readonly local_cidrs='${local_site_cidrs}'
+readonly remote_cidrs='${remote_site_cidrs}'
 readonly tailscale_bin="$${TAILSCALE_BIN:-/usr/bin/tailscale}"
 readonly timeout_bin="$${TIMEOUT_BIN:-/usr/bin/timeout}"
 readonly jq_bin="$${JQ_BIN:-/usr/bin/jq}"
@@ -273,11 +268,11 @@ for ((attempt = 1; attempt <= max_attempts; attempt++)); do
     "$timeout_bin" 5 "$tailscale_bin" status --json |
       "$jq_bin" -e '(.Version | startswith("1.80.")) and (.TUN == true) and (.BackendState == "Running") and ((.Health | length) == 0)' >/dev/null; then
     ready=true
-    IFS=',' read -ra advertised <<<"$local_cidrs"
-    for cidr in "$${advertised[@]}"; do
+    IFS=',' read -ra locals <<<"$local_cidrs"
+    for cidr in "$${locals[@]}"; do
       [[ -z "$cidr" ]] && continue
-      if ! "$timeout_bin" 5 "$tailscale_bin" status --json |
-        "$jq_bin" -e --arg cidr "$cidr" '(.Self.AllowedIPs // []) | index($cidr) != null' >/dev/null; then
+      if ! "$ip_bin" -j route get "$cidr" iif '${tun_name}' |
+        "$jq_bin" -e 'any(.[]; .dev == "${underlay_iface}" and ((.type // "unicast") == "unicast"))' >/dev/null; then
         ready=false
       fi
     done
@@ -367,8 +362,8 @@ RestartSec=3s
 TimeoutStartSec=210s
 TimeoutStopSec=30s
 KillSignal=SIGTERM
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
 NoNewPrivileges=yes
 PrivateDevices=no
 PrivateTmp=yes

@@ -23,24 +23,15 @@ func TestMetricsExposed(t *testing.T) {
 	required := []string{
 		"geneve_rx_packets",
 		"geneve_rx_bytes",
-		"geneve_tx_packets",
-		"geneve_tx_bytes",
 		"decap_errors",
-		"encap_errors",
 		"tun_rx_packets",
 		"tun_tx_packets",
 		"drops",
 		"geneve_options_validation_errors",
 		"gwlb_profile_rejections",
 		"gwlb_receive_drops",
-		"gwlb_send_failures",
-		"gwlb_missing_contexts",
-		"gwlb_conflicted_contexts",
-		"gwlb_possible_loops",
 		"gwlb_unsupported_inner",
-		"gwlb_context_expirations",
-		"gwlb_context_evictions",
-		"gwlb_context_collisions",
+		"symmetric_unexpected_egress",
 		"datapath_component_healthy",
 		"datapath_liveness_transitions",
 		"gwlb_mtu_drops",
@@ -54,6 +45,22 @@ func TestMetricsExposed(t *testing.T) {
 	for _, name := range required {
 		if !strings.Contains(body, name) {
 			t.Fatalf("missing metric %s", name)
+		}
+	}
+	for _, name := range []string{
+		"geneve_tx_packets",
+		"geneve_tx_bytes",
+		"encap_errors",
+		"gwlb_send_failures",
+		"gwlb_missing_contexts",
+		"gwlb_conflicted_contexts",
+		"gwlb_possible_loops",
+		"gwlb_context_expirations",
+		"gwlb_context_evictions",
+		"gwlb_context_collisions",
+	} {
+		if strings.Contains(body, name) {
+			t.Fatalf("obsolete metric %s is exposed", name)
 		}
 	}
 }

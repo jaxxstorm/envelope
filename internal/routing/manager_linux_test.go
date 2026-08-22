@@ -107,6 +107,7 @@ func TestLinuxRuleStateUsesExactShapeAndProtocolMarker(t *testing.T) {
 	}{
 		{name: "absent", json: `[{"priority":32766,"src":"all","dst":"all","table":"main"}]`, want: stateAbsent},
 		{name: "owned", json: "[" + fmt.Sprintf(base, ownerProtocol) + "]", want: stateOwned},
+		{name: "owned named protocol", json: `[{"priority":10000,"src":"all","dst":"10.10.0.0/24","iif":"tailscale0","table":100,"protocol":"bgp"}]`, want: stateOwned},
 		{name: "operator", json: "[" + fmt.Sprintf(base, 4) + "]", want: stateOperator},
 		{name: "omitted all-source", json: `[{"priority":10000,"dst":"10.10.0.0/24","iif":"tailscale0","table":100,"protocol":186}]`, want: stateOwned},
 		{name: "split destination prefix", json: `[{"priority":10000,"src":"all","dst":"10.10.0.0","dstlen":24,"iif":"tailscale0","table":"100","protocol":186}]`, want: stateOwned},

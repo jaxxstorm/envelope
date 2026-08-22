@@ -27,7 +27,7 @@ func TestLinuxIngressMTUDropReasons(t *testing.T) {
 	cfg := testConfig(t, "--tun-mtu=1280")
 	metricSet := metrics.New(prometheus.NewRegistry())
 	tunDev := &captureTun{}
-	dp := NewWithDevices(cfg, nil, metricSet, receiver, &captureSender{}, tunDev)
+	dp := NewWithDevices(cfg, nil, metricSet, receiver, tunDev)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- dp.ingressLoop(ctx) }()
@@ -77,8 +77,8 @@ func TestLinuxIngressMTUDropReasons(t *testing.T) {
 	if got := testutil.ToFloat64(metricSet.MTUDrops.WithLabelValues(metrics.MTUDropFamilyIPv6, metrics.MTUDropDirectionIngress)); got != 1 {
 		t.Fatalf("IPv6 MTU drops=%v, want 1", got)
 	}
-	if testutil.ToFloat64(metricSet.DecapErrors) != 0 || len(tunDev.writes) != 0 || dp.flows.Len() != 0 {
-		t.Fatal("oversized packet was misclassified or reached TUN/context state")
+	if testutil.ToFloat64(metricSet.DecapErrors) != 0 || len(tunDev.writes) != 0 {
+		t.Fatal("oversized packet was misclassified or reached TUN")
 	}
 	if got := testutil.ToFloat64(metricSet.GWLBReceiveDrops.WithLabelValues(metrics.ReceiveDropReasonDatagramTruncated)); got != 0 {
 		t.Fatalf("maximum-options MTU probe was reported as UDP truncation: %v", got)
@@ -96,7 +96,7 @@ func TestLinuxIngressMTUDropReasons(t *testing.T) {
 	}
 }
 
-func TestLinuxRealTunOneByteOversizeEgressDrop(t *testing.T) {
+func TestLinuxRealTunUnexpectedEgressDrop(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("requires root")
 	}
@@ -124,8 +124,7 @@ func TestLinuxRealTunOneByteOversizeEgressDrop(t *testing.T) {
 
 	cfg := testConfig(t, "--tun-mtu=1280")
 	metricSet := metrics.New(prometheus.NewRegistry())
-	sender := &captureSender{}
-	dp := NewWithDevices(cfg, nil, metricSet, &testReceiver{}, sender, tunDev)
+	dp := NewWithDevices(cfg, nil, metricSet, &testReceiver{}, tunDev)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- dp.egressLoop(ctx) }()
@@ -133,7 +132,7 @@ func TestLinuxRealTunOneByteOversizeEgressDrop(t *testing.T) {
 	// IPv6 interface setup). Assert the test packet's counter deltas.
 	time.Sleep(50 * time.Millisecond)
 	baselineDrops := testutil.ToFloat64(metricSet.Drops)
-	baselineMTUDrops := testutil.ToFloat64(metricSet.MTUDrops.WithLabelValues(metrics.MTUDropFamilyIPv4, metrics.MTUDropDirectionEgress))
+	baselineUnexpected := testutil.ToFloat64(metricSet.SymmetricUnexpectedEgress)
 
 	client, err := net.DialUDP("udp4", &net.UDPAddr{IP: net.ParseIP("198.18.0.1")}, &net.UDPAddr{IP: net.ParseIP("198.18.1.1"), Port: 20000})
 	if err != nil {
@@ -150,14 +149,14 @@ func TestLinuxRealTunOneByteOversizeEgressDrop(t *testing.T) {
 	client.Close()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for testutil.ToFloat64(metricSet.MTUDrops.WithLabelValues(metrics.MTUDropFamilyIPv4, metrics.MTUDropDirectionEgress)) != baselineMTUDrops+1 && time.Now().Before(deadline) {
+	for testutil.ToFloat64(metricSet.SymmetricUnexpectedEgress) != baselineUnexpected+1 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if got := testutil.ToFloat64(metricSet.MTUDrops.WithLabelValues(metrics.MTUDropFamilyIPv4, metrics.MTUDropDirectionEgress)); got != baselineMTUDrops+1 {
-		t.Fatalf("real-TUN IPv4 egress MTU drops=%v, want baseline %v + 1", got, baselineMTUDrops)
+	if got := testutil.ToFloat64(metricSet.SymmetricUnexpectedEgress); got != baselineUnexpected+1 {
+		t.Fatalf("real-TUN unexpected egress drops=%v, want baseline %v + 1", got, baselineUnexpected)
 	}
-	if got := testutil.ToFloat64(metricSet.Drops); got != baselineDrops+1 || len(sender.Requests()) != 0 {
-		t.Fatalf("oversized TUN packet drops=%v (baseline %v) sends=%d", got, baselineDrops, len(sender.Requests()))
+	if got := testutil.ToFloat64(metricSet.Drops); got != baselineDrops+1 {
+		t.Fatalf("unexpected TUN packet drops=%v, want baseline %v + 1", got, baselineDrops)
 	}
 
 	cancel()

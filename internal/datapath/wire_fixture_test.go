@@ -63,7 +63,7 @@ func TestFullGWLBPacketFixtures(t *testing.T) {
 					default:
 						reason = profileValidationReason(err)
 					}
-				} else if _, err = flowKeyFromPacket(inner); err != nil {
+				} else if err = validateInnerPacket(inner); err != nil {
 					reason = unsupportedReason(err)
 				}
 			}
@@ -145,4 +145,19 @@ func decodeOuterFixture(frame []byte) (decodedOuterFixture, string) {
 		destination: netip.AddrPortFrom(destinationIP, binary.BigEndian.Uint16(udp[2:4])),
 		payload:     udp[8:],
 	}, ""
+}
+
+func referenceChecksum(data []byte) uint16 {
+	var sum uint32
+	for len(data) > 1 {
+		sum += uint32(binary.BigEndian.Uint16(data[:2]))
+		data = data[2:]
+	}
+	if len(data) == 1 {
+		sum += uint32(data[0]) << 8
+	}
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + sum>>16
+	}
+	return ^uint16(sum)
 }

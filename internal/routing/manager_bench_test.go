@@ -3,7 +3,6 @@ package routing
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/jaxxstorm/envelope/internal/config"
 )
@@ -11,8 +10,7 @@ import (
 func BenchmarkEnsureManagedIdempotent(b *testing.B) {
 	cfg := routingConfig(b, config.RoutingModeManage)
 	ops := readyFakeOps(cfg)
-	ops.recordQueries = false
-	mgr, _ := newTestManager(b, cfg, ops, time.Hour)
+	mgr := newTestManager(b, cfg, ops)
 	if err := mgr.Initialize(context.Background()); err != nil || !mgr.Ready() {
 		b.Fatalf("initialize: %v (%s)", err, mgr.HealthReason())
 	}
@@ -30,9 +28,7 @@ func BenchmarkEnsureManagedIdempotent(b *testing.B) {
 func BenchmarkEffectiveRouteValidation(b *testing.B) {
 	cfg := routingConfig(b, config.RoutingModeVerify)
 	ops := readyFakeOps(cfg)
-	ops.recordQueries = false
-	addEquivalentReturnState(cfg, ops)
-	mgr, _ := newTestManager(b, cfg, ops, time.Hour)
+	mgr := newTestManager(b, cfg, ops)
 
 	ctx := context.Background()
 	b.ReportAllocs()

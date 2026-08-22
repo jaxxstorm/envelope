@@ -110,23 +110,19 @@ func newRoutingStatusHandler(routeMgr routing.Manager) http.HandlerFunc {
 
 func logStartup(cfg *config.Config, log *zap.Logger) {
 	log.Info("starting envelope",
+		zap.Int("config_version", cfg.ConfigVersion),
 		zap.String("udp_bind", cfg.UDPBind),
 		zap.String("tun_name", cfg.TunName),
 		zap.Int("tun_mtu", cfg.TunMTU),
 		zap.String("tailscale_iface", cfg.TailscaleIface),
 		zap.String("underlay_interface", cfg.UnderlayIface),
 		zap.String("routing_mode", string(cfg.RoutingMode)),
-		zap.Strings("gwlb_return_cidrs", cfg.EffectiveGWLBReturnCIDRs()),
-		zap.Strings("local_delivery_cidrs", cfg.EffectiveLocalDeliveryCIDRs()),
-		zap.Strings("remote_tailnet_cidrs", cfg.EffectiveRemoteTailnetCIDRs()),
+		zap.Strings("local_site_cidrs", cfg.EffectiveLocalSiteCIDRs()),
+		zap.Strings("remote_site_cidrs", cfg.EffectiveRemoteSiteCIDRs()),
 		zap.Int("routing_table_id", cfg.RoutingTableID),
 		zap.Int("routing_rule_priority", cfg.RoutingRulePriority),
 		zap.String("metrics_addr", cfg.MetricsAddr),
 		zap.Any("vni", cfg.VNI),
-		zap.Int("flow_capacity", cfg.FlowCapacity),
-		zap.Duration("tcp_flow_timeout", cfg.TCPFlowTimeout),
-		zap.Duration("udp_flow_timeout", cfg.UDPFlowTimeout),
-		zap.Duration("other_flow_timeout", cfg.OtherFlowTimeout),
 		zap.Int("persistent_error_threshold", cfg.PersistentErrorThreshold),
 	)
 }

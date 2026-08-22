@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-func TestCohostDirectionalRoles(t *testing.T) {
+func TestCohostSymmetricSites(t *testing.T) {
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skip("requires Docker")
 	}
@@ -23,11 +23,11 @@ func TestCohostDirectionalRoles(t *testing.T) {
 	cmd.Dir = repository
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("Headscale directional integration: %v\n%s", err, output)
+		t.Fatalf("Headscale symmetric integration: %v\n%s", err, output)
 	}
 }
 
-func TestSaaSCohostDirectionalRoles(t *testing.T) {
+func TestSaaSCohostSymmetricSites(t *testing.T) {
 	if os.Getenv("TAILSCALE_AUTH_KEY_A_FILE") == "" || os.Getenv("TAILSCALE_AUTH_KEY_B_FILE") == "" || os.Getenv("ENVELOPE_TAILNET_ROUTES_PREAPPROVED") != "1" {
 		t.Skip("optional SaaS compatibility test requires two auth-key files and pre-approved routes")
 	}
@@ -52,6 +52,6 @@ func TestSaaSCohostDirectionalRoles(t *testing.T) {
 	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("optional SaaS directional integration: %v\n%s", err, output)
+		t.Fatalf("optional SaaS symmetric integration: %v\n%s", err, output)
 	}
 }

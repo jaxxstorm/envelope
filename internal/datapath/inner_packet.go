@@ -13,71 +13,59 @@ var (
 	ErrTransportTruncated = errors.New("truncated inner TCP or UDP header")
 )
 
-func flowKeyFromPacket(pkt []byte) (flowKey, error) {
+func validateInnerPacket(pkt []byte) error {
 	if len(pkt) < 1 {
-		return flowKey{}, ErrInnerMalformed
+		return ErrInnerMalformed
 	}
 	switch pkt[0] >> 4 {
 	case 4:
-		return flowKeyIPv4(pkt)
+		return validateIPv4Packet(pkt)
 	case 6:
-		return flowKeyIPv6(pkt)
+		return validateIPv6Packet(pkt)
 	default:
-		return flowKey{}, ErrInnerMalformed
+		return ErrInnerMalformed
 	}
 }
 
-func flowKeyIPv4(pkt []byte) (flowKey, error) {
+func validateIPv4Packet(pkt []byte) error {
 	if len(pkt) < 20 {
-		return flowKey{}, ErrInnerMalformed
+		return ErrInnerMalformed
 	}
 	ihl := int(pkt[0]&0x0f) * 4
 	totalLen := int(binary.BigEndian.Uint16(pkt[2:4]))
 	if ihl < 20 || totalLen < ihl || totalLen != len(pkt) {
-		return flowKey{}, ErrInnerMalformed
+		return ErrInnerMalformed
 	}
 	fragment := binary.BigEndian.Uint16(pkt[6:8])
 	if fragment&0x2000 != 0 || fragment&0x1fff != 0 {
-		return flowKey{}, ErrIPv4Fragment
+		return ErrIPv4Fragment
 	}
 
 	proto := pkt[9]
-	key := flowKey{ipFamily: 4, proto: proto}
-	copy(key.srcIP[12:], pkt[12:16])
-	copy(key.dstIP[12:], pkt[16:20])
-	if err := parseTransportPorts(pkt[ihl:totalLen], proto, &key); err != nil {
-		return flowKey{}, err
-	}
-	return key, nil
+	return validateTransport(pkt[ihl:totalLen], proto)
 }
 
-func flowKeyIPv6(pkt []byte) (flowKey, error) {
+func validateIPv6Packet(pkt []byte) error {
 	if len(pkt) < 40 {
-		return flowKey{}, ErrInnerMalformed
+		return ErrInnerMalformed
 	}
 	totalLen := 40 + int(binary.BigEndian.Uint16(pkt[4:6]))
 	if totalLen != len(pkt) {
-		return flowKey{}, ErrInnerMalformed
+		return ErrInnerMalformed
 	}
 
 	proto := pkt[6]
 	transportOffset, extension, err := inspectIPv6Extensions(pkt[:totalLen], proto)
 	if err != nil {
-		return flowKey{}, err
+		return err
 	}
 	if extension {
-		return flowKey{}, ErrIPv6Extension
+		return ErrIPv6Extension
 	}
-	key := flowKey{ipFamily: 6, proto: proto}
-	copy(key.srcIP[:], pkt[8:24])
-	copy(key.dstIP[:], pkt[24:40])
-	if err := parseTransportPorts(pkt[transportOffset:totalLen], proto, &key); err != nil {
-		return flowKey{}, err
-	}
-	return key, nil
+	return validateTransport(pkt[transportOffset:totalLen], proto)
 }
 
-func parseTransportPorts(transport []byte, protocol uint8, key *flowKey) error {
+func validateTransport(transport []byte, protocol uint8) error {
 	switch protocol {
 	case 6:
 		if len(transport) < 20 {
@@ -98,8 +86,6 @@ func parseTransportPorts(transport []byte, protocol uint8, key *flowKey) error {
 	default:
 		return nil
 	}
-	key.srcPort = binary.BigEndian.Uint16(transport[0:2])
-	key.dstPort = binary.BigEndian.Uint16(transport[2:4])
 	return nil
 }
 

@@ -91,16 +91,6 @@ func (timeoutError) Error() string   { return "receive timeout" }
 func (timeoutError) Timeout() bool   { return true }
 func (timeoutError) Temporary() bool { return true }
 
-type lifecycleSender struct {
-	closes atomic.Int32
-}
-
-func (*lifecycleSender) SendPacket(SendRequest) error { return nil }
-func (s *lifecycleSender) Close() error {
-	s.closes.Add(1)
-	return nil
-}
-
 func TestHealthHandlerIncludesPersistentFailureReason(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	metricSet := metrics.New(reg)
@@ -141,6 +131,9 @@ func TestHealthHandlerIncludesPersistentFailureReason(t *testing.T) {
 }
 
 func TestLivenessThresholdAndRecoveryForEveryComponent(t *testing.T) {
+	if got, want := len(livenessComponents), 2; got != want {
+		t.Fatalf("liveness component count = %d, want %d", got, want)
+	}
 	for _, component := range livenessComponents {
 		t.Run(component, func(t *testing.T) {
 			reg := prometheus.NewRegistry()
@@ -171,7 +164,7 @@ func TestReceiveLoopTimeoutRecoversPersistentFailure(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	metricSet := metrics.New(reg)
 	cfg := testConfig(t, "--persistent-error-threshold=2")
-	dp := NewWithDevices(cfg, nil, metricSet, receiver, &captureSender{}, &captureTun{})
+	dp := NewWithDevices(cfg, nil, metricSet, receiver, &captureTun{})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- dp.ingressLoop(ctx) }()
@@ -193,7 +186,7 @@ func TestReceiveLoopTruncatedDatagramsArePeerDrops(t *testing.T) {
 	receiver := newScriptedReceiver()
 	reg := prometheus.NewRegistry()
 	metricSet := metrics.New(reg)
-	dp := NewWithDevices(testConfig(t, "--persistent-error-threshold=1"), nil, metricSet, receiver, &captureSender{}, &captureTun{})
+	dp := NewWithDevices(testConfig(t, "--persistent-error-threshold=1"), nil, metricSet, receiver, &captureTun{})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- dp.ingressLoop(ctx) }()
@@ -221,31 +214,28 @@ func TestReceiveLoopTruncatedDatagramsArePeerDrops(t *testing.T) {
 	}
 }
 
-func TestTunReadLoopPersistentFailureAndRecovery(t *testing.T) {
+func TestTunEgressDropsWithoutChangingLiveness(t *testing.T) {
 	tunDev := newScriptedTun()
-	sender := &captureSender{}
 	reg := prometheus.NewRegistry()
 	metricSet := metrics.New(reg)
 	cfg := testConfig(t, "--persistent-error-threshold=2")
-	dp := NewWithDevices(cfg, nil, metricSet, &testReceiver{}, sender, tunDev)
-	forward := innerIPv4UDP([4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, 1234, 443)
-	reverse := innerIPv4UDP([4]byte{10, 0, 0, 2}, [4]byte{10, 0, 0, 1}, 443, 1234)
-	dp.processIngress(encodeAWSGeneve(t, forward, sanitizedAWSOptions(), nil), testPacketMetadata())
+	dp := NewWithDevices(cfg, nil, metricSet, &testReceiver{}, tunDev)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- dp.egressLoop(ctx) }()
 	tunDev.reads <- tunReadResult{err: errors.New("TUN read failed once")}
 	tunDev.reads <- tunReadResult{err: errors.New("TUN read failed twice")}
-	waitForHealthReason(t, dp, metrics.LivenessComponentTunRead)
-	tunDev.reads <- tunReadResult{packet: reverse}
-	waitForReady(t, dp)
+	if !dp.Ready() {
+		t.Fatalf("TUN read failures changed liveness: %q", dp.HealthReason())
+	}
+	tunDev.reads <- tunReadResult{packet: innerIPv4UDP([4]byte{10, 0, 0, 2}, [4]byte{10, 0, 0, 1}, 443, 1234)}
 	deadline := time.Now().Add(time.Second)
-	for len(sender.Requests()) != 1 && time.Now().Before(deadline) {
+	for testutil.ToFloat64(metricSet.SymmetricUnexpectedEgress) != 1 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if len(sender.Requests()) != 1 {
-		t.Fatal("recovery packet was not sent")
+	if got := testutil.ToFloat64(metricSet.SymmetricUnexpectedEgress); got != 1 {
+		t.Fatalf("unexpected egress drops = %v, want 1", got)
 	}
 	cancel()
 	tunDev.Close()
@@ -257,9 +247,8 @@ func TestTunReadLoopPersistentFailureAndRecovery(t *testing.T) {
 func TestCloseStopsActiveRunAndIsIdempotent(t *testing.T) {
 	receiver := newScriptedReceiver()
 	tunDev := newScriptedTun()
-	sender := &lifecycleSender{}
 	reg := prometheus.NewRegistry()
-	dp := NewWithDevices(testConfig(t), nil, metrics.New(reg), receiver, sender, tunDev)
+	dp := NewWithDevices(testConfig(t), nil, metrics.New(reg), receiver, tunDev)
 	done := make(chan error, 1)
 	go func() { done <- dp.Run(context.Background()) }()
 	waitForRunStarted(t, dp)
@@ -281,8 +270,8 @@ func TestCloseStopsActiveRunAndIsIdempotent(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Close did not terminate active Run")
 	}
-	if receiver.closes.Load() != 1 || tunDev.closes.Load() != 1 || sender.closes.Load() != 1 {
-		t.Fatalf("devices closed receiver=%d tun=%d sender=%d", receiver.closes.Load(), tunDev.closes.Load(), sender.closes.Load())
+	if receiver.closes.Load() != 1 || tunDev.closes.Load() != 1 {
+		t.Fatalf("devices closed receiver=%d tun=%d", receiver.closes.Load(), tunDev.closes.Load())
 	}
 	dp.Close()
 	if err := dp.Run(context.Background()); err != nil {
@@ -294,7 +283,7 @@ func TestUnexpectedReceiverTerminationCancelsSiblingsAndReturnsError(t *testing.
 	receiver := newScriptedReceiver()
 	tunDev := newScriptedTun()
 	reg := prometheus.NewRegistry()
-	dp := NewWithDevices(testConfig(t), nil, metrics.New(reg), receiver, &captureSender{}, tunDev)
+	dp := NewWithDevices(testConfig(t), nil, metrics.New(reg), receiver, tunDev)
 	done := make(chan error, 1)
 	go func() { done <- dp.Run(context.Background()) }()
 	waitForRunStarted(t, dp)
@@ -319,7 +308,7 @@ func TestUnexpectedTunTerminationCancelsSiblingsAndReturnsError(t *testing.T) {
 	receiver := newScriptedReceiver()
 	tunDev := newScriptedTun()
 	reg := prometheus.NewRegistry()
-	dp := NewWithDevices(testConfig(t), nil, metrics.New(reg), receiver, &captureSender{}, tunDev)
+	dp := NewWithDevices(testConfig(t), nil, metrics.New(reg), receiver, tunDev)
 	done := make(chan error, 1)
 	go func() { done <- dp.Run(context.Background()) }()
 	waitForRunStarted(t, dp)
@@ -332,8 +321,8 @@ func TestUnexpectedTunTerminationCancelsSiblingsAndReturnsError(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("unexpected TUN termination did not stop Run")
 	}
-	if dp.Ready() || dp.HealthReason() != metrics.LivenessComponentTunRead {
-		t.Fatalf("TUN termination readiness=%v reason=%q", dp.Ready(), dp.HealthReason())
+	if !dp.Ready() || dp.HealthReason() != "ok" {
+		t.Fatalf("TUN termination changed liveness: readiness=%v reason=%q", dp.Ready(), dp.HealthReason())
 	}
 	if receiver.closes.Load() != 1 {
 		t.Fatal("TUN termination did not cancel and close receive sibling")

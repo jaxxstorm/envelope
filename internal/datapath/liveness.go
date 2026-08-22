@@ -8,9 +8,7 @@ import (
 
 var livenessComponents = [...]string{
 	metrics.LivenessComponentReceive,
-	metrics.LivenessComponentTunRead,
 	metrics.LivenessComponentTunWrite,
-	metrics.LivenessComponentSend,
 }
 
 type componentState struct {

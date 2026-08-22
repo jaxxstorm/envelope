@@ -67,16 +67,35 @@ def config_document(architecture: str = "amd64", *, expired: bool = False) -> di
             "ami_id": ami,
             "ssm_kms_key_arn": key,
             "azs": {"a": f"{region}a", "b": f"{region}b"},
-            "appliance_az_key": "a",
             "vpc_cidr": vpc,
-            "public_subnet_cidr": f"{prefix}.40.0/24",
-            "appliance_subnet_cidr": f"{prefix}.30.0/24",
+            "local_site_cidrs": [f"{prefix}.1.0/24", f"{prefix}.2.0/24"],
+            "remote_site_cidrs": [],
             "workload_subnet_cidrs": {"a": f"{prefix}.1.0/24", "b": f"{prefix}.2.0/24"},
+            "ingress_subnet_cidrs": {"a": f"{prefix}.3.0/24", "b": f"{prefix}.4.0/24"},
             "gwlbe_subnet_cidrs": {"a": f"{prefix}.10.0/24", "b": f"{prefix}.11.0/24"},
             "gwlb_subnet_cidrs": {"a": f"{prefix}.20.0/24", "b": f"{prefix}.21.0/24"},
-            "gwlb_return_cidrs": [f"{prefix}.1.0/24"],
-            "local_delivery_cidrs": [f"{prefix}.2.0/24"],
+            "target_subnet_cidrs": {"a": f"{prefix}.30.0/24", "b": f"{prefix}.31.0/24"},
+            "management_subnet_cidr": f"{prefix}.40.0/24",
+            "target_az_keys": ["a", "b"],
+            "ingress_router_az_keys": ["a", "b"],
         }
+
+    west = site(
+        "us-west-2",
+        "ami-0123456789abcdef0",
+        "arn:aws:kms:us-west-2:123456789012:key/west",
+        "10.10.0.0/16",
+        "10.10",
+    )
+    east = site(
+        "us-east-1",
+        "ami-0fedcba9876543210",
+        "arn:aws:kms:us-east-1:123456789012:key/east",
+        "10.20.0.0/16",
+        "10.20",
+    )
+    west["remote_site_cidrs"] = list(east["local_site_cidrs"])
+    east["remote_site_cidrs"] = list(west["local_site_cidrs"])
 
     return {
         "run_id": "envelope-fixture",
@@ -93,22 +112,7 @@ def config_document(architecture: str = "amd64", *, expired: bool = False) -> di
             "state_key": "runs/envelope-fixture/terraform.tfstate",
             "operator_principal_arns": ["arn:aws:iam::123456789012:role/envelope-operator"],
         },
-        "sites": {
-            "west": site(
-                "us-west-2",
-                "ami-0123456789abcdef0",
-                "arn:aws:kms:us-west-2:123456789012:key/west",
-                "10.10.0.0/16",
-                "10.10",
-            ),
-            "east": site(
-                "us-east-1",
-                "ami-0fedcba9876543210",
-                "arn:aws:kms:us-east-1:123456789012:key/east",
-                "10.20.0.0/16",
-                "10.20",
-            ),
-        },
+        "symmetric_topology": {"version": 2, "sites": {"west": west, "east": east}},
         "tailnet": {
             "name": "fixture.example",
             "tag": "tag:envelope-ci",
@@ -125,6 +129,22 @@ def make_config(tmp: pathlib.Path, architecture: str = "amd64", *, expired: bool
     return appliance.RunConfig.load(path, enforce_future_expiry=not expired)
 
 
+def symmetric_deployment_document(config: appliance.RunConfig) -> dict:
+    return {
+        "envelope_runtime_config": {
+            "value": {
+                site: {
+                    "config_version": 2,
+                    "local_site_cidrs": config.sites[site]["local_site_cidrs"],
+                    "remote_site_cidrs": config.sites[site]["remote_site_cidrs"],
+                }
+                for site in ("west", "east")
+            }
+        },
+        "cost_profile": {"value": {"profile": "symmetric-gwlb-ha-v2"}},
+    }
+
+
 def aws_preflight_summary_document(architecture: str = "amd64") -> dict:
     instance_type = "m7g.medium" if architecture == "arm64" else "t3.medium"
     workload_type = "t4g.micro" if architecture == "arm64" else "t3.micro"
@@ -133,10 +153,10 @@ def aws_preflight_summary_document(architecture: str = "amd64") -> dict:
         ("west", "us-west-2", ("us-west-2a", "us-west-2b")),
         ("east", "us-east-1", ("us-east-1a", "us-east-1b")),
     ):
-        instance_vcpus = {"appliance": 2, "workload": 2}
+        instance_vcpus = {"target": 2, "ingress_router": 2, "workload": 2}
         quotas = {}
         for gate, (service, quota_code, quota_name) in sorted(appliance.AWS_REGIONAL_QUOTA_CONTRACT.items()):
-            required = 6 if gate == "standard-vcpus" else 1
+            required = 12 if gate == "standard-vcpus" else 1
             quotas[gate] = {
                 "service": service,
                 "quota_name": quota_name,
@@ -169,10 +189,13 @@ def aws_preflight_summary_document(architecture: str = "amd64") -> dict:
                 "required": 1,
                 "available": limit,
             }
-        offerings = {f"{instance_type}@{zones[0]}", *(f"{workload_type}@{zone}" for zone in zones)}
+        offerings = {
+            *(f"{instance_type}@{zone}" for zone in zones),
+            *(f"{workload_type}@{zone}" for zone in zones),
+        }
         regions[region] = {
             "site": site,
-            "planned_instances": 3,
+            "planned_instances": 6,
             "instance_vcpus": instance_vcpus,
             "instance_offerings": sorted(offerings),
             "ssm_kms_key_sha256": hashlib.sha256(
@@ -194,8 +217,8 @@ def aws_preflight_summary_document(architecture: str = "amd64") -> dict:
             ],
             "operator_decision": "allowed",
             "run_instances_dry_run": {
-                "west": {"appliance": instance_type, "test": workload_type},
-                "east": {"appliance": instance_type, "test": workload_type},
+                "west": {"target": instance_type, "ingress_router": instance_type, "workload": workload_type},
+                "east": {"target": instance_type, "ingress_router": instance_type, "workload": workload_type},
             },
             "flow_log_delivery_role": list(appliance.AWS_FLOW_LOG_DELIVERY_ACTIONS),
         },
@@ -359,21 +382,18 @@ class ConfigAndPathTest(unittest.TestCase):
             artifact = artifact_identity(root)
             parameters = appliance.intended_ssm_parameters(config, "123456789012")
             values = appliance.terraform_variables(config, artifact, parameters)
-            self.assertEqual(values["west_azs"], config.sites["west"]["azs"])
+            self.assertEqual(values["symmetric_topology"]["sites"]["west"]["azs"], config.sites["west"]["azs"])
             self.assertEqual(config.raw["e2e_load_profile"], e2e_load_profile_document())
             self.assertEqual(values["e2e_load_profile"], config.raw["e2e_load_profile"])
             self.assertIsNot(values["e2e_load_profile"], config.raw["e2e_load_profile"])
-            self.assertEqual(
-                values["envelope_remote_tailnet_cidrs"]["west"],
-                [config.sites["east"]["workload_subnet_cidrs"][key] for key in ("a", "b")],
-            )
-            self.assertEqual(config.lane_cidrs["west"], ["10.10.1.0/24", "10.10.2.0/24"])
+            self.assertEqual(values["symmetric_topology"]["version"], 2)
+            self.assertEqual(config.site_cidrs["west"], ["10.10.1.0/24", "10.10.2.0/24"])
 
             document = config_document()
             document["tailnet"]["lane_cidrs"] = {"west": ["10.99.0.0/24"], "east": ["10.98.0.0/24"]}
             path = root / "duplicate.json"
             path.write_text(json.dumps(document))
-            with self.assertRaisesRegex(appliance.LifecycleError, "only CIDR source"):
+            with self.assertRaisesRegex(appliance.LifecycleError, "unsupported fields"):
                 appliance.RunConfig.load(path)
             document = config_document()
             document["network_tfvars"] = "second-source.json"
@@ -779,7 +799,7 @@ resource /* separator */ "aws_lb_target_group_attachment" "west" {{
             def run(inner, args, *, env=None, cwd=None, input_text=None):
                 inner.calls.append((args, env, cwd))
                 if len(args) > 1 and args[1] == "output":
-                    return json.dumps(deployment_document())
+                    return json.dumps(symmetric_deployment_document(config))
                 return ""
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -1267,9 +1287,7 @@ class CapabilityAWS:
             if operation == "describe-vpcs" and "Name=is-default,Values=true" in args:
                 return {"Vpcs": [{"VpcId": identities["vpc"], "IsDefault": True}]}
             if operation == "describe-subnets":
-                zone = self.config.sites[site]["azs"][
-                    self.config.sites[site]["appliance_az_key"]
-                ]
+                zone = next(iter(self.config.sites[site]["azs"].values()))
                 return {
                     "Subnets": [
                         {
@@ -1399,12 +1417,14 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
             summary["actions"]["run_instances_dry_run"],
             {
                 "west": {
-                    "appliance": config.raw["instance_type"],
-                    "test": config.raw["test_instance_type"],
+                    "target": config.raw["instance_type"],
+                    "ingress_router": config.raw["instance_type"],
+                    "workload": config.raw["test_instance_type"],
                 },
                 "east": {
-                    "appliance": config.raw["instance_type"],
-                    "test": config.raw["test_instance_type"],
+                    "target": config.raw["instance_type"],
+                    "ingress_router": config.raw["instance_type"],
+                    "workload": config.raw["test_instance_type"],
                 },
             },
         )
@@ -1413,9 +1433,9 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
             list(appliance.AWS_FLOW_LOG_DELIVERY_ACTIONS),
         )
         self.assertEqual(set(summary["regions"]), {"us-west-2", "us-east-1"})
-        self.assertEqual(summary["regions"]["us-west-2"]["planned_instances"], 3)
+        self.assertEqual(summary["regions"]["us-west-2"]["planned_instances"], 6)
         self.assertEqual(summary["regions"]["us-west-2"]["excluded_regional_nat_gateways"], 0)
-        self.assertEqual(summary["regions"]["us-west-2"]["quotas"]["standard-vcpus"]["required"], 6)
+        self.assertEqual(summary["regions"]["us-west-2"]["quotas"]["standard-vcpus"]["required"], 12)
         self.assertEqual(
             summary["regions"]["us-west-2"]["quotas"]["standard-vcpus"]["quota_code"],
             "L-1216C47A",
@@ -1517,7 +1537,7 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
             for args, region in aws.calls
             if args[:2] == ["ec2", "run-instances"]
         ]
-        self.assertEqual(len(dry_run_calls), 4)
+        self.assertEqual(len(dry_run_calls), 6)
         self.assertTrue(all("--dry-run" in args for args, _region in dry_run_calls))
         non_dry_mutations = [
             args
@@ -1567,7 +1587,7 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
                 context["kms:EncryptionContext:PARAMETER_ARN"][0],
             )
 
-    def test_run_instances_dry_run_uses_exact_four_safe_probe_commands(self):
+    def test_run_instances_dry_run_uses_exact_six_safe_probe_commands(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = make_config(pathlib.Path(temporary))
             aws = CapabilityAWS(config)
@@ -1575,12 +1595,14 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
 
         expected_summary = {
             "west": {
-                "appliance": config.raw["instance_type"],
-                "test": config.raw["test_instance_type"],
+                "target": config.raw["instance_type"],
+                "ingress_router": config.raw["instance_type"],
+                "workload": config.raw["test_instance_type"],
             },
             "east": {
-                "appliance": config.raw["instance_type"],
-                "test": config.raw["test_instance_type"],
+                "target": config.raw["instance_type"],
+                "ingress_router": config.raw["instance_type"],
+                "workload": config.raw["test_instance_type"],
             },
         }
         self.assertEqual(summary, expected_summary)
@@ -1611,7 +1633,7 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
             for args, region in aws.calls
             if args[:2] == ["ec2", "run-instances"]
         ]
-        self.assertEqual(len(run_calls), 4)
+        self.assertEqual(len(run_calls), 6)
         observed = set()
         for args, region in run_calls:
             site = next(
@@ -1663,7 +1685,7 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
         )
         for site in ("west", "east"):
             region = config.sites[site]["region"]
-            zone = config.sites[site]["azs"][config.sites[site]["appliance_az_key"]]
+            zone = next(iter(config.sites[site]["azs"].values()))
             regional_calls = [args for args, called_region in aws.calls if called_region == region]
             self.assertIn(
                 ["ec2", "describe-vpcs", "--filters", "Name=is-default,Values=true"],
@@ -1801,7 +1823,7 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
                             DryRunStatusAWS(config, mode),
                         )
                     message = str(raised.exception)
-                    self.assertIn("RunInstances dry-run gate west/appliance", message)
+                    self.assertIn("RunInstances dry-run gate west/target", message)
                     self.assertNotIn("UnauthorizedOperation", message)
                     self.assertNotIn("subnet-sensitive", message)
 
@@ -2109,7 +2131,7 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
             ]
             cases.append(operator)
             site = config_document()
-            site["sites"]["east"]["ssm_kms_key_arn"] = (
+            site["symmetric_topology"]["sites"]["east"]["ssm_kms_key_arn"] = (
                 "arn:aws-cn:kms:us-east-1:123456789012:key/east"
             )
             cases.append(site)
@@ -3823,7 +3845,7 @@ class PolicyAndAdapterTest(unittest.TestCase):
             "tag": "tag:envelope-ci",
             "tag_owners": ["group:infra"],
             "advertised_routes": ["10.10.1.0/24", "10.20.1.0/24"],
-            "lane_cidrs": {"west": ["10.10.1.0/24"], "east": ["10.20.1.0/24"]},
+            "site_cidrs": {"west": ["10.10.1.0/24"], "east": ["10.20.1.0/24"]},
             "snat_subnet_routes": False,
         }
         appliance.validate_tailnet_policy(copy.deepcopy(VALID_POLICY), **arguments)
@@ -6367,10 +6389,10 @@ class CloudInitSandboxTest(unittest.TestCase):
             "tun_name": "envelope0",
             "tailscale_iface": "tailscale0",
             "underlay_iface": "ens5",
+            "config_version": "2",
             "routing_mode": "manage",
-            "gwlb_return_cidrs": "10.10.1.0/24",
-            "local_delivery_cidrs": "10.10.2.0/24",
-            "remote_tailnet_cidrs": "10.20.1.0/24,10.20.2.0/24",
+            "local_site_cidrs": "10.10.0.0/16",
+            "remote_site_cidrs": "10.20.0.0/16",
             "routing_table_id": "100",
             "routing_rule_priority": "100",
         }
@@ -6391,7 +6413,14 @@ class CloudInitSandboxTest(unittest.TestCase):
                     if body[1].startswith("#!/usr/bin/env bash"):
                         subprocess.run(["bash", "-n"], input=body[1], text=True, check=True, capture_output=True)
         bootstrap = render_template(templates[1], self.template_values(digest))
-        self.assertIn("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW", bootstrap)
+        self.assertIn("ENVELOPE_CONFIG_VERSION=2", bootstrap)
+        self.assertIn("ENVELOPE_LOCAL_SITE_CIDRS=10.10.0.0/16", bootstrap)
+        self.assertIn("ENVELOPE_REMOTE_SITE_CIDRS=10.20.0.0/16", bootstrap)
+        self.assertNotIn("ENVELOPE_GWLB_RETURN_CIDRS", bootstrap)
+        self.assertNotIn("ENVELOPE_LOCAL_DELIVERY_CIDRS", bootstrap)
+        self.assertNotIn("ENVELOPE_REMOTE_TAILNET_CIDRS", bootstrap)
+        self.assertNotIn("ENVELOPE_TCP_FLOW_TIMEOUT", bootstrap)
+        self.assertNotIn("CAP_NET_RAW", bootstrap)
         self.assertIn("After=cloud-final.service network-online.target tailscaled.service", bootstrap)
         self.assertIn('"$binary" -t mangle -A FORWARD -j ENVELOPE-MSS', bootstrap)
         self.assertIn("snat", appliance.redact("snat"))
@@ -6441,15 +6470,17 @@ class CloudInitSandboxTest(unittest.TestCase):
             re.findall(r"^ReadWritePaths=.*$", host_unit, re.MULTILINE),
             ["ReadWritePaths=/run/envelope-host-network"],
         )
-        self.assertIn("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW", host_unit)
-        self.assertIn("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW", host_unit)
+        self.assertIn("CapabilityBoundingSet=CAP_NET_ADMIN", host_unit)
+        self.assertIn("AmbientCapabilities=CAP_NET_ADMIN", host_unit)
+        self.assertNotIn("CAP_NET_RAW", host_unit)
         self.assertIn("User=envelope", service_unit)
         self.assertIn("Group=envelope", service_unit)
         self.assertNotRegex(service_unit, r"(?m)^User=root$")
         self.assertIn("ExecStartPre=!/usr/local/sbin/envelope-preflight", service_unit)
         self.assertIn("ExecStart=/usr/local/bin/envelope", service_unit)
-        self.assertIn("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW", service_unit)
-        self.assertIn("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW", service_unit)
+        self.assertIn("CapabilityBoundingSet=CAP_NET_ADMIN", service_unit)
+        self.assertIn("AmbientCapabilities=CAP_NET_ADMIN", service_unit)
+        self.assertNotIn("CAP_NET_RAW", service_unit)
         self.assertIn("ProtectKernelTunables=yes", service_unit)
         self.assertIn("net.ipv4.conf.default.rp_filter = 0", rendered)
         self.assertIn("net.ipv4.conf.*.rp_filter = 0", rendered)
@@ -6457,6 +6488,12 @@ class CloudInitSandboxTest(unittest.TestCase):
         self.assertIn('"net.ipv4.conf.$iface.rp_filter=0"', host)
         self.assertIn('"$save_bin" -t "$table"', preflight)
         self.assertNotIn('rules=$("$save_bin")', preflight)
+        self.assertIn('route get "$cidr" iif \'envelope0\'', preflight)
+        self.assertIn('route show table 52 "$cidr"', preflight)
+        self.assertNotIn("(.Self.AllowedIPs // [])", preflight)
+        self.assertIn('"$envelope $underlay"', host)
+        self.assertIn('"$envelope $tailscale"', host)
+        self.assertNotIn('"$tailscale $envelope"', host)
 
     def test_vendored_tailscale_module_has_only_exact_package_installation_before_auth(self):
         module = ROOT / "example/terraform/modules/tailscale-cloudinit"
@@ -6586,14 +6623,20 @@ class CloudInitSandboxTest(unittest.TestCase):
                 "tailscale",
                 """
 if [[ ${1:-} == version ]]; then printf '%s\n' '1.80.3'; exit 0; fi
-printf '{"Version":"1.80.3","TUN":true,"BackendState":"%s","Health":[],"Self":{"AllowedIPs":["10.10.1.0/24","10.10.2.0/24"]},"Peer":{"fixture":{"PrimaryRoutes":["10.20.1.0/24","10.20.2.0/24"]}}}\n' "$BACKEND_STATE"
+printf '{"Version":"1.80.3","TUN":true,"BackendState":"%s","Health":[],"Self":{"AllowedIPs":[]},"Peer":{"fixture":{"PrimaryRoutes":["10.20.0.0/16"]}}}\n' "$BACKEND_STATE"
 """,
             )
             ip = executable(
                 "ip",
                 """
-if [[ $ROUTES_READY == true ]]; then
-  cidr=${@: -1}
+cidr=${@: -1}
+if [[ $* == *"route get"* ]]; then
+  if [[ $LOCAL_ROUTES_READY == true ]]; then
+    printf '[{"dst":"%s","dev":"ens5","type":"unicast"}]\n' "$cidr"
+  else
+    printf '%s\n' '[]'
+  fi
+elif [[ $ROUTES_READY == true ]]; then
   printf '[{"dst":"%s","dev":"tailscale0","type":"unicast"}]\n' "$cidr"
 else
   printf '%s\n' '[]'
@@ -6680,6 +6723,7 @@ cat "$RULES_DIR/$table"
                 "PREFLIGHT_RETRY_SECONDS": "0",
                 "BACKEND_STATE": "Running",
                 "ROUTES_READY": "true",
+                "LOCAL_ROUTES_READY": "true",
                 "RULES_DIR": str(rules_dir),
                 "SAVE_LOG": str(root / "save.log"),
                 "MISSING_TABLE": "",
@@ -6728,6 +6772,7 @@ cat "$RULES_DIR/$table"
             for name, overrides in {
                 "backend": {"BACKEND_STATE": "Stopped"},
                 "route withdrawal": {"ROUTES_READY": "false"},
+                "local delivery withdrawal": {"LOCAL_ROUTES_READY": "false"},
             }.items():
                 with self.subTest(name=name):
                     failed = subprocess.run(
@@ -6783,8 +6828,8 @@ class DeploymentOutputTest(unittest.TestCase):
 
             swapped = deployment_document()
             west = swapped["workload_instances"]["value"]["west"]
-            west["initiator"], west["responder"] = west["responder"], west["initiator"]
-            with self.assertRaisesRegex(appliance.LifecycleError, "configured role or AZ"):
+            west["initiator"]["cidr"] = "10.10.2.0/24"
+            with self.assertRaisesRegex(appliance.LifecycleError, "inconsistent IPv4 metadata"):
                 appliance.deployment_values(swapped, expected_sites=config.sites)
 
     def test_malformed_missing_and_duplicate_workload_output_fails_closed(self):

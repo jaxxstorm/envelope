@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/netip"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -55,15 +54,13 @@ type Datapath struct {
 	metrics *metrics.Metrics
 
 	receiver PacketReceiver
-	sender   PacketSender
 	tun      TunDevice
 
 	udpPool *bufferpool.Pool
 	tunPool *bufferpool.Pool
 
-	flows *flowTable
-	once  *logOnce
-	live  *livenessTracker
+	once *logOnce
+	live *livenessTracker
 
 	initialized atomic.Bool
 	closing     atomic.Bool
@@ -81,25 +78,19 @@ func New(cfg *config.Config, log *zap.Logger, metricSet *metrics.Metrics) (*Data
 	if err != nil {
 		return nil, err
 	}
-	sender, err := newPacketSender(cfg.MaxOuterPacketSize())
-	if err != nil {
-		_ = receiver.Close()
-		return nil, err
-	}
 	tunDev, err := tun.Open(cfg.TunName, cfg.TunMTU)
 	if err != nil {
-		_ = sender.Close()
 		_ = receiver.Close()
 		return nil, err
 	}
-	return newDatapath(cfg, log, metricSet, receiver, sender, tunDev), nil
+	return newDatapath(cfg, log, metricSet, receiver, tunDev), nil
 }
 
-func NewWithDevices(cfg *config.Config, log *zap.Logger, metricSet *metrics.Metrics, receiver PacketReceiver, sender PacketSender, tunDev TunDevice) *Datapath {
-	return newDatapath(cfg, log, metricSet, receiver, sender, tunDev)
+func NewWithDevices(cfg *config.Config, log *zap.Logger, metricSet *metrics.Metrics, receiver PacketReceiver, tunDev TunDevice) *Datapath {
+	return newDatapath(cfg, log, metricSet, receiver, tunDev)
 }
 
-func newDatapath(cfg *config.Config, log *zap.Logger, metricSet *metrics.Metrics, receiver PacketReceiver, sender PacketSender, tunDev TunDevice) *Datapath {
+func newDatapath(cfg *config.Config, log *zap.Logger, metricSet *metrics.Metrics, receiver PacketReceiver, tunDev TunDevice) *Datapath {
 	if log == nil {
 		log = zap.NewNop()
 	}
@@ -109,18 +100,11 @@ func newDatapath(cfg *config.Config, log *zap.Logger, metricSet *metrics.Metrics
 		debug:    log.Core().Enabled(zap.DebugLevel),
 		metrics:  metricSet,
 		receiver: receiver,
-		sender:   sender,
 		tun:      tunDev,
 		udpPool:  bufferpool.New(cfg.MaxUDPReceiveSize()),
 		tunPool:  bufferpool.New(cfg.TunMTU + 1),
-		flows: newFlowTable(flowTableConfig{
-			capacity:     cfg.FlowCapacity,
-			tcpTimeout:   cfg.TCPFlowTimeout,
-			udpTimeout:   cfg.UDPFlowTimeout,
-			otherTimeout: cfg.OtherFlowTimeout,
-		}),
-		once: newLogOnce(),
-		live: newLivenessTracker(cfg.PersistentErrorThreshold, metricSet),
+		once:     newLogOnce(),
+		live:     newLivenessTracker(cfg.PersistentErrorThreshold, metricSet),
 	}
 	dp.initialized.Store(true)
 	return dp
@@ -141,9 +125,6 @@ func (d *Datapath) closeDevices() {
 	d.closeOnce.Do(func() {
 		if d.receiver != nil {
 			_ = d.receiver.Close()
-		}
-		if d.sender != nil {
-			_ = d.sender.Close()
 		}
 		if d.tun != nil {
 			_ = d.tun.Close()
@@ -192,9 +173,8 @@ func (d *Datapath) Run(ctx context.Context) error {
 		return d.runLoop(groupCtx, metrics.LivenessComponentReceive, ErrReceiveLoopTerminated, d.ingressLoop)
 	})
 	g.Go(func() error {
-		return d.runLoop(groupCtx, metrics.LivenessComponentTunRead, ErrTunLoopTerminated, d.egressLoop)
+		return d.runLoop(groupCtx, "", ErrTunLoopTerminated, d.egressLoop)
 	})
-	g.Go(func() error { return d.flowSweepLoop(groupCtx) })
 	closed := make(chan struct{})
 	go func() {
 		<-groupCtx.Done()
@@ -216,34 +196,13 @@ func (d *Datapath) runLoop(ctx context.Context, component string, termination er
 	if ctx.Err() != nil || d.closing.Load() {
 		return nil
 	}
-	d.live.Fatal(component)
+	if component != "" {
+		d.live.Fatal(component)
+	}
 	if err == nil {
 		return termination
 	}
 	return fmt.Errorf("%w: %v", termination, err)
-}
-
-func (d *Datapath) flowSweepLoop(ctx context.Context) error {
-	interval := d.cfg.TCPFlowTimeout
-	for _, timeout := range []time.Duration{d.cfg.UDPFlowTimeout, d.cfg.OtherFlowTimeout} {
-		if timeout < interval {
-			interval = timeout
-		}
-	}
-	interval /= 2
-	if interval < time.Second {
-		interval = time.Second
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			d.recordExpirations(d.flows.Sweep())
-		}
-	}
 }
 
 func (d *Datapath) ingressLoop(ctx context.Context) error {
@@ -320,7 +279,7 @@ func (d *Datapath) processIngress(packet []byte, metadata PacketMetadata) {
 		d.rejectProfile(metrics.ProfileReasonDecode, err, "decode")
 		return
 	}
-	optionMetadata, err := geneve.ValidateAWSProfile(header, payload, d.cfg.EffectiveGeneveOptionsMax())
+	_, err = geneve.ValidateAWSProfile(header, payload, d.cfg.EffectiveGeneveOptionsMax())
 	if err != nil {
 		if isOptionValidationError(err) {
 			d.metrics.GeneveOptionsValidationErrors.WithLabelValues(optionValidationReason(err)).Inc()
@@ -336,8 +295,7 @@ func (d *Datapath) processIngress(packet []byte, metadata PacketMetadata) {
 		}
 		return
 	}
-	key, err := flowKeyFromPacket(payload)
-	if err != nil {
+	if err := validateInnerPacket(payload); err != nil {
 		d.rejectUnsupported(err, true)
 		return
 	}
@@ -345,15 +303,6 @@ func (d *Datapath) processIngress(packet []byte, metadata PacketMetadata) {
 		d.logAllowedTLVs(header.Options)
 	}
 
-	identity := newReturnIdentity(metadata, header, optionMetadata)
-	update := d.flows.Update(key, identity)
-	d.recordExpirations(update.expired)
-	if update.evicted > 0 {
-		d.metrics.GWLBContextEvictions.Add(float64(update.evicted))
-	}
-	if update.collision {
-		d.metrics.GWLBContextCollisions.Inc()
-	}
 	if err := writeTunPacket(d.tun, payload); err != nil {
 		d.live.Failure(metrics.LivenessComponentTunWrite)
 		d.metrics.DecapErrors.Inc()
@@ -375,7 +324,6 @@ func (d *Datapath) processIngress(packet []byte, metadata PacketMetadata) {
 			zap.Int("inner_size", len(payload)),
 			zap.Int("options_len", len(header.Options)),
 		}
-		fields = append(fields, flowKeyDebugFields(key)...)
 		d.log.Debug("packet in", fields...)
 	}
 }
@@ -393,13 +341,11 @@ func (d *Datapath) egressLoop(ctx context.Context) error {
 				}
 				return fmt.Errorf("%w: %v", ErrTunLoopTerminated, err)
 			}
-			d.live.Failure(metrics.LivenessComponentTunRead)
 			if d.once.ShouldLog("tun_read") {
 				d.log.Warn("tun read failed", zap.Error(err))
 			}
 			continue
 		}
-		d.live.Success(metrics.LivenessComponentTunRead)
 		d.processEgress(buf[:n])
 		d.tunPool.Put(buf)
 	}
@@ -407,88 +353,11 @@ func (d *Datapath) egressLoop(ctx context.Context) error {
 
 func (d *Datapath) processEgress(payload []byte) {
 	d.metrics.TunRxPackets.Inc()
-	if len(payload) > d.cfg.TunMTU {
-		d.metrics.Drops.Inc()
-		d.metrics.MTUDrops.WithLabelValues(mtuDropFamily(payload), metrics.MTUDropDirectionEgress).Inc()
-		if d.once.ShouldLog("mtu_egress") {
-			d.log.Warn("egress packet exceeds MTU", zap.Int("size", len(payload)), zap.Int("mtu", d.cfg.TunMTU))
-		}
-		return
+	d.metrics.SymmetricUnexpectedEgress.Inc()
+	if d.once.ShouldLog("unexpected_tun_egress") {
+		d.log.Warn("unexpected TUN egress dropped", zap.Int("inner_size", len(payload)))
 	}
-	key, err := flowKeyFromPacket(payload)
-	if err != nil {
-		d.rejectUnsupported(err, false)
-		return
-	}
-	lookup := d.flows.LookupEgress(key)
-	d.recordExpirations(lookup.expired)
-	switch lookup.status {
-	case flowLookupPossibleLoop:
-		d.metrics.GWLBPossibleLoops.Inc()
-		d.metrics.Drops.Inc()
-		return
-	case flowLookupConflicted:
-		d.metrics.GWLBConflictedContexts.Inc()
-		d.metrics.Drops.Inc()
-		return
-	case flowLookupMissing:
-		d.metrics.GWLBMissingContexts.Inc()
-		d.metrics.Drops.Inc()
-		return
-	}
-
-	identity := lookup.snapshot.identity
-	out := d.udpPool.Get()
-	header := geneve.Header{
-		VNI:      identity.vni,
-		Options:  identity.options,
-		Protocol: identity.protocol,
-		Critical: identity.fixedFlags&geneve.FlagCritical != 0,
-		OAM:      identity.fixedFlags&geneve.FlagOAM != 0,
-	}
-	n, err := geneve.Encode(out, header, payload)
-	if err != nil {
-		d.metrics.EncapErrors.Inc()
-		d.metrics.Drops.Inc()
-		d.udpPool.Put(out)
-		return
-	}
-	request := SendRequest{
-		Source:      netip.AddrPortFrom(identity.localIP, identity.flowPort),
-		Destination: netip.AddrPortFrom(identity.peerIP, awsGenevePort),
-		IfIndex:     identity.ifIndex,
-		Payload:     out[:n],
-	}
-	if err := d.sender.SendPacket(request); err != nil {
-		d.live.Failure(metrics.LivenessComponentSend)
-		d.metrics.GWLBSendFailures.Inc()
-		d.metrics.EncapErrors.Inc()
-		d.metrics.Drops.Inc()
-		if d.once.ShouldLog("packet_send") {
-			d.log.Warn("AWS-compliant packet send failed", zap.Error(err))
-		}
-		d.udpPool.Put(out)
-		return
-	}
-	d.live.Success(metrics.LivenessComponentSend)
-	_, expired := d.flows.Refresh(lookup.handle)
-	d.recordExpirations(expired)
-	d.metrics.GeneveTxPackets.Inc()
-	d.metrics.GeneveTxBytes.Add(float64(n))
-	if d.debug {
-		fields := []zap.Field{
-			zap.String("direction", "tun_to_gwlb"),
-			zap.String("source", request.Source.String()),
-			zap.String("destination", request.Destination.String()),
-			zap.Int("ifindex", request.IfIndex),
-			zap.Int("inner_size", len(payload)),
-			zap.Int("geneve_size", n),
-			zap.Int("options_len", len(identity.options)),
-		}
-		fields = append(fields, flowKeyDebugFields(key)...)
-		d.log.Debug("packet out", fields...)
-	}
-	d.udpPool.Put(out)
+	d.metrics.Drops.Inc()
 }
 
 func mtuDropFamily(packet []byte) string {
@@ -526,14 +395,6 @@ func (d *Datapath) rejectUnsupported(err error, ingress bool) {
 	d.metrics.Drops.Inc()
 	if ingress {
 		d.metrics.DecapErrors.Inc()
-	} else {
-		d.metrics.EncapErrors.Inc()
-	}
-}
-
-func (d *Datapath) recordExpirations(count int) {
-	if count > 0 {
-		d.metrics.GWLBContextExpirations.Add(float64(count))
 	}
 }
 
@@ -641,26 +502,4 @@ func unsupportedReason(err error) string {
 	default:
 		return metrics.UnsupportedReasonMalformed
 	}
-}
-
-func flowKeyDebugFields(key flowKey) []zap.Field {
-	srcIP := net.IP(key.srcIP[:]).String()
-	dstIP := net.IP(key.dstIP[:]).String()
-	if key.ipFamily == 4 {
-		srcIP = net.IP(key.srcIP[12:16]).String()
-		dstIP = net.IP(key.dstIP[12:16]).String()
-	}
-	fields := []zap.Field{
-		zap.String("src_ip", srcIP),
-		zap.String("dst_ip", dstIP),
-		zap.Uint8("proto", key.proto),
-		zap.Uint8("ip_family", key.ipFamily),
-	}
-	if key.proto == 6 || key.proto == 17 {
-		fields = append(fields,
-			zap.Uint16("src_port", key.srcPort),
-			zap.Uint16("dst_port", key.dstPort),
-		)
-	}
-	return fields
 }

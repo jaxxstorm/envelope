@@ -110,7 +110,7 @@ func (f *fakeRoutingManager) HealthReason() string {
 }
 
 func (f *fakeRoutingManager) Status() routing.Status {
-	return routing.Status{Mode: string(f.mode), Ready: f.ready.Load(), Reason: f.HealthReason(), GWLBReturnCIDRs: []string{"10.10.0.0/24"}}
+	return routing.Status{Mode: string(f.mode), Ready: f.ready.Load(), Reason: f.HealthReason(), LocalSiteCIDRs: []string{"10.10.0.0/24"}}
 }
 
 func TestRunLifecycle(t *testing.T) {
@@ -201,14 +201,13 @@ func TestHealthHandlerDatapathFailureCannotBeMaskedByRouting(t *testing.T) {
 	}
 }
 
-func TestStartupLogReportsDirectionalRoles(t *testing.T) {
+func TestStartupLogReportsSymmetricConfiguration(t *testing.T) {
 	cfg, err := config.Parse([]string{
 		"--udp-bind=:6081",
 		"--metrics-addr=:9090",
 		"--underlay-interface=eth0",
-		"--gwlb-return-cidrs=10.10.0.0/24",
-		"--local-delivery-cidrs=10.20.0.0/24",
-		"--remote-tailnet-cidrs=10.30.0.0/24",
+		"--local-site-cidrs=10.10.0.0/24",
+		"--remote-site-cidrs=10.20.0.0/24",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -220,13 +219,15 @@ func TestStartupLogReportsDirectionalRoles(t *testing.T) {
 		t.Fatalf("startup entries=%d, want 1", len(entries))
 	}
 	fields := entries[0].ContextMap()
-	for _, name := range []string{"gwlb_return_cidrs", "local_delivery_cidrs", "remote_tailnet_cidrs", "underlay_interface"} {
+	for _, name := range []string{"config_version", "local_site_cidrs", "remote_site_cidrs", "underlay_interface"} {
 		if _, ok := fields[name]; !ok {
 			t.Fatalf("startup log missing %q: %v", name, fields)
 		}
 	}
-	if _, legacy := fields["protected_cidrs"]; legacy {
-		t.Fatal("startup log retained legacy protected_cidrs field")
+	for _, name := range []string{"gwlb_return_cidrs", "local_delivery_cidrs", "remote_tailnet_cidrs", "flow_capacity", "tcp_flow_timeout", "udp_flow_timeout", "other_flow_timeout"} {
+		if _, legacy := fields[name]; legacy {
+			t.Fatalf("startup log retained legacy field %q", name)
+		}
 	}
 }
 
@@ -238,7 +239,7 @@ func TestRoutingStatusHandlerIsRedactedAndRoleSpecific(t *testing.T) {
 		t.Fatalf("status=%d", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, required := range []string{"gwlb_return_cidrs", "route_unaccepted", "10.10.0.0/24"} {
+	for _, required := range []string{"local_site_cidrs", "route_unaccepted", "10.10.0.0/24"} {
 		if !strings.Contains(body, required) {
 			t.Fatalf("routing status missing %q: %s", required, body)
 		}

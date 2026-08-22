@@ -122,7 +122,7 @@ func (s *systemOpsLinux) RuleState(ctx context.Context, family string, priority 
 			continue
 		}
 		ruleTable := rawTable(rule["table"])
-		ruleProtocol, _ := rawInt(rule["protocol"])
+		ruleProtocol := rawProtocol(rule["protocol"])
 		source := rawPrefix(rule, "src", "srclen", family)
 		allSource := "0.0.0.0/0"
 		if family == "-6" {
@@ -183,6 +183,7 @@ func (s *systemOpsLinux) Rules(ctx context.Context, family string) ([]policyRule
 			Input:                input,
 			Table:                table,
 			Action:               action,
+			Protocol:             rawProtocol(raw["protocol"]),
 			Mark:                 mark,
 			Mask:                 mask,
 			HasMark:              hasMark,
@@ -321,7 +322,7 @@ func (s *systemOpsLinux) RouteLookup(ctx context.Context, query routeQuery) (rou
 	if table == 0 {
 		table = mainRouteTable
 	}
-	protocol, _ := rawInt(route["protocol"])
+	protocol := rawProtocol(route["protocol"])
 	return routeResult{Device: rawString(route["dev"]), Table: table, Type: rawString(route["type"]), Protocol: protocol}, nil
 }
 
@@ -369,7 +370,7 @@ func (s *systemOpsLinux) routes(ctx context.Context, family string, table int, e
 		if routeTable == 0 {
 			routeTable = table
 		}
-		protocol, _ := rawInt(route["protocol"])
+		protocol := rawProtocol(route["protocol"])
 		source := rawPrefix(route, "from", "fromlen", family)
 		if !validPolicyRulePrefix(source, family) {
 			return nil, fmt.Errorf("decode table %d route source %q", table, source)
@@ -814,6 +815,18 @@ func rawInt(raw json.RawMessage) (int, bool) {
 func rawIntDefault(raw json.RawMessage) int {
 	value, _ := rawInt(raw)
 	return value
+}
+
+func rawProtocol(raw json.RawMessage) int {
+	if value, ok := rawInt(raw); ok {
+		return value
+	}
+	// iproute2 renders the numeric owner marker 186 as the registered BGP
+	// protocol name in JSON output.
+	if rawString(raw) == "bgp" {
+		return ownerProtocol
+	}
+	return 0
 }
 
 func rawBool(raw json.RawMessage) bool {

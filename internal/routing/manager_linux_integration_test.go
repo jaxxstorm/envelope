@@ -203,7 +203,7 @@ func TestRoutingNamespaceDisabledRPFilterTUNLookup(t *testing.T) {
 	}
 }
 
-func TestRoutingNamespaceDirectionalRoles(t *testing.T) {
+func TestRoutingNamespaceSymmetricTargetRoutes(t *testing.T) {
 	if os.Getenv(routingNamespaceHelperEnv) == "1" {
 		runRoutingNamespaceHelper(t)
 		return
@@ -266,7 +266,7 @@ func TestRoutingNamespaceDirectionalRoles(t *testing.T) {
 		routingTestTailscaleEnv + "=" + tailscalePath,
 		routingTestLockPathEnv + "=" + filepath.Join(commandDir, "routing.lock"),
 		"PATH=" + os.Getenv("PATH"),
-		os.Args[0], "-test.run=^TestRoutingNamespaceDirectionalRoles$", "-test.v",
+		os.Args[0], "-test.run=^TestRoutingNamespaceSymmetricTargetRoutes$", "-test.v",
 	}
 	cmd := exec.Command("ip", args...)
 	out, err := cmd.CombinedOutput()
@@ -288,9 +288,8 @@ func runRoutingNamespaceHelper(t *testing.T) {
 		"--tailscale-iface=tailscale0",
 		"--tun-name=envelope0",
 		"--tun-mtu=1280",
-		"--gwlb-return-cidrs=10.10.0.0/24,2001:db8:10::/64",
-		"--local-delivery-cidrs=10.20.0.0/24,2001:db8:20::/64",
-		"--remote-tailnet-cidrs=10.30.0.0/24,2001:db8:30::/64",
+		"--local-site-cidrs=10.20.0.0/24,2001:db8:20::/64",
+		"--remote-site-cidrs=10.30.0.0/24,2001:db8:30::/64",
 	})
 	if err != nil {
 		t.Fatalf("parse helper config: %v", err)
@@ -315,6 +314,13 @@ func runRoutingNamespaceHelper(t *testing.T) {
 		fib, _ := exec.Command(ops.paths.ip, "-j", "-details", "-N", "-4", "route", "show", "table", strconv.Itoa(config.TailscaleRouteTableID)).CombinedOutput()
 		t.Fatalf("initialize ready=%v reason=%s err=%v rules=%s fib=%s", mgr.Ready(), mgr.HealthReason(), err, rules, fib)
 	}
+	for _, family := range []string{"-4", "-6"} {
+		cidr := map[string]string{"-4": "10.20.0.0/24", "-6": "2001:db8:20::/64"}[family]
+		state, err := ops.RuleState(context.Background(), family, cfg.RoutingRulePriority, cfg.TunName, cidr, mainRouteTable, ownerProtocol)
+		if err != nil || state != stateOwned {
+			t.Fatalf("post-inspection rule family=%s cidr=%s state=%d err=%v", family, cidr, state, err)
+		}
+	}
 	writeIntegrationStatus(t, statusPath, "Running", true, false)
 	verifyCfg := *cfg
 	verifyCfg.RoutingMode = config.RoutingModeVerify
@@ -328,19 +334,10 @@ func runRoutingNamespaceHelper(t *testing.T) {
 	assertManagerReason(t, unavailableRM.(*manager), metrics.RoutingFailureReasonRouteUnavailable)
 	writeIntegrationStatus(t, statusPath, "Running", true, true)
 
-	assertEffectiveRoute(t, mgr.op, "-4", "10.10.0.1", "10.30.0.1", "tailscale0", "envelope0", cfg.RoutingTableID)
-	assertEffectiveRoute(t, mgr.op, "-4", "10.20.0.1", "10.30.0.1", "tailscale0", "underlay0", mainRouteTable)
-	assertEffectiveRoute(t, mgr.op, "-4", "10.30.0.1", "10.10.0.1", "envelope0", "tailscale0", config.TailscaleRouteTableID)
-	assertEffectiveRoute(t, mgr.op, "-6", "2001:db8:10::1", "2001:db8:30::1", "tailscale0", "envelope0", cfg.RoutingTableID)
-	assertEffectiveRoute(t, mgr.op, "-6", "2001:db8:20::1", "2001:db8:30::1", "tailscale0", "underlay0", mainRouteTable)
-	assertEffectiveRoute(t, mgr.op, "-6", "2001:db8:30::1", "2001:db8:10::1", "envelope0", "tailscale0", config.TailscaleRouteTableID)
-
-	runIntegrationCommand(t, "ip", "route", "add", "blackhole", "10.10.0.64/26", "table", strconv.Itoa(cfg.RoutingTableID))
-	mgr.reconcile(context.Background(), false)
-	assertManagerReason(t, mgr, metrics.RoutingFailureReasonReturnRoute)
-	runIntegrationCommand(t, "ip", "route", "del", "blackhole", "10.10.0.64/26", "table", strconv.Itoa(cfg.RoutingTableID))
-	mgr.reconcile(context.Background(), false)
-	assertManagerReady(t, mgr)
+	assertEffectiveRoute(t, mgr.op, "-4", "10.20.0.1", "10.30.0.1", "envelope0", "underlay0", mainRouteTable)
+	assertEffectiveRoute(t, mgr.op, "-4", "10.30.0.1", "10.20.0.1", "envelope0", "tailscale0", config.TailscaleRouteTableID)
+	assertEffectiveRoute(t, mgr.op, "-6", "2001:db8:20::1", "2001:db8:30::1", "envelope0", "underlay0", mainRouteTable)
+	assertEffectiveRoute(t, mgr.op, "-6", "2001:db8:30::1", "2001:db8:20::1", "envelope0", "tailscale0", config.TailscaleRouteTableID)
 
 	runIntegrationCommand(t, "ip", "route", "add", "table", "123", "10.20.0.0/24", "dev", "envelope0")
 	runIntegrationCommand(t, "ip", "rule", "add", "priority", "50", "from", "10.30.0.64/26", "to", "10.20.0.0/24", "table", "123")
@@ -361,14 +358,10 @@ func runRoutingNamespaceHelper(t *testing.T) {
 		port          int
 		expectedMSS   int
 	}{
-		{name: "IPv4 underlay to Tailscale", sourceNS: deliveryNS, destinationNS: remoteNS, captureIface: "tailpeer0", destination: "10.30.0.1", filter: "tcp", port: 18080, expectedMSS: 1240},
-		{name: "IPv4 Tailscale to underlay", sourceNS: remoteNS, destinationNS: deliveryNS, captureIface: "delivery0", destination: "10.20.0.1", filter: "tcp", port: 18081, expectedMSS: 1240},
-		{name: "IPv4 Envelope to Tailscale", sourceNS: returnNS, destinationNS: remoteNS, captureIface: "tailpeer0", destination: "10.30.0.1", filter: "tcp", port: 18082, expectedMSS: 1240},
-		{name: "IPv4 Tailscale to Envelope", sourceNS: remoteNS, destinationNS: returnNS, captureIface: "return0", destination: "10.10.0.1", filter: "tcp", port: 18083, expectedMSS: 1240},
-		{name: "IPv6 underlay to Tailscale", sourceNS: deliveryNS, destinationNS: remoteNS, captureIface: "tailpeer0", destination: "2001:db8:30::1", filter: "ip6 and tcp", port: 18180, expectedMSS: 1220},
-		{name: "IPv6 Tailscale to underlay", sourceNS: remoteNS, destinationNS: deliveryNS, captureIface: "delivery0", destination: "2001:db8:20::1", filter: "ip6 and tcp", port: 18181, expectedMSS: 1220},
-		{name: "IPv6 Envelope to Tailscale", sourceNS: returnNS, destinationNS: remoteNS, captureIface: "tailpeer0", destination: "2001:db8:30::1", filter: "ip6 and tcp", port: 18182, expectedMSS: 1220},
-		{name: "IPv6 Tailscale to Envelope", sourceNS: remoteNS, destinationNS: returnNS, captureIface: "return0", destination: "2001:db8:10::1", filter: "ip6 and tcp", port: 18183, expectedMSS: 1220},
+		{name: "IPv4 Envelope to local site", sourceNS: returnNS, destinationNS: deliveryNS, captureIface: "delivery0", destination: "10.20.0.1", filter: "tcp", port: 18080, expectedMSS: 1240},
+		{name: "IPv4 Envelope to remote site", sourceNS: returnNS, destinationNS: remoteNS, captureIface: "tailpeer0", destination: "10.30.0.1", filter: "tcp", port: 18081, expectedMSS: 1240},
+		{name: "IPv6 Envelope to local site", sourceNS: returnNS, destinationNS: deliveryNS, captureIface: "delivery0", destination: "2001:db8:20::1", filter: "ip6 and tcp", port: 18180, expectedMSS: 1220},
+		{name: "IPv6 Envelope to remote site", sourceNS: returnNS, destinationNS: remoteNS, captureIface: "tailpeer0", destination: "2001:db8:30::1", filter: "ip6 and tcp", port: 18181, expectedMSS: 1220},
 	}
 	for _, path := range mssPaths {
 		t.Run(path.name, func(t *testing.T) {
@@ -397,10 +390,10 @@ func runRoutingNamespaceHelper(t *testing.T) {
 	mgr.reconcile(context.Background(), false)
 	assertManagerReady(t, mgr)
 
-	deleteFirewallPath(t, ops.paths.iptables, "underlay0", "tailscale0")
+	deleteFirewallPath(t, ops.paths.iptables, "envelope0", "tailscale0")
 	mgr.reconcile(context.Background(), false)
 	assertManagerReason(t, mgr, metrics.RoutingFailureReasonFirewall)
-	addFirewallPath(t, ops.paths.iptables, "underlay0", "tailscale0")
+	addFirewallPath(t, ops.paths.iptables, "envelope0", "tailscale0")
 	mgr.reconcile(context.Background(), false)
 	assertManagerReady(t, mgr)
 
@@ -429,10 +422,10 @@ func runRoutingNamespaceHelper(t *testing.T) {
 		assertManagerReady(t, mgr)
 	}
 
-	deleteMSSPath(t, ops.paths.ip6tables, "tailscale0", "envelope0", 1220)
+	deleteMSSPath(t, ops.paths.ip6tables, "envelope0", "underlay0", 1220)
 	mgr.reconcile(context.Background(), false)
 	assertManagerReason(t, mgr, metrics.RoutingFailureReasonMSS)
-	addMSSPath(t, ops.paths.ip6tables, "tailscale0", "envelope0", 1220)
+	addMSSPath(t, ops.paths.ip6tables, "envelope0", "underlay0", 1220)
 	mgr.reconcile(context.Background(), false)
 	assertManagerReady(t, mgr)
 
@@ -465,11 +458,6 @@ func runRoutingNamespaceHelper(t *testing.T) {
 	mgr.reconcile(context.Background(), false)
 	assertManagerReady(t, mgr)
 
-	returnTarget := buildTargets(cfg.EffectiveGWLBReturnCIDRs())[0]
-	runIntegrationCommand(t, "ip", returnTarget.family, "rule", "del", "priority", strconv.Itoa(cfg.RoutingRulePriority), "iif", cfg.TailscaleIface, "to", returnTarget.cidr, "table", strconv.Itoa(cfg.RoutingTableID), "protocol", strconv.Itoa(ownerProtocol))
-	mgr.reconcile(context.Background(), false)
-	assertManagerReady(t, mgr)
-
 	before := integrationCommandOutput(t, "ip", "rule", "show")
 	if _, err := config.Parse([]string{"--udp-bind=:6081", "--metrics-addr=:9090", "--tun-name=shared0", "--tailscale-iface=shared0"}); err == nil {
 		t.Fatal("interface collision unexpectedly passed validation")
@@ -482,10 +470,11 @@ func runRoutingNamespaceHelper(t *testing.T) {
 	if err := mgr.cleanupManaged(); err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
-	for _, target := range buildTargets(cfg.EffectiveGWLBReturnCIDRs()) {
-		state, err := mgr.op.RuleState(context.Background(), target.family, cfg.RoutingRulePriority, cfg.TailscaleIface, target.cidr, cfg.RoutingTableID, ownerProtocol)
-		if err != nil || state == stateOwned {
-			t.Fatalf("owned rule survived cleanup for %s: state=%d err=%v", target.cidr, state, err)
+	for _, family := range []string{"-4", "-6"} {
+		cidr := map[string]string{"-4": "10.20.0.0/24", "-6": "2001:db8:20::/64"}[family]
+		state, err := ops.RuleState(context.Background(), family, cfg.RoutingRulePriority, cfg.TunName, cidr, mainRouteTable, ownerProtocol)
+		if err != nil || state != stateAbsent {
+			t.Fatalf("post-inspection rule cleanup family=%s cidr=%s state=%d err=%v", family, cidr, state, err)
 		}
 	}
 	if err := mgr.releaseLock(); err != nil {
@@ -607,13 +596,12 @@ func configureNamespaceAddresses(t *testing.T, routerNS, deliveryNS, remoteNS, r
 	}
 	runIntegrationCommand(t, "ip", "-n", routerNS, "route", "add", "10.20.0.0/24", "dev", "underlay0")
 	runIntegrationCommand(t, "ip", "-n", routerNS, "-6", "route", "add", "2001:db8:20::/64", "dev", "underlay0")
-	runIntegrationCommand(t, "ip", "-n", routerNS, "route", "add", "10.10.0.0/24", "dev", "envelope0")
+	runIntegrationCommand(t, "ip", "-n", routerNS, "route", "add", "table", strconv.Itoa(config.TailscaleRouteTableID), "10.20.0.0/24", "dev", "tailscale0")
+	runIntegrationCommand(t, "ip", "-n", routerNS, "-6", "route", "add", "table", strconv.Itoa(config.TailscaleRouteTableID), "2001:db8:20::/64", "dev", "tailscale0")
 	runIntegrationCommand(t, "ip", "-n", routerNS, "route", "add", "table", strconv.Itoa(config.TailscaleRouteTableID), "10.30.0.0/24", "dev", "tailscale0")
 	runIntegrationCommand(t, "ip", "-n", routerNS, "-6", "route", "add", "table", strconv.Itoa(config.TailscaleRouteTableID), "2001:db8:30::/64", "dev", "tailscale0")
-	for _, family := range []string{"-4", "-6"} {
-		runIntegrationCommand(t, "ip", "-n", routerNS, family, "rule", "add", "priority", "5200", "iif", "envelope0", "table", strconv.Itoa(config.TailscaleRouteTableID))
-		runIntegrationCommand(t, "ip", "-n", routerNS, family, "rule", "add", "priority", "5201", "iif", "underlay0", "table", strconv.Itoa(config.TailscaleRouteTableID))
-	}
+	runIntegrationCommand(t, "ip", "-n", routerNS, "-4", "rule", "add", "priority", "5270", "table", strconv.Itoa(config.TailscaleRouteTableID))
+	runIntegrationCommand(t, "ip", "-n", routerNS, "-6", "rule", "add", "priority", "5270", "table", strconv.Itoa(config.TailscaleRouteTableID))
 	runIntegrationCommand(t, "ip", "-n", routerNS, "link", "set", "tailscale0", "mtu", "1280")
 	runIntegrationCommand(t, "ip", "-n", remoteNS, "link", "set", "tailpeer0", "mtu", "1280")
 }
@@ -637,7 +625,7 @@ func configureRouterHostPolicy(t *testing.T, routerNS, iptablesPath, ip6tablesPa
 		runIntegrationCommand(t, "ip", "netns", "exec", routerNS, binary, "-I", "FORWARD", "1", "-j", filterChainName)
 		runIntegrationCommand(t, "ip", "netns", "exec", routerNS, binary, "-t", "mangle", "-N", mssChainName)
 		runIntegrationCommand(t, "ip", "netns", "exec", routerNS, binary, "-t", "mangle", "-I", "FORWARD", "1", "-j", mssChainName)
-		for _, direction := range [][2]string{{"underlay0", "tailscale0"}, {"tailscale0", "underlay0"}, {"envelope0", "tailscale0"}, {"tailscale0", "envelope0"}} {
+		for _, direction := range [][2]string{{"envelope0", "underlay0"}, {"envelope0", "tailscale0"}} {
 			runIntegrationCommand(t, "ip", "netns", "exec", routerNS, binary, "-A", filterChainName, "-i", direction[0], "-o", direction[1], "-j", "ACCEPT")
 			mss := "1240"
 			if binary == ip6tablesPath {
@@ -660,7 +648,7 @@ func writeIntegrationStatus(t *testing.T, path, backend string, approved, remote
 		Peer:         map[string]*tailscalePeerStatus{},
 	}
 	if approved {
-		status.Self.AllowedIPs = []string{"10.10.0.0/24", "2001:db8:10::/64", "10.20.0.0/24", "2001:db8:20::/64"}
+		status.Self.AllowedIPs = nil
 	}
 	if remote {
 		status.Peer["peer"] = &tailscalePeerStatus{
