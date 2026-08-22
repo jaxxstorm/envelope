@@ -251,10 +251,8 @@ host_contract_is_read_only_ready() {
     [[ $(grep -Ec -- '^-A FORWARD -j ENVELOPE-FORWARD$' <<<"$rules") == 1 ]] || return 1
     [[ $(grep -Ec -- '^-A FORWARD -j ENVELOPE-MSS$' <<<"$rules") == 1 ]] || return 1
     for direction in \
-      '${underlay_iface} ${tailscale_iface}' \
-      '${tailscale_iface} ${underlay_iface}' \
-      '${tun_name} ${tailscale_iface}' \
-      '${tailscale_iface} ${tun_name}'; do
+      '${tun_name} ${underlay_iface}' \
+      '${tun_name} ${tailscale_iface}'; do
       read -r input output <<<"$direction"
       grep -Fqx -- "-A ENVELOPE-FORWARD -i $input -o $output -j ACCEPT" <<<"$rules" || return 1
       grep -F -- "-A ENVELOPE-MSS -i $input -o $output -p tcp" <<<"$rules" >/dev/null || return 1

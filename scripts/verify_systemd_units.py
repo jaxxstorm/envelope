@@ -73,6 +73,16 @@ def verify_privilege_contract(text: str, units: dict[str, str]) -> None:
     for prohibited in ('"$underlay $tailscale"', '"$tailscale $underlay"', '"$tailscale $envelope"'):
         if prohibited in host:
             raise RuntimeError(f"host-network script retains directional forwarding path: {prohibited}")
+    for required in ("'${tun_name} ${underlay_iface}'", "'${tun_name} ${tailscale_iface}'"):
+        if required not in preflight:
+            raise RuntimeError(f"target preflight omits symmetric forwarding path: {required}")
+    for prohibited in (
+        "'${underlay_iface} ${tailscale_iface}'",
+        "'${tailscale_iface} ${underlay_iface}'",
+        "'${tailscale_iface} ${tun_name}'",
+    ):
+        if prohibited in preflight:
+            raise RuntimeError(f"target preflight retains directional forwarding path: {prohibited}")
     if "(.Self.AllowedIPs // [])" in preflight:
         raise RuntimeError("target preflight must not require ingress-router route advertisements")
     if 'route get "$cidr" iif \'${tun_name}\'' not in preflight:

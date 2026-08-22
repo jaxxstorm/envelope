@@ -6515,6 +6515,11 @@ class CloudInitSandboxTest(unittest.TestCase):
         self.assertIn('"$envelope $underlay"', host)
         self.assertIn('"$envelope $tailscale"', host)
         self.assertNotIn('"$tailscale $envelope"', host)
+        self.assertIn("'envelope0 ens5'", preflight)
+        self.assertIn("'envelope0 tailscale0'", preflight)
+        self.assertNotIn("'ens5 tailscale0'", preflight)
+        self.assertNotIn("'tailscale0 ens5'", preflight)
+        self.assertNotIn("'tailscale0 envelope0'", preflight)
 
     def test_vendored_tailscale_module_has_only_exact_package_installation_before_auth(self):
         module = ROOT / "example/terraform/modules/tailscale-cloudinit"
@@ -6684,19 +6689,15 @@ esac
 -P OUTPUT ACCEPT
 -N ENVELOPE-FORWARD
 -A FORWARD -j ENVELOPE-FORWARD
--A ENVELOPE-FORWARD -i ens5 -o tailscale0 -j ACCEPT
--A ENVELOPE-FORWARD -i tailscale0 -o ens5 -j ACCEPT
+-A ENVELOPE-FORWARD -i envelope0 -o ens5 -j ACCEPT
 -A ENVELOPE-FORWARD -i envelope0 -o tailscale0 -j ACCEPT
--A ENVELOPE-FORWARD -i tailscale0 -o envelope0 -j ACCEPT
 COMMIT
 """
             mangle_rules = """*mangle
 -N ENVELOPE-MSS
 -A FORWARD -j ENVELOPE-MSS
--A ENVELOPE-MSS -i ens5 -o tailscale0 -p tcp -j TCPMSS
--A ENVELOPE-MSS -i tailscale0 -o ens5 -p tcp -j TCPMSS
+-A ENVELOPE-MSS -i envelope0 -o ens5 -p tcp -j TCPMSS
 -A ENVELOPE-MSS -i envelope0 -o tailscale0 -p tcp -j TCPMSS
--A ENVELOPE-MSS -i tailscale0 -o envelope0 -p tcp -j TCPMSS
 COMMIT
 """
             save_body = """
