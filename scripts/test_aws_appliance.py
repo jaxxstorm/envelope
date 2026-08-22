@@ -6443,7 +6443,6 @@ class CloudInitSandboxTest(unittest.TestCase):
         self.assertNotIn("ENVELOPE_LOCAL_DELIVERY_CIDRS", bootstrap)
         self.assertNotIn("ENVELOPE_REMOTE_TAILNET_CIDRS", bootstrap)
         self.assertNotIn("ENVELOPE_TCP_FLOW_TIMEOUT", bootstrap)
-        self.assertNotIn("CAP_NET_RAW", bootstrap)
         self.assertIn("After=cloud-final.service network-online.target tailscaled.service", bootstrap)
         self.assertIn('"$binary" -t mangle -A FORWARD -j ENVELOPE-MSS', bootstrap)
         self.assertIn("snat", appliance.redact("snat"))
@@ -6493,9 +6492,8 @@ class CloudInitSandboxTest(unittest.TestCase):
             re.findall(r"^ReadWritePaths=.*$", host_unit, re.MULTILINE),
             ["ReadWritePaths=/run/envelope-host-network"],
         )
-        self.assertIn("CapabilityBoundingSet=CAP_NET_ADMIN", host_unit)
-        self.assertIn("AmbientCapabilities=CAP_NET_ADMIN", host_unit)
-        self.assertNotIn("CAP_NET_RAW", host_unit)
+        self.assertIn("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW", host_unit)
+        self.assertIn("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW", host_unit)
         self.assertIn("User=envelope", service_unit)
         self.assertIn("Group=envelope", service_unit)
         self.assertNotRegex(service_unit, r"(?m)^User=root$")

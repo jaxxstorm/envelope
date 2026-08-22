@@ -140,8 +140,9 @@ ExecStart=/usr/local/sbin/envelope-host-network
 RemainAfterExit=yes
 RuntimeDirectory=envelope-host-network
 RuntimeDirectoryMode=0700
-CapabilityBoundingSet=CAP_NET_ADMIN
-AmbientCapabilities=CAP_NET_ADMIN
+# iptables-legacy opens a raw control socket while applying the firewall contract.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes

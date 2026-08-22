@@ -86,8 +86,8 @@ def verify_privilege_contract(text: str, units: dict[str, str]) -> None:
         "RuntimeDirectory=envelope-host-network",
         "RuntimeDirectoryMode=0700",
         "ReadWritePaths=/run/envelope-host-network",
-        "CapabilityBoundingSet=CAP_NET_ADMIN",
-        "AmbientCapabilities=CAP_NET_ADMIN",
+        "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW",
+        "AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW",
     )
     if any(value not in host_unit for value in required_host):
         raise RuntimeError("host-network mutations must run in the ordered root oneshot")
@@ -109,8 +109,8 @@ def verify_privilege_contract(text: str, units: dict[str, str]) -> None:
         raise RuntimeError("Envelope unit does not separate root preflight from the unprivileged main process")
     if re.search(r"^User=root$", service_unit, re.MULTILINE):
         raise RuntimeError("Envelope main process must not run as root")
-    if "CAP_NET_RAW" in host_unit or "CAP_NET_RAW" in service_unit:
-        raise RuntimeError("symmetric target services must not grant CAP_NET_RAW")
+    if "CAP_NET_RAW" in service_unit:
+        raise RuntimeError("the unprivileged Envelope service must not grant CAP_NET_RAW")
 
 
 def main() -> int:
