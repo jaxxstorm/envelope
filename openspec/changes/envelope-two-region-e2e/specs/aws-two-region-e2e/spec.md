@@ -37,6 +37,10 @@ The acceptance runner SHALL verify AWS identity and regions, required permission
 - **WHEN** any required identity, permission, quota, secret, policy, artifact, or cleanup input is missing
 - **THEN** the runner exits before creating billable resources and identifies the failed gate
 
+#### Scenario: Unsupported Terraform executable
+- **WHEN** the selected Terraform executable is not the reviewed `1.10.5` version
+- **THEN** protected preflight fails before durable preparation or resource creation and identifies the selected version
+
 ### Requirement: Saved-plan and convergence gate
 The acceptance runner SHALL initialize from a clean working directory, validate and inspect a saved plan, apply exactly that plan once, and require a no-change plan after runtime convergence.
 
@@ -58,6 +62,17 @@ The acceptance runner SHALL require cloud-init completion, active `tailscaled` a
 #### Scenario: Component not ready
 - **WHEN** any required component does not become ready before timeout
 - **THEN** traffic tests do not start and component-specific diagnostics are collected
+
+### Requirement: Gateway endpoint stabilization
+The acceptance runner SHALL require every configured Gateway Load Balancer endpoint to be `available` and at least five minutes old before sending the first test packet. It SHALL record the observed endpoint age in readiness evidence.
+
+#### Scenario: Fresh available endpoint
+- **WHEN** a GWLBE reports `available` but its newest creation timestamp is less than five minutes old
+- **THEN** the runner waits within the readiness budget and does not start traffic until the stabilization interval completes
+
+#### Scenario: Endpoint cannot stabilize
+- **WHEN** the remaining readiness budget cannot accommodate the endpoint stabilization interval
+- **THEN** the runner fails before traffic and reports the endpoint-readiness condition
 
 ### Requirement: Cold-flow acceptance in both directions
 The acceptance runner SHALL clear Envelope flow context before each directional test and SHALL prove ICMP, TCP, and UDP connectivity without reverse-direction warm-up.
@@ -84,6 +99,10 @@ The acceptance runner SHALL capture and assert the actual AWS outer IPv4/UDP and
 #### Scenario: Unexpected wire behavior
 - **WHEN** a captured return packet reverses UDP ports, changes required metadata, or fails checksum/header validation
 - **THEN** acceptance fails even if an application probe reports success
+
+#### Scenario: Readiness-gated one-packet capture
+- **WHEN** an MTU or TCP SYN test waits for a one-packet PCAP before sending its probe
+- **THEN** the capture flushes its PCAP header so readiness completes without waiting for the packet it gates
 
 ### Requirement: MTU and transport acceptance
 The acceptance runner SHALL verify MTU-safe ICMP, TCP MSS behavior, UDP payload boundaries, and bounded throughput in both directional lanes.

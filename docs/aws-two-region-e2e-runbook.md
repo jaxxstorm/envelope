@@ -19,6 +19,7 @@ This does **not** prove arbitrary initiation in both directions from one workloa
 
 - Use a clean, reviewed, protected revision on a Linux runner. The artifact builder rejects dirty source.
 - Install Python 3.11 or newer, AWS CLI v2, `jq`, the Go version in `scripts/reviewed-go-toolchain.txt`, and Terraform exactly `1.10.5` with its CLI wrapper disabled.
+- Ensure `terraform` on `PATH` resolves to `1.10.5`; `run-all` checks `terraform version -json` during protected preflight and rejects any other version before durable preparation. For a non-default install, prepend its directory, for example `PATH="/approved/terraform-1.10.5:$PATH"`.
 - Complete the backend, KMS, AMI, package-availability, IAM, and artifact prerequisites in the [AWS appliance runbook](aws-appliance-runbook.md).
 - Use an operator-owned versioned, KMS-encrypted S3 backend. The run may create and remove only its exact state, lock, and manifest keys; it must never delete the shared bucket or key.
 - Use two reviewed AL2023 AMI IDs and two regional SSM KMS keys. Confirm regional EC2, VPC, NAT, EIP, GWLB/GWLBE, SSM, IAM, S3, CloudWatch Logs, and service-quota capacity before apply.

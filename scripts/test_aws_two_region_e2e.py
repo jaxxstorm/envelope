@@ -3614,6 +3614,44 @@ class RunAllCoordinatorTest(unittest.TestCase):
                 bad_operations.build()
             self.assertEqual(len(command_runner.calls), 1)
 
+    def test_preflight_rejects_an_unsupported_terraform_before_aws_preflight(self) -> None:
+        class VersionRunner:
+            def __init__(self, version: str) -> None:
+                self.version = version
+                self.calls: list[list[str]] = []
+
+            def run(
+                self,
+                args: list[str],
+                *,
+                env: dict[str, str] | None = None,
+                cwd: pathlib.Path | None = None,
+                input_text: str | None = None,
+            ) -> str:
+                self.calls.append(args)
+                if args != ["terraform", "version", "-json"]:
+                    raise AssertionError(f"unexpected command: {args!r}")
+                return json.dumps({"terraform_version": self.version})
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            config = SimpleNamespace(architecture="amd64", artifact_manifest=root / "manifest.json")
+            runner = VersionRunner("1.9.0")
+            operations = e2e.AwsRunAllOperations(
+                config,
+                SimpleNamespace(),
+                runner,
+                root / "run",
+                ROOT / "example" / "terraform",
+                SimpleNamespace(cleanup=lambda: {"complete": True}),
+            )
+
+            with mock.patch.object(e2e, "run_preflight", side_effect=AssertionError("AWS preflight ran")):
+                with self.assertRaisesRegex(e2e.E2EError, "requires Terraform 1.10.5; selected version is '1.9.0'"):
+                    operations.preflight()
+
+            self.assertEqual(runner.calls, [["terraform", "version", "-json"]])
+
     def test_run_all_cli_defaults_preserve_run_live_as_separate_entry_point(self) -> None:
         args = e2e.build_parser().parse_args(["run-all", "--config", "config.json"])
         self.assertEqual(args.subcommand, "run-all")

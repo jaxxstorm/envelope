@@ -72,6 +72,7 @@ EXIT_CONTRACT_ERROR = 2
 EXIT_CLEANUP_FAILED = 3
 RUN_ALL_HARD_TIMEOUT_SECONDS = 5400
 GWLBE_STABILIZATION_SECONDS = 300
+TERRAFORM_CORE_VERSION = "1.10.5"
 
 _VPC_ID_RE = re.compile(r"vpc-[0-9a-f]{8,17}")
 _VPCE_ID_RE = re.compile(r"vpce-[0-9a-f]{8,17}")
@@ -10095,12 +10096,26 @@ class AwsRunAllOperations:
         }
 
     def preflight(self) -> Mapping[str, Any]:
+        try:
+            terraform_version_document = json.loads(self.runner.run(["terraform", "version", "-json"]))
+        except json.JSONDecodeError as error:
+            raise E2EError("selected Terraform executable returned invalid version JSON") from error
+        terraform_version = (
+            terraform_version_document.get("terraform_version")
+            if isinstance(terraform_version_document, Mapping)
+            else None
+        )
+        if terraform_version != TERRAFORM_CORE_VERSION:
+            raise E2EError(
+                f"protected run requires Terraform {TERRAFORM_CORE_VERSION}; selected version is {terraform_version!r}"
+            )
         artifact, account_id = run_preflight(self.config, self.aws, self.tailscale())
         return {
             "account_id": account_id,
             "architecture": artifact.get("architecture"),
             "artifact_sha256": artifact.get("sha256"),
             "manifest": artifact.get("manifest_path"),
+            "terraform_version": terraform_version,
             "read_only": True,
         }
 

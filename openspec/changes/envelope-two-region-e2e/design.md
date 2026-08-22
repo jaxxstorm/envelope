@@ -52,11 +52,11 @@ The orchestrator restarts Envelope on both appliances, waits for both targets to
 
 ### 4. Gate packet tests on effective readiness
 
-Apply completion is not readiness. Before traffic, the orchestrator checks cloud-init, both systemd services, Tailscale Running state, route approval/acceptance, effective Linux routes, sysctls/firewall/MSS state, Envelope health/metrics, and GWLB target health.
+Apply completion is not readiness. Before traffic, the orchestrator checks cloud-init, both systemd services, Tailscale Running state, route approval/acceptance, effective Linux routes, sysctls/firewall/MSS state, Envelope health/metrics, and GWLB target health. It also requires each `available` GWLBE endpoint to be at least five minutes old. Live observations showed that target health can become green while a newly created endpoint still drops the first workload packet without reaching the GWLB; the bounded endpoint age prevents this transient from being misclassified as an Envelope routing failure.
 
 ### 5. Capture live wire evidence
 
-Bounded `tcpdump` captures on appliance underlay, `envelope0`, and `tailscale0` surround each cold test. Assertions identify the flow and verify the GWLB-selected UDP source port remains the return source, destination remains 6081, outer addresses are swapped, VNI is 0, and AWS options including the flow cookie are byte-identical. Captures are sanitized or deleted after assertions.
+Bounded `tcpdump` captures on appliance underlay, `envelope0`, and `tailscale0` surround each cold test. Assertions identify the flow and verify the GWLB-selected UDP source port remains the return source, destination remains 6081, outer addresses are swapped, VNI is 0, and AWS options including the flow cookie are byte-identical. Readiness-gated one-packet captures use packet-buffered output so their PCAP header is visible before the first packet is sent. Captures are sanitized or deleted after assertions.
 
 ### 6. Test traffic in increasing risk order
 
@@ -72,6 +72,8 @@ A wrapper configures a unique run key in the shared operator-owned durable encry
 - [Directional lanes could be mistaken for general site-to-site support] -> Name lane roles in outputs/docs and explicitly reject overlapping initiator/responder CIDRs.
 - [Packet captures can contain sensitive addresses and metadata] -> Limit filters and duration, assert in place, and retain only redacted summaries.
 - [Live tests can fail for external AWS or Tailscale reasons] -> Separate preflight/readiness failures from datapath failures and collect component-specific evidence.
+- [A healthy target may precede usable endpoint data-plane service] -> Require an available GWLBE endpoint stabilization interval and record its age before traffic.
+- [A capture can deadlock waiting for its own first packet] -> Flush the PCAP header before readiness checks and keep the capture bounded and cleanup-owned.
 - [A quick restart may not cross GWLB unhealthy thresholds] -> Prove a new process generation and empty context before each cold test; reserve a deliberate long stop for target-health transition acceptance.
 - [Runner loss bypasses local cleanup] -> Recover durable state and the protected manifest through an independent TTL janitor.
 
