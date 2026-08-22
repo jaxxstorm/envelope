@@ -362,6 +362,32 @@ class ProtectedDeploymentParsingTest(unittest.TestCase):
         self.assertEqual(deployment.load_profile.safe_inner_mtu, 1280)
         self.assertRegex(deployment.load_profile.sha256, r"^[0-9a-f]{64}$")
 
+    def test_accepts_v2_runtime_identity_and_ha_cost_profile(self) -> None:
+        output = protected_output()
+        for site, prefix in (("west", "10.10"), ("east", "10.20")):
+            output["envelope_runtime_config"]["value"][site].update(
+                {
+                    "config_version": 2,
+                    "local_site_cidrs": [f"{prefix}.1.0/24", f"{prefix}.2.0/24"],
+                    "remote_site_cidrs": ["10.20.1.0/24", "10.20.2.0/24"]
+                    if site == "west"
+                    else ["10.10.1.0/24", "10.10.2.0/24"],
+                }
+            )
+        output["cost_profile"]["value"] = {
+            "profile": "symmetric-gwlb-ha-v2",
+            "resource_counts": {
+                "target_instances": {"west": 2, "east": 2},
+                "ingress_routers": {"west": 2, "east": 2},
+                "workload_instances": 4,
+                "vpc_flow_logs": 2,
+                "cloudwatch_log_groups": 2,
+                "flow_log_iam_roles": 1,
+            },
+        }
+
+        self.assertEqual(e2e.parse_protected_deployment_output(output).west_runtime.site, "west")
+
     def test_load_profile_is_required_and_strictly_bounded(self) -> None:
         missing = protected_output()
         del missing["e2e_load_profile"]

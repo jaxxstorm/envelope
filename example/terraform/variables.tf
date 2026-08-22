@@ -63,6 +63,24 @@ variable "approved_max_fixed_hourly_usd" {
   default = 5
 }
 
+variable "e2e_load_profile" {
+  type = object({
+    profile_id                     = string
+    approved_at                    = string
+    safe_inner_mtu                 = number
+    maximum_tcp_mss                = number
+    sustained_tcp_duration_seconds = number
+    minimum_sustained_tcp_bytes    = number
+    iperf_duration_seconds         = number
+    minimum_throughput_mbps        = number
+    concurrent_duration_seconds    = number
+    concurrent_tcp_flows           = number
+    concurrent_udp_flows           = number
+    maximum_udp_loss_percent       = number
+    maximum_p99_latency_ms         = number
+  })
+}
+
 variable "symmetric_topology" {
   type = object({
     version = number

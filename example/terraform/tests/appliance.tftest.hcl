@@ -26,6 +26,21 @@ variables {
   west_tailscale_kms_key_arn = "arn:aws:kms:us-west-2:123456789012:key/west"
   east_tailscale_kms_key_arn = "arn:aws:kms:us-east-1:123456789012:key/east"
   tailscale_tag              = "tag:envelope-ci"
+  e2e_load_profile = {
+    profile_id                     = "envelope-e2e-v1"
+    approved_at                    = "2026-08-20T10:00:00Z"
+    safe_inner_mtu                 = 1280
+    maximum_tcp_mss                = 1240
+    sustained_tcp_duration_seconds = 15
+    minimum_sustained_tcp_bytes    = 1048576
+    iperf_duration_seconds         = 10
+    minimum_throughput_mbps        = 5.0
+    concurrent_duration_seconds    = 15
+    concurrent_tcp_flows           = 4
+    concurrent_udp_flows           = 4
+    maximum_udp_loss_percent       = 1.0
+    maximum_p99_latency_ms         = 250.0
+  }
   symmetric_topology = {
     version = 2
     sites = {
@@ -67,6 +82,14 @@ run "symmetric_two_az_paths" {
   assert {
     condition     = length(aws_vpc_endpoint.west) == 2 && length(aws_vpc_endpoint.east) == 2 && length(aws_instance.envelope_target_west) == 2 && length(aws_instance.envelope_target_east) == 2 && length(aws_instance.tailnet_ingress_west) == 2 && length(aws_instance.tailnet_ingress_east) == 2
     error_message = "every enabled AZ must have a GWLBE, target, and AZ-spread ingress router."
+  }
+  assert {
+    condition     = length(aws_instance.workload_west) == 2 && length(aws_instance.workload_east) == 2 && toset(keys(aws_instance.workload_west)) == toset(["initiator", "responder"]) && toset(keys(aws_instance.workload_east)) == toset(["initiator", "responder"])
+    error_message = "each site must have one workload per AZ with explicit initiator and responder roles."
+  }
+  assert {
+    condition     = output.workload_instances.west.initiator.cidr == local.workload_roles.west.initiator.cidr && output.workload_instances.east.responder.cidr == local.workload_roles.east.responder.cidr && output.artifact_identity.sha256 == var.artifact_sha256 && output.e2e_load_profile == var.e2e_load_profile
+    error_message = "protected lifecycle workload, artifact, and load-profile outputs must be emitted."
   }
   assert {
     condition     = alltrue([for target in values(aws_instance.envelope_target_west) : target.source_dest_check == false]) && alltrue([for target in values(aws_instance.envelope_target_east) : target.source_dest_check == false]) && alltrue([for router in values(aws_instance.tailnet_ingress_west) : router.source_dest_check == false]) && alltrue([for router in values(aws_instance.tailnet_ingress_east) : router.source_dest_check == false])

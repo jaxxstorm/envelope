@@ -130,7 +130,7 @@ def make_config(tmp: pathlib.Path, architecture: str = "amd64", *, expired: bool
 
 
 def symmetric_deployment_document(config: appliance.RunConfig) -> dict:
-    return {
+    document = {
         "envelope_runtime_config": {
             "value": {
                 site: {
@@ -142,7 +142,27 @@ def symmetric_deployment_document(config: appliance.RunConfig) -> dict:
             }
         },
         "cost_profile": {"value": {"profile": "symmetric-gwlb-ha-v2"}},
+        "artifact_identity": {
+            "value": {
+                "architecture": config.architecture,
+                "ec2_arch": appliance.ARCHITECTURES[config.architecture],
+                "sha256": "a" * 64,
+                "revision": "b" * 40,
+            }
+        },
     }
+    for name in (
+        "e2e_load_profile",
+        "flow_log_evidence",
+        "gwlb_endpoint_ids",
+        "gwlb_target_group_arns",
+        "instance_ids",
+        "symmetric_topology",
+        "vpc_ids",
+        "workload_instances",
+    ):
+        document[name] = {"value": {}}
+    return document
 
 
 def aws_preflight_summary_document(architecture: str = "amd64") -> dict:

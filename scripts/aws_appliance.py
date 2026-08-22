@@ -5411,7 +5411,7 @@ def protected_plan_path(run_dir: pathlib.Path, requested: pathlib.Path | None, f
 
 
 def validate_symmetric_saved_plan(document: Any, config: RunConfig) -> list[str]:
-    """Check only the reviewed v2 output contract before a protected apply."""
+    """Check the reviewed v2 output contract before a protected apply."""
 
     if not isinstance(document, dict):
         return ["saved plan is not an object"]
@@ -5419,23 +5419,48 @@ def validate_symmetric_saved_plan(document: Any, config: RunConfig) -> list[str]
     outputs = planned.get("outputs") if isinstance(planned, dict) else None
     if not isinstance(outputs, dict):
         return ["saved plan omits planned outputs"]
+    required_outputs = {
+        "artifact_identity",
+        "cost_profile",
+        "e2e_load_profile",
+        "envelope_runtime_config",
+        "flow_log_evidence",
+        "gwlb_endpoint_ids",
+        "gwlb_target_group_arns",
+        "instance_ids",
+        "symmetric_topology",
+        "vpc_ids",
+        "workload_instances",
+    }
     runtime = outputs.get("envelope_runtime_config", {}).get("value") if isinstance(outputs.get("envelope_runtime_config"), dict) else None
     cost = outputs.get("cost_profile", {}).get("value") if isinstance(outputs.get("cost_profile"), dict) else None
+    artifact = outputs.get("artifact_identity", {}).get("value") if isinstance(outputs.get("artifact_identity"), dict) else None
     failures: list[str] = []
+    if set(outputs) != required_outputs:
+        failures.append("saved plan does not declare the complete symmetric deployment output contract")
     if not isinstance(runtime, dict) or set(runtime) != set(DEPLOYMENT_SITES):
         failures.append("saved plan omits symmetric runtime identities")
     else:
         for site in DEPLOYMENT_SITES:
             value = runtime.get(site)
             expected = config.sites[site]
-            if not isinstance(value, dict) or value != {
-                "config_version": 2,
-                "local_site_cidrs": expected["local_site_cidrs"],
-                "remote_site_cidrs": expected["remote_site_cidrs"],
-            }:
+            if not isinstance(value, dict) or any(
+                value.get(key) != expected_value
+                for key, expected_value in {
+                    "config_version": 2,
+                    "local_site_cidrs": expected["local_site_cidrs"],
+                    "remote_site_cidrs": expected["remote_site_cidrs"],
+                }.items()
+            ):
                 failures.append(f"saved plan {site} runtime does not match symmetric topology v2")
     if not isinstance(cost, dict) or cost.get("profile") != "symmetric-gwlb-ha-v2":
         failures.append("saved plan does not declare the symmetric HA cost profile")
+    if not isinstance(artifact, dict) or artifact.get("architecture") != config.architecture or artifact.get(
+        "ec2_arch"
+    ) != ARCHITECTURES[config.architecture] or not re.fullmatch(r"[0-9a-f]{64}", str(artifact.get("sha256", ""))) or not re.fullmatch(
+        r"[0-9a-f]{40}", str(artifact.get("revision", ""))
+    ):
+        failures.append("saved plan omits a valid reviewed artifact identity")
     return failures
 
 
@@ -5935,24 +5960,9 @@ def parse_deployment_json(value: str, description: str = "deployment output") ->
 
 
 def validate_symmetric_deployment_output(document: dict[str, Any], config: RunConfig) -> None:
-    """Accept only Terraform's v2 runtime and HA cost outputs after apply."""
+    """Accept the complete v2 Terraform output contract after apply."""
 
-    if not isinstance(document, dict) or set(document) != {"envelope_runtime_config", "cost_profile"}:
-        raise LifecycleError("deployment output must contain only symmetric runtime and cost profiles")
-    runtime_output, cost_output = document["envelope_runtime_config"], document["cost_profile"]
-    runtime = runtime_output.get("value") if isinstance(runtime_output, dict) else None
-    cost = cost_output.get("value") if isinstance(cost_output, dict) else None
-    failures = validate_symmetric_saved_plan(
-        {
-            "planned_values": {
-                "outputs": {
-                    "envelope_runtime_config": {"value": runtime},
-                    "cost_profile": {"value": cost},
-                }
-            }
-        },
-        config,
-    )
+    failures = validate_symmetric_saved_plan({"planned_values": {"outputs": document}}, config)
     if failures:
         raise LifecycleError("deployment output failed symmetric validation: " + "; ".join(failures))
 

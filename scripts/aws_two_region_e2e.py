@@ -956,7 +956,15 @@ def _parse_runtime(site: Site, value: Any) -> RuntimeTopology:
         "artifact_sha256",
         "artifact_revision",
     }
-    _exact_keys(mapping, expected, f"envelope_runtime_config.{site}")
+    v2_identity = {"config_version", "local_site_cidrs", "remote_site_cidrs"}
+    if set(mapping) not in (expected, expected | v2_identity):
+        _exact_keys(mapping, expected, f"envelope_runtime_config.{site}")
+    if v2_identity.issubset(mapping):
+        if mapping["config_version"] != 2:
+            raise DeploymentError(f"envelope_runtime_config.{site}.config_version must be 2")
+        for name in ("local_site_cidrs", "remote_site_cidrs"):
+            if not isinstance(mapping[name], list) or not all(isinstance(item, str) for item in mapping[name]):
+                raise DeploymentError(f"envelope_runtime_config.{site}.{name} must be a string list")
 
     def cidrs(name: str) -> tuple[str, ...]:
         candidate = mapping[name]
@@ -1040,18 +1048,27 @@ def parse_protected_deployment_output(
 
     cost = _mapping(_required_output(document, "cost_profile"), "cost_profile")
     counts = _mapping(cost.get("resource_counts"), "cost_profile.resource_counts")
-    regional_targets = counts.get("regional_targets")
-    if (
-        cost.get("profile") != "directional-lane-acceptance"
-        or counts.get("appliance_instances") != 2
-        or counts.get("workload_instances") != 4
-        or counts.get("vpc_flow_logs") != 2
-        or counts.get("cloudwatch_log_groups") != 2
-        or counts.get("flow_log_iam_roles") != 1
-        or regional_targets != {"west": 1, "east": 1}
-    ):
+    directional_cost = (
+        cost.get("profile") == "directional-lane-acceptance"
+        and counts.get("appliance_instances") == 2
+        and counts.get("workload_instances") == 4
+        and counts.get("vpc_flow_logs") == 2
+        and counts.get("cloudwatch_log_groups") == 2
+        and counts.get("flow_log_iam_roles") == 1
+        and counts.get("regional_targets") == {"west": 1, "east": 1}
+    )
+    symmetric_cost = (
+        cost.get("profile") == "symmetric-gwlb-ha-v2"
+        and counts.get("target_instances") == {"west": 2, "east": 2}
+        and counts.get("ingress_routers") == {"west": 2, "east": 2}
+        and counts.get("workload_instances") == 4
+        and counts.get("vpc_flow_logs") == 2
+        and counts.get("cloudwatch_log_groups") == 2
+        and counts.get("flow_log_iam_roles") == 1
+    )
+    if not directional_cost and not symmetric_cost:
         raise DeploymentError(
-            "cost profile does not declare exactly two appliances, four workloads, two managed Flow Logs, and one target per site"
+            "cost profile does not declare exactly two appliances, four workloads, and the required flow-log and regional target capacity"
         )
 
     appliances = {
