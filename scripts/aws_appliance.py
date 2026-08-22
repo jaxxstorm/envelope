@@ -5243,23 +5243,25 @@ def validate_terraform_source_contract(terraform_dir: pathlib.Path) -> None:
         raise LifecycleError("reviewed Terraform source contains an automatic override or variable file")
     expected_blocks = (
         '''resource "aws_lb_target_group_attachment" "west" {
+  for_each         = aws_instance.envelope_target_west
   target_group_arn = aws_lb_target_group.west.arn
-  target_id        = aws_instance.envelope_west.id
+  target_id        = each.value.id
 }''',
         '''resource "aws_lb_target_group_attachment" "east" {
   provider         = aws.east
+  for_each         = aws_instance.envelope_target_east
   target_group_arn = aws_lb_target_group.east.arn
-  target_id        = aws_instance.envelope_east.id
+  target_id        = each.value.id
 }''',
     )
-    raw_gwlb = (terraform_dir / "gwlb.tf").read_text()
-    if "<<" in raw_gwlb or "\\u" in raw_gwlb or "\\U" in raw_gwlb:
+    raw_topology = (terraform_dir / "topology.tf").read_text()
+    if "<<" in raw_topology or "\\u" in raw_topology or "\\U" in raw_topology:
         raise LifecycleError("reviewed GWLB source contains a prohibited heredoc or escaped label")
-    gwlb = strip_hcl_comments(raw_gwlb)
-    if any(gwlb.count(block) != 1 for block in expected_blocks):
+    topology = strip_hcl_comments(raw_topology)
+    if any(topology.count(block) != 1 for block in expected_blocks):
         raise LifecycleError("reviewed Terraform source does not use exact direct regional target attachments")
     for site in ("west", "east"):
-        if len(re.findall(rf'resource\s+"aws_lb_target_group_attachment"\s+"{site}"\s*\{{', gwlb)) != 1:
+        if len(re.findall(rf'resource\s+"aws_lb_target_group_attachment"\s+"{site}"\s*\{{', topology)) != 1:
             raise LifecycleError("reviewed Terraform source has an ambiguous regional target attachment")
 
 

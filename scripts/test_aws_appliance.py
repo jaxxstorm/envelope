@@ -700,13 +700,13 @@ class ConfigAndPathTest(unittest.TestCase):
                 appliance.SubprocessRunner(), ROOT / "example/terraform", run_dir, revision
             )
             expected = subprocess.run(
-                ["git", "show", f"{revision}:example/terraform/gwlb.tf"],
+                ["git", "show", f"{revision}:example/terraform/topology.tf"],
                 cwd=ROOT,
                 text=True,
                 capture_output=True,
                 check=True,
             ).stdout
-            self.assertEqual((snapshot / "gwlb.tf").read_text(), expected)
+            self.assertEqual((snapshot / "topology.tf").read_text(), expected)
             self.assertEqual(
                 stat.S_IMODE((snapshot / "cloud-init" / "envelope-e2e-agent.py").stat().st_mode),
                 0o700,
@@ -720,19 +720,21 @@ class ConfigAndPathTest(unittest.TestCase):
             restored, restored_identity = appliance.materialize_durable_terraform_source(source_record, run_dir)
             self.assertEqual(restored_identity, identity)
             self.assertEqual(appliance.terraform_source_digest(restored), baseline)
-            gwlb = restored / "gwlb.tf"
-            original = gwlb.read_text()
-            gwlb.write_text(
+            topology = restored / "topology.tf"
+            original = topology.read_text()
+            topology.write_text(
                 original.replace(
-                    "target_id        = aws_instance.envelope_west.id",
-                    'target_id        = format("%s-unexpected", aws_instance.envelope_west.id)',
+                    "target_id        = each.value.id",
+                    'target_id        = format("%s-unexpected", each.value.id)',
+                    1,
                 )
             )
             with self.assertRaisesRegex(appliance.LifecycleError, "direct regional target"):
                 appliance.validate_terraform_source_contract(restored)
             west_block = '''resource "aws_lb_target_group_attachment" "west" {
+  for_each         = aws_instance.envelope_target_west
   target_group_arn = aws_lb_target_group.west.arn
-  target_id        = aws_instance.envelope_west.id
+  target_id        = each.value.id
 }'''
             commented_bypass = original.replace(
                 west_block,
@@ -740,23 +742,24 @@ class ConfigAndPathTest(unittest.TestCase):
 {west_block}
 */
 resource /* separator */ "aws_lb_target_group_attachment" "west" {{
+  for_each         = aws_instance.envelope_target_west
   target_group_arn = aws_lb_target_group.west.arn
-  target_id        = format("%s-unexpected", aws_instance.envelope_west.id)
+  target_id        = format("%s-unexpected", each.value.id)
 }}''',
             )
-            gwlb.write_text(commented_bypass)
+            topology.write_text(commented_bypass)
             with self.assertRaisesRegex(appliance.LifecycleError, "direct regional target"):
                 appliance.validate_terraform_source_contract(restored)
-            gwlb.write_text("locals { fixture = <<-EOT\n" + west_block + "\nEOT\n}\n" + original)
+            topology.write_text("locals { fixture = <<-EOT\n" + west_block + "\nEOT\n}\n" + original)
             with self.assertRaisesRegex(appliance.LifecycleError, "heredoc"):
                 appliance.validate_terraform_source_contract(restored)
-            gwlb.write_text(original)
+            topology.write_text(original)
             (restored / "override.tf").write_text('resource "terraform_data" "unexpected" {}\n')
             self.assertNotEqual(appliance.terraform_source_digest(restored), baseline)
             with self.assertRaisesRegex(appliance.LifecycleError, "override"):
                 appliance.validate_terraform_source_contract(restored)
             (restored / "override.tf").unlink()
-            (restored / "unsafe.tf").symlink_to(restored / "gwlb.tf")
+            (restored / "unsafe.tf").symlink_to(restored / "topology.tf")
             with self.assertRaisesRegex(appliance.LifecycleError, "symlink"):
                 appliance.terraform_source_digest(restored)
 
