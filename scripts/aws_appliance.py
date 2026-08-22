@@ -747,6 +747,11 @@ class AwsCLI:
         env["AWS_PAGER"] = ""
         for name in self.excluded_environment:
             env.pop(name, None)
+        try:
+            return self.runner.run(command, env=env)
+        except CommandError as error:
+            if "InvalidSignatureException" not in error.raw_stderr or "Signature expired:" not in error.raw_stderr:
+                raise
         return self.runner.run(command, env=env)
 
     def json(self, args: list[str], *, region: str | None = None) -> dict[str, Any]:

@@ -710,6 +710,38 @@ class ConfigAndPathTest(unittest.TestCase):
         self.assertNotIn("CUSTOM_TS_ID", child_env)
         self.assertNotIn("CUSTOM_TS_SECRET", child_env)
 
+    def test_aws_cli_retries_only_explicit_signature_expiry_once(self):
+        class ExpiredOnceRunner:
+            def __init__(self):
+                self.calls = 0
+
+            def run(inner, args, *, env=None, cwd=None, input_text=None):
+                inner.calls += 1
+                if inner.calls == 1:
+                    raise appliance.CommandError(
+                        args,
+                        254,
+                        "An error occurred (InvalidSignatureException): Signature expired: fixture",
+                    )
+                return '{"Account":"123456789012"}'
+
+        runner = ExpiredOnceRunner()
+        self.assertEqual(appliance.AwsCLI(runner).json(["sts", "get-caller-identity"])["Account"], "123456789012")
+        self.assertEqual(runner.calls, 2)
+
+        class OtherFailureRunner:
+            def __init__(self):
+                self.calls = 0
+
+            def run(inner, args, *, env=None, cwd=None, input_text=None):
+                inner.calls += 1
+                raise appliance.CommandError(args, 254, "An error occurred (AccessDeniedException): denied")
+
+        runner = OtherFailureRunner()
+        with self.assertRaises(appliance.CommandError):
+            appliance.AwsCLI(runner).call(["sts", "get-caller-identity"])
+        self.assertEqual(runner.calls, 1)
+
     def test_terraform_source_snapshot_is_exactly_materialized_from_artifact_revision(self):
         revision = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, capture_output=True, check=True
