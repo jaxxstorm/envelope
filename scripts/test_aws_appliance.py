@@ -6497,7 +6497,7 @@ class CloudInitSandboxTest(unittest.TestCase):
         self.assertIn("User=envelope", service_unit)
         self.assertIn("Group=envelope", service_unit)
         self.assertNotRegex(service_unit, r"(?m)^User=root$")
-        self.assertIn("ExecStartPre=!/usr/local/sbin/envelope-preflight", service_unit)
+        self.assertIn("ExecStartPre=+/usr/local/sbin/envelope-preflight", service_unit)
         self.assertIn("ExecStart=/usr/local/bin/envelope", service_unit)
         self.assertIn("CapabilityBoundingSet=CAP_NET_ADMIN", service_unit)
         self.assertIn("AmbientCapabilities=CAP_NET_ADMIN", service_unit)

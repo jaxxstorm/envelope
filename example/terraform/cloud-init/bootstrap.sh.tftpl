@@ -356,7 +356,8 @@ User=envelope
 Group=envelope
 EnvironmentFile=/etc/envelope/site.env
 EnvironmentFile=/etc/envelope/artifact.env
-ExecStartPre=!/usr/local/sbin/envelope-preflight
+# The reviewed preflight only reads root-owned network state before dropping to envelope.
+ExecStartPre=+/usr/local/sbin/envelope-preflight
 ExecStart=/usr/local/bin/envelope
 Restart=on-failure
 RestartSec=3s

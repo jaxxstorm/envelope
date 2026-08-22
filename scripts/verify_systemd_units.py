@@ -98,7 +98,7 @@ def verify_privilege_contract(text: str, units: dict[str, str]) -> None:
     required_service = (
         "User=envelope",
         "Group=envelope",
-        "ExecStartPre=!/usr/local/sbin/envelope-preflight",
+        "ExecStartPre=+/usr/local/sbin/envelope-preflight",
         "ExecStart=/usr/local/bin/envelope",
         "CapabilityBoundingSet=CAP_NET_ADMIN",
         "AmbientCapabilities=CAP_NET_ADMIN",
