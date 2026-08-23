@@ -10616,6 +10616,7 @@ class AwsRunAllOperations:
         self.terraform_dir = terraform_dir.expanduser().resolve()
         self.lifecycle = lifecycle
         self._tailscale: Any = None
+        self._validated_preflight: tuple[dict[str, Any], str] | None = None
 
     def tailscale(self) -> Any:
         if self._tailscale is None:
@@ -10661,6 +10662,7 @@ class AwsRunAllOperations:
                 f"protected run requires Terraform {TERRAFORM_CORE_VERSION}; selected version is {terraform_version!r}"
             )
         artifact, account_id = run_preflight(self.config, self.aws, self.tailscale())
+        self._validated_preflight = (artifact, account_id)
         return {
             "account_id": account_id,
             "architecture": artifact.get("architecture"),
@@ -10671,7 +10673,17 @@ class AwsRunAllOperations:
         }
 
     def prepare(self) -> Mapping[str, Any]:
-        manifest = protected_prepare(self.config, self.aws, self.tailscale(), self.run_dir)
+        if self._validated_preflight is None:
+            raise LifecycleError("protected preparation requires the successful run-all preflight stage")
+        validated_preflight = self._validated_preflight
+        self._validated_preflight = None
+        manifest = protected_prepare(
+            self.config,
+            self.aws,
+            self.tailscale(),
+            self.run_dir,
+            validated_preflight=validated_preflight,
+        )
         if manifest.get("phase") != "prepared":
             raise LifecycleError("protected preparation did not reach its durable prepared phase")
         return {"manifest_phase": "prepared", "published": True}

@@ -5765,6 +5765,20 @@ class SSMAndCleanupTest(unittest.TestCase):
                 if path.is_file():
                     self.assertNotIn("fixture-auth-material", path.read_text())
 
+            validated_aws = FakeAWS()
+            with mock.patch.object(
+                appliance, "run_preflight", side_effect=AssertionError("duplicate preflight")
+            ), mock.patch.object(appliance, "validate_artifact", return_value=artifact):
+                validated_manifest = appliance.prepare(
+                    config,
+                    validated_aws,
+                    FakeTailscale(),
+                    root / "validated-run",
+                    validated_preflight=(artifact, "123456789012"),
+                )
+            self.assertEqual(validated_manifest["phase"], "prepared")
+            self.assertEqual(validated_aws.sites, ["us-west-2", "us-east-1"])
+
     def test_prepare_distinguishes_only_exact_manifest_create_collisions(self):
         class FailingAWS:
             def __init__(self, stderr):

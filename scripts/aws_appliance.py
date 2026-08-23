@@ -4921,8 +4921,32 @@ def manifest_create_collision(error: CommandError) -> bool:
 
 
 @serialized_run_operation
-def prepare(config: RunConfig, aws: AwsCLI, tailscale: TailscaleAPI, run_dir: pathlib.Path) -> dict[str, Any]:
-    artifact, account_id = run_preflight(config, aws, tailscale)
+def prepare(
+    config: RunConfig,
+    aws: AwsCLI,
+    tailscale: TailscaleAPI,
+    run_dir: pathlib.Path,
+    *,
+    validated_preflight: tuple[dict[str, Any], str] | None = None,
+) -> dict[str, Any]:
+    if validated_preflight is None:
+        artifact, account_id = run_preflight(config, aws, tailscale)
+    else:
+        artifact, account_id = validated_preflight
+        current_artifact = validate_artifact(config)
+        identity_fields = (
+            "architecture",
+            "ec2_architecture",
+            "sha256",
+            "revision",
+            "version",
+            "go_version",
+            "manifest_sha256",
+            "manifest_path",
+            "path",
+        )
+        if any(artifact.get(field) != current_artifact.get(field) for field in identity_fields):
+            raise LifecycleError("validated preflight artifact changed before protected preparation")
     store = ManifestStore(config, aws, run_dir)
     manifest = new_manifest(config, artifact, account_id)
     manifest["prepare_started_at"] = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace(

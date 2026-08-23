@@ -3678,6 +3678,45 @@ class RunAllCoordinatorTest(unittest.TestCase):
 
             self.assertEqual(runner.calls, [["terraform", "version", "-json"]])
 
+    def test_run_all_preparation_reuses_the_successful_preflight_result(self) -> None:
+        class VersionRunner:
+            def run(self, args, *, env=None, cwd=None, input_text=None):
+                if args != ["terraform", "version", "-json"]:
+                    raise AssertionError(f"unexpected command: {args!r}")
+                return json.dumps({"terraform_version": e2e.TERRAFORM_CORE_VERSION})
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            config = SimpleNamespace(architecture="amd64", artifact_manifest=root / "manifest.json")
+            operations = e2e.AwsRunAllOperations(
+                config,
+                SimpleNamespace(),
+                VersionRunner(),
+                root / "run",
+                ROOT / "example" / "terraform",
+                SimpleNamespace(cleanup=lambda: {"complete": True}),
+            )
+            artifact = {"architecture": "amd64", "sha256": "a" * 64, "manifest_path": str(root / "manifest.json")}
+            tailscale = object()
+            operations._tailscale = tailscale
+
+            with mock.patch.object(e2e, "run_preflight", return_value=(artifact, "123456789012")) as preflight, mock.patch.object(
+                e2e, "protected_prepare", return_value={"phase": "prepared"}
+            ) as prepare:
+                operations.preflight()
+                operations.prepare()
+
+            preflight.assert_called_once_with(config, operations.aws, tailscale)
+            prepare.assert_called_once_with(
+                config,
+                operations.aws,
+                tailscale,
+                operations.run_dir,
+                validated_preflight=(artifact, "123456789012"),
+            )
+            with self.assertRaisesRegex(e2e.LifecycleError, "successful run-all preflight"):
+                operations.prepare()
+
     def test_run_all_cli_defaults_preserve_run_live_as_separate_entry_point(self) -> None:
         args = e2e.build_parser().parse_args(["run-all", "--config", "config.json"])
         self.assertEqual(args.subcommand, "run-all")
