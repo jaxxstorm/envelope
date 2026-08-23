@@ -270,8 +270,16 @@ for ((attempt = 1; attempt <= max_attempts; attempt++)); do
     IFS=',' read -ra locals <<<"$local_cidrs"
     for cidr in "$${locals[@]}"; do
       [[ -z "$cidr" ]] && continue
-      if ! "$ip_bin" -j route get "$cidr" iif '${tun_name}' |
-        "$jq_bin" -e 'any(.[]; .dev == "${underlay_iface}" and ((.type // "unicast") == "unicast"))' >/dev/null; then
+      if ! "$ip_bin" -j route show table main match "$cidr" |
+        "$jq_bin" -e '
+          map(select((.type // "unicast") == "unicast")) |
+          sort_by(
+            if (.dst // "default") == "default" then 0
+            elif (.dst | contains("/")) then (.dst | split("/")[1] | tonumber)
+            else 128 end
+          ) |
+          last | .dev == "${underlay_iface}"
+        ' >/dev/null; then
         ready=false
       fi
     done

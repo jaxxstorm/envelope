@@ -85,8 +85,10 @@ def verify_privilege_contract(text: str, units: dict[str, str]) -> None:
             raise RuntimeError(f"target preflight retains directional forwarding path: {prohibited}")
     if "(.Self.AllowedIPs // [])" in preflight:
         raise RuntimeError("target preflight must not require ingress-router route advertisements")
-    if 'route get "$cidr" iif \'${tun_name}\'' not in preflight:
-        raise RuntimeError("target preflight must verify local-site post-inspection delivery")
+    if 'route show table main match "$cidr"' not in preflight:
+        raise RuntimeError("target preflight must verify the underlying local-site delivery route")
+    if 'route get "$cidr" iif \'${tun_name}\'' in preflight:
+        raise RuntimeError("target preflight must not require the TUN before Envelope creates it")
     if 'route show table 52 "$cidr"' not in preflight:
         raise RuntimeError("target preflight must verify remote-site Tailscale delivery")
     required_host = (

@@ -6541,7 +6541,8 @@ class CloudInitSandboxTest(unittest.TestCase):
         self.assertIn('"net.ipv4.conf.$iface.rp_filter=0"', host)
         self.assertIn('"$save_bin" -t "$table"', preflight)
         self.assertNotIn('rules=$("$save_bin")', preflight)
-        self.assertIn('route get "$cidr" iif \'envelope0\'', preflight)
+        self.assertIn('route show table main match "$cidr"', preflight)
+        self.assertNotIn('route get "$cidr" iif \'envelope0\'', preflight)
         self.assertIn('route show table 52 "$cidr"', preflight)
         self.assertNotIn("(.Self.AllowedIPs // [])", preflight)
         self.assertIn('"$envelope $underlay"', host)
@@ -6688,7 +6689,7 @@ printf '{"Version":"1.80.3","TUN":true,"BackendState":"%s","Health":[],"Self":{"
                 "ip",
                 """
 cidr=${@: -1}
-if [[ $* == *"route get"* ]]; then
+if [[ $* == *"route show table main match"* ]]; then
   if [[ $LOCAL_ROUTES_READY == true ]]; then
     printf '[{"dst":"%s","dev":"ens5","type":"unicast"}]\n' "$cidr"
   else
