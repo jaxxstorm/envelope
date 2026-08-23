@@ -75,7 +75,7 @@ Relevant symmetric datapath metrics include `geneve_rx_packets`, `tun_tx_packets
 
 ## Linux Requirements
 
-Envelope needs `CAP_NET_ADMIN` to create/configure `envelope0` and to validate or manage supported routing. It does not require a raw-socket capability for symmetric forwarding.
+Envelope needs `CAP_NET_ADMIN` to create/configure `envelope0` and to validate or manage supported routing. On the protected Amazon Linux profile it also receives `CAP_NET_RAW` solely because `iptables-legacy` requires it for continuous read-only firewall inspection; symmetric forwarding does not emit raw packets.
 
 For `verify` and `manage`, the target must satisfy forwarding, reverse-path-filter, firewall, MSS, local VPC delivery, and remote Tailscale-route validation. The target is ready only after its GENEVE receiver, TUN injection, and complete route path are ready. The ingress-router readiness check is separate: it verifies Running Tailscale, exact approved local-site advertisements without SNAT, and an effective local GWLBE route.
 

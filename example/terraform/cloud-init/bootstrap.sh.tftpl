@@ -370,8 +370,9 @@ RestartSec=3s
 TimeoutStartSec=210s
 TimeoutStopSec=30s
 KillSignal=SIGTERM
-AmbientCapabilities=CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_ADMIN
+# iptables-legacy requires CAP_NET_RAW for continuous read-only firewall verification.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 NoNewPrivileges=yes
 PrivateDevices=no
 PrivateTmp=yes

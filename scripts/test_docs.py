@@ -63,7 +63,10 @@ class DocsContractTest(unittest.TestCase):
 
         for content, required_values in (
             (self.home, ("GENEVE", "envelope0", "tailscale0", "Linux-only", "not hitless")),
-            (self.getting_started, ("go build", "component_wire_smoke.sh", "CAP_NET_ADMIN", "protected")),
+            (
+                self.getting_started,
+                ("go build", "component_wire_smoke.sh", "CAP_NET_ADMIN", "CAP_NET_RAW", "legacy firewall", "protected"),
+            ),
             (self.terraform_example, ("illustrative input shape", '"version": 2', "target_az_keys", "ingress_router_az_keys")),
             (self.appliance_runbook, ("Target Readiness", "Security Boundary", "bounded")),
             (self.e2e_runbook, ("Evidence Expectations", "not hitless", "fresh approved run identity")),
@@ -79,7 +82,6 @@ class DocsContractTest(unittest.TestCase):
             r"(?i)remote[-_]tailnet[-_]cidrs",
             r"(?i)--flow-(?:capacity|timeout)",
             r"(?i)appliance_az_key",
-            r"(?i)CAP_NET_RAW",
             r"(?i)raw (?:IPv4|UDP).{0,40}GENEVE",
             r"(?i)return traffic.{0,80}re-encapsulat",
             r"(?i)(?:one|single) GWLBE",

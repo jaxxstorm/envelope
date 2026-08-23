@@ -112,8 +112,8 @@ def verify_privilege_contract(text: str, units: dict[str, str]) -> None:
         "Group=envelope",
         "ExecStartPre=+/usr/local/sbin/envelope-preflight",
         "ExecStart=/usr/local/bin/envelope",
-        "CapabilityBoundingSet=CAP_NET_ADMIN",
-        "AmbientCapabilities=CAP_NET_ADMIN",
+        "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW",
+        "AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW",
         "ProtectKernelTunables=yes",
         "Requires=envelope-host-network.service",
     )
@@ -121,8 +121,6 @@ def verify_privilege_contract(text: str, units: dict[str, str]) -> None:
         raise RuntimeError("Envelope unit does not separate root preflight from the unprivileged main process")
     if re.search(r"^User=root$", service_unit, re.MULTILINE):
         raise RuntimeError("Envelope main process must not run as root")
-    if "CAP_NET_RAW" in service_unit:
-        raise RuntimeError("the unprivileged Envelope service must not grant CAP_NET_RAW")
 
 
 def main() -> int:

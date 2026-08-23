@@ -35,7 +35,7 @@ This does not contact AWS, create a GWLB endpoint, connect to a Tailnet, model t
 
 ## Host Integration
 
-Symmetric targets need `CAP_NET_ADMIN` for `envelope0` and supported host-route validation or management. They do not need raw-socket privileges for normal forwarding.
+Symmetric targets need `CAP_NET_ADMIN` for `envelope0` and supported host-route validation or management. The protected Amazon Linux service also receives `CAP_NET_RAW` solely for continuous read-only legacy firewall inspection; normal symmetric forwarding does not emit raw packets.
 
 `routing-mode=off` is datapath-only. `verify` validates host prerequisites without changing them. `manage` validates the configured symmetric path and reconciles only its documented routing ownership. For either enabled mode, provide version 2 with disjoint `local-site-cidrs` and `remote-site-cidrs`; a target must deliver the first to its local post-inspection VPC path and the second to `tailscale0`.
 
