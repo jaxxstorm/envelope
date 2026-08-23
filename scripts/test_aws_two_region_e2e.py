@@ -475,6 +475,34 @@ class ProtectedDeploymentParsingTest(unittest.TestCase):
         self.assertNotIn("delete-flow-logs", called_operations)
         self.assertNotIn("put-bucket-policy", called_operations)
 
+    def test_target_health_selects_one_member_from_the_ha_target_group(self) -> None:
+        target = e2e.ApplianceTarget(
+            "west",
+            "us-west-2",
+            "i-0123456789abcdef0",
+            "arn:aws:elasticloadbalancing:us-west-2:123456789012:targetgroup/west/abcdef0123456789",
+            "vpc-0123456789abcdef0",
+        )
+
+        class TargetHealthAWS:
+            def json(self, args, *, region=None):
+                return {
+                    "TargetHealthDescriptions": [
+                        {"Target": {"Id": "i-0123456789abcdef0"}, "TargetHealth": {"State": "healthy"}},
+                        {"Target": {"Id": "i-0fedcba9876543210"}, "TargetHealth": {"State": "healthy"}},
+                    ]
+                }
+
+        operations = e2e.AwsLiveOperations(
+            SimpleNamespace(run_id="fixture-live", sites={}),
+            TargetHealthAWS(),
+            pathlib.Path("/tmp/not-used"),
+        )
+        self.assertEqual(
+            operations._target_health(target),
+            {"count": 2, "target_id": "i-0123456789abcdef0", "status": "healthy", "reason": None},
+        )
+
 
 class FakeClock:
     def __init__(self) -> None:

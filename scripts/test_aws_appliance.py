@@ -308,14 +308,36 @@ def deployment_document() -> dict:
             "instance_id": instance_id,
         }
 
+    target_groups = {
+        "east": "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/east/fixture",
+        "west": "arn:aws:elasticloadbalancing:us-west-2:123456789012:targetgroup/west/fixture",
+    }
+
+    def site_topology(site, region, local_cidrs, remote_cidrs):
+        return {
+            "region": region,
+            "local_site_cidrs": local_cidrs,
+            "remote_site_cidrs": remote_cidrs,
+            "target_fleet": [
+                {
+                    "region": region,
+                    "az_key": az_key,
+                    "instance_id": f"i-appliance-{site}" + ("-b" if az_key == "b" else ""),
+                    "target_group_arn": target_groups[site],
+                }
+                for az_key in ("a", "b")
+            ],
+            "ingress_router_fleet": [
+                {"region": region, "az_key": az_key, "instance_id": f"i-ingress-{site}-{az_key}"}
+                for az_key in ("a", "b")
+            ],
+        }
+
     return {
         "gwlb_target_group_arns": {
             "sensitive": False,
             "type": ["map", "string"],
-            "value": {
-                "east": "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/east/fixture",
-                "west": "arn:aws:elasticloadbalancing:us-west-2:123456789012:targetgroup/west/fixture",
-            },
+            "value": target_groups,
         },
         "workload_instances": {
             "sensitive": False,
@@ -363,6 +385,28 @@ def deployment_document() -> dict:
             "sensitive": False,
             "type": ["map", "string"],
             "value": {"east": "i-appliance-east", "west": "i-appliance-west"},
+        },
+        "symmetric_topology": {
+            "sensitive": False,
+            "type": ["object", {}],
+            "value": {
+                "config_version": 2,
+                "run_id": "envelope-fixture",
+                "sites": {
+                    "west": site_topology(
+                        "west",
+                        "us-west-2",
+                        ["10.10.1.0/24", "10.10.2.0/24"],
+                        ["10.20.1.0/24", "10.20.2.0/24"],
+                    ),
+                    "east": site_topology(
+                        "east",
+                        "us-east-1",
+                        ["10.20.1.0/24", "10.20.2.0/24"],
+                        ["10.10.1.0/24", "10.10.2.0/24"],
+                    ),
+                },
+            },
         },
     }
 
@@ -6975,6 +7019,38 @@ class DeploymentOutputTest(unittest.TestCase):
 
 
 class ReadinessTest(unittest.TestCase):
+    def test_symmetric_target_fleets_must_match_configured_azs_and_target_groups(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            for name, mutate in (
+                (
+                    "duplicate identity",
+                    lambda document: document["symmetric_topology"]["value"]["sites"]["west"]["target_fleet"][1].update(
+                        {"instance_id": "i-appliance-west"}
+                    ),
+                ),
+                (
+                    "wrong AZ",
+                    lambda document: document["symmetric_topology"]["value"]["sites"]["west"]["target_fleet"][1].update(
+                        {"az_key": "a"}
+                    ),
+                ),
+                (
+                    "wrong target group",
+                    lambda document: document["symmetric_topology"]["value"]["sites"]["west"]["target_fleet"][1].update(
+                        {"target_group_arn": "arn:fixture:wrong"}
+                    ),
+                ),
+            ):
+                with self.subTest(name=name):
+                    document = deployment_document()
+                    mutate(document)
+                    _instances, target_groups, _workloads = appliance.deployment_values(
+                        document, expected_sites=config.sites
+                    )
+                    with self.assertRaises(appliance.LifecycleError):
+                        appliance.deployment_target_fleets(document, config, target_groups)
+
     def test_deployment_wait_requires_two_appliances_four_workloads_and_two_targets(self):
         class FakeAWS:
             def __init__(self):
@@ -6996,7 +7072,16 @@ class ReadinessTest(unittest.TestCase):
                     return {"Status": "Success"}
                 if operation == "describe-target-health":
                     inner.targets.append((region, args[-1]))
-                    return {"TargetHealthDescriptions": [{"TargetHealth": {"State": "healthy"}}]}
+                    site = "west" if region == "us-west-2" else "east"
+                    return {
+                        "TargetHealthDescriptions": [
+                            {
+                                "Target": {"Id": f"i-appliance-{site}" + ("-b" if az_key == "b" else "")},
+                                "TargetHealth": {"State": "healthy"},
+                            }
+                            for az_key in ("a", "b")
+                        ]
+                    }
                 raise AssertionError(args)
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -7091,7 +7176,7 @@ class ReadinessTest(unittest.TestCase):
             self.assertNotIn(secret, serialized)
             self.assertNotIn(secret, str(raised.exception))
 
-    def test_ssm_and_target_waits_require_success_and_single_healthy_target(self):
+    def test_ssm_and_target_waits_require_success_and_the_exact_healthy_fleet(self):
         class FakeAWS:
             def json(self, args, *, region=None):
                 operation = args[1]
@@ -7102,14 +7187,24 @@ class ReadinessTest(unittest.TestCase):
                 if operation == "get-command-invocation":
                     return {"Status": "Success"}
                 if operation == "describe-target-health":
-                    return {"TargetHealthDescriptions": [{"TargetHealth": {"State": "healthy"}}]}
+                    return {
+                        "TargetHealthDescriptions": [
+                            {"Target": {"Id": target_id}, "TargetHealth": {"State": "healthy"}}
+                            for target_id in ("i-fixture-a", "i-fixture-b")
+                        ]
+                    }
                 raise AssertionError(args)
 
         aws = FakeAWS()
         deadline = time.monotonic() + 1
         appliance.wait_for_instance(aws, region="us-west-2", instance_id="i-fixture", deadline=deadline, sleep=lambda _: None)
         appliance.wait_for_target(
-            aws, region="us-west-2", target_group_arn="arn:fixture", deadline=deadline, sleep=lambda _: None
+            aws,
+            region="us-west-2",
+            target_group_arn="arn:fixture",
+            expected_target_ids=("i-fixture-a", "i-fixture-b"),
+            deadline=deadline,
+            sleep=lambda _: None,
         )
         commands = "\n".join(appliance.READINESS_COMMANDS)
         self.assertIn("600s cloud-init status --wait", commands)

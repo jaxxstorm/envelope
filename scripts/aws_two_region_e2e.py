@@ -7152,13 +7152,20 @@ class AwsLiveOperations:
             region=target.region,
         )
         descriptions = response.get("TargetHealthDescriptions")
-        if not isinstance(descriptions, list) or len(descriptions) != 1:
-            return {"count": len(descriptions) if isinstance(descriptions, list) else -1, "status": "invalid"}
-        value = descriptions[0]
-        if not isinstance(value, Mapping):
-            return {"count": 1, "status": "invalid"}
+        if not isinstance(descriptions, list):
+            return {"count": -1, "status": "invalid"}
+        matches = [
+            value
+            for value in descriptions
+            if isinstance(value, Mapping)
+            and isinstance(value.get("Target"), Mapping)
+            and value["Target"].get("Id") == target.instance_id
+        ]
+        if len(matches) != 1:
+            return {"count": len(descriptions), "status": "invalid"}
+        value = matches[0]
         return {
-            "count": 1,
+            "count": len(descriptions),
             "target_id": value.get("Target", {}).get("Id") if isinstance(value.get("Target"), Mapping) else None,
             "status": value.get("TargetHealth", {}).get("State")
             if isinstance(value.get("TargetHealth"), Mapping)
@@ -7173,8 +7180,7 @@ class AwsLiveOperations:
             dict[str, Any],
             self._wait_until(
                 lambda: self._target_health(target),
-                lambda value: value.get("count") == 1
-                and value.get("target_id") == target.instance_id
+                lambda value: value.get("target_id") == target.instance_id
                 and value.get("status") == status,
                 timeout_seconds=timeout_seconds,
                 description=f"{target.site} GWLB target status {status}",

@@ -5872,21 +5872,56 @@ def wait_for_instance(
     raise LifecycleError(f"SSM readiness timed out for {node_label} in {region}")
 
 
-def wait_for_target(aws: AwsCLI, *, region: str, target_group_arn: str, deadline: float, sleep: Any = time.sleep) -> None:
+def wait_for_target(
+    aws: AwsCLI,
+    *,
+    region: str,
+    target_group_arn: str,
+    expected_target_ids: tuple[str, ...],
+    deadline: float,
+    sleep: Any = time.sleep,
+) -> None:
+    expected = set(expected_target_ids)
+    if not expected or len(expected) != len(expected_target_ids):
+        raise LifecycleError("GWLB readiness requires unique expected target identities")
     last_state = "unknown"
     while time.monotonic() < deadline:
         response = aws.json(
             ["elbv2", "describe-target-health", "--target-group-arn", target_group_arn], region=region
         )
         descriptions = response.get("TargetHealthDescriptions", [])
-        if len(descriptions) != 1:
+        if not isinstance(descriptions, list):
+            last_state = "target-schema-invalid"
+        elif len(descriptions) != len(expected):
             last_state = f"target-count-{len(descriptions)}"
         else:
-            health = descriptions[0].get("TargetHealth", {})
-            state = str(health.get("State", "unknown"))
-            last_state = state if re.fullmatch(r"[a-z-]{1,64}", state) else "invalid"
-            if last_state == "healthy":
+            identities = [
+                value.get("Target", {}).get("Id")
+                for value in descriptions
+                if isinstance(value, dict) and isinstance(value.get("Target"), dict)
+            ]
+            if (
+                len(identities) != len(expected)
+                or any(
+                    not isinstance(identity, str) or not DEPLOYMENT_INSTANCE_ID_RE.fullmatch(identity)
+                    for identity in identities
+                )
+                or set(identities) != expected
+            ):
+                last_state = "target-identities-invalid"
+                sleep(5)
+                continue
+            states = [
+                str(value.get("TargetHealth", {}).get("State", "unknown"))
+                for value in descriptions
+                if isinstance(value, dict) and isinstance(value.get("TargetHealth"), dict)
+            ]
+            if len(states) != len(expected) or any(not re.fullmatch(r"[a-z-]{1,64}", state) for state in states):
+                last_state = "target-states-invalid"
+            elif all(state == "healthy" for state in states):
                 return
+            else:
+                last_state = "target-states-" + "-".join(sorted(states))
         sleep(5)
     raise LifecycleError(f"GWLB target in {region} did not become healthy; last state={last_state}")
 
@@ -5996,6 +6031,78 @@ def validate_symmetric_deployment_output(document: dict[str, Any], config: RunCo
         raise LifecycleError("deployment output failed symmetric validation: " + "; ".join(failures))
 
 
+def deployment_output_value(document: dict[str, Any], name: str) -> Any:
+    if not isinstance(document, dict):
+        raise LifecycleError("deployment output must be a JSON object")
+    value = document.get(name)
+    if isinstance(value, dict) and "value" in value:
+        if set(value) - {"value", "type", "sensitive"}:
+            raise LifecycleError(f"deployment output {name} has an invalid Terraform wrapper")
+        return value["value"]
+    return value
+
+
+def deployment_target_fleets(
+    document: dict[str, Any], config: RunConfig, target_groups: dict[str, str]
+) -> dict[str, tuple[str, ...]]:
+    value = deployment_output_value(document, "symmetric_topology")
+    if not isinstance(value, dict) or set(value) != {"config_version", "run_id", "sites"}:
+        raise LifecycleError("deployment output symmetric_topology has an invalid shape")
+    if value["config_version"] != 2 or value["run_id"] != config.run_id:
+        raise LifecycleError("deployment output symmetric_topology has an invalid version or run identity")
+    sites = value["sites"]
+    if not isinstance(sites, dict) or set(sites) != set(DEPLOYMENT_SITES):
+        raise LifecycleError("deployment output symmetric_topology.sites must contain exactly west and east")
+
+    result: dict[str, tuple[str, ...]] = {}
+    all_ids: list[str] = []
+    site_fields = {"region", "local_site_cidrs", "remote_site_cidrs", "target_fleet", "ingress_router_fleet"}
+    member_fields = {"region", "az_key", "instance_id", "target_group_arn"}
+    for site in DEPLOYMENT_SITES:
+        site_value = sites[site]
+        expected = config.sites[site]
+        if (
+            not isinstance(site_value, dict)
+            or set(site_value) != site_fields
+            or site_value["region"] != expected["region"]
+            or site_value["local_site_cidrs"] != expected["local_site_cidrs"]
+            or site_value["remote_site_cidrs"] != expected["remote_site_cidrs"]
+        ):
+            raise LifecycleError(f"deployment output symmetric_topology.sites.{site} contradicts the run config")
+        fleet = site_value["target_fleet"]
+        expected_az_keys = set(expected["target_az_keys"])
+        if not isinstance(fleet, list) or len(fleet) != len(expected_az_keys):
+            raise LifecycleError(f"deployment output symmetric_topology.sites.{site}.target_fleet has invalid capacity")
+        ids: list[str] = []
+        az_keys: list[str] = []
+        for member in fleet:
+            if (
+                not isinstance(member, dict)
+                or set(member) != member_fields
+                or member["region"] != expected["region"]
+                or not isinstance(member["az_key"], str)
+                or member["az_key"] not in expected_az_keys
+                or member["target_group_arn"] != target_groups[site]
+                or not isinstance(member["instance_id"], str)
+                or not DEPLOYMENT_INSTANCE_ID_RE.fullmatch(member["instance_id"])
+                or redact(member["instance_id"]) != member["instance_id"]
+            ):
+                raise LifecycleError(
+                    f"deployment output symmetric_topology.sites.{site}.target_fleet has an invalid member"
+                )
+            ids.append(member["instance_id"])
+            az_keys.append(member["az_key"])
+        if set(az_keys) != expected_az_keys or len(set(ids)) != len(ids):
+            raise LifecycleError(
+                f"deployment output symmetric_topology.sites.{site}.target_fleet does not cover each configured AZ"
+            )
+        result[site] = tuple(ids)
+        all_ids.extend(ids)
+    if len(set(all_ids)) != len(all_ids):
+        raise LifecycleError("deployment output symmetric target fleets contain duplicate instance identities")
+    return result
+
+
 def deployment_values(
     document: dict[str, Any],
     *,
@@ -6010,16 +6117,8 @@ def deployment_values(
     if not isinstance(document, dict):
         raise LifecycleError("deployment output must be a JSON object")
 
-    def output_value(name: str) -> Any:
-        value = document.get(name)
-        if isinstance(value, dict) and "value" in value:
-            if set(value) - {"value", "type", "sensitive"}:
-                raise LifecycleError(f"deployment output {name} has an invalid Terraform wrapper")
-            return value["value"]
-        return value
-
     def exact_site_strings(name: str, pattern: re.Pattern[str]) -> dict[str, str]:
-        value = output_value(name)
+        value = deployment_output_value(document, name)
         if not isinstance(value, dict) or set(value) != set(DEPLOYMENT_SITES):
             raise LifecycleError(f"deployment output {name} must contain exactly west and east")
         result: dict[str, str] = {}
@@ -6038,7 +6137,7 @@ def deployment_values(
 
     instances = exact_site_strings("instance_ids", DEPLOYMENT_INSTANCE_ID_RE)
     target_groups = exact_site_strings("gwlb_target_group_arns", DEPLOYMENT_TARGET_GROUP_ARN_RE)
-    workload_value = output_value("workload_instances")
+    workload_value = deployment_output_value(document, "workload_instances")
     if not isinstance(workload_value, dict) or set(workload_value) != set(DEPLOYMENT_SITES):
         raise LifecycleError("deployment output workload_instances must contain exactly west and east")
     if expected_sites is not None and (
@@ -6211,6 +6310,7 @@ def wait_deployment(
     if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or timeout_seconds <= 0:
         raise LifecycleError("deployment readiness timeout must be a positive integer")
     instances, target_groups, workloads = deployment_values(deployment, expected_sites=config.sites)
+    target_fleets = deployment_target_fleets(deployment, config, target_groups)
     deadline = time.monotonic() + timeout_seconds
     try:
         for site in DEPLOYMENT_SITES:
@@ -6239,6 +6339,7 @@ def wait_deployment(
                 aws,
                 region=config.sites[site]["region"],
                 target_group_arn=target_groups[site],
+                expected_target_ids=target_fleets[site],
                 deadline=deadline,
                 sleep=sleep,
             )
