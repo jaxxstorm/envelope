@@ -2,32 +2,38 @@ schema: spec-driven
 
 context: |
   Project: Envelope
-  Purpose: A lightweight shim that integrates AWS Gateway Load Balancer (GWLB) with Tailscale by terminating/originating
-  GENEVE (UDP/6081), decapsulating encapsulated IP packets, and forwarding them to a Tailscale-managed TUN device.
-  Return traffic is re-encapsulated into GENEVE and sent back to GWLB to preserve symmetric flow behavior.
+  Purpose: A lightweight AWS Gateway Load Balancer (GWLB) packet-turnaround target. For each valid GENEVE packet on
+  UDP/6081, Envelope immediately returns exactly one packet to that GWLB with byte-identical inner data and the current
+  packet's outer tuple, VNI, ordered options, and flow cookie. Separate Tailscale transport routers carry inspected inner
+  traffic between sites; Envelope targets do not inject into a TUN or directly forward inner packets.
 
   Tech stack:
   - Language: Go (preferred) with no cgo/c bindings.
   - OS: Linux only (initially).
   - Tailscale integration:
-    - Envelope creates/owns envelope0 and tailscaled independently owns tailscale0; Linux routing connects them.
-  - AWS: Targeted for deployment behind GWLB as a transparent appliance endpoint.
+    - Dedicated transport-router hosts own tailscale0, exact route advertisements, accepted routes, no-NAT forwarding,
+      firewall policy, and MSS clamping.
+    - Envelope targets do not run tailscaled, create envelope0, or carry inner site routes.
+  - AWS: Targets sit behind GWLB; GWLBE post-inspection route tables select VPC local delivery or a ready same-site
+    transport-router ENI.
 
   Networking conventions & assumptions:
   - GENEVE runs over UDP/6081.
-  - Inner payload is treated as L3 IP packets (no L2 bridging in v1).
-  - Avoid conntrack/NAT in v1 unless strictly required for AWS return-path correctness.
-  - Handle MTU carefully due to encapsulation overhead; prefer PMTU-safe defaults and clear operator guidance.
+  - Inner payload is treated as L3 IP packets; targets do not perform L2 bridging.
+  - Target processing is packet-scoped and stateless across packets; invalid packets produce no return.
+  - Inter-site transport preserves source addresses and performs no conntrack or NAT.
+  - Target receive bounds and transport-router path MTU/MSS are separate operational contracts.
 
   Performance goals:
-  - Keep datapath minimal: UDP recv -> GENEVE decap -> write to TUN; read from TUN -> GENEVE encap -> UDP send.
+  - Keep target datapath minimal: UDP receive -> validate GENEVE/AWS metadata -> build one raw IPv4/UDP return -> send.
   - Prefer batching and buffer pooling (sync.Pool) to reduce allocations and GC pressure.
-  - Instrument for pps/bytes/latency to enable tuning.
+  - Benchmark packet construction and GENEVE option validation without restoring routing-manager benchmarks.
 
   Observability:
   - Structured logs (zap-style or slog), no noisy debug by default.
   - Prometheus metrics on :9090/metrics and health endpoint :9090/healthz.
-  - Include per-stage counters: geneve_rx/tx, decap/encap_errors, tun_rx/tx, drops, latency histograms.
+  - Include packet receive/return, profile rejection, boundary drop, MTU drop, send failure, and target-component readiness
+    metrics. Transport-router, Tailnet, AWS route, and ENI readiness is collected separately by protected acceptance.
 
   Repo expectations:
   - Specs are the source of truth; code and tests must trace back to specs and acceptance criteria.
@@ -60,7 +66,9 @@ rules:
   tests:
     - Must include:
       - Unit tests for GENEVE header parsing/serialization (with fuzz targets if practical).
-      - End-to-end test: UDP/6081 in -> decap -> tun write; tun read -> encap -> UDP/6081 out.
+      - Packet-level test: valid UDP/6081 ingress -> exactly one byte-identical packet-scoped GWLB return.
+      - Negative packet-level test: malformed AWS/GENEVE metadata -> no return.
+      - Secretless two-site Headscale integration with separate packet-turnaround targets and transport routers.
     - Provide pcap fixtures for at least:
       - minimal GENEVE packet
       - packet with options (GWLB relevant TLVs if used)
@@ -73,7 +81,7 @@ rules:
   docs:
     - README must include:
       - What Envelope is / is not
-      - Deployment modes (v1 single TUN; v2 policy routing optional)
-      - Required Linux capabilities and sysctls
+      - Packet-turnaround target and separate transport-router roles
+      - Required Linux capabilities, host sysctls, firewall, and protected-readiness ownership
       - MTU guidance and troubleshooting steps
     - Avoid marketing language; keep it operational and precise.

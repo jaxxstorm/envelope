@@ -2,17 +2,16 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jaxxstorm/envelope/internal/config"
 	"github.com/jaxxstorm/envelope/internal/datapath"
 	"github.com/jaxxstorm/envelope/internal/metrics"
-	"github.com/jaxxstorm/envelope/internal/routing"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
@@ -21,64 +20,49 @@ import (
 
 type Runner interface {
 	Run(context.Context) error
-	HealthHandler(http.ResponseWriter, *http.Request)
 	Ready() bool
 	HealthReason() string
 	Close()
 }
 
 type runnerFactory func(*config.Config, *zap.Logger, *metrics.Metrics) (Runner, error)
-type routingFactory func(*config.Config, *zap.Logger, *metrics.Metrics) (routing.Manager, error)
 
-func Run(ctx context.Context, cfg *config.Config, log *zap.Logger) error {
-	return run(ctx, cfg, log, newDatapathRunner, newRoutingManager)
+type serverShutdowner interface {
+	Shutdown(context.Context) error
 }
 
-func run(ctx context.Context, cfg *config.Config, log *zap.Logger, factory runnerFactory, newRouting routingFactory) error {
+func Run(ctx context.Context, cfg *config.Config, log *zap.Logger) error {
+	return run(ctx, cfg, log, newDatapathRunner)
+}
+
+func run(ctx context.Context, cfg *config.Config, log *zap.Logger, factory runnerFactory) error {
 	logStartup(cfg, log)
 
 	reg := prometheus.NewRegistry()
-	m := metrics.New(reg)
+	m := metrics.NewTarget(reg)
 
 	dp, err := factory(cfg, log, m)
 	if err != nil {
 		return err
 	}
-	defer dp.Close()
-
-	routeMgr, err := newRouting(cfg, log, m)
-	if err != nil {
-		return err
+	var closeOnce sync.Once
+	closeRunner := func() {
+		closeOnce.Do(dp.Close)
 	}
-	log.Info("interface ownership model",
-		zap.String("envelope_tun_iface", cfg.TunName),
-		zap.String("tailscale_iface", cfg.TailscaleIface),
-		zap.String("routing_mode", string(routeMgr.Mode())),
-	)
-	if err := routeMgr.Initialize(ctx); err != nil {
-		return err
-	}
-
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
-	mux.HandleFunc("/healthz", newHealthHandler(dp, routeMgr, log))
-	mux.HandleFunc("/debug/routing", newRoutingStatusHandler(routeMgr))
+	defer closeRunner()
 
 	srv := &http.Server{
 		Addr:              cfg.MetricsAddr,
-		Handler:           mux,
+		Handler:           newTargetHandler(dp, reg, log),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	g, ctx := errgroup.WithContext(ctx)
+	g, groupCtx := errgroup.WithContext(ctx)
 	g.Go(func() error {
-		if err := dp.Run(ctx); err != nil {
+		if err := dp.Run(groupCtx); err != nil {
 			return err
 		}
 		return nil
-	})
-	g.Go(func() error {
-		return routeMgr.Run(ctx)
 	})
 	g.Go(func() error {
 		err := srv.ListenAndServe()
@@ -89,38 +73,34 @@ func run(ctx context.Context, cfg *config.Config, log *zap.Logger, factory runne
 	})
 
 	g.Go(func() error {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		<-groupCtx.Done()
+		shutdownTarget(closeRunner, srv)
 		return nil
 	})
 
 	return g.Wait()
 }
 
-func newRoutingStatusHandler(routeMgr routing.Manager) http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(routeMgr.Status()); err != nil {
-			http.Error(w, "encode routing status", http.StatusInternalServerError)
-		}
-	}
+func shutdownTarget(closeRunner func(), srv serverShutdowner) {
+	closeRunner()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(shutdownCtx)
+}
+
+func newTargetHandler(dp Runner, reg *prometheus.Registry, log *zap.Logger) http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	mux.HandleFunc("/healthz", newHealthHandler(dp, log))
+	return mux
 }
 
 func logStartup(cfg *config.Config, log *zap.Logger) {
-	log.Info("starting envelope",
+	log.Info("starting Envelope GWLB packet-return target",
 		zap.Int("config_version", cfg.ConfigVersion),
+		zap.String("mode", cfg.Mode),
 		zap.String("udp_bind", cfg.UDPBind),
-		zap.String("tun_name", cfg.TunName),
-		zap.Int("tun_mtu", cfg.TunMTU),
-		zap.String("tailscale_iface", cfg.TailscaleIface),
-		zap.String("underlay_interface", cfg.UnderlayIface),
-		zap.String("routing_mode", string(cfg.RoutingMode)),
-		zap.Strings("local_site_cidrs", cfg.EffectiveLocalSiteCIDRs()),
-		zap.Strings("remote_site_cidrs", cfg.EffectiveRemoteSiteCIDRs()),
-		zap.Int("routing_table_id", cfg.RoutingTableID),
-		zap.Int("routing_rule_priority", cfg.RoutingRulePriority),
+		zap.Int("max_inner_packet_size", cfg.MaxInnerPacketSize),
 		zap.String("metrics_addr", cfg.MetricsAddr),
 		zap.Any("vni", cfg.VNI),
 		zap.Int("persistent_error_threshold", cfg.PersistentErrorThreshold),
@@ -139,11 +119,7 @@ func newDatapathRunner(cfg *config.Config, log *zap.Logger, m *metrics.Metrics) 
 	return &datapathRunner{Datapath: dp}, nil
 }
 
-func newRoutingManager(cfg *config.Config, log *zap.Logger, m *metrics.Metrics) (routing.Manager, error) {
-	return routing.New(cfg, log, m)
-}
-
-func newHealthHandler(dp Runner, routeMgr routing.Manager, log *zap.Logger) http.HandlerFunc {
+func newHealthHandler(dp Runner, log *zap.Logger) http.HandlerFunc {
 	if log == nil {
 		log = zap.NewNop()
 	}
@@ -155,11 +131,7 @@ func newHealthHandler(dp Runner, routeMgr routing.Manager, log *zap.Logger) http
 		if !dp.Ready() {
 			status = http.StatusServiceUnavailable
 			reason = dp.HealthReason()
-			body = "datapath not ready: " + reason
-		} else if routeMgr.Mode() != config.RoutingModeOff && !routeMgr.Ready() {
-			status = http.StatusServiceUnavailable
-			reason = routeMgr.HealthReason()
-			body = "routing not ready: " + reason
+			body = "packet return not ready: " + reason
 		}
 
 		if debug {
@@ -170,7 +142,6 @@ func newHealthHandler(dp Runner, routeMgr routing.Manager, log *zap.Logger) http
 				zap.String("remote_addr", r.RemoteAddr),
 				zap.String("user_agent", ua),
 				zap.Bool("is_gwlb_healthcheck", strings.Contains(strings.ToLower(ua), "elb-healthchecker")),
-				zap.String("routing_mode", string(routeMgr.Mode())),
 				zap.Int("status", status),
 				zap.String("reason", reason),
 			)

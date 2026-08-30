@@ -2,13 +2,16 @@ package datapath
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/jaxxstorm/envelope/internal/bufferpool"
 	"github.com/jaxxstorm/envelope/internal/config"
 	"github.com/jaxxstorm/envelope/internal/geneve"
 	"github.com/jaxxstorm/envelope/internal/metrics"
@@ -26,36 +29,72 @@ func (*testReceiver) ReadPacket([]byte) (int, PacketMetadata, error) {
 func (*testReceiver) SetReadDeadline(time.Time) error { return nil }
 func (*testReceiver) Close() error                    { return nil }
 
-type captureTun struct {
-	writes   [][]byte
-	writeErr error
+type captureSender struct {
+	mu       sync.Mutex
+	requests []SendRequest
+	attempts int
+	closes   int
+	err      error
 }
 
-func (*captureTun) Read([]byte) (int, error) { return 0, net.ErrClosed }
-func (t *captureTun) Write(packet []byte) (int, error) {
-	if t.writeErr != nil {
-		return 0, t.writeErr
+func (s *captureSender) SendPacket(request SendRequest) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.attempts++
+	if s.err != nil {
+		return s.err
 	}
-	t.writes = append(t.writes, append([]byte(nil), packet...))
-	return len(packet), nil
+	request.Payload = append([]byte(nil), request.Payload...)
+	s.requests = append(s.requests, request)
+	return nil
 }
-func (*captureTun) Close() error { return nil }
+
+func (s *captureSender) Close() error {
+	s.mu.Lock()
+	s.closes++
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *captureSender) Requests() []SendRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]SendRequest(nil), s.requests...)
+}
+
+func (s *captureSender) Attempts() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.attempts
+}
+
+func (s *captureSender) SetError(err error) {
+	s.mu.Lock()
+	s.err = err
+	s.mu.Unlock()
+}
+
+func (s *captureSender) Closes() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closes
+}
 
 func testConfig(t testing.TB, extra ...string) *config.Config {
 	t.Helper()
-	args := []string{"--udp-bind=:6081", "--metrics-addr=:9090", "--tun-mtu=1500"}
+	args := []string{"--udp-bind=:6081", "--metrics-addr=:9090", "--max-inner-packet-size=1500"}
 	args = append(args, extra...)
-	cfg, err := config.Parse(args)
+	cfg, err := config.ParseTarget(args)
 	if err != nil {
 		t.Fatalf("parse config: %v", err)
 	}
 	return cfg
 }
 
-func newTestDatapath(t testing.TB, cfg *config.Config, log *zap.Logger, tunDev *captureTun) (*Datapath, *metrics.Metrics) {
+func newTestDatapath(t testing.TB, cfg *config.Config, log *zap.Logger, sender PacketSender) (*Datapath, *metrics.Metrics) {
 	t.Helper()
-	metricSet := metrics.New(prometheus.NewRegistry())
-	return NewWithDevices(cfg, log, metricSet, &testReceiver{}, tunDev), metricSet
+	metricSet := metrics.NewTarget(prometheus.NewRegistry())
+	return newWithPacketIO(cfg, log, metricSet, &testReceiver{}, sender), metricSet
 }
 
 func geneveTestTLV(class uint16, rawType, reserved uint8, data []byte) []byte {
@@ -100,6 +139,19 @@ func innerIPv4UDP(source, destination [4]byte, sourcePort, destinationPort uint1
 	return packet
 }
 
+func innerIPv6UDP(sourcePort, destinationPort uint16) []byte {
+	packet := make([]byte, 48)
+	packet[0] = 0x60
+	binary.BigEndian.PutUint16(packet[4:6], 8)
+	packet[6] = 17
+	packet[7] = 64
+	packet[23], packet[39] = 1, 2
+	binary.BigEndian.PutUint16(packet[40:42], sourcePort)
+	binary.BigEndian.PutUint16(packet[42:44], destinationPort)
+	binary.BigEndian.PutUint16(packet[44:46], 8)
+	return packet
+}
+
 func encodeAWSGeneve(t testing.TB, payload, options []byte, mutate func(*geneve.Header)) []byte {
 	t.Helper()
 	header := geneve.Header{VNI: 0, Options: options}
@@ -114,52 +166,247 @@ func encodeAWSGeneve(t testing.TB, payload, options []byte, mutate func(*geneve.
 	return packet[:n]
 }
 
-func TestSymmetricIngressIsIndependentOfFlowHistory(t *testing.T) {
-	packetA := innerIPv4UDP([4]byte{10, 0, 0, 1}, [4]byte{10, 1, 0, 1}, 1234, 443)
-	packetB := innerIPv4UDP([4]byte{10, 1, 0, 1}, [4]byte{10, 0, 0, 1}, 443, 1234)
-	for _, payload := range [][]byte{packetA, packetB} {
-		t.Run("independent healthy target", func(t *testing.T) {
-			tunDev := &captureTun{}
-			dp, metricSet := newTestDatapath(t, testConfig(t), zap.NewNop(), tunDev)
-			dp.processIngress(encodeAWSGeneve(t, payload, sanitizedAWSOptions(), nil), testPacketMetadata())
-			if len(tunDev.writes) != 1 || !bytes.Equal(tunDev.writes[0], payload) {
-				t.Fatal("valid packet was not injected into TUN")
-			}
-			if got := testutil.ToFloat64(metricSet.TunTxPackets); got != 1 {
-				t.Fatalf("TUN injection metric = %v, want 1", got)
+func TestIngressReturnsExactPacketWithAWSOuterTuple(t *testing.T) {
+	sender := &captureSender{}
+	dp, metricSet := newTestDatapath(t, testConfig(t), zap.NewNop(), sender)
+	inner := innerIPv4UDP([4]byte{10, 0, 0, 1}, [4]byte{10, 1, 0, 1}, 1234, 443)
+	options := sanitizedAWSOptions()
+	options[2] |= geneve.OptionTypeCriticalMask
+	packet := encodeAWSGeneve(t, inner, options, func(header *geneve.Header) { header.Critical = true })
+
+	dp.processIngress(packet, testPacketMetadata())
+
+	requests := sender.Requests()
+	if sender.Attempts() != 1 || len(requests) != 1 {
+		t.Fatalf("send attempts=%d successful requests=%d, want exactly one", sender.Attempts(), len(requests))
+	}
+	request := requests[0]
+	if request.Source != netip.MustParseAddrPort("198.51.100.20:40000") {
+		t.Fatalf("source = %s, want 198.51.100.20:40000", request.Source)
+	}
+	if request.Destination != netip.MustParseAddrPort("192.0.2.10:6081") {
+		t.Fatalf("destination = %s, want 192.0.2.10:6081", request.Destination)
+	}
+	if request.IfIndex != 7 {
+		t.Fatalf("ifindex = %d, want 7", request.IfIndex)
+	}
+	header, returnedInner, err := geneve.Decode(request.Payload)
+	if err != nil {
+		t.Fatalf("decode return packet: %v", err)
+	}
+	if header.VNI != 0 || header.Protocol != geneve.ProtoIPv4 || !header.Critical {
+		t.Fatalf("return header = %+v", header)
+	}
+	if !bytes.Equal(header.Options, options) || !bytes.Equal(returnedInner, inner) || !bytes.Equal(request.Payload, packet) {
+		t.Fatal("return changed the GENEVE options, cookie, protocol, VNI, or inner packet")
+	}
+	if got := testutil.ToFloat64(metricSet.GeneveRxPackets); got != 1 {
+		t.Fatalf("valid GENEVE RX packets = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metricSet.GeneveTxPackets); got != 1 {
+		t.Fatalf("GENEVE TX packets = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metricSet.GeneveTxBytes); got != float64(len(packet)) {
+		t.Fatalf("GENEVE TX bytes = %v, want %d", got, len(packet))
+	}
+}
+
+func TestIngressReturnsUseOnlyCurrentPacketMetadata(t *testing.T) {
+	sender := &captureSender{}
+	dp, _ := newTestDatapath(t, testConfig(t), zap.NewNop(), sender)
+	innerA := innerIPv4UDP([4]byte{10, 0, 0, 1}, [4]byte{10, 1, 0, 1}, 1234, 443)
+	innerB := innerIPv6UDP(443, 1234)
+	optionsA := sanitizedAWSOptions()
+	optionsB := sanitizedAWSOptions()
+	copy(optionsB[4:8], []byte{1, 2, 3, 4})
+	packetA := encodeAWSGeneve(t, innerA, optionsA, nil)
+	packetB := encodeAWSGeneve(t, innerB, optionsB, nil)
+	metadataA := testPacketMetadata()
+	metadataB := PacketMetadata{
+		Peer:    netip.MustParseAddrPort("203.0.113.30:51000"),
+		Local:   netip.MustParseAddrPort("198.51.100.21:6081"),
+		IfIndex: 11,
+	}
+
+	dp.processIngress(packetA, metadataA)
+	dp.processIngress(packetB, metadataB)
+
+	requests := sender.Requests()
+	if len(requests) != 2 || sender.Attempts() != 2 {
+		t.Fatalf("send attempts=%d successful requests=%d, want two", sender.Attempts(), len(requests))
+	}
+	if requests[0].Source != netip.MustParseAddrPort("198.51.100.20:40000") ||
+		requests[0].Destination != netip.MustParseAddrPort("192.0.2.10:6081") ||
+		!bytes.Equal(requests[0].Payload, packetA) {
+		t.Fatal("first return did not use only the first packet metadata")
+	}
+	if requests[1].Source != netip.MustParseAddrPort("198.51.100.21:51000") ||
+		requests[1].Destination != netip.MustParseAddrPort("203.0.113.30:6081") ||
+		requests[1].IfIndex != 11 || !bytes.Equal(requests[1].Payload, packetB) {
+		t.Fatal("second return retained metadata from another packet")
+	}
+	headerB, returnedInnerB, err := geneve.Decode(requests[1].Payload)
+	if err != nil || headerB.Protocol != geneve.ProtoIPv6 || !bytes.Equal(returnedInnerB, innerB) {
+		t.Fatalf("second return protocol or payload changed: header=%+v err=%v", headerB, err)
+	}
+}
+
+func TestOpaqueInnerPacketsReturnByteForByte(t *testing.T) {
+	ipv4Fragment := innerIPv4UDP([4]byte{10, 0, 0, 1}, [4]byte{10, 1, 0, 1}, 1234, 443)
+	binary.BigEndian.PutUint16(ipv4Fragment[6:8], 0x2000)
+
+	ipv6Extension := make([]byte, 56)
+	ipv6Extension[0] = 0x60
+	binary.BigEndian.PutUint16(ipv6Extension[4:6], 16)
+	ipv6Extension[6] = 0
+	ipv6Extension[40] = 17
+	binary.BigEndian.PutUint16(ipv6Extension[52:54], 8)
+
+	ipv6Fragment := make([]byte, 48)
+	ipv6Fragment[0] = 0x60
+	binary.BigEndian.PutUint16(ipv6Fragment[4:6], 8)
+	ipv6Fragment[6] = 44
+	ipv6Fragment[40] = 17
+	binary.BigEndian.PutUint16(ipv6Fragment[42:44], 1)
+
+	for _, tc := range []struct {
+		name  string
+		inner []byte
+	}{
+		{name: "IPv4 fragment", inner: ipv4Fragment},
+		{name: "IPv6 extension", inner: ipv6Extension},
+		{name: "IPv6 fragment", inner: ipv6Fragment},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sender := &captureSender{}
+			dp, _ := newTestDatapath(t, testConfig(t), zap.NewNop(), sender)
+			packet := encodeAWSGeneve(t, tc.inner, sanitizedAWSOptions(), nil)
+			dp.processIngress(packet, testPacketMetadata())
+
+			requests := sender.Requests()
+			if sender.Attempts() != 1 || len(requests) != 1 || !bytes.Equal(requests[0].Payload, packet) {
+				t.Fatal("opaque inner packet was not returned exactly once byte-for-byte")
 			}
 		})
 	}
 }
 
-func TestTargetRestartNeedsNoRestoredState(t *testing.T) {
-	forward := innerIPv4UDP([4]byte{10, 0, 0, 1}, [4]byte{10, 1, 0, 1}, 1234, 443)
-	reverse := innerIPv4UDP([4]byte{10, 1, 0, 1}, [4]byte{10, 0, 0, 1}, 443, 1234)
-	oldTarget, _ := newTestDatapath(t, testConfig(t), zap.NewNop(), &captureTun{})
-	oldTarget.processIngress(encodeAWSGeneve(t, forward, sanitizedAWSOptions(), nil), testPacketMetadata())
+func TestConcurrentIdenticalInnerTupleIsolation(t *testing.T) {
+	const packetCount = 64
+	sender := &captureSender{}
+	dp, _ := newTestDatapath(t, testConfig(t), zap.NewNop(), sender)
+	inner := innerIPv4UDP([4]byte{10, 0, 0, 1}, [4]byte{10, 1, 0, 1}, 1234, 443)
+	type expectedReturn struct {
+		ifIndex int
+		payload []byte
+	}
+	expected := make(map[uint16]expectedReturn, packetCount)
 
-	tunDev := &captureTun{}
-	restartedTarget, _ := newTestDatapath(t, testConfig(t), zap.NewNop(), tunDev)
-	restartedTarget.processIngress(encodeAWSGeneve(t, reverse, sanitizedAWSOptions(), nil), testPacketMetadata())
-	if got := len(tunDev.writes); got != 1 {
-		t.Fatalf("post-restart packet injections = %d, want 1", got)
+	var workers sync.WaitGroup
+	for i := range packetCount {
+		port := uint16(40000 + i)
+		options := sanitizedAWSOptions()
+		binary.BigEndian.PutUint32(options[4:8], uint32(i+1))
+		packet := encodeAWSGeneve(t, inner, options, nil)
+		metadata := PacketMetadata{
+			Peer:    netip.AddrPortFrom(netip.MustParseAddr("192.0.2.10"), port),
+			Local:   netip.MustParseAddrPort("198.51.100.20:6081"),
+			IfIndex: i + 1,
+		}
+		expected[port] = expectedReturn{ifIndex: metadata.IfIndex, payload: packet}
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			dp.processIngress(packet, metadata)
+		}()
+	}
+	workers.Wait()
+
+	requests := sender.Requests()
+	if sender.Attempts() != packetCount || len(requests) != packetCount {
+		t.Fatalf("send attempts=%d returns=%d, want %d exactly once returns", sender.Attempts(), len(requests), packetCount)
+	}
+	seen := make(map[uint16]bool, packetCount)
+	for _, request := range requests {
+		port := request.Source.Port()
+		want, ok := expected[port]
+		if !ok || seen[port] {
+			t.Fatalf("unexpected or duplicate packet identity for source port %d", port)
+		}
+		seen[port] = true
+		if request.Source.Addr() != netip.MustParseAddr("198.51.100.20") ||
+			request.Destination != netip.MustParseAddrPort("192.0.2.10:6081") ||
+			request.IfIndex != want.ifIndex || !bytes.Equal(request.Payload, want.payload) {
+			t.Fatalf("packet identity %d was mixed with another concurrent packet", port)
+		}
 	}
 }
 
-func TestUnexpectedTunEgressIsDroppedWithoutGeneveEmission(t *testing.T) {
-	payload := innerIPv4UDP([4]byte{10, 0, 0, 1}, [4]byte{10, 1, 0, 1}, 1234, 443)
-	core, observed := observer.New(zap.WarnLevel)
-	dp, metricSet := newTestDatapath(t, testConfig(t), zap.New(core), &captureTun{})
-	dp.processEgress(payload)
-	dp.processEgress(payload)
-	if got := testutil.ToFloat64(metricSet.SymmetricUnexpectedEgress); got != 2 {
-		t.Fatalf("unexpected egress metric = %v, want 2", got)
+func TestTargetRestartNeedsNoRestoredState(t *testing.T) {
+	oldSender := &captureSender{}
+	oldTarget, _ := newTestDatapath(t, testConfig(t), zap.NewNop(), oldSender)
+	oldPacket := encodeAWSGeneve(t, innerIPv4UDP([4]byte{10, 0, 0, 1}, [4]byte{10, 1, 0, 1}, 1234, 443), sanitizedAWSOptions(), nil)
+	oldTarget.processIngress(oldPacket, testPacketMetadata())
+	oldTarget.Close()
+
+	restartedSender := &captureSender{}
+	restartedTarget, _ := newTestDatapath(t, testConfig(t), zap.NewNop(), restartedSender)
+	postRestartPacket := encodeAWSGeneve(t, innerIPv4UDP([4]byte{10, 1, 0, 1}, [4]byte{10, 0, 0, 1}, 443, 1234), sanitizedAWSOptions(), nil)
+	restartedTarget.processIngress(postRestartPacket, testPacketMetadata())
+	requests := restartedSender.Requests()
+	if len(requests) != 1 || !bytes.Equal(requests[0].Payload, postRestartPacket) {
+		t.Fatalf("post-restart returns = %d, want one independent return", len(requests))
 	}
-	if got := testutil.ToFloat64(metricSet.Drops); got != 2 {
-		t.Fatalf("drops = %v, want 2", got)
+}
+
+func TestProductionConstructorOpensOnlyPacketReceiverAndSender(t *testing.T) {
+	receiver := &testReceiver{}
+	sender := &captureSender{}
+	dp, err := newWithPacketIOFactories(
+		testConfig(t),
+		zap.NewNop(),
+		metrics.NewTarget(prometheus.NewRegistry()),
+		func(bind string) (PacketReceiver, error) {
+			if bind != ":6081" {
+				t.Fatalf("receiver bind = %q, want :6081", bind)
+			}
+			return receiver, nil
+		},
+		func(maxPacket int) (PacketSender, error) {
+			if maxPacket <= 0 {
+				t.Fatalf("sender packet size = %d", maxPacket)
+			}
+			return sender, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("construct production datapath: %v", err)
 	}
-	if entries := observed.FilterMessage("unexpected TUN egress dropped").All(); len(entries) != 1 {
-		t.Fatalf("unexpected egress logs = %d, want 1", len(entries))
+	dp.Close()
+}
+
+func TestProductionConstructorRejectsInvalidModeBeforePacketIO(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Mode = "direct-forward"
+	opened := false
+	_, err := newWithPacketIOFactories(
+		cfg,
+		zap.NewNop(),
+		metrics.NewTarget(prometheus.NewRegistry()),
+		func(string) (PacketReceiver, error) {
+			opened = true
+			return &testReceiver{}, nil
+		},
+		func(int) (PacketSender, error) {
+			opened = true
+			return &captureSender{}, nil
+		},
+	)
+	if err == nil {
+		t.Fatal("invalid target mode unexpectedly accepted")
+	}
+	if opened {
+		t.Fatal("packet I/O opened before invalid target mode was rejected")
 	}
 }
 
@@ -172,6 +419,7 @@ func TestAWSProfileRejectionMatrix(t *testing.T) {
 		metadata PacketMetadata
 		reason   string
 	}{
+		{name: "decode", packet: func(*testing.T) []byte { return []byte{0} }, metadata: testPacketMetadata(), reason: metrics.ProfileReasonDecode},
 		{name: "nonzero VNI", packet: func(t *testing.T) []byte {
 			return encodeAWSGeneve(t, validPayload, validOptions, func(h *geneve.Header) { h.VNI = 1 })
 		}, metadata: testPacketMetadata(), reason: metrics.ProfileReasonVNI},
@@ -181,6 +429,9 @@ func TestAWSProfileRejectionMatrix(t *testing.T) {
 		{name: "missing cookie", packet: func(t *testing.T) []byte {
 			return encodeAWSGeneve(t, validPayload, geneveTestTLV(geneve.AWSOptionClass, geneve.AWSOptionTypeVPCE, 0, make([]byte, 8)), nil)
 		}, metadata: testPacketMetadata(), reason: metrics.ProfileReasonOptions},
+		{name: "protocol mismatch", packet: func(t *testing.T) []byte {
+			return encodeAWSGeneve(t, validPayload, validOptions, func(h *geneve.Header) { h.Protocol = geneve.ProtoIPv6 })
+		}, metadata: testPacketMetadata(), reason: metrics.ProfileReasonProtocol},
 		{name: "wrong local port", packet: func(t *testing.T) []byte { return encodeAWSGeneve(t, validPayload, validOptions, nil) }, metadata: func() PacketMetadata {
 			m := testPacketMetadata()
 			m.Local = netip.AddrPortFrom(m.Local.Addr(), 6080)
@@ -189,8 +440,15 @@ func TestAWSProfileRejectionMatrix(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			dp, metricSet := newTestDatapath(t, testConfig(t), zap.NewNop(), &captureTun{})
+			sender := &captureSender{}
+			dp, metricSet := newTestDatapath(t, testConfig(t), zap.NewNop(), sender)
 			dp.processIngress(tc.packet(t), tc.metadata)
+			if sender.Attempts() != 0 {
+				t.Fatal("invalid packet emitted a return")
+			}
+			if got := testutil.ToFloat64(metricSet.GeneveRxPackets); got != 0 {
+				t.Fatalf("valid receive packets = %v, want 0", got)
+			}
 			if got := testutil.ToFloat64(metricSet.GWLBProfileRejections.WithLabelValues(tc.reason)); got != 1 {
 				t.Fatalf("profile reason %q = %v, want 1", tc.reason, got)
 			}
@@ -198,25 +456,95 @@ func TestAWSProfileRejectionMatrix(t *testing.T) {
 	}
 }
 
-func TestTunWritePersistentFailureAndRecovery(t *testing.T) {
-	tunDev := &captureTun{writeErr: errors.New("TUN write failed")}
-	dp, _ := newTestDatapath(t, testConfig(t, "--persistent-error-threshold=1"), zap.NewNop(), tunDev)
+func TestInvalidInnerPacketsEmitNoReturn(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		inner []byte
+	}{
+		{name: "short IPv4", inner: []byte{0x45}},
+		{name: "short IPv6", inner: []byte{0x60}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sender := &captureSender{}
+			dp, metricSet := newTestDatapath(t, testConfig(t), zap.NewNop(), sender)
+			dp.processIngress(encodeAWSGeneve(t, tc.inner, sanitizedAWSOptions(), nil), testPacketMetadata())
+			if sender.Attempts() != 0 || testutil.ToFloat64(metricSet.GeneveRxPackets) != 0 || testutil.ToFloat64(metricSet.GeneveTxPackets) != 0 {
+				t.Fatal("invalid inner packet was counted as valid or emitted a return")
+			}
+			if got := testutil.ToFloat64(metricSet.GWLBInnerValidationFailures.WithLabelValues(metrics.InnerValidationReasonMalformed)); got != 1 {
+				t.Fatalf("inner validation failures = %v, want 1", got)
+			}
+		})
+	}
+}
+
+func TestSendFailureMetricsHealthAndRecovery(t *testing.T) {
+	receiver := newScriptedReceiver()
+	sender := &captureSender{err: errors.New("send failed")}
+	metricSet := metrics.NewTarget(prometheus.NewRegistry())
+	dp := newWithPacketIO(testConfig(t, "--persistent-error-threshold=1"), zap.NewNop(), metricSet, receiver, sender)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- dp.Run(ctx) }()
+	waitForReady(t, dp)
 	payload := innerIPv4UDP([4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, 1234, 443)
 	packet := encodeAWSGeneve(t, payload, sanitizedAWSOptions(), nil)
-	dp.processIngress(packet, testPacketMetadata())
-	if dp.Ready() || dp.HealthReason() != metrics.LivenessComponentTunWrite {
-		t.Fatal("persistent TUN write failure did not change liveness")
+	receiver.results <- receiverResult{packet: packet, metadata: testPacketMetadata()}
+	waitForHealthReason(t, dp, "sender_persistent_failure")
+	waitForMetricValue(t, metricSet.GWLBSendFailures, 1)
+	if sender.Attempts() != 1 || len(sender.Requests()) != 0 {
+		t.Fatal("failed return had unexpected side effects")
 	}
-	tunDev.writeErr = nil
+	if testutil.ToFloat64(metricSet.GWLBSendFailures) != 1 ||
+		testutil.ToFloat64(metricSet.GWLBReturnBuildFailures) != 0 ||
+		testutil.ToFloat64(metricSet.Drops) != 1 ||
+		testutil.ToFloat64(metricSet.GeneveTxPackets) != 0 {
+		t.Fatal("send failure metrics were not recorded")
+	}
+	sender.SetError(nil)
+	receiver.results <- receiverResult{packet: packet, metadata: testPacketMetadata()}
+	waitForReady(t, dp)
+	waitForMetricValue(t, metricSet.GeneveTxPackets, 1)
+	if sender.Attempts() != 2 || len(sender.Requests()) != 1 || testutil.ToFloat64(metricSet.GeneveTxPackets) != 1 {
+		t.Fatal("successful retry did not emit exactly one counted return")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func waitForMetricValue(t *testing.T, collector prometheus.Collector, want float64) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if testutil.ToFloat64(collector) == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("metric value = %v, want %v", testutil.ToFloat64(collector), want)
+}
+
+func TestPacketReturnBuildFailureEmitsNothing(t *testing.T) {
+	sender := &captureSender{}
+	dp, metricSet := newTestDatapath(t, testConfig(t), zap.NewNop(), sender)
+	dp.udpPool = bufferpool.New(1)
+	packet := encodeAWSGeneve(t, innerIPv4UDP([4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, 1234, 443), sanitizedAWSOptions(), nil)
+
 	dp.processIngress(packet, testPacketMetadata())
-	if !dp.Ready() {
-		t.Fatal("successful TUN write did not recover liveness")
+
+	if sender.Attempts() != 0 ||
+		testutil.ToFloat64(metricSet.GWLBReturnBuildFailures) != 1 ||
+		testutil.ToFloat64(metricSet.GWLBSendFailures) != 0 ||
+		testutil.ToFloat64(metricSet.Drops) != 1 {
+		t.Fatal("packet-return build failure was emitted or not counted")
 	}
 }
 
 func TestTLVParsingLogsAllowedAndRedacted(t *testing.T) {
 	core, observed := observer.New(zap.DebugLevel)
-	dp, _ := newTestDatapath(t, testConfig(t, "--geneve-tlv-parse", "--geneve-tlv-allowlist=0x0108:1,0x0108:3"), zap.New(core), &captureTun{})
+	dp, _ := newTestDatapath(t, testConfig(t, "--geneve-tlv-parse", "--geneve-tlv-allowlist=0x0108:1,0x0108:3"), zap.New(core), &captureSender{})
 	dp.logAllowedTLVs(sanitizedAWSOptions())
 	entries := observed.FilterMessage("geneve tlvs parsed").All()
 	if len(entries) != 1 {

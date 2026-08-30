@@ -6,6 +6,7 @@ readonly resolver='${auth_key}'
 readonly expected_version='${package_version}'
 readonly max_retries='${max_retries}'
 readonly retry_delay='${retry_delay}'
+readonly pre_setup_gate='${pre_setup_gate}'
 
 resolve_auth_key() {
   case "$resolver" in
@@ -15,6 +16,10 @@ resolve_auth_key() {
 }
 
 /usr/bin/tailscale version | /usr/bin/grep -Eq "^$expected_version([[:space:]]|$)"
+if [[ -n "$pre_setup_gate" && ! -f "$pre_setup_gate" ]]; then
+  printf '%s\n' 'required pre-setup gate did not complete' >&2
+  exit 1
+fi
 /usr/bin/systemctl enable --now tailscaled.service
 
 for ((attempt = 1; attempt <= max_retries; attempt++)); do

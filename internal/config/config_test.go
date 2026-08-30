@@ -1,289 +1,150 @@
 package config
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/jaxxstorm/envelope/internal/geneve"
 )
 
-func TestParseAndValidate(t *testing.T) {
-	_, err := Parse([]string{"--udp-bind=", "--metrics-addr=:9090"})
-	if err == nil {
-		t.Fatalf("expected error for empty udp bind")
+func TestParseTargetDefaultsAndValidation(t *testing.T) {
+	for _, args := range [][]string{
+		{"--udp-bind="},
+		{"--max-inner-packet-size=0"},
+		{"--max-inner-packet-size=65507"},
+		{"--vni=20000000"},
+	} {
+		if _, err := ParseTarget(args); err == nil {
+			t.Fatalf("ParseTarget(%v) unexpectedly succeeded", args)
+		}
 	}
 
-	_, err = Parse([]string{"--udp-bind=:6081", "--tun-name=", "--metrics-addr=:9090"})
-	if err == nil {
-		t.Fatalf("expected error for empty tun name")
-	}
-
-	_, err = Parse([]string{"--udp-bind=:6081", "--tun-mtu=0", "--metrics-addr=:9090"})
-	if err == nil {
-		t.Fatalf("expected error for invalid MTU")
-	}
-
-	_, err = Parse([]string{"--udp-bind=:6081", "--vni=20000000", "--metrics-addr=:9090"})
-	if err == nil {
-		t.Fatalf("expected error for invalid VNI")
-	}
-
-	cfg, err := Parse([]string{"--udp-bind=:6081", "--metrics-addr=:9090"})
+	cfg, err := ParseTarget(nil)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.UDPBind != ":6081" {
-		t.Fatalf("unexpected udp bind: %s", cfg.UDPBind)
-	}
-	if cfg.TunName == "" {
-		t.Fatalf("expected default tun name")
-	}
-	if cfg.TunMTU != 1280 {
-		t.Fatalf("expected default tun mtu 1280, got %d", cfg.TunMTU)
+		t.Fatalf("parse defaults: %v", err)
 	}
 	if cfg.ConfigVersion != 2 {
-		t.Fatalf("expected default config version 2, got %d", cfg.ConfigVersion)
+		t.Fatalf("config version = %d, want 2", cfg.ConfigVersion)
+	}
+	if cfg.Mode != "packet-return" {
+		t.Fatalf("mode = %q, want packet-return", cfg.Mode)
+	}
+	if cfg.UDPBind != ":6081" {
+		t.Fatalf("UDP bind = %q, want :6081", cfg.UDPBind)
+	}
+	if cfg.MaxInnerPacketSize != 1280 {
+		t.Fatalf("max inner packet size = %d, want 1280", cfg.MaxInnerPacketSize)
 	}
 	if cfg.PersistentErrorThreshold != 3 {
-		t.Fatalf("expected default persistent error threshold 3, got %d", cfg.PersistentErrorThreshold)
+		t.Fatalf("persistent error threshold = %d, want 3", cfg.PersistentErrorThreshold)
 	}
 	if cfg.GeneveOptionsMaxBytes != geneve.MaxOptionsLen {
-		t.Fatalf("expected default geneve options max %d, got %d", geneve.MaxOptionsLen, cfg.GeneveOptionsMaxBytes)
+		t.Fatalf("GENEVE options maximum = %d, want %d", cfg.GeneveOptionsMaxBytes, geneve.MaxOptionsLen)
 	}
-	if cfg.GeneveTLVParse {
-		t.Fatalf("expected TLV parsing disabled by default")
+}
+
+func TestPacketReturnModeCLIAndEnvironment(t *testing.T) {
+	if cfg, err := ParseTarget([]string{"--mode=packet-return"}); err != nil || cfg.Mode != "packet-return" {
+		t.Fatalf("explicit packet-return CLI mode: cfg=%v err=%v", cfg, err)
 	}
-	if cfg.RoutingMode != RoutingModeOff {
-		t.Fatalf("expected routing mode off by default, got %q", cfg.RoutingMode)
+	if _, err := ParseTarget([]string{"--mode=direct-forward"}); err == nil {
+		t.Fatal("obsolete target mode unexpectedly accepted")
 	}
-	if cfg.TailscaleIface != "tailscale0" {
-		t.Fatalf("expected default tailscale iface tailscale0, got %q", cfg.TailscaleIface)
+
+	t.Setenv("ENVELOPE_MODE", "packet-return")
+	if cfg, err := ParseTarget(nil); err != nil || cfg.Mode != "packet-return" {
+		t.Fatalf("packet-return environment mode: cfg=%v err=%v", cfg, err)
 	}
-	if cfg.UnderlayIface != "" {
-		t.Fatalf("expected no underlay interface while routing is off, got %q", cfg.UnderlayIface)
+	t.Setenv("ENVELOPE_MODE", "direct-forward")
+	if _, err := ParseTarget(nil); err == nil {
+		t.Fatal("unsupported environment mode unexpectedly accepted")
 	}
-	if cfg.RoutingTableID != 100 {
-		t.Fatalf("expected default routing table id 100, got %d", cfg.RoutingTableID)
+}
+
+func TestMaxInnerPacketSizeEnvironment(t *testing.T) {
+	t.Setenv("ENVELOPE_MAX_INNER_PACKET_SIZE", "1400")
+	cfg, err := ParseTarget(nil)
+	if err != nil {
+		t.Fatalf("parse max inner packet size: %v", err)
 	}
-	if cfg.RoutingRulePriority != 100 {
-		t.Fatalf("expected default routing rule priority 100, got %d", cfg.RoutingRulePriority)
+	if cfg.MaxInnerPacketSize != 1400 {
+		t.Fatalf("max inner packet size = %d, want 1400", cfg.MaxInnerPacketSize)
 	}
 }
 
 func TestAWSProfileConfiguration(t *testing.T) {
 	invalid := [][]string{
-		{"--udp-bind=:6080", "--metrics-addr=:9090"},
-		{"--udp-bind=[::1]:6081", "--metrics-addr=:9090"},
-		{"--udp-bind=:6081", "--metrics-addr=:9090", "--vni=1"},
-		{"--udp-bind=:6081", "--metrics-addr=:9090", "--persistent-error-threshold=0"},
+		{"--udp-bind=:6080"},
+		{"--udp-bind=[::1]:6081"},
+		{"--vni=1"},
+		{"--persistent-error-threshold=0"},
 	}
 	for _, args := range invalid {
-		if _, err := Parse(args); err == nil {
-			t.Fatalf("Parse(%v) unexpectedly succeeded", args)
+		if _, err := ParseTarget(args); err == nil {
+			t.Fatalf("ParseTarget(%v) unexpectedly succeeded", args)
 		}
 	}
 
-	if _, err := Parse([]string{"--udp-bind=127.0.0.1:6081", "--metrics-addr=:9090", "--vni=0"}); err != nil {
+	if _, err := ParseTarget([]string{"--udp-bind=127.0.0.1:6081", "--vni=0"}); err != nil {
 		t.Fatalf("valid explicit AWS profile rejected: %v", err)
 	}
 }
 
 func TestTLVAllowlistParsing(t *testing.T) {
-	cfg, err := Parse([]string{
-		"--udp-bind=:6081",
-		"--metrics-addr=:9090",
-		"--geneve-tlv-allowlist=0x0102:0x03,4:5",
-	})
+	cfg, err := ParseTarget([]string{"--geneve-tlv-allowlist=0x0102:0x03,4:5"})
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("parse allowlist: %v", err)
 	}
-	if !cfg.TLVAllowed(geneve.TLVKey{Class: 0x0102, Type: 0x03}) {
-		t.Fatalf("expected allowlist to include 0x0102:0x03")
-	}
-	if !cfg.TLVAllowed(geneve.TLVKey{Class: 4, Type: 5}) {
-		t.Fatalf("expected allowlist to include 4:5")
+	if !cfg.TLVAllowed(geneve.TLVKey{Class: 0x0102, Type: 0x03}) || !cfg.TLVAllowed(geneve.TLVKey{Class: 4, Type: 5}) {
+		t.Fatal("configured TLV allowlist entries are missing")
 	}
 	if cfg.TLVAllowed(geneve.TLVKey{Class: 1, Type: 1}) {
-		t.Fatalf("did not expect allowlist to include 1:1")
+		t.Fatal("unexpected TLV allowlist entry")
 	}
 }
 
 func TestInvalidGeneveOptionConfig(t *testing.T) {
-	_, err := Parse([]string{
-		"--udp-bind=:6081",
-		"--metrics-addr=:9090",
-		"--geneve-options-max-bytes=999",
-	})
-	if err == nil {
-		t.Fatalf("expected error for invalid options max bytes")
-	}
-
-	_, err = Parse([]string{
-		"--udp-bind=:6081",
-		"--metrics-addr=:9090",
-		"--geneve-tlv-allowlist=notvalid",
-	})
-	if err == nil {
-		t.Fatalf("expected error for invalid tlv allowlist entry")
-	}
-
-	_, err = Parse([]string{
-		"--udp-bind=:6081",
-		"--metrics-addr=:9090",
-		"--geneve-options-max-bytes=250",
-	})
-	if err == nil {
-		t.Fatalf("expected error for non-word-aligned options max")
-	}
-
-	_, err = Parse([]string{
-		"--udp-bind=:6081",
-		"--metrics-addr=:9090",
-		"--geneve-tlv-allowlist=0x0108:0x80",
-	})
-	if err == nil {
-		t.Fatalf("expected error for type containing the critical bit")
-	}
-}
-
-func TestRoutingSymmetricRoleConfiguration(t *testing.T) {
-	_, err := Parse([]string{
-		"--udp-bind=:6081",
-		"--metrics-addr=:9090",
-		"--routing-mode=manage",
-		"--underlay-interface=eth0",
-	})
-	if err == nil {
-		t.Fatalf("expected error when manage mode has no site cidrs")
-	}
-	_, err = Parse([]string{
-		"--udp-bind=:6081",
-		"--metrics-addr=:9090",
-		"--routing-mode=verify",
-		"--underlay-interface=eth0",
-	})
-	if err == nil {
-		t.Fatalf("expected error when verify mode has no site cidrs")
-	}
-
-	cfg, err := Parse([]string{
-		"--udp-bind=:6081",
-		"--metrics-addr=:9090",
-		"--routing-mode=manage",
-		"--underlay-interface=eth0",
-		"--local-site-cidrs=172.16.1.42/16,10.0.0.0/8",
-		"--remote-site-cidrs=192.168.0.0/16,100.96.0.0/11",
-		"--routing-table-id=123",
-		"--routing-rule-priority=321",
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.RoutingMode != RoutingModeManage {
-		t.Fatalf("expected manage mode, got %q", cfg.RoutingMode)
-	}
-	if got := cfg.EffectiveLocalSiteCIDRs(); len(got) != 2 || got[0] != "172.16.0.0/16" {
-		t.Fatalf("unexpected local site cidrs: %v", got)
-	}
-	if got := cfg.EffectiveRemoteSiteCIDRs(); len(got) != 2 || got[0] != "192.168.0.0/16" {
-		t.Fatalf("unexpected remote site cidrs: %v", got)
-	}
-	if cfg.UnderlayIface != "eth0" {
-		t.Fatalf("unexpected underlay interface %q", cfg.UnderlayIface)
-	}
-}
-
-func TestRoutingSiteEnvironmentInputs(t *testing.T) {
-	t.Setenv("ENVELOPE_ROUTING_MODE", "manage")
-	t.Setenv("ENVELOPE_UNDERLAY_INTERFACE", "eth0")
-	t.Setenv("ENVELOPE_LOCAL_SITE_CIDRS", "10.0.0.0/24")
-	t.Setenv("ENVELOPE_REMOTE_SITE_CIDRS", "10.0.1.0/24")
-	cfg, err := Parse(nil)
-	if err != nil {
-		t.Fatalf("parse environment inputs: %v", err)
-	}
-	if len(cfg.EffectiveLocalSiteCIDRs()) != 1 || len(cfg.EffectiveRemoteSiteCIDRs()) != 1 {
-		t.Fatalf("site environment inputs were not independent")
-	}
-}
-
-func TestRoutingSiteCIDRsMustBePairwiseDisjoint(t *testing.T) {
-	tests := []struct {
-		name  string
-		flags []string
-		left  string
-		right string
-	}{
-		{name: "local covers remote", flags: []string{"--local-site-cidrs=10.0.0.0/8", "--remote-site-cidrs=10.1.0.0/16"}, left: "10.0.0.0/8", right: "10.1.0.0/16"},
-		{name: "same local role overlap", flags: []string{"--local-site-cidrs=10.0.0.0/8,10.1.0.0/16"}, left: "10.0.0.0/8", right: "10.1.0.0/16"},
-		{name: "exact remote duplicate", flags: []string{"--remote-site-cidrs=2001:db8::/48,2001:db8::/48"}, left: "2001:db8::/48", right: "2001:db8::/48"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			args := []string{"--udp-bind=:6081", "--metrics-addr=:9090"}
-			args = append(args, tt.flags...)
-			_, err := Parse(args)
-			if err == nil {
-				t.Fatal("expected overlap error")
-			}
-			if !strings.Contains(err.Error(), tt.left) || !strings.Contains(err.Error(), tt.right) {
-				t.Fatalf("overlap error does not name both values: %v", err)
-			}
-		})
-	}
-}
-
-func TestRoutingInterfacesMustBeValidAndDistinct(t *testing.T) {
-	tests := [][]string{
-		{"--routing-mode=verify"},
-		{"--routing-mode=verify", "--underlay-interface=not/a/device"},
-		{"--tun-name=shared0", "--tailscale-iface=shared0"},
-	}
-	for _, flags := range tests {
-		args := []string{"--udp-bind=:6081", "--metrics-addr=:9090"}
-		args = append(args, flags...)
-		if _, err := Parse(args); err == nil {
-			t.Fatalf("Parse(%v) unexpectedly succeeded", flags)
+	for _, args := range [][]string{
+		{"--geneve-options-max-bytes=0"},
+		{"--geneve-options-max-bytes=4"},
+		{"--geneve-options-max-bytes=999"},
+		{"--geneve-options-max-bytes=250"},
+		{"--geneve-tlv-allowlist=notvalid"},
+		{"--geneve-tlv-allowlist=0x0108:0x80"},
+	} {
+		if _, err := ParseTarget(args); err == nil {
+			t.Fatalf("ParseTarget(%v) unexpectedly succeeded", args)
 		}
 	}
 }
 
-func TestInvalidRoutingConfig(t *testing.T) {
-	for _, table := range []string{"0", "52", "253", "254", "255", "256"} {
-		_, err := Parse([]string{
-			"--udp-bind=:6081",
-			"--metrics-addr=:9090",
-			"--routing-table-id=" + table,
-		})
-		if err == nil {
-			t.Fatalf("expected error for unsafe routing table id %s", table)
-		}
+func TestGeneveOptionsMaximumFitsMinimumAWSFlowCookieTLV(t *testing.T) {
+	cfg, err := ParseTarget([]string{"--geneve-options-max-bytes=8"})
+	if err != nil {
+		t.Fatalf("minimum flow-cookie option capacity rejected: %v", err)
+	}
+	if cfg.GeneveOptionsMaxBytes != 8 {
+		t.Fatalf("GENEVE options maximum = %d, want 8", cfg.GeneveOptionsMaxBytes)
 	}
 
-	_, err := Parse([]string{
-		"--udp-bind=:6081",
-		"--metrics-addr=:9090",
-		"--routing-rule-priority=0",
-	})
-	if err == nil {
-		t.Fatalf("expected error for invalid routing rule priority")
-	}
-
-	_, err = Parse([]string{
-		"--udp-bind=:6081",
-		"--metrics-addr=:9090",
-		"--routing-mode=manage",
-		"--underlay-interface=eth0",
-		"--local-site-cidrs=not-a-cidr",
-		"--remote-site-cidrs=10.0.0.0/24",
-	})
-	if err == nil {
-		t.Fatalf("expected error for invalid local site cidr")
+	_, err = ParseTarget([]string{"--geneve-options-max-bytes=4"})
+	if err == nil || !strings.Contains(err.Error(), ">= 8") || !strings.Contains(err.Error(), "flow-cookie TLV") {
+		t.Fatalf("undersized flow-cookie capacity was not clearly rejected: %v", err)
 	}
 }
 
-func TestLegacyConfigurationIsRejected(t *testing.T) {
-	for _, flag := range []string{
+func TestProductionTargetRejectsObsoleteFlags(t *testing.T) {
+	flags := []string{
+		"--tun-name=envelope0",
+		"--tun-mtu=1280",
+		"--tailscale-iface=tailscale0",
+		"--underlay-interface=eth0",
+		"--routing-mode=off",
+		"--routing-table-id=100",
+		"--routing-rule-priority=100",
+		"--local-site-cidrs=10.0.0.0/24",
+		"--remote-site-cidrs=10.0.1.0/24",
 		"--gwlb-return-cidrs=10.0.0.0/24",
 		"--local-delivery-cidrs=10.0.0.0/24",
 		"--remote-tailnet-cidrs=10.0.0.0/24",
@@ -291,15 +152,35 @@ func TestLegacyConfigurationIsRejected(t *testing.T) {
 		"--tcp-flow-timeout=1s",
 		"--udp-flow-timeout=1s",
 		"--other-flow-timeout=1s",
-	} {
+		"--protected-cidrs=10.0.0.0/24",
+		"--flow-timeout=1m",
+	}
+	for _, flag := range flags {
 		t.Run(flag, func(t *testing.T) {
-			if _, err := Parse([]string{flag}); err == nil {
-				t.Fatalf("legacy flag %q was accepted", flag)
+			_, err := ParseTarget([]string{flag})
+			if err == nil || !strings.Contains(err.Error(), strings.SplitN(flag, "=", 2)[0]) || !strings.Contains(err.Error(), "obsolete") {
+				t.Fatalf("obsolete flag %q was not clearly rejected: %v", flag, err)
 			}
 		})
 	}
 
-	for _, name := range []string{
+	_, err := ParseTarget([]string{"--tun-name", "envelope0"})
+	if err == nil || !strings.Contains(err.Error(), "--tun-name") {
+		t.Fatalf("split obsolete flag was not rejected: %v", err)
+	}
+}
+
+func TestProductionTargetRejectsObsoleteEnvironment(t *testing.T) {
+	names := []string{
+		"ENVELOPE_TUN_NAME",
+		"ENVELOPE_TUN_MTU",
+		"ENVELOPE_TAILSCALE_IFACE",
+		"ENVELOPE_UNDERLAY_INTERFACE",
+		"ENVELOPE_ROUTING_MODE",
+		"ENVELOPE_ROUTING_TABLE_ID",
+		"ENVELOPE_ROUTING_RULE_PRIORITY",
+		"ENVELOPE_LOCAL_SITE_CIDRS",
+		"ENVELOPE_REMOTE_SITE_CIDRS",
 		"ENVELOPE_GWLB_RETURN_CIDRS",
 		"ENVELOPE_LOCAL_DELIVERY_CIDRS",
 		"ENVELOPE_REMOTE_TAILNET_CIDRS",
@@ -307,33 +188,77 @@ func TestLegacyConfigurationIsRejected(t *testing.T) {
 		"ENVELOPE_TCP_FLOW_TIMEOUT",
 		"ENVELOPE_UDP_FLOW_TIMEOUT",
 		"ENVELOPE_OTHER_FLOW_TIMEOUT",
-	} {
+		"ENVELOPE_PROTECTED_CIDRS",
+		"ENVELOPE_FLOW_TIMEOUT",
+	}
+	for _, name := range names {
 		t.Run(name, func(t *testing.T) {
-			t.Setenv(name, "legacy")
-			_, err := Parse(nil)
-			if err == nil || !strings.Contains(err.Error(), name) {
-				t.Fatalf("legacy environment variable %q was not rejected: %v", name, err)
+			t.Setenv(name, "obsolete")
+			_, err := ParseTarget(nil)
+			if err == nil || !strings.Contains(err.Error(), name) || !strings.Contains(err.Error(), "obsolete") {
+				t.Fatalf("obsolete environment variable %q was not clearly rejected: %v", name, err)
 			}
 		})
 	}
 }
 
+func TestObsoleteInputsAreRejectedBeforeCurrentParsing(t *testing.T) {
+	_, err := ParseTarget([]string{"--tun-name=envelope0", "--not-a-current-flag"})
+	if err == nil || !strings.Contains(err.Error(), "--tun-name") || strings.Contains(err.Error(), "not-a-current-flag") {
+		t.Fatalf("obsolete flag was not rejected first: %v", err)
+	}
+
+	t.Setenv("ENVELOPE_FLOW_CAPACITY", "1")
+	_, err = ParseTarget([]string{"--udp-bind=:6080"})
+	if err == nil || !strings.Contains(err.Error(), "ENVELOPE_FLOW_CAPACITY") || strings.Contains(err.Error(), "udp bind") {
+		t.Fatalf("obsolete environment was not rejected first: %v", err)
+	}
+}
+
+func TestPacketReturnConfigHasNoObsoleteFields(t *testing.T) {
+	typeOfConfig := reflect.TypeOf(Config{})
+	for _, name := range []string{
+		"TunName",
+		"TunMTU",
+		"TailscaleIface",
+		"UnderlayIface",
+		"RoutingMode",
+		"LocalSiteCIDRs",
+		"RemoteSiteCIDRs",
+		"RoutingTableID",
+		"RoutingRulePriority",
+		"GWLBReturnCIDRs",
+		"LocalDeliveryCIDRs",
+		"RemoteTailnetCIDRs",
+		"FlowCapacity",
+		"TCPFlowTimeout",
+		"UDPFlowTimeout",
+		"OtherFlowTimeout",
+		"ProtectedCIDRs",
+		"FlowTimeout",
+	} {
+		if _, found := typeOfConfig.FieldByName(name); found {
+			t.Fatalf("packet-return Config retained obsolete field %s", name)
+		}
+	}
+}
+
 func TestConfigVersionMustBeTwo(t *testing.T) {
-	_, err := Parse([]string{"--config-version=1"})
+	_, err := ParseTarget([]string{"--config-version=1"})
 	if err == nil || !strings.Contains(err.Error(), "config version") {
 		t.Fatalf("unsupported config version was not rejected: %v", err)
 	}
 }
 
-func TestUDPReceiveCapacityIncludesEveryValidIPv4UDPPayload(t *testing.T) {
-	cfg, err := Parse([]string{"--udp-bind=:6081", "--metrics-addr=:9090", "--tun-mtu=1280", "--geneve-options-max-bytes=252"})
+func TestUDPReceiveCapacityIncludesOversizedDatagrams(t *testing.T) {
+	cfg, err := ParseTarget([]string{"--max-inner-packet-size=1280", "--geneve-options-max-bytes=252"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got, want := cfg.MaxUDPReceiveSize(), 65507; got != want {
-		t.Fatalf("receive size=%d, want %d", got, want)
+		t.Fatalf("receive size = %d, want %d", got, want)
 	}
 	if cfg.MaxUDPReceiveSize() <= cfg.MaxUDPPacketSize() {
-		t.Fatalf("receive size=%d does not cover oversized packets above configured maximum=%d", cfg.MaxUDPReceiveSize(), cfg.MaxUDPPacketSize())
+		t.Fatalf("receive size %d does not cover packets above configured maximum %d", cfg.MaxUDPReceiveSize(), cfg.MaxUDPPacketSize())
 	}
 }

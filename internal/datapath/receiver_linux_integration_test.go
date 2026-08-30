@@ -3,6 +3,7 @@
 package datapath
 
 import (
+	"context"
 	"errors"
 	"net"
 	"net/netip"
@@ -11,6 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jaxxstorm/envelope/internal/metrics"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"golang.org/x/sys/unix"
 )
 
@@ -98,6 +102,49 @@ func TestLinuxReceiverReportsOversizedDatagramAsPacketTruncation(t *testing.T) {
 	}
 	if _, _, err := receiver.ReadPacket(make([]byte, 64)); !errors.Is(err, ErrPacketTruncated) {
 		t.Fatalf("receive error = %v, want ErrPacketTruncated", err)
+	}
+}
+
+func TestLinuxReceiverToSenderMalformedPacketEmitsNothing(t *testing.T) {
+	lockIntegrationGenevePort(t)
+	receiver, err := listenPacketReceiver("127.0.0.1:6081")
+	if err != nil {
+		t.Fatalf("listen receiver: %v", err)
+	}
+	metricSet := metrics.NewTarget(prometheus.NewRegistry())
+	sender := &captureSender{}
+	dp := newWithPacketIO(testConfig(t), nil, metricSet, receiver, sender)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- dp.ingressLoop(ctx) }()
+
+	client, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 6081})
+	if err != nil {
+		t.Fatalf("dial receiver: %v", err)
+	}
+	if _, err := client.Write([]byte{0}); err != nil {
+		client.Close()
+		t.Fatalf("send malformed datagram: %v", err)
+	}
+	_ = client.Close()
+
+	deadline := time.Now().Add(time.Second)
+	for testutil.ToFloat64(metricSet.GWLBProfileRejections.WithLabelValues(metrics.ProfileReasonDecode)) != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if sender.Attempts() != 0 || testutil.ToFloat64(metricSet.GeneveRxPackets) != 0 || testutil.ToFloat64(metricSet.GeneveTxPackets) != 0 {
+		t.Fatal("malformed production receiver input reached the sender or valid packet counters")
+	}
+
+	cancel()
+	_ = receiver.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ingress loop: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ingress loop did not stop")
 	}
 }
 

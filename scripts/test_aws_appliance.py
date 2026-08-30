@@ -10,6 +10,7 @@ import os
 import pathlib
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -23,19 +24,30 @@ from unittest import mock
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import aws_appliance as appliance  # noqa: E402
+import transport_router_readiness as transport_readiness  # noqa: E402
 
 
 VALID_POLICY = {
     "tagOwners": {"tag:envelope-ci": ["group:infra"]},
     "autoApprovers": {
         "routes": {
-            "10.10.0.0/16": ["tag:envelope-ci"],
-            "10.20.0.0/16": ["tag:envelope-ci"],
+            "10.10.1.0/24": ["tag:envelope-ci"],
+            "10.10.2.0/24": ["tag:envelope-ci"],
+            "10.20.1.0/24": ["tag:envelope-ci"],
+            "10.20.2.0/24": ["tag:envelope-ci"],
         }
     },
     "grants": [
-        {"src": ["10.10.0.0/16"], "dst": ["10.20.0.0/16"], "ip": ["*"]},
-        {"src": ["10.20.0.0/16"], "dst": ["10.10.0.0/16"], "ip": ["*"]},
+        {
+            "src": ["10.10.1.0/24", "10.10.2.0/24"],
+            "dst": ["10.20.1.0/24", "10.20.2.0/24"],
+            "ip": ["*"],
+        },
+        {
+            "src": ["10.20.1.0/24", "10.20.2.0/24"],
+            "dst": ["10.10.1.0/24", "10.10.2.0/24"],
+            "ip": ["*"],
+        },
     ],
 }
 
@@ -71,13 +83,13 @@ def config_document(architecture: str = "amd64", *, expired: bool = False) -> di
             "local_site_cidrs": [f"{prefix}.1.0/24", f"{prefix}.2.0/24"],
             "remote_site_cidrs": [],
             "workload_subnet_cidrs": {"a": f"{prefix}.1.0/24", "b": f"{prefix}.2.0/24"},
-            "ingress_subnet_cidrs": {"a": f"{prefix}.3.0/24", "b": f"{prefix}.4.0/24"},
+            "transport_subnet_cidrs": {"a": f"{prefix}.3.0/24", "b": f"{prefix}.4.0/24"},
             "gwlbe_subnet_cidrs": {"a": f"{prefix}.10.0/24", "b": f"{prefix}.11.0/24"},
             "gwlb_subnet_cidrs": {"a": f"{prefix}.20.0/24", "b": f"{prefix}.21.0/24"},
             "target_subnet_cidrs": {"a": f"{prefix}.30.0/24", "b": f"{prefix}.31.0/24"},
             "management_subnet_cidr": f"{prefix}.40.0/24",
             "target_az_keys": ["a", "b"],
-            "ingress_router_az_keys": ["a", "b"],
+            "transport_router_az_keys": ["a", "b"],
         }
 
     west = site(
@@ -105,6 +117,11 @@ def config_document(architecture: str = "amd64", *, expired: bool = False) -> di
         "instance_type": "m7g.medium" if architecture == "arm64" else "t3.medium",
         "test_instance_type": "t4g.micro" if architecture == "arm64" else "t3.micro",
         "e2e_load_profile": e2e_load_profile_document(),
+        "envelope": {
+            "mode": "packet-return",
+            "udp_bind": "0.0.0.0:6081",
+            "max_inner_packet_size": 1280,
+        },
         "backend": {
             "bucket": "operator-backend",
             "region": "us-west-2",
@@ -112,7 +129,19 @@ def config_document(architecture: str = "amd64", *, expired: bool = False) -> di
             "state_key": "runs/envelope-fixture/terraform.tfstate",
             "operator_principal_arns": ["arn:aws:iam::123456789012:role/envelope-operator"],
         },
-        "symmetric_topology": {"version": 2, "sites": {"west": west, "east": east}},
+        "symmetric_topology": {
+            "version": 2,
+            "sites": {"west": west, "east": east},
+            "route_failover": {
+                "initial_transport_router_az_by_gwlbe_az": {
+                    "west": {"a": "a", "b": "b"},
+                    "east": {"a": "a", "b": "b"},
+                },
+                "mutation_timeout_seconds": 120,
+                "restoration_timeout_seconds": 120,
+                "recovery_timeout_seconds": 600,
+            },
+        },
         "tailnet": {
             "name": "fixture.example",
             "tag": "tag:envelope-ci",
@@ -129,39 +158,1317 @@ def make_config(tmp: pathlib.Path, architecture: str = "amd64", *, expired: bool
     return appliance.RunConfig.load(path, enforce_future_expiry=not expired)
 
 
+def fixture_tailnet_hostnames(run_id: str = "envelope-fixture") -> list[str]:
+    return [
+        f"{run_id}-{site}-transport-{az_key}"
+        for site in ("west", "east")
+        for az_key in ("a", "b")
+    ]
+
+
+def fixture_tailnet_roles(run_id: str = "envelope-fixture") -> dict[str, str]:
+    return {hostname: "transport-router" for hostname in fixture_tailnet_hostnames(run_id)}
+
+
+def fixture_tailnet_devices(run_id: str = "envelope-fixture") -> list[dict[str, object]]:
+    devices = []
+    for index, hostname in enumerate(fixture_tailnet_hostnames(run_id), start=1):
+        site = "west" if f"{run_id}-west-" in hostname else "east"
+        prefix = "10.10" if site == "west" else "10.20"
+        az_index = 1 if hostname.endswith("-a") else 2
+        routes = [f"{prefix}.{az_index}.0/24"]
+        devices.append(
+            {
+                "id": f"device-{index}",
+                "nodeId": f"node-{index}",
+                "hostname": hostname,
+                "tags": ["tag:envelope-ci"],
+                "advertisedRoutes": routes,
+                "enabledRoutes": routes,
+            }
+        )
+    return devices
+
+
+def fixture_target_groups() -> dict[str, str]:
+    return {
+        "west": "arn:aws:elasticloadbalancing:us-west-2:123456789012:targetgroup/west/fixture",
+        "east": "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/east/fixture",
+    }
+
+
+def fixture_symmetric_topology(config: appliance.RunConfig) -> dict:
+    target_groups = fixture_target_groups()
+    return {
+        "config_version": 2,
+        "run_id": config.run_id,
+        "route_failover": copy.deepcopy(config.route_failover),
+        "sites": {
+            site: {
+                "region": config.sites[site]["region"],
+                "local_site_cidrs": sorted(config.sites[site]["local_site_cidrs"]),
+                "remote_site_cidrs": sorted(config.sites[site]["remote_site_cidrs"]),
+                "target_fleet": [
+                    {
+                        "region": config.sites[site]["region"],
+                        "az_key": az_key,
+                        "instance_id": f"i-target-{site}-{az_key}",
+                        "target_group_arn": target_groups[site],
+                    }
+                    for az_key in config.sites[site]["target_az_keys"]
+                ],
+                "transport_router_fleet": [
+                    {
+                        "region": config.sites[site]["region"],
+                        "az_key": az_key,
+                        "instance_id": f"i-transport-{site}-{az_key}",
+                        "network_interface_id": f"eni-transport-{site}-{az_key}",
+                        "gwlbe_route_table_id": f"rtb-gwlbe-{site}-{az_key}",
+                        "advertised_prefix": config.sites[site][
+                            "workload_subnet_cidrs"
+                        ][az_key],
+                    }
+                    for az_key in config.sites[site]["transport_router_az_keys"]
+                ],
+            }
+            for site in ("west", "east")
+        },
+    }
+
+
+def fixture_transport_router_readiness_expectations(
+    config: appliance.RunConfig,
+) -> dict:
+    sites = {}
+    for site in ("west", "east"):
+        contract = transport_readiness.build_readiness_contract(
+            config.sites[site]["local_site_cidrs"],
+            config.sites[site]["remote_site_cidrs"],
+            "ens5",
+            "tailscale0",
+            config.raw["e2e_load_profile"]["maximum_tcp_mss"],
+        )
+        contract_sha256 = hashlib.sha256(
+            json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        sites[site] = {**contract, "contract_sha256": contract_sha256}
+    return {"config_version": 2, "sites": sites}
+
+
+def fixture_route_failover_output(config: appliance.RunConfig, topology: dict) -> dict:
+    transport_fleets = {
+        site: {
+            member["az_key"]: member
+            for member in topology["sites"][site]["transport_router_fleet"]
+        }
+        for site in ("west", "east")
+    }
+    selections = config.route_failover[
+        "initial_transport_router_az_by_gwlbe_az"
+    ]
+    return {
+        "config_version": 2,
+        "mutation_timeout_seconds": config.route_failover[
+            "mutation_timeout_seconds"
+        ],
+        "restoration_timeout_seconds": config.route_failover[
+            "restoration_timeout_seconds"
+        ],
+        "recovery_timeout_seconds": config.route_failover[
+            "recovery_timeout_seconds"
+        ],
+        "same_az_preferred": {
+            site: all(gwlbe_az == selected for gwlbe_az, selected in selections[site].items())
+            for site in ("west", "east")
+        },
+        "sites": {
+            site: {
+                gwlbe_az: {
+                    "route_table_id": transport_fleets[site][gwlbe_az][
+                        "gwlbe_route_table_id"
+                    ],
+                    "source_workload_prefix": config.sites[site][
+                        "workload_subnet_cidrs"
+                    ][gwlbe_az],
+                    "remote_site_cidrs": sorted(
+                        config.sites[site]["remote_site_cidrs"]
+                    ),
+                    "initial_transport_router_az_key": transport_az,
+                    "initial_network_interface_id": transport_fleets[site][transport_az][
+                        "network_interface_id"
+                    ],
+                }
+                for gwlbe_az, transport_az in selections[site].items()
+            }
+            for site in ("west", "east")
+        },
+    }
+
+
+def fixture_workload_instances(config: appliance.RunConfig) -> dict:
+    result = {}
+    for site in ("west", "east"):
+        az_keys = sorted(config.sites[site]["azs"])
+        result[site] = {}
+        for role, az_key in zip(("initiator", "responder"), az_keys, strict=True):
+            cidr = config.sites[site]["workload_subnet_cidrs"][az_key]
+            result[site][role] = {
+                "instance_id": f"i-workload-{site}-{role}",
+                "private_ip": cidr.removesuffix("0/24") + "10",
+                "az_key": az_key,
+                "availability_zone": config.sites[site]["azs"][az_key],
+                "subnet_id": f"subnet-{site}-{az_key}",
+                "cidr": cidr,
+                "route_table_id": f"rtb-workload-{site}-{az_key}",
+            }
+    return result
+
+
 def symmetric_deployment_document(config: appliance.RunConfig) -> dict:
-    document = {
+    topology = fixture_symmetric_topology(config)
+    account_id = config.sites["west"]["ssm_kms_key_arn"].split(":", 5)[4]
+    return {
         "envelope_runtime_config": {
             "value": {
                 site: {
                     "config_version": 2,
-                    "local_site_cidrs": config.sites[site]["local_site_cidrs"],
-                    "remote_site_cidrs": config.sites[site]["remote_site_cidrs"],
+                    **config.raw["envelope"],
+                    "artifact_sha256": "a" * 64,
+                    "artifact_revision": "b" * 40,
                 }
                 for site in ("west", "east")
             }
         },
-        "cost_profile": {"value": {"profile": "symmetric-gwlb-ha-v2"}},
+        "cost_profile": {
+            "value": {
+                "profile": "symmetric-gwlb-ha-v2",
+                "estimated_fixed_hourly_usd": config.raw["cost"]["estimated_fixed_hourly_usd"],
+                "approved_max_hourly_usd": config.raw["cost"]["approved_max_fixed_hourly_usd"],
+                "resource_counts": {
+                    "gwlbe_endpoints": 4,
+                    "target_instances": {"west": 2, "east": 2},
+                    "transport_routers": {"west": 2, "east": 2},
+                    "workload_instances": 4,
+                    "nat_gateways": 2,
+                    "elastic_ips": 2,
+                    "gateway_load_balancers": 2,
+                    "vpc_flow_logs": 2,
+                    "cloudwatch_log_groups": 2,
+                    "flow_log_iam_roles": 1,
+                    "iam_roles": {
+                        "target": 2,
+                        "workload": 2,
+                        "transport": 2,
+                        "flow_log": 1,
+                    },
+                    "iam_instance_profiles": {
+                        "target": 2,
+                        "workload": 2,
+                        "transport": 2,
+                    },
+                },
+                "route_failover_bounds": {
+                    field: config.route_failover[field]
+                    for field in (
+                        "mutation_timeout_seconds",
+                        "restoration_timeout_seconds",
+                        "recovery_timeout_seconds",
+                    )
+                },
+                "nat_topology_limit": {
+                    "gateways_per_site": 1,
+                    "expanded_for_ha": False,
+                    "placement": (
+                        "one shared NAT gateway in each site's single management subnet"
+                    ),
+                    "limitation": (
+                        "private egress is not multi-AZ within a site and remains outside "
+                        "the protected data path"
+                    ),
+                },
+            }
+        },
         "artifact_identity": {
             "value": {
+                "bucket": (
+                    f"{config.run_id}-{account_id}-{config.sites['west']['region']}-artifact"
+                ),
+                "key": f"artifacts/{'b' * 40}/envelope-linux-{config.architecture}",
                 "architecture": config.architecture,
                 "ec2_arch": appliance.ARCHITECTURES[config.architecture],
                 "sha256": "a" * 64,
                 "revision": "b" * 40,
+                "version": "fixture.1",
             }
         },
+        "e2e_load_profile": {"value": copy.deepcopy(config.raw["e2e_load_profile"])},
+        "flow_log_evidence": {
+            "value": {
+                site: {
+                    "flow_log_id": f"fl-{site}-fixture",
+                    "log_group_arn": (
+                        f"arn:aws:logs:{config.sites[site]['region']}:{account_id}:"
+                        f"log-group:/aws/vpc-flow-logs/{config.run_id}/{site}"
+                    ),
+                    "region": config.sites[site]["region"],
+                }
+                for site in ("west", "east")
+            }
+        },
+        "gwlb_endpoint_ids": {
+            "value": {
+                site: {az_key: f"vpce-{site}-{az_key}" for az_key in ("a", "b")}
+                for site in ("west", "east")
+            }
+        },
+        "gwlb_target_group_arns": {"value": fixture_target_groups()},
+        "route_failover": {
+            "value": fixture_route_failover_output(config, topology)
+        },
+        "symmetric_topology": {"value": topology},
+        "transport_router_readiness_expectations": {
+            "value": fixture_transport_router_readiness_expectations(config)
+        },
+        "vpc_ids": {
+            "value": {site: f"vpc-{site}-fixture" for site in ("west", "east")}
+        },
+        "workload_instances": {"value": fixture_workload_instances(config)},
     }
-    for name in (
-        "e2e_load_profile",
-        "flow_log_evidence",
-        "gwlb_endpoint_ids",
-        "gwlb_target_group_arns",
-        "instance_ids",
-        "symmetric_topology",
-        "vpc_ids",
-        "workload_instances",
-    ):
-        document[name] = {"value": {}}
+
+
+_PLAN_VALUE_MISSING = object()
+
+
+def split_plan_unknowns(
+    value: object, unknown_paths: set[tuple[object, ...]]
+) -> tuple[object, object, bool]:
+    if () in unknown_paths:
+        return _PLAN_VALUE_MISSING, True, True
+    if isinstance(value, dict):
+        after = {}
+        unknown = {}
+        has_unknown = False
+        for key, child in value.items():
+            child_paths = {
+                path[1:] for path in unknown_paths if path and path[0] == key
+            }
+            if not child_paths:
+                after[key] = copy.deepcopy(child)
+                continue
+            child_after, child_unknown, child_has_unknown = split_plan_unknowns(
+                child, child_paths
+            )
+            if child_after is not _PLAN_VALUE_MISSING:
+                after[key] = child_after
+            if child_has_unknown:
+                unknown[key] = child_unknown
+                has_unknown = True
+        return after, unknown if has_unknown else False, has_unknown
+    if isinstance(value, list):
+        after = []
+        unknown = []
+        has_unknown = False
+        for index, child in enumerate(value):
+            child_paths = {
+                path[1:] for path in unknown_paths if path and path[0] == index
+            }
+            if not child_paths:
+                after.append(copy.deepcopy(child))
+                unknown.append(False)
+                continue
+            child_after, child_unknown, child_has_unknown = split_plan_unknowns(
+                child, child_paths
+            )
+            after.append(None if child_after is _PLAN_VALUE_MISSING else child_after)
+            unknown.append(child_unknown if child_has_unknown else False)
+            has_unknown = has_unknown or child_has_unknown
+        return after, unknown if has_unknown else False, has_unknown
+    raise AssertionError("fixture unknown path does not identify a value leaf")
+
+
+def symmetric_output_references() -> dict[str, list[str]]:
+    return {
+        "artifact_identity": [
+            "local.artifact_bucket_name",
+            "local.artifact_object_key",
+            "var.artifact_sha256",
+            "var.architecture",
+            "local.ec2_architecture",
+            "var.artifact_revision",
+            "var.artifact_version",
+        ],
+        "vpc_ids": [
+            "aws_vpc.west.id",
+            "aws_vpc.west",
+            "aws_vpc.east.id",
+            "aws_vpc.east",
+        ],
+        "gwlb_target_group_arns": [
+            "aws_lb_target_group.west.arn",
+            "aws_lb_target_group.west",
+            "aws_lb_target_group.east.arn",
+            "aws_lb_target_group.east",
+        ],
+        "gwlb_endpoint_ids": [
+            "aws_vpc_endpoint.west",
+            "aws_vpc_endpoint.east",
+        ],
+        "workload_instances": [
+            "local.workload_roles.west",
+            "local.workload_roles",
+            "aws_instance.workload_west",
+            "aws_instance.workload_west",
+            "local.sites.west.azs",
+            "local.sites",
+            "aws_subnet.workload_west",
+            "aws_route_table.workload_west",
+            "local.workload_roles.east",
+            "local.workload_roles",
+            "aws_instance.workload_east",
+            "aws_instance.workload_east",
+            "local.sites.east.azs",
+            "local.sites",
+            "aws_subnet.workload_east",
+            "aws_route_table.workload_east",
+        ],
+        "flow_log_evidence": [
+            "aws_flow_log.west.id",
+            "aws_flow_log.west",
+            "aws_cloudwatch_log_group.flow_west.arn",
+            "aws_cloudwatch_log_group.flow_west",
+            "var.west_region",
+            "aws_flow_log.east.id",
+            "aws_flow_log.east",
+            "aws_cloudwatch_log_group.flow_east.arn",
+            "aws_cloudwatch_log_group.flow_east",
+            "var.east_region",
+        ],
+        "e2e_load_profile": ["var.e2e_load_profile"],
+        "symmetric_topology": [
+            "var.symmetric_topology.version",
+            "var.symmetric_topology",
+            "var.name",
+            "local.route_failover",
+            "local.initial_transport_router_advertise_routes",
+            "var.west_region",
+            "local.sites.west.local_site_cidrs",
+            "local.sites",
+            "local.sites.west.remote_site_cidrs",
+            "aws_instance.envelope_target_west",
+            "aws_lb_target_group.west",
+            "aws_instance.transport_router_west",
+            "aws_route_table.gwlbe_west",
+            "var.east_region",
+            "local.sites.east.local_site_cidrs",
+            "local.sites.east.remote_site_cidrs",
+            "aws_instance.envelope_target_east",
+            "aws_lb_target_group.east",
+            "aws_instance.transport_router_east",
+            "aws_route_table.gwlbe_east",
+        ],
+        "envelope_runtime_config": [
+            "local.sites",
+            "local.packet_return_runtime",
+        ],
+        "transport_router_readiness_expectations": [
+            "local.transport_router_contracts",
+            "local.transport_router_contract_sha256",
+        ],
+        "route_failover": [
+            "local.route_failover",
+            "aws_route_table.gwlbe_west",
+            "local.sites.west.remote_site_cidrs",
+            "local.sites",
+            "aws_instance.transport_router_west",
+            "aws_route_table.gwlbe_east",
+            "local.sites.east.remote_site_cidrs",
+            "aws_instance.transport_router_east",
+        ],
+        "cost_profile": [
+            "var.estimated_fixed_hourly_usd",
+            "var.approved_max_fixed_hourly_usd",
+            "aws_vpc_endpoint.west",
+            "aws_vpc_endpoint.east",
+            "aws_instance.envelope_target_west",
+            "aws_instance.envelope_target_east",
+            "aws_instance.transport_router_west",
+            "aws_instance.transport_router_east",
+            "aws_instance.workload_west",
+            "aws_instance.workload_east",
+            "aws_nat_gateway.west",
+            "aws_nat_gateway.east",
+            "aws_eip.nat_west",
+            "aws_eip.nat_east",
+            "aws_lb.west",
+            "aws_lb.east",
+            "aws_flow_log.west",
+            "aws_flow_log.east",
+            "aws_cloudwatch_log_group.flow_west",
+            "aws_cloudwatch_log_group.flow_east",
+            "aws_iam_role.flow_logs",
+            "aws_iam_role.runtime_west",
+            "aws_iam_role.runtime_east",
+            "aws_iam_role.workload_west",
+            "aws_iam_role.workload_east",
+            "aws_iam_role.transport_west",
+            "aws_iam_role.transport_east",
+            "aws_iam_instance_profile.runtime_west",
+            "aws_iam_instance_profile.runtime_east",
+            "aws_iam_instance_profile.workload_west",
+            "aws_iam_instance_profile.workload_east",
+            "aws_iam_instance_profile.transport_west",
+            "aws_iam_instance_profile.transport_east",
+            "local.route_failover",
+        ],
+    }
+
+
+def fresh_output_unknown_paths(config: appliance.RunConfig) -> dict[str, set[tuple[object, ...]]]:
+    paths: dict[str, set[tuple[object, ...]]] = {
+        "vpc_ids": {(site,) for site in ("west", "east")},
+        "gwlb_target_group_arns": {(site,) for site in ("west", "east")},
+        "gwlb_endpoint_ids": {
+            (site, az_key)
+            for site in ("west", "east")
+            for az_key in config.sites[site]["azs"]
+        },
+        "workload_instances": {
+            (site, role, field)
+            for site in ("west", "east")
+            for role in ("initiator", "responder")
+            for field in ("instance_id", "private_ip", "subnet_id", "route_table_id")
+        },
+        "flow_log_evidence": {
+            (site, field)
+            for site in ("west", "east")
+            for field in ("flow_log_id", "log_group_arn")
+        },
+        "symmetric_topology": set(),
+        "route_failover": set(),
+    }
+    for site in ("west", "east"):
+        for index, _az_key in enumerate(sorted(config.sites[site]["target_az_keys"])):
+            paths["symmetric_topology"].update(
+                {
+                    ("sites", site, "target_fleet", index, "instance_id"),
+                    ("sites", site, "target_fleet", index, "target_group_arn"),
+                }
+            )
+        for index, _az_key in enumerate(
+            sorted(config.sites[site]["transport_router_az_keys"])
+        ):
+            paths["symmetric_topology"].update(
+                {
+                    ("sites", site, "transport_router_fleet", index, "instance_id"),
+                    (
+                        "sites",
+                        site,
+                        "transport_router_fleet",
+                        index,
+                        "network_interface_id",
+                    ),
+                    (
+                        "sites",
+                        site,
+                        "transport_router_fleet",
+                        index,
+                        "gwlbe_route_table_id",
+                    ),
+                }
+            )
+        for az_key in config.sites[site]["azs"]:
+            paths["route_failover"].update(
+                {
+                    ("sites", site, az_key, "route_table_id"),
+                    ("sites", site, az_key, "initial_network_interface_id"),
+                }
+            )
+    return paths
+
+
+def symmetric_plan_output_documents(
+    config: appliance.RunConfig,
+) -> tuple[dict, dict, dict]:
+    complete = {
+        name: copy.deepcopy(wrapper["value"])
+        for name, wrapper in symmetric_deployment_document(config).items()
+    }
+    unknown_paths = fresh_output_unknown_paths(config)
+    planned_outputs = {}
+    output_changes = {}
+    for name, value in complete.items():
+        after, after_unknown, has_unknown = split_plan_unknowns(
+            value, unknown_paths.get(name, set())
+        )
+        planned_outputs[name] = {"sensitive": False}
+        if not has_unknown:
+            planned_outputs[name]["value"] = copy.deepcopy(after)
+        output_changes[name] = {
+            "actions": ["create"],
+            "before": None,
+            "after": after,
+            "after_unknown": after_unknown,
+            "before_sensitive": False,
+            "after_sensitive": False,
+        }
+    configured_outputs = {
+        name: {
+            "sensitive": False,
+            "expression": {"references": references},
+        }
+        for name, references in symmetric_output_references().items()
+    }
+    return planned_outputs, output_changes, configured_outputs
+
+
+def symmetric_saved_plan_document(config: appliance.RunConfig) -> dict:
+    addresses = {
+        *(f'aws_vpc_endpoint.{site}["{az_key}"]' for site in ("west", "east") for az_key in ("a", "b")),
+        *(f'aws_instance.envelope_target_{site}["{az_key}"]' for site in ("west", "east") for az_key in ("a", "b")),
+        *(f'aws_instance.transport_router_{site}["{az_key}"]' for site in ("west", "east") for az_key in ("a", "b")),
+        *(f'aws_instance.workload_{site}["{role}"]' for site in ("west", "east") for role in ("initiator", "responder")),
+        *(f'aws_lb_target_group_attachment.{site}["{az_key}"]' for site in ("west", "east") for az_key in ("a", "b")),
+        *(
+            f'aws_{resource}.{domain}_{site}["{az_key}"]'
+            for resource in ("subnet", "route_table", "route_table_association")
+            for domain in ("workload", "transport", "gwlbe", "target")
+            for site in ("west", "east")
+            for az_key in ("a", "b")
+        ),
+        *(
+            f'aws_route.target_default_{site}["{az_key}"]'
+            for site in ("west", "east")
+            for az_key in ("a", "b")
+        ),
+        *(
+            f'aws_route.workload_to_remote_{site}[{json.dumps(f"{az_key}:{cidr}")}]'
+            for site in ("west", "east")
+            for az_key in config.sites[site]["azs"]
+            for cidr in config.sites[site]["remote_site_cidrs"]
+        ),
+        *(
+            f'aws_route.transport_to_local_{site}[{json.dumps(f"{az_key}:{cidr}")}]'
+            for site in ("west", "east")
+            for az_key in config.sites[site]["azs"]
+            for cidr in config.sites[site]["local_site_cidrs"]
+        ),
+        *(
+            f'aws_route.gwlbe_to_remote_{site}[{json.dumps(f"{az_key}:{cidr}")}]'
+            for site in ("west", "east")
+            for az_key in config.sites[site]["azs"]
+            for cidr in config.sites[site]["remote_site_cidrs"]
+        ),
+    }
+    approved = appliance.symmetric_managed_resource_addresses()
+    represented = {re.sub(r"\[[^]]+\]", "", address) for address in addresses}
+    addresses.update(approved - represented)
+
+    transport_members = {
+        site: {
+            member["az_key"]: member
+            for member in fixture_symmetric_topology(config)["sites"][site]["transport_router_fleet"]
+        }
+        for site in ("west", "east")
+    }
+
+    def route_identity(address: str) -> tuple[str, str, str, str] | None:
+        match = re.fullmatch(
+            r'aws_route\.(workload_to_remote|transport_to_local|gwlbe_to_remote)_(west|east)\["([^:]+):(.+)"\]',
+            address,
+        )
+        return match.groups() if match is not None else None
+
+    def policy_document(site: str, *, role: str) -> str:
+        statements: list[dict] = []
+        core = {
+            "Effect": "Allow",
+            "Action": sorted(appliance.INSTANCE_SSM_CORE_ACTIONS),
+            "Resource": ["*"],
+        }
+        if role == "transport":
+            kms_key_arn = config.sites[site]["ssm_kms_key_arn"]
+            account_id = kms_key_arn.split(":", 5)[4]
+            secret_arn = (
+                f"arn:aws:ssm:{config.sites[site]['region']}:{account_id}:"
+                f"parameter/{config.run_id}/tailscale-auth"
+            )
+            statements = [
+                {
+                    "Effect": "Allow",
+                    "Action": ["ssm:GetParameter"],
+                    "Resource": [secret_arn],
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": ["kms:Decrypt"],
+                    "Resource": [kms_key_arn],
+                    "Condition": {
+                        "StringEquals": {
+                            "kms:CallerAccount": account_id,
+                            "kms:EncryptionContext:PARAMETER_ARN": secret_arn,
+                            "kms:ViaService": (
+                                f"ssm.{config.sites[site]['region']}.amazonaws.com"
+                            ),
+                        }
+                    },
+                },
+                core,
+            ]
+        elif role == "runtime":
+            account_id = config.sites[site]["ssm_kms_key_arn"].split(":", 5)[4]
+            artifact_arn = (
+                f"arn:aws:s3:::{config.run_id}-{account_id}-{config.sites['west']['region']}-artifact/"
+                f"artifacts/{'b' * 40}/envelope-linux-{config.architecture}"
+            )
+            statements = [
+                {
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject"],
+                    "Resource": [artifact_arn],
+                },
+                core,
+            ]
+        elif role == "workload":
+            statements = [core]
+        elif role == "flow":
+            account_id = config.sites["west"]["ssm_kms_key_arn"].split(":", 5)[4]
+            statements = [
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "logs:CreateLogStream",
+                        "logs:DescribeLogStreams",
+                        "logs:PutLogEvents",
+                    ],
+                    "Resource": [
+                        f"arn:aws:logs:{config.sites[owner]['region']}:{account_id}:"
+                        f"log-group:/aws/vpc-flow-logs/{config.run_id}/{owner}:*"
+                        for owner in ("west", "east")
+                    ],
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": ["logs:DescribeLogGroups"],
+                    "Resource": ["*"],
+                },
+            ]
+        return json.dumps({"Version": "2012-10-17", "Statement": statements}, separators=(",", ":"))
+
+    def planned_resource(address: str) -> dict:
+        resource = {"address": address, "mode": "managed", "values": {}}
+        route = route_identity(address)
+        if route is not None:
+            family, site, az_key, cidr = route
+            domain = {
+                "workload_to_remote": "workload",
+                "transport_to_local": "transport",
+                "gwlbe_to_remote": "gwlbe",
+            }[family]
+            resource["index"] = f"{az_key}:{cidr}"
+            resource["values"] = {
+                "destination_cidr_block": cidr,
+                "route_table_id": f"rtb-{domain}-{site}-{az_key}",
+            }
+            if family == "gwlbe_to_remote":
+                selected_az = config.route_failover[
+                    "initial_transport_router_az_by_gwlbe_az"
+                ][site][az_key]
+                resource["values"]["network_interface_id"] = transport_members[site][
+                    selected_az
+                ]["network_interface_id"]
+            else:
+                resource["values"]["vpc_endpoint_id"] = f"vpce-{site}-{az_key}"
+        subnet_match = re.fullmatch(
+            r'aws_subnet\.(workload|transport|gwlbe|target)_(west|east)\["([^\"]+)"\]',
+            address,
+        )
+        if subnet_match is not None:
+            domain, site, az_key = subnet_match.groups()
+            resource["index"] = az_key
+            resource["values"] = {"id": f"subnet-{domain}-{site}-{az_key}"}
+            if domain == "transport":
+                resource["values"]["tags"] = {"Role": "transport-router"}
+        route_table_match = re.fullmatch(
+            r'aws_route_table\.(workload|transport|gwlbe|target)_(west|east)\["([^\"]+)"\]',
+            address,
+        )
+        if route_table_match is not None:
+            domain, site, az_key = route_table_match.groups()
+            resource["index"] = az_key
+            resource["values"] = {"id": f"rtb-{domain}-{site}-{az_key}", "route": []}
+            if domain == "transport":
+                resource["values"]["tags"] = {"Role": "transport-router"}
+        association_match = re.fullmatch(
+            r'aws_route_table_association\.(workload|transport|gwlbe|target)_(west|east)\["([^\"]+)"\]',
+            address,
+        )
+        if association_match is not None:
+            domain, site, az_key = association_match.groups()
+            resource["index"] = az_key
+            resource["values"] = {
+                "subnet_id": f"subnet-{domain}-{site}-{az_key}",
+                "route_table_id": f"rtb-{domain}-{site}-{az_key}",
+            }
+        endpoint_match = re.fullmatch(r'aws_vpc_endpoint\.(west|east)\["([^\"]+)"\]', address)
+        if endpoint_match is not None:
+            site, az_key = endpoint_match.groups()
+            resource["index"] = az_key
+            resource["values"] = {"id": f"vpce-{site}-{az_key}"}
+        target_default_match = re.fullmatch(
+            r'aws_route\.target_default_(west|east)\["([^\"]+)"\]', address
+        )
+        if target_default_match is not None:
+            site, az_key = target_default_match.groups()
+            resource["index"] = az_key
+            resource["values"] = {
+                "route_table_id": f"rtb-target-{site}-{az_key}",
+                "destination_cidr_block": "0.0.0.0/0",
+                "nat_gateway_id": f"nat-{site}",
+            }
+        target_match = re.fullmatch(r'aws_instance\.envelope_target_(west|east)\["([^\"]+)"\]', address)
+        if target_match is not None:
+            site, az_key = target_match.groups()
+            resource["index"] = az_key
+            resource["values"] = {
+                "id": f"i-target-{site}-{az_key}",
+                "associate_public_ip_address": False,
+                "source_dest_check": True,
+                "subnet_id": f"subnet-target-{site}-{az_key}",
+                "iam_instance_profile": f"{config.run_id}-{site}-runtime",
+                "user_data_base64": f"packet-return-{site}-{az_key}",
+            }
+        transport_match = re.fullmatch(r'aws_instance\.transport_router_(west|east)\["([^\"]+)"\]', address)
+        if transport_match is not None:
+            site, az_key = transport_match.groups()
+            resource["index"] = az_key
+            resource["values"] = {
+                "id": f"i-transport-{site}-{az_key}",
+                "associate_public_ip_address": False,
+                "source_dest_check": False,
+                "subnet_id": f"subnet-transport-{site}-{az_key}",
+                "primary_network_interface_id": f"eni-transport-{site}-{az_key}",
+                "iam_instance_profile": f"{config.run_id}-{site}-transport",
+                "tags": {"Role": "transport-router"},
+                "volume_tags": {"Role": "transport-router"},
+            }
+        workload_match = re.fullmatch(
+            r'aws_instance\.workload_(west|east)\["([^\"]+)"\]', address
+        )
+        if workload_match is not None:
+            site, role = workload_match.groups()
+            resource["index"] = role
+            resource["values"] = {
+                "id": f"i-workload-{site}-{role}",
+                "associate_public_ip_address": False,
+                "iam_instance_profile": f"{config.run_id}-{site}-workload",
+            }
+        if address in {
+            "aws_iam_role.transport_west",
+            "aws_iam_role.transport_east",
+            "aws_security_group.transport_west",
+            "aws_security_group.transport_east",
+        }:
+            resource["values"] = {"tags": {"Role": "transport-router"}}
+        policy_match = re.fullmatch(
+            r"aws_iam_role_policy\.(transport|runtime|workload)_(west|east)", address
+        )
+        if policy_match is not None:
+            role, site = policy_match.groups()
+            resource["values"] = {"policy": policy_document(site, role=role)}
+        elif address == "aws_iam_role_policy.flow_logs":
+            resource["values"] = {"policy": policy_document("west", role="flow")}
+        return resource
+
+    def configured_resource(address: str) -> dict:
+        resource = {"address": address, "mode": "managed"}
+        association_match = re.fullmatch(
+            r"aws_route_table_association\.(workload|transport|gwlbe|target)_(west|east)",
+            address,
+        )
+        if association_match is not None:
+            domain, site = association_match.groups()
+            resource.update(
+                {
+                    "for_each_expression": {
+                        "references": [
+                            f"local.sites.{site}.azs",
+                            f"local.sites.{site}",
+                            "local.sites",
+                        ]
+                    },
+                    "expressions": {
+                        "subnet_id": {
+                            "references": [f"aws_subnet.{domain}_{site}", "each.key"]
+                        },
+                        "route_table_id": {
+                            "references": [f"aws_route_table.{domain}_{site}", "each.key"]
+                        },
+                    },
+                }
+            )
+        endpoint_match = re.fullmatch(r"aws_vpc_endpoint\.(west|east)", address)
+        if endpoint_match is not None:
+            site = endpoint_match.group(1)
+            resource.update(
+                {
+                    "for_each_expression": {
+                        "references": [
+                            f"local.sites.{site}.azs",
+                            f"local.sites.{site}",
+                            "local.sites",
+                        ]
+                    },
+                    "expressions": {
+                        "subnet_ids": {
+                            "references": [f"aws_subnet.gwlbe_{site}", "each.key"]
+                        }
+                    },
+                }
+            )
+        route_match = re.fullmatch(
+            r"aws_route\.(workload_to_remote|transport_to_local|gwlbe_to_remote)_(west|east)",
+            address,
+        )
+        if route_match is not None:
+            family, site = route_match.groups()
+            domain, cidr_field, target_field, target_base = {
+                "workload_to_remote": (
+                    "workload",
+                    "remote_site_cidrs",
+                    "vpc_endpoint_id",
+                    f"aws_vpc_endpoint.{site}",
+                ),
+                "transport_to_local": (
+                    "transport",
+                    "local_site_cidrs",
+                    "vpc_endpoint_id",
+                    f"aws_vpc_endpoint.{site}",
+                ),
+                "gwlbe_to_remote": (
+                    "gwlbe",
+                    "remote_site_cidrs",
+                    "network_interface_id",
+                    f"aws_instance.transport_router_{site}",
+                ),
+            }[family]
+            resource.update(
+                {
+                    "for_each_expression": {
+                        "references": [
+                            f"local.sites.{site}.azs",
+                            f"local.sites.{site}.{cidr_field}",
+                            f"local.sites.{site}",
+                            "local.sites",
+                        ]
+                    },
+                    "expressions": {
+                        "route_table_id": {
+                            "references": [
+                                f"aws_route_table.{domain}_{site}",
+                                "each.value.az_key",
+                                "each.value",
+                            ]
+                        },
+                        "destination_cidr_block": {
+                            "references": ["each.value.cidr", "each.value"]
+                        },
+                        target_field: {
+                            "references": (
+                                [
+                                    target_base,
+                                    f"local.route_failover.initial_transport_router_az_by_gwlbe_az.{site}",
+                                    "local.route_failover.initial_transport_router_az_by_gwlbe_az",
+                                    "local.route_failover",
+                                    "each.value.az_key",
+                                    "each.value",
+                                ]
+                                if family == "gwlbe_to_remote"
+                                else [target_base, "each.value.az_key", "each.value"]
+                            )
+                        },
+                    },
+                }
+            )
+        target_default_match = re.fullmatch(r"aws_route\.target_default_(west|east)", address)
+        if target_default_match is not None:
+            site = target_default_match.group(1)
+            resource.update(
+                {
+                    "for_each_expression": {
+                        "references": [
+                            f"local.sites.{site}.azs",
+                            f"local.sites.{site}",
+                            "local.sites",
+                        ]
+                    },
+                    "expressions": {
+                        "route_table_id": {
+                            "references": [f"aws_route_table.target_{site}", "each.key"]
+                        },
+                        "nat_gateway_id": {
+                            "references": [
+                                f"aws_nat_gateway.{site}.id",
+                                f"aws_nat_gateway.{site}",
+                            ]
+                        },
+                    },
+                }
+            )
+        target_match = re.fullmatch(r"aws_instance\.envelope_target_(west|east)", address)
+        if target_match is not None:
+            site = target_match.group(1)
+            resource["for_each_expression"] = {
+                "references": [
+                    f"local.sites.{site}.target_az_keys",
+                    f"local.sites.{site}",
+                    "local.sites",
+                ]
+            }
+            resource["expressions"] = {
+                "subnet_id": {
+                    "references": [f"aws_subnet.target_{site}", "each.key"]
+                },
+                "vpc_security_group_ids": {
+                    "references": [
+                        f"aws_security_group.target_{site}.id",
+                        f"aws_security_group.target_{site}",
+                    ]
+                },
+                "iam_instance_profile": {
+                    "references": [
+                        f"aws_iam_instance_profile.runtime_{site}.name",
+                        f"aws_iam_instance_profile.runtime_{site}",
+                    ]
+                },
+                "user_data_base64": {
+                    "references": [
+                        f"data.cloudinit_config.target_{site}.rendered",
+                        f"data.cloudinit_config.target_{site}",
+                    ]
+                },
+            }
+            resource["depends_on"] = [
+                f"aws_iam_role_policy.runtime_{site}",
+                f"aws_route_table_association.target_{site}",
+                f"aws_route.target_default_{site}",
+                "aws_s3_object.envelope",
+            ]
+        transport_match = re.fullmatch(r"aws_instance\.transport_router_(west|east)", address)
+        if transport_match is not None:
+            site = transport_match.group(1)
+            resource["for_each_expression"] = {
+                "references": [
+                    f"local.sites.{site}.transport_router_az_keys",
+                    f"local.sites.{site}",
+                    "local.sites",
+                ]
+            }
+            resource["expressions"] = {
+                "subnet_id": {
+                    "references": [f"aws_subnet.transport_{site}", "each.key"]
+                },
+                "vpc_security_group_ids": {
+                    "references": [
+                        f"aws_security_group.transport_{site}.id",
+                        f"aws_security_group.transport_{site}",
+                    ]
+                },
+                "iam_instance_profile": {
+                    "references": [
+                        f"aws_iam_instance_profile.transport_{site}.name",
+                        f"aws_iam_instance_profile.transport_{site}",
+                    ]
+                },
+                "user_data_base64": {
+                    "references": [f"module.tailscale_transport_{site}", "each.key"]
+                },
+            }
+            resource["depends_on"] = [
+                f"aws_iam_role_policy.transport_{site}",
+                f"aws_route_table_association.transport_{site}",
+                f"aws_route.transport_default_{site}",
+                f"aws_route.transport_to_local_{site}",
+            ]
+        workload_match = re.fullmatch(r"aws_instance\.workload_(west|east)", address)
+        if workload_match is not None:
+            site = workload_match.group(1)
+            resource["for_each_expression"] = {
+                "references": [f"local.workload_roles.{site}"]
+            }
+            resource["expressions"] = {
+                "subnet_id": {
+                    "references": [f"aws_subnet.workload_{site}", "each.value.az_key"]
+                },
+                "vpc_security_group_ids": {
+                    "references": [f"aws_security_group.workload_{site}", "each.key"]
+                },
+                "iam_instance_profile": {
+                    "references": [
+                        f"aws_iam_instance_profile.workload_{site}.name",
+                        f"aws_iam_instance_profile.workload_{site}",
+                    ]
+                },
+            }
+            resource["depends_on"] = [f"aws_iam_role_policy.workload_{site}"]
+        policy_match = re.fullmatch(
+            r"aws_iam_role_policy\.(transport|runtime|workload)_(west|east)", address
+        )
+        if policy_match is not None:
+            role, site = policy_match.groups()
+            resource["expressions"] = {
+                "role": {
+                    "references": [
+                        f"aws_iam_role.{role}_{site}.id",
+                        f"aws_iam_role.{role}_{site}",
+                    ]
+                },
+                "policy": {
+                    "references": [
+                        "local.workload_policy"
+                        if role == "workload"
+                        else f"local.{role}_policy.{site}"
+                    ]
+                },
+            }
+        elif address == "aws_iam_role_policy.flow_logs":
+            resource["expressions"] = {
+                "role": {
+                    "references": [
+                        "aws_iam_role.flow_logs.id",
+                        "aws_iam_role.flow_logs",
+                    ]
+                },
+                "policy": {"references": ["local.flow_log_delivery_policy"]},
+            }
+        profile_match = re.fullmatch(
+            r"aws_iam_instance_profile\.(transport|runtime|workload)_(west|east)", address
+        )
+        if profile_match is not None:
+            role, site = profile_match.groups()
+            resource["expressions"] = {
+                "role": {
+                    "references": [
+                        f"aws_iam_role.{role}_{site}.name",
+                        f"aws_iam_role.{role}_{site}",
+                    ]
+                }
+            }
+        return resource
+
+    planned_resources = [planned_resource(address) for address in sorted(addresses)]
+    configured_addresses = sorted({re.sub(r"\[[^]]+\]", "", address) for address in addresses})
+    configured_resources = [configured_resource(address) for address in configured_addresses]
+    configured_resources.extend(
+        {
+            "address": f"data.cloudinit_config.target_{site}",
+            "mode": "data",
+            "expressions": {
+                "part": {
+                    "references": [
+                        f"local.{site}_artifact_installer",
+                        f"local.{site}_target_bootstrap",
+                    ]
+                }
+            },
+        }
+        for site in ("west", "east")
+    )
+    changes = [
+        {"address": address, "mode": "managed", "change": {"actions": ["create"]}}
+        for address in sorted(addresses)
+    ]
+    variable_values = appliance.terraform_variables(
+        config,
+        artifact_identity(config.path.parents[1], config.architecture),
+        appliance.intended_ssm_parameters(config, "123456789012"),
+    )
+    variable_values.update(
+        {
+            "envelope_tailscale_iface": "tailscale0",
+            "envelope_underlay_interface": "ens5",
+        }
+    )
+    planned_outputs, output_changes, configured_outputs = (
+        symmetric_plan_output_documents(config)
+    )
+    return {
+        "variables": {
+            name: {"value": value}
+            for name, value in variable_values.items()
+        },
+        "applyable": True,
+        "complete": True,
+        "errored": False,
+        "deferred_changes": [],
+        "output_changes": output_changes,
+        "planned_values": {
+            "outputs": planned_outputs,
+            "root_module": {"resources": planned_resources},
+        },
+        "configuration": {
+            "root_module": {
+                "resources": configured_resources,
+                "outputs": configured_outputs,
+                "module_calls": {
+                    f"tailscale_transport_{site}": {
+                        "expressions": {
+                            "advertise_routes": {
+                                "references": [
+                                    "local.initial_transport_router_advertise_routes",
+                                    f"local.initial_transport_router_advertise_routes.{site}",
+                                    "each.key",
+                                ]
+                            },
+                            "auth_key": {
+                                "references": [f"local.{site}_transport_auth_resolver"]
+                            },
+                            "accept_routes": {"constant_value": True},
+                            "snat_subnet_routes": {"constant_value": False},
+                        },
+                        "module": {"resources": [], "module_calls": {}},
+                    }
+                    for site in ("west", "east")
+                },
+            }
+        },
+        "resource_changes": changes,
+    }
+
+
+def symmetric_saved_plan_with_unknown_route_identities(
+    config: appliance.RunConfig,
+) -> dict:
+    document = symmetric_saved_plan_document(config)
+    unknown_fields: dict[str, set[str]] = {}
+    for resource in document["planned_values"]["root_module"]["resources"]:
+        address = resource["address"]
+        fields: set[str] = set()
+        if address.startswith("aws_instance."):
+            fields.add("id")
+        if address.startswith("aws_instance.transport_router_"):
+            fields.add("primary_network_interface_id")
+        if address.startswith("aws_route_table.gwlbe_"):
+            fields.add("id")
+        if address.startswith("aws_route.gwlbe_to_remote_"):
+            fields.update({"route_table_id", "network_interface_id"})
+        if not fields:
+            continue
+        values = resource["values"]
+        present = {field for field in fields if field in values}
+        for field in present:
+            values.pop(field)
+        if present:
+            unknown_fields[address] = present
+
+    for change in document["resource_changes"]:
+        fields = unknown_fields.get(change["address"])
+        if fields is None:
+            continue
+        resource = next(
+            item
+            for item in document["planned_values"]["root_module"]["resources"]
+            if item["address"] == change["address"]
+        )
+        change["change"].update(
+            {
+                "before": None,
+                "after": copy.deepcopy(resource["values"]),
+                "after_unknown": {field: True for field in sorted(fields)},
+                "before_sensitive": False,
+                "after_sensitive": False,
+                "replace_paths": [],
+            }
+        )
+    return document
+
+
+def symmetric_replacement_saved_plan_document(
+    config: appliance.RunConfig,
+    *,
+    address: str,
+    old_instance_id: str,
+    target_group_arn: str,
+) -> dict:
+    document = symmetric_saved_plan_document(config)
+    complete = {
+        name: copy.deepcopy(wrapper["value"])
+        for name, wrapper in symmetric_deployment_document(config).items()
+    }
+    match = appliance.TARGET_REPLACEMENT_ADDRESS_RE.fullmatch(address)
+    if match is None:
+        raise AssertionError(address)
+    site, az_key = match.groups()
+    target_index = sorted(config.sites[site]["target_az_keys"]).index(az_key)
+    topology_before = complete["symmetric_topology"]
+    topology_before["sites"][site]["target_fleet"][target_index].update(
+        {
+            "instance_id": old_instance_id,
+            "target_group_arn": target_group_arn,
+        }
+    )
+
+    for name, value in complete.items():
+        document["planned_values"]["outputs"][name] = {
+            "sensitive": False,
+            "value": copy.deepcopy(value),
+        }
+        document["output_changes"][name] = {
+            "actions": ["no-op"],
+            "before": copy.deepcopy(value),
+            "after": copy.deepcopy(value),
+            "after_unknown": False,
+            "before_sensitive": False,
+            "after_sensitive": False,
+        }
+
+    topology_after, topology_unknown, has_unknown = split_plan_unknowns(
+        topology_before,
+        {("sites", site, "target_fleet", target_index, "instance_id")},
+    )
+    if not has_unknown:
+        raise AssertionError("replacement topology fixture has no unknown target identity")
+    document["planned_values"]["outputs"]["symmetric_topology"] = {
+        "sensitive": False
+    }
+    document["output_changes"]["symmetric_topology"] = {
+        "actions": ["update"],
+        "before": copy.deepcopy(topology_before),
+        "after": topology_after,
+        "after_unknown": topology_unknown,
+        "before_sensitive": False,
+        "after_sensitive": False,
+    }
+
+    for change in document["resource_changes"]:
+        change["change"]["actions"] = ["no-op"]
+    target = next(
+        change for change in document["resource_changes"] if change["address"] == address
+    )
+    target.update({"action_reason": "replace_by_request"})
+    target["change"] = {
+        "actions": ["delete", "create"],
+        "before": {"id": old_instance_id},
+    }
+    attachment_address = f'aws_lb_target_group_attachment.{site}["{az_key}"]'
+    attachment = next(
+        change
+        for change in document["resource_changes"]
+        if change["address"] == attachment_address
+    )
+    attachment["change"] = {
+        "actions": ["delete", "create"],
+        "before": {
+            "target_id": old_instance_id,
+            "target_group_arn": target_group_arn,
+        },
+        "after": {"target_id": None, "target_group_arn": target_group_arn},
+    }
+    planned_target = next(
+        resource
+        for resource in document["planned_values"]["root_module"]["resources"]
+        if resource["address"] == address
+    )
+    planned_target["values"].pop("id", None)
     return document
 
 
@@ -173,7 +1480,7 @@ def aws_preflight_summary_document(architecture: str = "amd64") -> dict:
         ("west", "us-west-2", ("us-west-2a", "us-west-2b")),
         ("east", "us-east-1", ("us-east-1a", "us-east-1b")),
     ):
-        instance_vcpus = {"target": 2, "ingress_router": 2, "workload": 2}
+        instance_vcpus = {"target": 2, "transport_router": 2, "workload": 2}
         quotas = {}
         for gate, (service, quota_code, quota_name) in sorted(appliance.AWS_REGIONAL_QUOTA_CONTRACT.items()):
             required = 12 if gate == "standard-vcpus" else 1
@@ -237,8 +1544,8 @@ def aws_preflight_summary_document(architecture: str = "amd64") -> dict:
             ],
             "operator_decision": "allowed",
             "run_instances_dry_run": {
-                "west": {"target": instance_type, "ingress_router": instance_type, "workload": workload_type},
-                "east": {"target": instance_type, "ingress_router": instance_type, "workload": workload_type},
+                "west": {"target": instance_type, "transport_router": instance_type, "workload": workload_type},
+                "east": {"target": instance_type, "transport_router": instance_type, "workload": workload_type},
             },
             "flow_log_delivery_role": list(appliance.AWS_FLOW_LOG_DELIVERY_ACTIONS),
         },
@@ -294,6 +1601,67 @@ def mark_manifest_applied(manifest: dict) -> None:
 def mark_manifest_apply_started(manifest: dict) -> None:
     manifest["saved_plan"] = {"apply_started": True, "applied": False}
     manifest["apply_claimed_at"] = "2026-08-20T12:00:00Z"
+    manifest["apply_claim_id"] = "123e4567-e89b-42d3-a456-426614174000"
+
+
+def live_gwlbe_route_tables(
+    config: appliance.RunConfig,
+    deployment: dict,
+) -> dict[str, dict]:
+    topology = deployment["symmetric_topology"]["value"]
+    vpc_ids = deployment["vpc_ids"]["value"]
+    result = {}
+    for site in ("west", "east"):
+        result[config.sites[site]["region"]] = {
+            "NetworkInterfaces": [
+                {
+                    "NetworkInterfaceId": member["network_interface_id"],
+                    "VpcId": vpc_ids[site],
+                    "Status": "in-use",
+                    "Attachment": {
+                        "InstanceId": member["instance_id"],
+                        "DeviceIndex": 0,
+                        "Status": "attached",
+                    },
+                }
+                for member in sorted(
+                    topology["sites"][site]["transport_router_fleet"],
+                    key=lambda value: value["az_key"],
+                )
+            ],
+            "RouteTables": [
+                {
+                    "RouteTableId": member["gwlbe_route_table_id"],
+                    "VpcId": vpc_ids[site],
+                    "Routes": [
+                        {
+                            "DestinationCidrBlock": config.sites[site]["vpc_cidr"],
+                            "GatewayId": "local",
+                            "Origin": "CreateRouteTable",
+                            "State": "active",
+                        },
+                        *[
+                            {
+                                "DestinationCidrBlock": prefix,
+                                "NetworkInterfaceId": member[
+                                    "network_interface_id"
+                                ],
+                                "Origin": "CreateRoute",
+                                "State": "active",
+                            }
+                            for prefix in sorted(
+                                config.sites[site]["remote_site_cidrs"]
+                            )
+                        ],
+                    ],
+                }
+                for member in sorted(
+                    topology["sites"][site]["transport_router_fleet"],
+                    key=lambda value: value["az_key"],
+                )
+            ]
+        }
+    return result
 
 
 def deployment_document() -> dict:
@@ -327,9 +1695,16 @@ def deployment_document() -> dict:
                 }
                 for az_key in ("a", "b")
             ],
-            "ingress_router_fleet": [
-                {"region": region, "az_key": az_key, "instance_id": f"i-ingress-{site}-{az_key}"}
-                for az_key in ("a", "b")
+            "transport_router_fleet": [
+                {
+                    "region": region,
+                    "az_key": az_key,
+                    "instance_id": f"i-transport-{site}-{az_key}",
+                    "network_interface_id": f"eni-transport-{site}-{az_key}",
+                    "gwlbe_route_table_id": f"rtb-gwlbe-{site}-{az_key}",
+                    "advertised_prefix": local_cidrs[index],
+                }
+                for index, az_key in enumerate(("a", "b"))
             ],
         }
 
@@ -381,17 +1756,21 @@ def deployment_document() -> dict:
                 },
             },
         },
-        "instance_ids": {
-            "sensitive": False,
-            "type": ["map", "string"],
-            "value": {"east": "i-appliance-east", "west": "i-appliance-west"},
-        },
         "symmetric_topology": {
             "sensitive": False,
             "type": ["object", {}],
             "value": {
                 "config_version": 2,
                 "run_id": "envelope-fixture",
+                "route_failover": {
+                    "initial_transport_router_az_by_gwlbe_az": {
+                        "west": {"a": "a", "b": "b"},
+                        "east": {"a": "a", "b": "b"},
+                    },
+                    "mutation_timeout_seconds": 120,
+                    "restoration_timeout_seconds": 120,
+                    "recovery_timeout_seconds": 600,
+                },
                 "sites": {
                     "west": site_topology(
                         "west",
@@ -428,6 +1807,1147 @@ def owned_tag_list(config: appliance.RunConfig) -> list[dict[str, str]]:
 
 
 class ConfigAndPathTest(unittest.TestCase):
+    def test_manifest_transition_reconciles_commit_response_loss_and_collisions(self):
+        original = {"phase": "original"}
+        candidate = {"phase": "candidate"}
+
+        class Store:
+            def __init__(self, mode):
+                self.mode = mode
+                self.value = copy.deepcopy(original)
+                self.remote_etag = '"etag-0"'
+
+            def write(self, value, *, if_match=None):
+                self.assert_etag = if_match
+                if self.mode in {"committed", "interrupted"}:
+                    self.value = copy.deepcopy(value)
+                    self.remote_etag = '"etag-1"'
+                elif self.mode == "competing":
+                    self.value = {"phase": "competitor"}
+                    self.remote_etag = '"etag-competitor"'
+                if self.mode == "interrupted":
+                    raise KeyboardInterrupt("injected interrupt")
+                raise appliance.LifecycleError("injected response loss")
+
+            def recover(self):
+                return copy.deepcopy(self.value)
+
+        committed = Store("committed")
+        self.assertEqual(
+            appliance.persist_manifest_transition(
+                committed, original, candidate, description="fixture transition"
+            ),
+            "recovered-committed",
+        )
+        self.assertEqual(committed.assert_etag, '"etag-0"')
+        with self.assertRaisesRegex(appliance.LifecycleError, "response loss"):
+            appliance.persist_manifest_transition(
+                Store("uncommitted"), original, candidate, description="fixture transition"
+            )
+        with self.assertRaises(appliance.ConcurrentLifecycleError):
+            appliance.persist_manifest_transition(
+                Store("competing"), original, candidate, description="fixture transition"
+            )
+        with self.assertRaisesRegex(KeyboardInterrupt, "injected interrupt"):
+            appliance.persist_manifest_transition(
+                Store("interrupted"), original, candidate, description="fixture transition"
+            )
+
+    def test_approved_saved_plan_graph_matches_every_terraform_resource_block(self):
+        actual = {
+            f"{resource_type}.{name}"
+            for path in (ROOT / "example" / "terraform").glob("*.tf")
+            for resource_type, name in re.findall(
+                r'^resource\s+"([^"]+)"\s+"([^"]+)"',
+                path.read_text(),
+                flags=re.MULTILINE,
+            )
+        }
+        self.assertEqual(appliance.symmetric_managed_resource_addresses(), actual)
+
+    def test_complete_output_fixture_matches_every_terraform_output_block(self):
+        actual = {
+            name
+            for path in (ROOT / "example" / "terraform").glob("*.tf")
+            for name in re.findall(
+                r'^output\s+"([^"]+)"',
+                path.read_text(),
+                flags=re.MULTILINE,
+            )
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            fixture = symmetric_deployment_document(config)
+        self.assertEqual(actual, set(appliance.SYMMETRIC_DEPLOYMENT_OUTPUT_FIELDS))
+        self.assertEqual(set(fixture), actual)
+
+    def test_manifest_accepts_only_exact_replacement_journal_states(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            manifest = appliance.new_manifest(config, artifact_identity(root), "123456789012")
+            mark_manifest_applied(manifest)
+            manifest["phase"] = "e2e_replacement_ready"
+            manifest["e2e"] = {
+                "claim_id": "11111111-2222-4333-8444-555555555555",
+                "output_sha256": "d" * 64,
+                "started_at": "2026-08-20T12:00:00Z",
+                "replacement": {
+                    "address": 'aws_instance.envelope_target_west["a"]',
+                    "old_instance_id": "i-0123456789abcdef0",
+                    "started_at": "2026-08-20T12:01:00Z",
+                },
+            }
+            appliance.validate_manifest(manifest, config)
+
+            completed = copy.deepcopy(manifest)
+            completed["phase"] = "e2e_running"
+            completed["e2e"]["replacement"].update(
+                {"finished_at": "2026-08-20T12:02:00Z", "new_output_sha256": "e" * 64}
+            )
+            appliance.validate_manifest(completed, config)
+            failed = copy.deepcopy(manifest)
+            failed["phase"] = "e2e_running"
+            failed["e2e"]["replacement"]["failed_at"] = "2026-08-20T12:02:00Z"
+            appliance.validate_manifest(failed, config)
+
+            ambiguous = copy.deepcopy(completed)
+            ambiguous["e2e"]["replacement"]["failed_at"] = "2026-08-20T12:03:00Z"
+            with self.assertRaisesRegex(appliance.LifecycleError, "replacement journal"):
+                appliance.validate_manifest(ambiguous, config)
+
+    def test_saved_plan_requires_the_exact_symmetric_fleet_graph(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            document = symmetric_saved_plan_document(config)
+            self.assertEqual(appliance.validate_symmetric_saved_plan(document, config), [])
+            computed_outputs = {
+                "vpc_ids",
+                "gwlb_target_group_arns",
+                "gwlb_endpoint_ids",
+                "workload_instances",
+                "flow_log_evidence",
+                "symmetric_topology",
+                "route_failover",
+            }
+            self.assertEqual(
+                set(document["configuration"]["root_module"]["outputs"]),
+                set(appliance.SYMMETRIC_DEPLOYMENT_OUTPUT_FIELDS),
+            )
+            self.assertEqual(
+                set(document["output_changes"]),
+                set(appliance.SYMMETRIC_DEPLOYMENT_OUTPUT_FIELDS),
+            )
+            for output_name in computed_outputs:
+                with self.subTest(plan_time_unknown=output_name):
+                    self.assertNotIn(
+                        "value", document["planned_values"]["outputs"][output_name]
+                    )
+                    self.assertTrue(
+                        appliance.output_has_unknown(
+                            document["output_changes"][output_name]["after_unknown"]
+                        )
+                    )
+            workload_after = document["output_changes"]["workload_instances"][
+                "after"
+            ]["west"]["initiator"]
+            self.assertEqual(workload_after["az_key"], "a")
+            self.assertNotIn("instance_id", workload_after)
+            self.assertIs(
+                document["output_changes"]["route_failover"]["after_unknown"][
+                    "sites"
+                ]["west"]["a"]["route_table_id"],
+                True,
+            )
+
+            missing = copy.deepcopy(document)
+            missing["resource_changes"] = [
+                change
+                for change in missing["resource_changes"]
+                if change["address"] != 'aws_instance.envelope_target_west["a"]'
+            ]
+            self.assertTrue(
+                any("omits required fleet resources" in failure for failure in appliance.validate_symmetric_saved_plan(missing, config))
+            )
+
+            collateral = copy.deepcopy(document)
+            collateral["resource_changes"].append(
+                {
+                    "address": "aws_vpc.unrelated",
+                    "mode": "managed",
+                    "change": {"actions": ["update"]},
+                }
+            )
+            self.assertTrue(
+                any("update or destroy" in failure for failure in appliance.validate_symmetric_saved_plan(collateral, config))
+            )
+            deferred = copy.deepcopy(document)
+            deferred["deferred_changes"] = [{"reason": "provider deferred fixture"}]
+            self.assertTrue(
+                any("deferred" in failure for failure in appliance.validate_symmetric_saved_plan(deferred, config))
+            )
+            incomplete = copy.deepcopy(document)
+            incomplete["complete"] = False
+            self.assertTrue(
+                any("complete, applyable" in failure for failure in appliance.validate_symmetric_saved_plan(incomplete, config))
+            )
+            coherent_extra = copy.deepcopy(document)
+            extra = {"address": "aws_iam_role.unreviewed", "mode": "managed"}
+            coherent_extra["configuration"]["root_module"]["resources"].append(extra)
+            coherent_extra["planned_values"]["root_module"]["resources"].append(extra)
+            coherent_extra["resource_changes"].append(
+                {**extra, "change": {"actions": ["create"]}}
+            )
+            self.assertTrue(
+                any("approved symmetric resource graph" in failure for failure in appliance.validate_symmetric_saved_plan(coherent_extra, config))
+            )
+            coherent_missing = copy.deepcopy(document)
+            omitted = "aws_route.workload_to_remote_west"
+            coherent_missing["configuration"]["root_module"]["resources"] = [
+                resource
+                for resource in coherent_missing["configuration"]["root_module"]["resources"]
+                if resource["address"] != omitted
+            ]
+            coherent_missing["planned_values"]["root_module"]["resources"] = [
+                resource
+                for resource in coherent_missing["planned_values"]["root_module"]["resources"]
+                if resource["address"] != omitted
+            ]
+            coherent_missing["resource_changes"] = [
+                change for change in coherent_missing["resource_changes"] if change["address"] != omitted
+            ]
+            self.assertTrue(
+                any("approved symmetric resource graph" in failure for failure in appliance.validate_symmetric_saved_plan(coherent_missing, config))
+            )
+
+    def test_saved_plan_unknown_route_identities_still_require_exact_resource_references(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            document = symmetric_saved_plan_with_unknown_route_identities(config)
+            route = next(
+                resource
+                for resource in document["planned_values"]["root_module"]["resources"]
+                if resource["address"]
+                == 'aws_route.gwlbe_to_remote_west["a:10.20.1.0/24"]'
+            )
+            self.assertNotIn("route_table_id", route["values"])
+            self.assertNotIn("network_interface_id", route["values"])
+            transport = next(
+                resource
+                for resource in document["planned_values"]["root_module"]["resources"]
+                if resource["address"] == 'aws_instance.transport_router_west["a"]'
+            )
+            route_table = next(
+                resource
+                for resource in document["planned_values"]["root_module"]["resources"]
+                if resource["address"] == 'aws_route_table.gwlbe_west["a"]'
+            )
+            self.assertNotIn("id", transport["values"])
+            self.assertNotIn("primary_network_interface_id", transport["values"])
+            self.assertNotIn("id", route_table["values"])
+            self.assertEqual(
+                next(
+                    change
+                    for change in document["resource_changes"]
+                    if change["address"] == route["address"]
+                )["change"]["after_unknown"],
+                {"network_interface_id": True, "route_table_id": True},
+            )
+            self.assertEqual(
+                appliance.validate_symmetric_saved_plan(document, config), []
+            )
+
+            unanchored = copy.deepcopy(document)
+            configured_route = next(
+                resource
+                for resource in unanchored["configuration"]["root_module"]["resources"]
+                if resource["address"] == "aws_route.gwlbe_to_remote_west"
+            )
+            configured_route["expressions"]["network_interface_id"]["references"][
+                0
+            ] = "aws_instance.transport_router_east"
+            self.assertTrue(
+                any(
+                    "reviewed same-site transport ENI" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        unanchored, config
+                    )
+                )
+            )
+
+    def test_saved_plan_rejects_mutated_current_output_contracts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            document = symmetric_saved_plan_document(config)
+
+            for output_name in (
+                "transport_router_readiness_expectations",
+                "route_failover",
+            ):
+                with self.subTest(missing_output=output_name):
+                    missing = copy.deepcopy(document)
+                    missing["planned_values"]["outputs"].pop(output_name)
+                    self.assertTrue(
+                        any(
+                            "complete symmetric deployment output contract" in failure
+                            for failure in appliance.validate_symmetric_saved_plan(
+                                missing, config
+                            )
+                        )
+                    )
+
+            for section, remove in (
+                (
+                    "configured",
+                    lambda value: value["configuration"]["root_module"][
+                        "outputs"
+                    ].pop("vpc_ids"),
+                ),
+                (
+                    "change",
+                    lambda value: value["output_changes"].pop("vpc_ids"),
+                ),
+            ):
+                with self.subTest(missing_declaration=section):
+                    missing = copy.deepcopy(document)
+                    remove(missing)
+                    self.assertTrue(
+                        any(
+                            "complete symmetric deployment output contract" in failure
+                            for failure in appliance.validate_symmetric_saved_plan(
+                                missing, config
+                            )
+                        )
+                    )
+
+            for output_name in (
+                "symmetric_topology",
+                "transport_router_readiness_expectations",
+                "route_failover",
+            ):
+                with self.subTest(wrong_output_reference=output_name):
+                    wrong_reference = copy.deepcopy(document)
+                    wrong_reference["configuration"]["root_module"]["outputs"][
+                        output_name
+                    ]["expression"]["references"].append(
+                        "aws_instance.unreviewed.id"
+                    )
+                    self.assertTrue(
+                        any(
+                            "exact authorized references" in failure
+                            for failure in appliance.validate_symmetric_saved_plan(
+                                wrong_reference, config
+                            )
+                        )
+                    )
+
+            missing_unknown = copy.deepcopy(document)
+            missing_unknown["output_changes"]["route_failover"]["after_unknown"][
+                "sites"
+            ]["west"]["a"].pop("route_table_id")
+            self.assertTrue(
+                any(
+                    "route_failover output change has an invalid known/unknown shape"
+                    in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        missing_unknown, config
+                    )
+                )
+            )
+
+            wrong_known_shape = copy.deepcopy(document)
+            wrong_known_shape["output_changes"]["workload_instances"]["after"][
+                "west"
+            ]["initiator"]["az_key"] = "b"
+            self.assertTrue(
+                any(
+                    "workload_instances output change has an invalid known/unknown shape"
+                    in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        wrong_known_shape, config
+                    )
+                )
+            )
+
+            wrong_runtime = copy.deepcopy(document)
+            wrong_runtime["output_changes"]["envelope_runtime_config"]["after"][
+                "west"
+            ]["mode"] = "forward"
+            self.assertTrue(
+                any(
+                    "runtime is not the canonical packet-return configuration" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        wrong_runtime, config
+                    )
+                )
+            )
+
+            wrong_load_profile = copy.deepcopy(document)
+            wrong_load_profile["output_changes"]["e2e_load_profile"]["after"][
+                "safe_inner_mtu"
+            ] = 1279
+            self.assertTrue(
+                any(
+                    "load profile differs" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        wrong_load_profile, config
+                    )
+                )
+            )
+
+            def readiness(document_value):
+                return document_value["output_changes"][
+                    "transport_router_readiness_expectations"
+                ]["after"]
+
+            readiness_mutations = {
+                "schema": lambda value: value.update({"config_version": 3}),
+                "schema type": lambda value: value.update({"config_version": 2.0}),
+                "extra field": lambda value: value["sites"]["west"].update(
+                    {"legacy": True}
+                ),
+                "local CIDR": lambda value: value["sites"]["west"][
+                    "local_site_cidrs"
+                ].append("10.99.0.0/24"),
+                "policy rule": lambda value: value["sites"]["west"][
+                    "local_policy_rules"
+                ][0].update({"priority": 99}),
+                "policy rule type": lambda value: value["sites"]["west"][
+                    "local_policy_rules"
+                ][0].update({"priority": 100.0}),
+                "firewall": lambda value: value["sites"]["west"][
+                    "forward_rules"
+                ][0].update({"action": "DROP"}),
+                "forwarding type": lambda value: value["sites"]["west"].update(
+                    {"ipv4_forwarding": 1}
+                ),
+                "MSS": lambda value: value["sites"]["west"]["mss_rules"][0].update(
+                    {"action": "ACCEPT"}
+                ),
+                "MSS ceiling": lambda value: value["sites"]["west"].update(
+                    {"approved_maximum_tcp_mss": 1239}
+                ),
+                "mangle policy": lambda value: value["sites"]["west"].update(
+                    {"mangle_forward_policy": "DROP"}
+                ),
+                "recovery marker": lambda value: value["sites"]["west"].update(
+                    {"recovery_marker": "/tmp/stale"}
+                ),
+                "full policy rules": lambda value: value["sites"]["west"][
+                    "ipv4_policy_rules"
+                ][0].update({"table": "main"}),
+                "remote route table": lambda value: value["sites"]["west"].update(
+                    {"remote_route_table": 53}
+                ),
+                "contract SHA": lambda value: value["sites"]["west"].update(
+                    {"contract_sha256": "0" * 64}
+                ),
+            }
+            for name, mutate in readiness_mutations.items():
+                with self.subTest(readiness=name):
+                    changed = copy.deepcopy(document)
+                    mutate(readiness(changed))
+                    self.assertTrue(
+                        any(
+                            "transport-router readiness expectations" in failure
+                            for failure in appliance.validate_symmetric_saved_plan(
+                                changed, config
+                            )
+                        )
+                    )
+
+            def failover(document_value):
+                return document_value["output_changes"]["route_failover"]["after"]
+
+            failover_mutations = {
+                "schema": lambda value: value.update({"config_version": 3}),
+                "extra field": lambda value: value.update({"legacy": True}),
+                "route table": lambda value: value["sites"]["west"]["a"].update(
+                    {"route_table_id": "rtb-wrong"}
+                ),
+                "initial ENI": lambda value: value["sites"]["west"]["a"].update(
+                    {"initial_network_interface_id": "eni-transport-west-b"}
+                ),
+                "initial AZ": lambda value: value["sites"]["west"]["a"].update(
+                    {"initial_transport_router_az_key": "b"}
+                ),
+                "remote CIDRs": lambda value: value["sites"]["west"]["a"].update(
+                    {"remote_site_cidrs": ["10.99.0.0/24"]}
+                ),
+                "bound type": lambda value: value.update(
+                    {"mutation_timeout_seconds": 120.0}
+                ),
+                "preference type": lambda value: value["same_az_preferred"].update(
+                    {"west": 1}
+                ),
+            }
+            for field in (
+                "mutation_timeout_seconds",
+                "restoration_timeout_seconds",
+                "recovery_timeout_seconds",
+            ):
+                failover_mutations[field] = lambda value, field=field: value.update(
+                    {field: value[field] + 1}
+                )
+            for name, mutate in failover_mutations.items():
+                with self.subTest(route_failover=name):
+                    changed = copy.deepcopy(document)
+                    mutate(failover(changed))
+                    self.assertTrue(
+                        any(
+                            "route_failover output" in failure
+                            for failure in appliance.validate_symmetric_saved_plan(
+                                changed, config
+                            )
+                        )
+                    )
+
+            topology_mismatch = copy.deepcopy(document)
+            topology_mismatch["output_changes"]["symmetric_topology"]["after"][
+                "route_failover"
+            ]["mutation_timeout_seconds"] += 1
+            self.assertTrue(
+                any(
+                    "symmetric_topology output change" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        topology_mismatch, config
+                    )
+                )
+            )
+
+            cost_paths = (
+                ("resource_counts", "nat_gateways"),
+                ("resource_counts", "elastic_ips"),
+                ("resource_counts", "gateway_load_balancers"),
+                ("resource_counts", "iam_roles", "target"),
+                ("resource_counts", "iam_roles", "workload"),
+                ("resource_counts", "iam_roles", "transport"),
+                ("resource_counts", "iam_roles", "flow_log"),
+                ("resource_counts", "iam_instance_profiles", "target"),
+                ("resource_counts", "iam_instance_profiles", "workload"),
+                ("resource_counts", "iam_instance_profiles", "transport"),
+                ("route_failover_bounds", "mutation_timeout_seconds"),
+                ("route_failover_bounds", "restoration_timeout_seconds"),
+                ("route_failover_bounds", "recovery_timeout_seconds"),
+                ("nat_topology_limit", "gateways_per_site"),
+                ("nat_topology_limit", "expanded_for_ha"),
+                ("nat_topology_limit", "placement"),
+                ("nat_topology_limit", "limitation"),
+            )
+            for path in cost_paths:
+                with self.subTest(cost_path=".".join(path)):
+                    changed = copy.deepcopy(document)
+                    target = changed["output_changes"]["cost_profile"]["after"]
+                    for field in path[:-1]:
+                        target = target[field]
+                    current = target[path[-1]]
+                    target[path[-1]] = not current if isinstance(current, bool) else 99
+                    self.assertTrue(
+                        any(
+                            "symmetric HA cost profile" in failure
+                            for failure in appliance.validate_symmetric_saved_plan(
+                                changed, config
+                            )
+                        )
+                    )
+
+    def test_saved_plan_rejects_every_ingress_era_schema_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            document = symmetric_saved_plan_document(config)
+
+            obsolete_input = copy.deepcopy(document)
+            topology = obsolete_input["variables"]["symmetric_topology"]["value"]["sites"]["west"]
+            topology["ingress_subnet_cidrs"] = topology.pop("transport_subnet_cidrs")
+            topology["ingress_router_az_keys"] = topology.pop("transport_router_az_keys")
+            self.assertTrue(
+                any(
+                    "variables differ" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(obsolete_input, config)
+                )
+            )
+
+            obsolete_output = copy.deepcopy(document)
+            site_output = obsolete_output["output_changes"]["symmetric_topology"][
+                "after"
+            ]["sites"]["west"]
+            site_output["ingress_router_fleet"] = site_output.pop("transport_router_fleet")
+            self.assertTrue(appliance.validate_symmetric_saved_plan(obsolete_output, config))
+
+            obsolete_count = copy.deepcopy(document)
+            counts = obsolete_count["output_changes"]["cost_profile"]["after"][
+                "resource_counts"
+            ]
+            counts["ingress_routers"] = counts.pop("transport_routers")
+            self.assertTrue(
+                any(
+                    "symmetric HA cost profile" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(obsolete_count, config)
+                )
+            )
+
+            aliases = (
+                ("aws_instance.transport_router_west", "aws_instance.tailnet_ingress_west"),
+                ("aws_subnet.transport_west", "aws_subnet.ingress_west"),
+                ("aws_route_table.transport_west", "aws_route_table.ingress_west"),
+                (
+                    "aws_route_table_association.transport_west",
+                    "aws_route_table_association.ingress_west",
+                ),
+                ("aws_security_group.transport_west", "aws_security_group.ingress_west"),
+                ("aws_route.transport_default_west", "aws_route.ingress_default_west"),
+                ("aws_route.transport_to_local_west", "aws_route.ingress_to_local_west"),
+            )
+            for current, obsolete in aliases:
+                with self.subTest(resource=obsolete):
+                    obsolete_resource = copy.deepcopy(document)
+                    for resource in obsolete_resource["configuration"]["root_module"]["resources"]:
+                        if resource["address"] == current:
+                            resource["address"] = obsolete
+                    for resource in obsolete_resource["planned_values"]["root_module"]["resources"]:
+                        if resource["address"].startswith(current):
+                            resource["address"] = obsolete + resource["address"][len(current) :]
+                    for change in obsolete_resource["resource_changes"]:
+                        if change["address"].startswith(current):
+                            change["address"] = obsolete + change["address"][len(current) :]
+                    self.assertTrue(
+                        any(
+                            "approved symmetric resource graph" in failure
+                            for failure in appliance.validate_symmetric_saved_plan(
+                                obsolete_resource, config
+                            )
+                        )
+                    )
+
+    def test_saved_plan_binds_packet_return_routes_targets_and_transport_secret_ownership(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            document = symmetric_saved_plan_document(config)
+
+            wrong_eni = copy.deepcopy(document)
+            next(
+                resource
+                for resource in wrong_eni["planned_values"]["root_module"]["resources"]
+                if resource["address"] == 'aws_route.gwlbe_to_remote_west["a:10.20.1.0/24"]'
+            )["values"]["network_interface_id"] = "eni-transport-west-b"
+            self.assertTrue(
+                any(
+                    "reviewed same-site transport ENI" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(wrong_eni, config)
+                )
+            )
+
+            wrong_route_reference = copy.deepcopy(document)
+            next(
+                resource
+                for resource in wrong_route_reference["configuration"]["root_module"]["resources"]
+                if resource["address"] == "aws_route.gwlbe_to_remote_west"
+            )["expressions"]["network_interface_id"]["references"][0] = (
+                "aws_instance.transport_router_east"
+            )
+            self.assertTrue(
+                any(
+                    "reviewed same-site transport ENI" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(wrong_route_reference, config)
+                )
+            )
+
+            crossed_domain = copy.deepcopy(document)
+            next(
+                resource
+                for resource in crossed_domain["configuration"]["root_module"]["resources"]
+                if resource["address"] == "aws_route_table_association.workload_west"
+            )["expressions"]["route_table_id"]["references"][0] = "aws_route_table.gwlbe_west"
+            self.assertTrue(
+                any(
+                    "route domains are not distinct" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(crossed_domain, config)
+                )
+            )
+
+            wrong_preinspection_endpoint = copy.deepcopy(document)
+            next(
+                resource
+                for resource in wrong_preinspection_endpoint["planned_values"]["root_module"]["resources"]
+                if resource["address"] == 'aws_route.workload_to_remote_west["a:10.20.1.0/24"]'
+            )["values"]["vpc_endpoint_id"] = "vpce-west-b"
+            self.assertTrue(
+                any(
+                    "same-AZ GWLBE" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        wrong_preinspection_endpoint, config
+                    )
+                )
+            )
+
+            source_dest_check = copy.deepcopy(document)
+            next(
+                resource
+                for resource in source_dest_check["planned_values"]["root_module"]["resources"]
+                if resource["address"] == 'aws_instance.envelope_target_west["a"]'
+            )["values"]["source_dest_check"] = False
+            self.assertTrue(
+                any(
+                    "packet-return source-dest-check enforcement" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(source_dest_check, config)
+                )
+            )
+
+            obsolete_role_tag = copy.deepcopy(document)
+            next(
+                resource
+                for resource in obsolete_role_tag["planned_values"]["root_module"]["resources"]
+                if resource["address"] == 'aws_instance.transport_router_west["a"]'
+            )["values"]["tags"]["Role"] = "tailnet-ingress"
+            self.assertTrue(
+                any(
+                    "same-AZ eligible ENI" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(obsolete_role_tag, config)
+                )
+            )
+
+            missing_bootstrap_dependency = copy.deepcopy(document)
+            next(
+                resource
+                for resource in missing_bootstrap_dependency["configuration"]["root_module"]["resources"]
+                if resource["address"] == "aws_instance.envelope_target_west"
+            )["depends_on"].remove("aws_s3_object.envelope")
+            self.assertTrue(
+                any(
+                    "incomplete bootstrap dependency" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        missing_bootstrap_dependency, config
+                    )
+                )
+            )
+
+            broad_runtime = copy.deepcopy(document)
+            runtime = next(
+                resource
+                for resource in broad_runtime["planned_values"]["root_module"]["resources"]
+                if resource["address"] == "aws_iam_role_policy.runtime_west"
+            )
+            policy = json.loads(runtime["values"]["policy"])
+            policy["Statement"][0]["Action"] = ["s3:*"]
+            runtime["values"]["policy"] = json.dumps(policy)
+            self.assertTrue(
+                any(
+                    "exact least-privilege" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(broad_runtime, config)
+                )
+            )
+
+            wrong_cost = copy.deepcopy(document)
+            wrong_cost["output_changes"]["cost_profile"]["after"][
+                "estimated_fixed_hourly_usd"
+            ] = 1.5
+            self.assertTrue(
+                any(
+                    "symmetric HA cost profile" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(wrong_cost, config)
+                )
+            )
+
+            obsolete_variable = copy.deepcopy(document)
+            obsolete_variable["variables"]["envelope_tun_name"] = {"value": "envelope0"}
+            self.assertTrue(
+                any(
+                    "variable schema contains obsolete" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(obsolete_variable, config)
+                )
+            )
+
+            target_tailscale = copy.deepcopy(document)
+            next(
+                resource
+                for resource in target_tailscale["configuration"]["root_module"]["resources"]
+                if resource["address"] == "aws_instance.envelope_target_west"
+            )["expressions"]["user_data_base64"]["references"] = [
+                "module.tailscale_target_west.rendered"
+            ]
+            self.assertTrue(
+                any(
+                    "Tailscale user-data" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(target_tailscale, config)
+                )
+            )
+
+            target_inner_route = copy.deepcopy(document)
+            next(
+                resource
+                for resource in target_inner_route["planned_values"]["root_module"]["resources"]
+                if resource["address"] == 'aws_route_table.target_east["a"]'
+            )["values"]["route"] = [{"cidr_block": "10.10.1.0/24"}]
+            self.assertTrue(
+                any(
+                    "target route tables contain an inner route" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(target_inner_route, config)
+                )
+            )
+
+            leaked_secret = copy.deepcopy(document)
+            runtime_policy = next(
+                resource
+                for resource in leaked_secret["planned_values"]["root_module"]["resources"]
+                if resource["address"] == "aws_iam_role_policy.runtime_west"
+            )
+            runtime_policy["values"]["policy"] = next(
+                resource
+                for resource in leaked_secret["planned_values"]["root_module"]["resources"]
+                if resource["address"] == "aws_iam_role_policy.transport_west"
+            )["values"]["policy"]
+            self.assertTrue(
+                any(
+                    "outside its exact transport role" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(leaked_secret, config)
+                )
+            )
+
+            wrong_transport_secret = copy.deepcopy(document)
+            transport_policy = next(
+                resource
+                for resource in wrong_transport_secret["planned_values"]["root_module"]["resources"]
+                if resource["address"] == "aws_iam_role_policy.transport_east"
+            )
+            policy = json.loads(transport_policy["values"]["policy"])
+            policy["Statement"][0]["Resource"] = [
+                "arn:aws:ssm:us-west-2:123456789012:parameter/envelope-fixture/tailscale-auth"
+            ]
+            transport_policy["values"]["policy"] = json.dumps(policy)
+            self.assertTrue(
+                any(
+                    "does not own exact secret access" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(wrong_transport_secret, config)
+                )
+            )
+
+            def mutate_transport_policy(document, mutation):
+                resource = next(
+                    item
+                    for item in document["planned_values"]["root_module"]["resources"]
+                    if item["address"] == "aws_iam_role_policy.transport_west"
+                )
+                value = json.loads(resource["values"]["policy"])
+                mutation(value["Statement"])
+                resource["values"]["policy"] = json.dumps(value)
+
+            def kms_statement(statements):
+                return next(statement for statement in statements if statement["Action"] == ["kms:Decrypt"])
+
+            condition_mutations = {
+                "missing condition": lambda statements: kms_statement(statements).pop("Condition"),
+                "wrong caller": lambda statements: kms_statement(statements)["Condition"]["StringEquals"].update(
+                    {"kms:CallerAccount": "210987654321"}
+                ),
+                "wrong service": lambda statements: kms_statement(statements)["Condition"]["StringEquals"].update(
+                    {"kms:ViaService": "ssm.us-east-1.amazonaws.com"}
+                ),
+                "wrong parameter": lambda statements: kms_statement(statements)["Condition"]["StringEquals"].update(
+                    {
+                        "kms:EncryptionContext:PARAMETER_ARN": (
+                            "arn:aws:ssm:us-west-2:123456789012:parameter/other/tailscale-auth"
+                        )
+                    }
+                ),
+                "extra condition": lambda statements: kms_statement(statements)["Condition"].update(
+                    {"ArnLike": {"kms:EncryptionContext:PARAMETER_ARN": "*"}}
+                ),
+                "condition on SSM": lambda statements: statements[0].update(
+                    {"Condition": {"StringEquals": {"aws:PrincipalAccount": "123456789012"}}}
+                ),
+                "condition on core": lambda statements: statements[2].update(
+                    {"Condition": {"StringEquals": {"aws:PrincipalAccount": "123456789012"}}}
+                ),
+            }
+            for name, mutation in condition_mutations.items():
+                with self.subTest(transport_condition=name):
+                    weakened = copy.deepcopy(document)
+                    mutate_transport_policy(weakened, mutation)
+                    self.assertTrue(
+                        any(
+                            "reviewed KMS context" in failure
+                            for failure in appliance.validate_symmetric_saved_plan(
+                                weakened, config
+                            )
+                        )
+                    )
+
+            broad_workload = copy.deepcopy(document)
+            workload_policy = next(
+                item
+                for item in broad_workload["planned_values"]["root_module"]["resources"]
+                if item["address"] == "aws_iam_role_policy.workload_west"
+            )
+            workload_document = json.loads(workload_policy["values"]["policy"])
+            workload_document["Statement"][0]["Action"].append("ssm:GetParameter")
+            workload_policy["values"]["policy"] = json.dumps(workload_document)
+            self.assertTrue(
+                any(
+                    "SSM-core-only" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        broad_workload, config
+                    )
+                )
+            )
+
+            artifact_arn = (
+                "arn:aws:s3:::envelope-fixture-123456789012-us-west-2-artifact/"
+                f"artifacts/{'b' * 40}/envelope-linux-{config.architecture}"
+            )
+            workload_permissions = {
+                "artifact": ("s3:GetObject", artifact_arn),
+                "secret": (
+                    "ssm:GetParameter",
+                    "arn:aws:ssm:us-west-2:123456789012:"
+                    "parameter/envelope-fixture/tailscale-auth",
+                ),
+                "route mutation": ("ec2:ReplaceRoute", "*"),
+            }
+            for name, (action, resource) in workload_permissions.items():
+                with self.subTest(workload_permission=name):
+                    changed = copy.deepcopy(document)
+                    workload_policy = next(
+                        item
+                        for item in changed["planned_values"]["root_module"][
+                            "resources"
+                        ]
+                        if item["address"] == "aws_iam_role_policy.workload_west"
+                    )
+                    workload_document = json.loads(workload_policy["values"]["policy"])
+                    workload_document["Statement"].append(
+                        {
+                            "Effect": "Allow",
+                            "Action": [action],
+                            "Resource": [resource],
+                        }
+                    )
+                    workload_policy["values"]["policy"] = json.dumps(
+                        workload_document
+                    )
+                    self.assertTrue(
+                        any(
+                            "SSM-core-only" in failure
+                            for failure in appliance.validate_symmetric_saved_plan(
+                                changed, config
+                            )
+                        )
+                    )
+
+            duplicate_core = copy.deepcopy(document)
+            duplicate_policy = next(
+                item
+                for item in duplicate_core["planned_values"]["root_module"][
+                    "resources"
+                ]
+                if item["address"] == "aws_iam_role_policy.workload_west"
+            )
+            duplicate_document = json.loads(duplicate_policy["values"]["policy"])
+            duplicate_document["Statement"][0]["Action"].append(
+                duplicate_document["Statement"][0]["Action"][0]
+            )
+            duplicate_policy["values"]["policy"] = json.dumps(duplicate_document)
+            self.assertTrue(
+                any(
+                    "SSM-core-only" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        duplicate_core, config
+                    )
+                )
+            )
+
+            crossed_workload_role = copy.deepcopy(document)
+            workload_configuration = next(
+                item
+                for item in crossed_workload_role["configuration"]["root_module"][
+                    "resources"
+                ]
+                if item["address"] == "aws_iam_role_policy.workload_west"
+            )
+            workload_configuration["expressions"]["role"]["references"] = [
+                "aws_iam_role.workload_east.id",
+                "aws_iam_role.workload_east",
+            ]
+            self.assertTrue(
+                any(
+                    "SSM-core-only" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        crossed_workload_role, config
+                    )
+                )
+            )
+
+            for name, mutate in {
+                "wildcard action": lambda policy: policy["Statement"][0].update(
+                    {"Action": ["logs:*"]}
+                ),
+                "wildcard resource": lambda policy: policy["Statement"][0].update(
+                    {"Resource": ["*"]}
+                ),
+                "wrong region": lambda policy: policy["Statement"][0]["Resource"].__setitem__(
+                    0, policy["Statement"][0]["Resource"][0].replace("us-west-2", "us-east-2")
+                ),
+                "extra statement": lambda policy: policy["Statement"].append(
+                    {"Effect": "Allow", "Action": ["logs:GetLogEvents"], "Resource": ["*"]}
+                ),
+            }.items():
+                with self.subTest(flow_log_policy=name):
+                    changed = copy.deepcopy(document)
+                    flow_policy = next(
+                        item
+                        for item in changed["planned_values"]["root_module"][
+                            "resources"
+                        ]
+                        if item["address"] == "aws_iam_role_policy.flow_logs"
+                    )
+                    flow_document = json.loads(flow_policy["values"]["policy"])
+                    mutate(flow_document)
+                    flow_policy["values"]["policy"] = json.dumps(flow_document)
+                    self.assertTrue(
+                        any(
+                            "exact regional CloudWatch delivery role" in failure
+                            for failure in appliance.validate_symmetric_saved_plan(
+                                changed, config
+                            )
+                        )
+                    )
+
+            unknown_flow_policy = copy.deepcopy(document)
+            next(
+                item
+                for item in unknown_flow_policy["planned_values"]["root_module"][
+                    "resources"
+                ]
+                if item["address"] == "aws_iam_role_policy.flow_logs"
+            )["values"].pop("policy")
+            unknown_failures = appliance.validate_symmetric_saved_plan(
+                unknown_flow_policy, config
+            )
+            self.assertTrue(
+                any("IAM policies do not expose" in failure for failure in unknown_failures)
+            )
+            self.assertTrue(
+                any(
+                    "exact regional CloudWatch delivery role" in failure
+                    for failure in unknown_failures
+                )
+            )
+
+            flow_artifact = copy.deepcopy(document)
+            flow_policy = next(
+                item
+                for item in flow_artifact["planned_values"]["root_module"][
+                    "resources"
+                ]
+                if item["address"] == "aws_iam_role_policy.flow_logs"
+            )
+            flow_document = json.loads(flow_policy["values"]["policy"])
+            flow_document["Statement"].append(
+                {
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject"],
+                    "Resource": [artifact_arn],
+                }
+            )
+            flow_policy["values"]["policy"] = json.dumps(flow_document)
+            self.assertTrue(
+                any(
+                    "artifact access outside the exact target runtime roles" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        flow_artifact, config
+                    )
+                )
+            )
+
+    def test_replacement_plan_is_bound_to_one_current_target_and_attachment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            address = 'aws_instance.envelope_target_west["a"]'
+            old_instance_id = "i-0123456789abcdef0"
+            target_group_arn = "arn:aws:elasticloadbalancing:us-west-2:123456789012:targetgroup/west/fixture"
+            document = symmetric_replacement_saved_plan_document(
+                config,
+                address=address,
+                old_instance_id=old_instance_id,
+                target_group_arn=target_group_arn,
+            )
+            self.assertNotIn(
+                "value",
+                document["planned_values"]["outputs"]["symmetric_topology"],
+            )
+            self.assertIs(
+                document["output_changes"]["symmetric_topology"]["after_unknown"][
+                    "sites"
+                ]["west"]["target_fleet"][0]["instance_id"],
+                True,
+            )
+            self.assertEqual(
+                document["output_changes"]["cost_profile"]["actions"], ["no-op"]
+            )
+
+            self.assertEqual(
+                appliance.validate_symmetric_saved_plan(
+                    document,
+                    config,
+                    replace_address=address,
+                    replace_instance_id=old_instance_id,
+                    replace_target_group_arn=target_group_arn,
+                ),
+                [],
+            )
+
+            wrong_attachment = copy.deepcopy(document)
+            next(
+                change
+                for change in wrong_attachment["resource_changes"]
+                if change["address"] == 'aws_lb_target_group_attachment.west["a"]'
+            )["change"]["before"]["target_id"] = "i-1123456789abcdef0"
+            self.assertTrue(
+                any(
+                    "attachment is not bound" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        wrong_attachment,
+                        config,
+                        replace_address=address,
+                        replace_instance_id=old_instance_id,
+                        replace_target_group_arn=target_group_arn,
+                    )
+                )
+            )
+
+            wrong_identity = copy.deepcopy(document)
+            self.assertTrue(
+                any(
+                    "exact authorized current target" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        wrong_identity,
+                        config,
+                        replace_address=address,
+                        replace_instance_id="i-1123456789abcdef0",
+                        replace_target_group_arn=target_group_arn,
+                    )
+                )
+            )
+            collateral = copy.deepcopy(document)
+            collateral["resource_changes"].append(
+                {
+                    "address": "aws_vpc.west",
+                    "mode": "managed",
+                    "change": {"actions": ["update"]},
+                }
+            )
+            self.assertTrue(
+                any(
+                    "outside the authorized target" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        collateral,
+                        config,
+                        replace_address=address,
+                        replace_instance_id=old_instance_id,
+                        replace_target_group_arn=target_group_arn,
+                    )
+                )
+            )
+
     def test_expired_config_loads_only_for_recovery_commands(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -446,12 +2966,55 @@ class ConfigAndPathTest(unittest.TestCase):
             artifact = artifact_identity(root)
             parameters = appliance.intended_ssm_parameters(config, "123456789012")
             values = appliance.terraform_variables(config, artifact, parameters)
+            self.assertEqual(set(values), appliance.TERRAFORM_VARIABLE_FIELDS)
             self.assertEqual(values["symmetric_topology"]["sites"]["west"]["azs"], config.sites["west"]["azs"])
             self.assertEqual(config.raw["e2e_load_profile"], e2e_load_profile_document())
             self.assertEqual(values["e2e_load_profile"], config.raw["e2e_load_profile"])
             self.assertIsNot(values["e2e_load_profile"], config.raw["e2e_load_profile"])
             self.assertEqual(values["symmetric_topology"]["version"], 2)
+            self.assertEqual(
+                values["symmetric_topology"]["route_failover"],
+                config_document()["symmetric_topology"]["route_failover"],
+            )
+            self.assertIsNot(
+                values["symmetric_topology"]["route_failover"], config.route_failover
+            )
+            for site in ("west", "east"):
+                topology = values["symmetric_topology"]["sites"][site]
+                self.assertIn("transport_subnet_cidrs", topology)
+                self.assertIn("transport_router_az_keys", topology)
+                self.assertNotIn("ingress_subnet_cidrs", topology)
+                self.assertNotIn("ingress_router_az_keys", topology)
             self.assertEqual(config.site_cidrs["west"], ["10.10.1.0/24", "10.10.2.0/24"])
+            self.assertEqual(
+                config.raw["cost"],
+                {
+                    "estimated_fixed_hourly_usd": 4.0,
+                    "approved_max_fixed_hourly_usd": 5.0,
+                },
+            )
+            self.assertEqual(
+                config.raw["envelope"],
+                {
+                    "mode": "packet-return",
+                    "udp_bind": "0.0.0.0:6081",
+                    "max_inner_packet_size": 1280,
+                },
+            )
+            self.assertFalse(
+                {
+                    "envelope_mode",
+                    "envelope_udp_bind",
+                    "envelope_max_inner_packet_size",
+                    "envelope_routing_mode",
+                    "envelope_tun_name",
+                    "envelope_tailscale_iface",
+                    "envelope_underlay_interface",
+                    "envelope_routing_table_id",
+                    "envelope_routing_rule_priority",
+                    "ebs_root_volume_size",
+                }.intersection(values)
+            )
 
             document = config_document()
             document["tailnet"]["lane_cidrs"] = {"west": ["10.99.0.0/24"], "east": ["10.98.0.0/24"]}
@@ -464,6 +3027,200 @@ class ConfigAndPathTest(unittest.TestCase):
             path.write_text(json.dumps(document))
             with self.assertRaisesRegex(appliance.LifecycleError, "unsupported fields"):
                 appliance.RunConfig.load(path)
+            document = config_document()
+            document["ebs_root_volume_size"] = 20
+            path.write_text(json.dumps(document))
+            with self.assertRaisesRegex(appliance.LifecycleError, "unsupported fields"):
+                appliance.RunConfig.load(path)
+
+    def test_route_failover_input_is_exact_bounded_and_same_az(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            valid = config_document()
+            path = root / "route-failover.json"
+            path.write_text(json.dumps(valid))
+            config = appliance.RunConfig.load(path)
+            self.assertEqual(
+                appliance.terraform_variables(
+                    config,
+                    artifact_identity(root),
+                    appliance.intended_ssm_parameters(config, "123456789012"),
+                )["symmetric_topology"]["route_failover"],
+                valid["symmetric_topology"]["route_failover"],
+            )
+
+            whole_number = config_document()
+            whole_number["symmetric_topology"]["route_failover"][
+                "mutation_timeout_seconds"
+            ] = 1.0
+            whole_number_path = root / "route-failover-whole-number.json"
+            whole_number_path.write_text(json.dumps(whole_number))
+            self.assertEqual(
+                appliance.RunConfig.load(whole_number_path).route_failover[
+                    "mutation_timeout_seconds"
+                ],
+                1,
+            )
+
+            cases = []
+            missing = config_document()
+            missing["symmetric_topology"].pop("route_failover")
+            cases.append(("missing", missing))
+            extra = config_document()
+            extra["symmetric_topology"]["route_failover"]["legacy_timeout"] = 1
+            cases.append(("extra", extra))
+            missing_az = config_document()
+            missing_az["symmetric_topology"]["route_failover"][
+                "initial_transport_router_az_by_gwlbe_az"
+            ]["west"].pop("b")
+            cases.append(("missing AZ", missing_az))
+            cross_site = config_document()
+            cross_site["symmetric_topology"]["route_failover"][
+                "initial_transport_router_az_by_gwlbe_az"
+            ]["west"]["a"] = "east-a"
+            cases.append(("cross-site AZ", cross_site))
+            cross_az = config_document()
+            cross_az["symmetric_topology"]["route_failover"][
+                "initial_transport_router_az_by_gwlbe_az"
+            ]["west"] = {"a": "b", "b": "a"}
+            cases.append(("cross-AZ selection", cross_az))
+            short_restoration = config_document()
+            short_restoration["symmetric_topology"]["route_failover"][
+                "restoration_timeout_seconds"
+            ] = 1
+            cases.append(("restoration quiet window", short_restoration))
+            short_recovery = config_document()
+            short_recovery["symmetric_topology"]["route_failover"][
+                "recovery_timeout_seconds"
+            ] = 10
+            cases.append(("recovery quiet window", short_recovery))
+            for field in (
+                "mutation_timeout_seconds",
+                "restoration_timeout_seconds",
+                "recovery_timeout_seconds",
+            ):
+                for value in (True, 0, 1.5, 7201):
+                    invalid = config_document()
+                    invalid["symmetric_topology"]["route_failover"][field] = value
+                    cases.append((f"{field}={value!r}", invalid))
+
+            for index, (name, document) in enumerate(cases):
+                with self.subTest(name=name):
+                    candidate = root / f"route-failover-{index}.json"
+                    candidate.write_text(json.dumps(document))
+                    with self.assertRaisesRegex(appliance.LifecycleError, "route_failover"):
+                        appliance.RunConfig.load(candidate)
+
+    def test_config_rejects_ingress_era_topology_fields_without_aliases(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for current, obsolete in (
+                ("transport_subnet_cidrs", "ingress_subnet_cidrs"),
+                ("transport_router_az_keys", "ingress_router_az_keys"),
+            ):
+                with self.subTest(field=obsolete):
+                    document = config_document()
+                    site = document["symmetric_topology"]["sites"]["west"]
+                    site[obsolete] = site.pop(current)
+                    path = root / f"obsolete-{obsolete}.json"
+                    path.write_text(json.dumps(document))
+                    with self.assertRaisesRegex(appliance.LifecycleError, "unsupported fields"):
+                        appliance.RunConfig.load(path)
+
+    def test_cost_defaults_match_approved_ha_profile_and_reject_non_finite_values(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            self.assertEqual(config.raw["cost"]["estimated_fixed_hourly_usd"], 4.0)
+            self.assertEqual(config.raw["cost"]["approved_max_fixed_hourly_usd"], 5.0)
+
+            for index, value in enumerate((True, "4", float("nan"), float("inf"))):
+                with self.subTest(value=value):
+                    document = config_document()
+                    document["cost"] = {
+                        "estimated_fixed_hourly_usd": value,
+                        "approved_max_fixed_hourly_usd": 5,
+                    }
+                    path = root / f"cost-{index}.json"
+                    path.write_text(json.dumps(document))
+                    with self.assertRaisesRegex(appliance.LifecycleError, "cost"):
+                        appliance.RunConfig.load(path)
+
+    def test_config_rejects_collapsed_route_domains_and_duplicate_fleet_azs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            collapsed = config_document()
+            collapsed["symmetric_topology"]["sites"]["west"]["target_subnet_cidrs"]["a"] = (
+                collapsed["symmetric_topology"]["sites"]["west"]["workload_subnet_cidrs"]["a"]
+            )
+            path = root / "collapsed.json"
+            path.write_text(json.dumps(collapsed))
+            with self.assertRaisesRegex(appliance.LifecycleError, "subnet role CIDRs must not overlap"):
+                appliance.RunConfig.load(path)
+
+            resolver_overlap = config_document()
+            west = resolver_overlap["symmetric_topology"]["sites"]["west"]
+            west["local_site_cidrs"][0] = "10.10.0.0/24"
+            west["workload_subnet_cidrs"]["a"] = "10.10.0.0/24"
+            path = root / "resolver-overlap.json"
+            path.write_text(json.dumps(resolver_overlap))
+            with self.assertRaisesRegex(appliance.LifecycleError, "VPC DNS resolver"):
+                appliance.RunConfig.load(path)
+
+            for field in ("target_az_keys", "transport_router_az_keys"):
+                with self.subTest(field=field):
+                    duplicate_az = config_document()
+                    duplicate_az["symmetric_topology"]["sites"]["west"][field] = [
+                        "a",
+                        "a",
+                        "b",
+                    ]
+                    path = root / f"duplicate-{field}.json"
+                    path.write_text(json.dumps(duplicate_az))
+                    with self.assertRaisesRegex(
+                        appliance.LifecycleError, "fleets must cover every AZ"
+                    ):
+                        appliance.RunConfig.load(path)
+
+    def test_packet_return_envelope_is_required_exact_and_has_no_legacy_v2_fields(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            cases = []
+            missing_object = config_document()
+            missing_object.pop("envelope")
+            cases.append(("missing object", missing_object, "required version-2 packet-return object"))
+            missing_field = config_document()
+            missing_field["envelope"].pop("udp_bind")
+            cases.append(("missing field", missing_field, "contain exactly"))
+            for field in (
+                "routing_mode",
+                "tun_name",
+                "tailscale_iface",
+                "underlay_interface",
+                "routing_table_id",
+                "routing_rule_priority",
+                "local_site_cidrs",
+                "remote_site_cidrs",
+            ):
+                legacy = config_document()
+                legacy["envelope"][field] = "obsolete"
+                cases.append((field, legacy, "unsupported fields"))
+            for field, value in (
+                ("mode", "manage"),
+                ("udp_bind", "127.0.0.1:6081"),
+                ("max_inner_packet_size", 1279),
+                ("max_inner_packet_size", True),
+            ):
+                wrong_value = config_document()
+                wrong_value["envelope"][field] = value
+                cases.append((f"{field}={value}", wrong_value, re.escape(f"envelope.{field}")))
+
+            for index, (name, document, message) in enumerate(cases):
+                with self.subTest(name=name):
+                    path = root / f"envelope-{index}.json"
+                    path.write_text(json.dumps(document))
+                    with self.assertRaisesRegex(appliance.LifecycleError, message):
+                        appliance.RunConfig.load(path)
 
     def test_e2e_load_profile_is_required_and_has_an_exact_shape(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -745,14 +3502,82 @@ class ConfigAndPathTest(unittest.TestCase):
             self.assertNotIn("TS_OAUTH_CLIENT_SECRET", aws_env)
 
     def test_subprocess_runner_strips_configured_oauth_names_defensively(self):
-        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        process = mock.Mock(returncode=0)
+        process.communicate.return_value = ("", "")
         with mock.patch.dict(os.environ, {"CUSTOM_TS_ID": "id", "CUSTOM_TS_SECRET": "secret"}), mock.patch(
-            "subprocess.run", return_value=completed
-        ) as run:
+            "subprocess.Popen", return_value=process
+        ) as popen:
             appliance.SubprocessRunner(("CUSTOM_TS_ID", "CUSTOM_TS_SECRET")).run(["fixture"])
-        child_env = run.call_args.kwargs["env"]
+        child_env = popen.call_args.kwargs["env"]
         self.assertNotIn("CUSTOM_TS_ID", child_env)
         self.assertNotIn("CUSTOM_TS_SECRET", child_env)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    def test_subprocess_timeout_kills_the_process_group_and_reaps_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = pathlib.Path(temporary) / "orphan-ran"
+            child = (
+                "import pathlib,time; time.sleep(.3); "
+                f"pathlib.Path({str(marker)!r}).write_text('orphan')"
+            )
+            parent = (
+                "import subprocess,sys,time; "
+                f"subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(30)"
+            )
+            started = time.monotonic()
+            with self.assertRaises(appliance.CommandTimeoutError):
+                appliance.SubprocessRunner().run(
+                    [sys.executable, "-c", parent], timeout_seconds=0.05
+                )
+            self.assertLess(time.monotonic() - started, 2)
+            time.sleep(0.4)
+            self.assertFalse(marker.exists())
+
+    def test_aws_text_and_json_timeouts_are_native_with_explicit_fake_adapter(self):
+        class TimeoutRunner:
+            def __init__(self):
+                self.timeouts = []
+
+            def run(
+                self,
+                args,
+                *,
+                env=None,
+                cwd=None,
+                input_text=None,
+                timeout_seconds=None,
+            ):
+                self.timeouts.append(timeout_seconds)
+                return '{"Account":"123456789012"}'
+
+        native = TimeoutRunner()
+        aws = appliance.AwsCLI(native)
+        self.assertEqual(
+            aws.json(["sts", "get-caller-identity"], timeout_seconds=2)["Account"],
+            "123456789012",
+        )
+        self.assertEqual(
+            json.loads(aws.text(["sts", "get-caller-identity"], timeout=2))["Account"],
+            "123456789012",
+        )
+        self.assertEqual(len(native.timeouts), 2)
+        self.assertTrue(all(0 < value <= 2 for value in native.timeouts))
+
+        class ImmediateFake:
+            def __init__(self):
+                self.calls = 0
+
+            def run(self, args, *, env=None, cwd=None, input_text=None):
+                self.calls += 1
+                return '{"Account":"123456789012"}'
+
+        immediate = ImmediateFake()
+        adapted = appliance.AwsCLI(appliance.ImmediateCommandRunnerAdapter(immediate))
+        self.assertEqual(
+            adapted.json(["sts", "get-caller-identity"], timeout_seconds=1)["Account"],
+            "123456789012",
+        )
+        self.assertEqual(immediate.calls, 1)
 
     def test_aws_cli_retries_only_explicit_signature_expiry_once(self):
         class ExpiredOnceRunner:
@@ -866,15 +3691,20 @@ resource /* separator */ "aws_lb_target_group_attachment" "west" {{
                 self.etag = '"manifest-0"'
                 self.version = 0
                 self.manifests = []
+                self.fail_after_phases = set()
 
             def json(self, args, *, region=None):
                 if args[1] == "put-object":
                     if "--if-match" in args and args[args.index("--if-match") + 1] != self.etag:
                         raise appliance.CommandError(args, 412, "PreconditionFailed")
                     self.remote = pathlib.Path(args[args.index("--body") + 1]).read_bytes()
-                    self.manifests.append(json.loads(self.remote))
+                    payload = json.loads(self.remote)
+                    self.manifests.append(payload)
                     self.version += 1
                     self.etag = f'"manifest-{self.version}"'
+                    if payload.get("phase") in self.fail_after_phases:
+                        self.fail_after_phases.remove(payload.get("phase"))
+                        raise appliance.LifecycleError("injected response loss after durable manifest write")
                     return {"ETag": self.etag}
                 if args[1] == "get-object":
                     pathlib.Path(args[-1]).write_bytes(self.remote)
@@ -951,6 +3781,7 @@ resource /* separator */ "aws_lb_target_group_attachment" "west" {{
                     appliance.terraform_apply(config, aws, runner, store.run_dir, terraform_dir, plan)
 
             success_aws = ManifestAWS()
+            success_aws.fail_after_phases = {"apply_claimed", "applied"}
             success_store = appliance.ManifestStore(config, success_aws, root / "success-run")
             success_plan = success_store.run_dir / "apply.tfplan"
             success_store.run_dir.mkdir(parents=True)
@@ -982,10 +3813,65 @@ resource /* separator */ "aws_lb_target_group_attachment" "west" {{
                 )
             successful = success_store.load_local()
             claimed = next(value for value in success_aws.manifests if value["phase"] == "apply_claimed")
+            self.assertRegex(claimed["apply_claim_id"], appliance.OPERATION_CLAIM_ID_RE)
             self.assertEqual(successful["phase"], "applied")
             self.assertTrue(successful["saved_plan"]["applied"])
             self.assertEqual(successful["saved_plan"]["applied_at"], claimed["apply_claimed_at"])
             self.assertNotIn("apply_claimed_at", successful)
+            self.assertNotIn("apply_claim_id", successful)
+
+            replacement_aws = ManifestAWS()
+            replacement_store = appliance.ManifestStore(config, replacement_aws, root / "replacement-run")
+            replacement_plan = replacement_store.run_dir / "replace.tfplan"
+            replacement_store.run_dir.mkdir(parents=True)
+            replacement_plan.write_bytes(b"reviewed-replacement-plan")
+            replacement_manifest = appliance.new_manifest(
+                config, artifact_identity(root), "123456789012"
+            )
+            transport_ids = {
+                str(device["hostname"]): str(device["id"])
+                for device in fixture_tailnet_devices()
+            }
+            replacement_manifest["tailnet"]["nodes_expected"] = True
+            replacement_manifest["tailnet"]["device_ids"] = transport_ids
+            replacement_manifest["saved_plan"] = {
+                "path": str(replacement_plan.resolve()),
+                "sha256": hashlib.sha256(replacement_plan.read_bytes()).hexdigest(),
+                "replacement": 'aws_instance.envelope_target_west["a"]',
+                "replacement_instance_id": "i-0123456789abcdef0",
+                "source": source_identity,
+                "apply_started": False,
+                "applied": False,
+            }
+            replacement_manifest["terraform_source"] = source_identity
+            replacement_manifest["phase"] = "replacement_planned"
+            replacement_store.write(replacement_manifest)
+            target_tailnet_factory = mock.Mock(
+                side_effect=AssertionError("target replacement touched Tailnet lifecycle")
+            )
+            with mock.patch.object(appliance.BackendValidator, "validate"), mock.patch.object(
+                appliance,
+                "materialize_durable_terraform_source",
+                return_value=(terraform_dir, source_identity),
+            ):
+                appliance.terraform_apply(
+                    config,
+                    replacement_aws,
+                    SuccessRunner(),
+                    replacement_store.run_dir,
+                    terraform_dir,
+                    replacement_plan,
+                    tailscale_factory=target_tailnet_factory,
+                )
+            replaced = replacement_store.load_local()
+            target_tailnet_factory.assert_not_called()
+            self.assertEqual(replaced["tailnet"]["device_ids"], transport_ids)
+            self.assertFalse(
+                any(
+                    "replacement_device" in str(value.get("phase", ""))
+                    for value in replacement_aws.manifests
+                )
+            )
 
     def test_no_drift_runner_uses_durable_inputs_and_maps_exit_two_to_drift(self):
         class CaptureRunner:
@@ -1517,12 +4403,12 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
             {
                 "west": {
                     "target": config.raw["instance_type"],
-                    "ingress_router": config.raw["instance_type"],
+                    "transport_router": config.raw["instance_type"],
                     "workload": config.raw["test_instance_type"],
                 },
                 "east": {
                     "target": config.raw["instance_type"],
-                    "ingress_router": config.raw["instance_type"],
+                    "transport_router": config.raw["instance_type"],
                     "workload": config.raw["test_instance_type"],
                 },
             },
@@ -1695,12 +4581,12 @@ class AWSCapabilityQuotaPreflightTest(unittest.TestCase):
         expected_summary = {
             "west": {
                 "target": config.raw["instance_type"],
-                "ingress_router": config.raw["instance_type"],
+                "transport_router": config.raw["instance_type"],
                 "workload": config.raw["test_instance_type"],
             },
             "east": {
                 "target": config.raw["instance_type"],
-                "ingress_router": config.raw["instance_type"],
+                "transport_router": config.raw["instance_type"],
                 "workload": config.raw["test_instance_type"],
             },
         }
@@ -3943,14 +6829,36 @@ class PolicyAndAdapterTest(unittest.TestCase):
         arguments = {
             "tag": "tag:envelope-ci",
             "tag_owners": ["group:infra"],
-            "advertised_routes": ["10.10.1.0/24", "10.20.1.0/24"],
-            "site_cidrs": {"west": ["10.10.1.0/24"], "east": ["10.20.1.0/24"]},
+            "advertised_routes": [
+                "10.10.1.0/24",
+                "10.10.2.0/24",
+                "10.20.1.0/24",
+                "10.20.2.0/24",
+            ],
+            "site_cidrs": {
+                "west": ["10.10.1.0/24", "10.10.2.0/24"],
+                "east": ["10.20.1.0/24", "10.20.2.0/24"],
+            },
             "snat_subnet_routes": False,
         }
         appliance.validate_tailnet_policy(copy.deepcopy(VALID_POLICY), **arguments)
+        policy_with_disjoint_extras = copy.deepcopy(VALID_POLICY)
+        policy_with_disjoint_extras["autoApprovers"]["routes"].update(
+            {
+                "10.30.1.0/24": ["tag:envelope-ci"],
+                "10.40.1.0/24": ["tag:envelope-ci"],
+            }
+        )
+        policy_with_disjoint_extras["grants"].extend(
+            [
+                {"src": ["10.30.1.0/24"], "dst": ["10.40.1.0/24"], "ip": ["*"]},
+                {"src": ["10.40.1.0/24"], "dst": ["10.30.1.0/24"], "ip": ["*"]},
+            ]
+        )
+        appliance.validate_tailnet_policy(policy_with_disjoint_extras, **arguments)
         cases = {
             "tag owner": lambda value: value["tagOwners"].clear(),
-            "auto approval": lambda value: value["autoApprovers"]["routes"].pop("10.20.0.0/16"),
+            "auto approval": lambda value: value["autoApprovers"]["routes"].pop("10.20.2.0/24"),
             "grant": lambda value: value["grants"].pop(),
         }
         for name, mutate in cases.items():
@@ -3961,6 +6869,45 @@ class PolicyAndAdapterTest(unittest.TestCase):
                     appliance.validate_tailnet_policy(policy, **arguments)
         with self.assertRaisesRegex(appliance.LifecycleError, "SNAT"):
             appliance.validate_tailnet_policy(copy.deepcopy(VALID_POLICY), **{**arguments, "snat_subnet_routes": True})
+
+        broad_policies = {}
+        route_supernet = copy.deepcopy(VALID_POLICY)
+        route_supernet["autoApprovers"]["routes"]["10.10.0.0/16"] = ["tag:envelope-ci"]
+        broad_policies["route supernet"] = route_supernet
+        route_subnet = copy.deepcopy(VALID_POLICY)
+        route_subnet["autoApprovers"]["routes"]["10.10.1.0/25"] = ["tag:envelope-ci"]
+        broad_policies["route subnet"] = route_subnet
+        wildcard_source = copy.deepcopy(VALID_POLICY)
+        wildcard_source["grants"].append(
+            {"src": ["*"], "dst": ["10.20.1.0/24"], "ip": ["*"]}
+        )
+        broad_policies["wildcard source"] = wildcard_source
+        wildcard_tcp_source = copy.deepcopy(VALID_POLICY)
+        wildcard_tcp_source["grants"].append(
+            {"src": ["*"], "dst": ["10.20.1.0/24"], "ip": ["tcp"]}
+        )
+        broad_policies["wildcard TCP source"] = wildcard_tcp_source
+        wildcard_destination = copy.deepcopy(VALID_POLICY)
+        wildcard_destination["grants"].append(
+            {"src": ["10.10.1.0/24"], "dst": ["*"], "ip": ["*"]}
+        )
+        broad_policies["wildcard destination"] = wildcard_destination
+        wildcard_port_destination = copy.deepcopy(VALID_POLICY)
+        wildcard_port_destination["grants"].append(
+            {"src": ["10.10.1.0/24"], "dst": ["*:*"], "ip": ["*"]}
+        )
+        broad_policies["wildcard port destination"] = wildcard_port_destination
+        grant_supernet = copy.deepcopy(VALID_POLICY)
+        grant_supernet["grants"].append(
+            {"src": ["10.10.0.0/16"], "dst": ["10.20.0.0/16"], "ip": ["*"]}
+        )
+        broad_policies["grant supernet"] = grant_supernet
+        extra_owner = copy.deepcopy(VALID_POLICY)
+        extra_owner["tagOwners"]["tag:envelope-ci"].append("*")
+        broad_policies["unreviewed tag owner"] = extra_owner
+        for name, policy in broad_policies.items():
+            with self.subTest(name=name), self.assertRaises(appliance.LifecycleError):
+                appliance.validate_tailnet_policy(policy, **arguments)
 
     def test_oauth_key_shape_and_lifecycle_are_fixture_testable(self):
         transport = FakeHTTP()
@@ -4495,6 +7442,39 @@ class SecurityAndBackendTest(unittest.TestCase):
             appliance.validate_manifest(json.loads(serialized), config)
             self.assertEqual(set(manifest["terraform_variables"]), set(appliance.terraform_variables(config, artifact, manifest["ssm_parameters"])))
             self.assertEqual([value["created"] for value in manifest["ssm_parameters"]], [False, False])
+            self.assertEqual(manifest["tailnet"]["device_roles"], fixture_tailnet_roles())
+            self.assertEqual(manifest["tailnet"]["expected_hostnames"], fixture_tailnet_hostnames())
+            self.assertFalse(
+                any("-target-" in hostname for hostname in manifest["tailnet"]["expected_hostnames"])
+            )
+            fabricated_target = copy.deepcopy(manifest)
+            fabricated_target["tailnet"]["expected_hostnames"].append(
+                "envelope-fixture-west-target-a"
+            )
+            with self.assertRaisesRegex(appliance.LifecycleError, "Tailnet identity"):
+                appliance.validate_manifest(fabricated_target, config)
+
+            legacy_role = copy.deepcopy(manifest)
+            legacy_role["tailnet"].pop("device_roles")
+            legacy_role["tailnet"]["device_role"] = "transport-router"
+            with self.assertRaisesRegex(appliance.LifecycleError, "Tailnet identity"):
+                appliance.validate_manifest(legacy_role, config)
+
+            ingress_hostname = copy.deepcopy(manifest)
+            current_hostname = ingress_hostname["tailnet"]["expected_hostnames"][0]
+            obsolete_hostname = current_hostname.replace("-transport-", "-ingress-")
+            ingress_hostname["tailnet"]["expected_hostnames"][0] = obsolete_hostname
+            ingress_hostname["tailnet"]["device_roles"] = {
+                obsolete_hostname if hostname == current_hostname else hostname: role
+                for hostname, role in ingress_hostname["tailnet"]["device_roles"].items()
+            }
+            with self.assertRaisesRegex(appliance.LifecycleError, "Tailnet identity"):
+                appliance.validate_manifest(ingress_hostname, config)
+
+            target_role = copy.deepcopy(manifest)
+            target_role["tailnet"]["device_roles"][fixture_tailnet_hostnames()[0]] = "target"
+            with self.assertRaisesRegex(appliance.LifecycleError, "Tailnet identity"):
+                appliance.validate_manifest(target_role, config)
 
     def test_manifest_apply_timestamp_contract_rejects_missing_or_stale_claim_state(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -4525,6 +7505,9 @@ class SecurityAndBackendTest(unittest.TestCase):
             active_without_claim = copy.deepcopy(active)
             active_without_claim.pop("apply_claimed_at")
             cases["apply_claimed_at"] = active_without_claim
+            active_without_id = copy.deepcopy(active)
+            active_without_id.pop("apply_claim_id")
+            cases["unique claim ID"] = active_without_id
             invalid_timestamp = copy.deepcopy(applied)
             invalid_timestamp["saved_plan"]["applied_at"] = "2026-08-20T12:00:00+00:00"
             cases["canonical UTC"] = invalid_timestamp
@@ -5481,6 +8464,141 @@ class MetadataTest(unittest.TestCase):
 
 
 class SSMAndCleanupTest(unittest.TestCase):
+    @staticmethod
+    def interrupt_cleanup_aws():
+        class CleanupAWS:
+            def __init__(self):
+                self.remote = b""
+                self.etag = '"manifest-0"'
+                self.version = 0
+
+            def json(self, args, *, region=None):
+                operation = args[1]
+                if operation == "put-object":
+                    self.remote = pathlib.Path(args[args.index("--body") + 1]).read_bytes()
+                    self.version += 1
+                    self.etag = f'"manifest-{self.version}"'
+                    return {"ETag": self.etag}
+                if operation == "get-object":
+                    pathlib.Path(args[-1]).write_bytes(self.remote)
+                    return {"ETag": self.etag, "VersionId": str(self.version)}
+                if operation == "describe-parameters":
+                    return {"Parameters": []}
+                if operation == "get-resources":
+                    return {"ResourceTagMappingList": []}
+                raise AssertionError(args)
+
+            def object_exists(self, bucket, key, region):
+                return False
+
+        return CleanupAWS()
+
+    def test_cleanup_hard_timeout_is_not_swallowed_or_allowed_to_continue(self):
+        if not hasattr(signal, "SIGALRM") or not hasattr(signal, "setitimer"):
+            self.skipTest("POSIX interval timers are required")
+        self.assertFalse(issubclass(appliance.CleanupDeadlineExceeded, Exception))
+
+        class UnusedRunner:
+            def run(self, *args, **kwargs):
+                raise AssertionError("state-free cleanup must not invoke Terraform")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            aws = self.interrupt_cleanup_aws()
+            store = appliance.ManifestStore(config, aws, root / "timeout")
+            store.write(appliance.new_manifest(config, artifact_identity(root), "123456789012"))
+            later_cleanup = mock.Mock()
+
+            def block_forever(*_args, **_kwargs):
+                while True:
+                    time.sleep(0.01)
+
+            started = time.monotonic()
+            with mock.patch.object(
+                appliance, "cleanup_tailnet_devices", side_effect=block_forever
+            ), mock.patch.object(appliance, "delete_ssm_parameter", later_cleanup):
+                with self.assertRaises(appliance.CleanupDeadlineExceeded):
+                    appliance.cleanup(
+                        config,
+                        appliance.ImmediateAwsCLIAdapter(aws),
+                        object(),
+                        appliance.ImmediateCommandRunnerAdapter(UnusedRunner()),
+                        store.run_dir,
+                        root / "terraform",
+                        recover=False,
+                        dry_run=False,
+                        skip_destroy=True,
+                        timeout_seconds=0.05,
+                    )
+            self.assertLess(time.monotonic() - started, 1)
+            later_cleanup.assert_not_called()
+
+    def test_keyboard_interrupt_and_sigterm_do_not_skip_independent_cleanup(self):
+        if not hasattr(signal, "SIGALRM") or not hasattr(signal, "setitimer"):
+            self.skipTest("POSIX interval timers are required")
+
+        class UnusedRunner:
+            def run(self, *args, **kwargs):
+                raise AssertionError("state-free cleanup must not invoke Terraform")
+
+        for name, interruption, expected in (
+            (
+                "keyboard",
+                lambda: (_ for _ in ()).throw(KeyboardInterrupt("injected interrupt")),
+                KeyboardInterrupt,
+            ),
+            ("sigterm", lambda: signal.raise_signal(signal.SIGTERM), appliance.CleanupInterrupted),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                config = make_config(root)
+                aws = self.interrupt_cleanup_aws()
+                store = appliance.ManifestStore(config, aws, root / name)
+                store.write(
+                    appliance.new_manifest(config, artifact_identity(root), "123456789012")
+                )
+                calls = []
+
+                def interrupt_devices(*_args, **_kwargs):
+                    calls.append("devices")
+                    interruption()
+                    return []
+
+                def delete_parameter(_aws, parameter):
+                    calls.append(f"parameter-{parameter['site']}")
+
+                def audit(*_args, **_kwargs):
+                    calls.append("residual-audit")
+                    return []
+
+                with mock.patch.object(
+                    appliance, "cleanup_tailnet_devices", side_effect=interrupt_devices
+                ), mock.patch.object(
+                    appliance, "delete_ssm_parameter", side_effect=delete_parameter
+                ), mock.patch.object(
+                    appliance, "recover_auth_key_ids", return_value=[]
+                ), mock.patch.object(appliance, "audit_run_resources", side_effect=audit):
+                    with self.assertRaises(expected):
+                        appliance.cleanup(
+                            config,
+                            appliance.ImmediateAwsCLIAdapter(aws),
+                            object(),
+                            appliance.ImmediateCommandRunnerAdapter(UnusedRunner()),
+                            store.run_dir,
+                            root / "terraform",
+                            recover=False,
+                            dry_run=False,
+                            skip_destroy=True,
+                            timeout_seconds=2,
+                        )
+
+                self.assertEqual(
+                    calls,
+                    ["devices", "parameter-west", "parameter-east", "residual-audit"],
+                )
+                self.assertEqual(store.load_local()["phase"], "cleanup_incomplete")
+
     def test_ssm_secret_uses_protected_cli_input_file_not_argv(self):
         class FakeAWS:
             def __init__(self):
@@ -5517,12 +8635,18 @@ class SSMAndCleanupTest(unittest.TestCase):
         class FakeAPI:
             def __init__(self):
                 self.deleted = []
-                self.devices = [
-                    {"id": "west", "hostname": "envelope-fixture-west", "tags": ["tag:envelope-ci"]},
-                    {"id": "east", "hostname": "envelope-fixture-east.fixture", "tags": ["tag:envelope-ci"]},
-                    {"id": "wrong-tag", "hostname": "envelope-fixture-west", "tags": ["tag:other"]},
-                    {"id": "wrong-name", "hostname": "other-west", "tags": ["tag:envelope-ci"]},
-                ]
+                self.devices = fixture_tailnet_devices()
+                self.devices[1]["hostname"] = f"{self.devices[1]['hostname']}.fixture"
+                self.devices.extend(
+                    [
+                        {
+                            "id": "wrong-tag",
+                            "hostname": fixture_tailnet_hostnames()[0],
+                            "tags": ["tag:other"],
+                        },
+                        {"id": "wrong-name", "hostname": "other-west", "tags": ["tag:envelope-ci"]},
+                    ]
+                )
 
             def list_devices(inner):
                 return inner.devices
@@ -5534,17 +8658,20 @@ class SSMAndCleanupTest(unittest.TestCase):
         api = FakeAPI()
         manifest = {
             "tailnet": {
-                "expected_hostnames": ["envelope-fixture-west", "envelope-fixture-east"],
+                "expected_hostnames": fixture_tailnet_hostnames(),
+                "device_roles": fixture_tailnet_roles(),
                 "tag": "tag:envelope-ci",
                 "nodes_expected": True,
                 "device_ids": {},
             }
         }
         selected = appliance.cleanup_tailnet_devices(api, manifest, dry_run=False)
-        self.assertEqual(set(selected), {"west", "east"})
-        self.assertEqual(set(api.deleted), {"west", "east"})
+        expected_ids = {str(device["id"]) for device in fixture_tailnet_devices()}
+        self.assertEqual(set(selected), expected_ids)
+        self.assertEqual(set(api.deleted), expected_ids)
+        self.assertEqual([device["id"] for device in api.devices], ["wrong-tag", "wrong-name"])
 
-    def test_partial_recovery_accepts_unambiguous_zero_one_or_two_node_subsets(self):
+    def test_partial_recovery_accepts_zero_to_four_transport_node_subsets(self):
         class API:
             def __init__(self, devices):
                 self.devices = devices
@@ -5559,48 +8686,230 @@ class SSMAndCleanupTest(unittest.TestCase):
 
         manifest = {
             "tailnet": {
-                "expected_hostnames": ["envelope-fixture-west", "envelope-fixture-east"],
+                "expected_hostnames": fixture_tailnet_hostnames(),
+                "device_roles": fixture_tailnet_roles(),
                 "tag": "tag:envelope-ci",
                 "nodes_expected": True,
                 "device_ids": {},
             }
         }
-        candidates = [
-            {"id": "west", "hostname": "envelope-fixture-west", "tags": ["tag:envelope-ci"]},
-            {"id": "east", "hostname": "envelope-fixture-east", "tags": ["tag:envelope-ci"]},
-        ]
-        for count in (0, 1, 2):
+        candidates = fixture_tailnet_devices()
+        for count in (0, 1, 2, 4):
             with self.subTest(count=count):
                 api = API(copy.deepcopy(candidates[:count]))
                 selected = appliance.cleanup_tailnet_devices(api, manifest, dry_run=False)
                 self.assertEqual(selected, sorted(device["id"] for device in candidates[:count]))
                 self.assertEqual(api.deleted, selected)
 
-    def test_partial_recovery_rejects_duplicate_hostname_tag_identity(self):
+    def test_partial_recovery_deletes_exact_and_numeric_retry_nodes(self):
         class API:
-            def list_devices(self):
-                return [
-                    {"id": "west-1", "hostname": "envelope-fixture-west", "tags": ["tag:envelope-ci"]},
-                    {"id": "west-2", "hostname": "envelope-fixture-west", "tags": ["tag:envelope-ci"]},
+            def __init__(self):
+                self.deleted = []
+                self.devices = [
+                    {
+                        "id": "transport-exact",
+                        "hostname": "envelope-fixture-west-transport-a",
+                        "tags": ["tag:envelope-ci"],
+                    },
+                    {
+                        "id": "transport-retry",
+                        "hostname": "envelope-fixture-west-transport-a-1",
+                        "tags": ["tag:envelope-ci"],
+                    },
                 ]
+
+            def list_devices(self):
+                return self.devices
+
+            def delete_device(self, device_id):
+                self.deleted.append(device_id)
+                self.devices = [device for device in self.devices if device["id"] != device_id]
 
         manifest = {
             "tailnet": {
-                "expected_hostnames": ["envelope-fixture-west", "envelope-fixture-east"],
+                "expected_hostnames": fixture_tailnet_hostnames(),
+                "device_roles": fixture_tailnet_roles(),
                 "tag": "tag:envelope-ci",
                 "nodes_expected": True,
                 "device_ids": {},
             }
         }
-        with self.assertRaisesRegex(appliance.LifecycleError, "ambiguous duplicate"):
-            appliance.cleanup_tailnet_devices(API(), manifest, dry_run=False)
+        api = API()
+        selected = appliance.cleanup_tailnet_devices(api, manifest, dry_run=False)
+        self.assertEqual(selected, ["transport-exact", "transport-retry"])
+        self.assertEqual(api.deleted, selected)
 
     def test_readiness_records_exact_full_field_node_ids_durably(self):
         class API:
             def list_devices(self):
+                return fixture_tailnet_devices()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            manifest = appliance.new_manifest(config, artifact_identity(root), "123456789012")
+            mark_manifest_applied(manifest)
+            manifest["phase"] = "readiness_started"
+            manifest["readiness_started_at"] = "2026-08-20T12:00:00Z"
+            manifest["readiness_claim_id"] = "123e4567-e89b-42d3-a456-426614174000"
+            store = appliance.ManifestStore(config, BackendAWS(config), root / "run")
+            store.write(manifest, upload=False)
+            with mock.patch.object(
+                appliance,
+                "persist_manifest_transition",
+                side_effect=lambda target, _original, candidate, **_kwargs: target.write(
+                    candidate, upload=False
+                ),
+            ):
+                identifiers = appliance.record_ready_devices(API(), store, manifest)
+            self.assertEqual(
+                identifiers,
+                {str(device["hostname"]): str(device["id"]) for device in fixture_tailnet_devices()},
+            )
+            persisted = json.loads(store.path.read_text())
+            self.assertEqual(persisted["tailnet"]["device_ids"], identifiers)
+            self.assertEqual(persisted["phase"], "ready")
+
+    def test_readiness_discovers_numeric_aliases_and_selects_the_only_enabled_advertiser(self):
+        class API:
+            def list_devices(self):
+                devices = fixture_tailnet_devices()
+                exact = devices[0]
+                exact["enabledRoutes"] = []
+                alias = copy.deepcopy(exact)
+                alias.update(
+                    {
+                        "id": "device-alias",
+                        "nodeId": "node-alias",
+                        "hostname": f"{exact['hostname']}-1",
+                        "enabledRoutes": list(exact["advertisedRoutes"]),
+                    }
+                )
+                return [alias, *reversed(devices)]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            manifest = appliance.new_manifest(
+                config, artifact_identity(root), "123456789012"
+            )
+            mark_manifest_applied(manifest)
+            manifest["phase"] = "readiness_started"
+            manifest["readiness_started_at"] = "2026-08-20T12:00:00Z"
+            manifest["readiness_claim_id"] = "123e4567-e89b-42d3-a456-426614174000"
+            store = appliance.ManifestStore(config, BackendAWS(config), root / "run")
+            store.write(manifest, upload=False)
+            with mock.patch.object(
+                appliance,
+                "persist_manifest_transition",
+                side_effect=lambda target, _original, candidate, **_kwargs: target.write(
+                    candidate, upload=False
+                ),
+            ):
+                identifiers = appliance.record_ready_devices(API(), store, manifest)
+
+        self.assertEqual(
+            identifiers["envelope-fixture-west-transport-a"], "device-alias"
+        )
+        self.assertEqual(set(identifiers), set(fixture_tailnet_hostnames()))
+
+    def test_readiness_fails_closed_on_duplicate_enabled_numeric_aliases(self):
+        class API:
+            def list_devices(self):
+                devices = fixture_tailnet_devices()
+                alias = copy.deepcopy(devices[0])
+                alias.update(
+                    {
+                        "id": "device-alias",
+                        "nodeId": "node-alias",
+                        "hostname": f"{devices[0]['hostname']}-2",
+                    }
+                )
+                return [*devices, alias]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            manifest = appliance.new_manifest(
+                config, artifact_identity(root), "123456789012"
+            )
+            mark_manifest_applied(manifest)
+            manifest["phase"] = "readiness_started"
+            manifest["readiness_started_at"] = "2026-08-20T12:00:00Z"
+            manifest["readiness_claim_id"] = "123e4567-e89b-42d3-a456-426614174000"
+            store = appliance.ManifestStore(config, BackendAWS(config), root / "run")
+            store.write(manifest, upload=False)
+            with self.assertRaisesRegex(
+                appliance.LifecycleError, "exactly one enabled Tailnet advertiser"
+            ):
+                appliance.record_ready_devices(API(), store, manifest)
+            self.assertEqual(store.load_local()["phase"], "readiness_started")
+
+    def test_readiness_inspects_disabled_numeric_alias_route_fields(self):
+        class API:
+            def list_devices(self):
+                devices = fixture_tailnet_devices()
+                alias = copy.deepcopy(devices[0])
+                alias.update(
+                    {
+                        "id": "device-alias",
+                        "nodeId": "node-alias",
+                        "hostname": f"{devices[0]['hostname']}-3",
+                        "advertisedRoutes": ["10.99.0.0/24"],
+                        "enabledRoutes": [],
+                    }
+                )
+                return [alias, *devices]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            manifest = appliance.new_manifest(
+                config, artifact_identity(root), "123456789012"
+            )
+            mark_manifest_applied(manifest)
+            manifest["phase"] = "readiness_started"
+            manifest["readiness_started_at"] = "2026-08-20T12:00:00Z"
+            manifest["readiness_claim_id"] = "123e4567-e89b-42d3-a456-426614174000"
+            store = appliance.ManifestStore(config, BackendAWS(config), root / "run")
+            store.write(manifest, upload=False)
+            with self.assertRaisesRegex(
+                appliance.LifecycleError, "exact approved symmetric prefixes"
+            ):
+                appliance.record_ready_devices(API(), store, manifest)
+
+    def test_readiness_rejects_unapproved_transport_route_advertisements(self):
+        class API:
+            def list_devices(self):
+                devices = fixture_tailnet_devices()
+                devices[2]["enabledRoutes"] = ["10.10.1.0/24"]
+                return devices
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            manifest = appliance.new_manifest(config, artifact_identity(root), "123456789012")
+            mark_manifest_applied(manifest)
+            manifest["phase"] = "readiness_started"
+            manifest["readiness_started_at"] = "2026-08-20T12:00:00Z"
+            manifest["readiness_claim_id"] = "123e4567-e89b-42d3-a456-426614174000"
+            store = appliance.ManifestStore(config, BackendAWS(config), root / "run")
+            store.write(manifest, upload=False)
+            with self.assertRaisesRegex(appliance.LifecycleError, "exact approved symmetric prefixes"):
+                appliance.record_ready_devices(API(), store, manifest)
+
+    def test_readiness_rejects_any_run_scoped_target_tailnet_device(self):
+        class API:
+            def list_devices(self):
                 return [
-                    {"id": "node-west", "hostname": "envelope-fixture-west", "tags": ["tag:envelope-ci"]},
-                    {"id": "node-east", "hostname": "envelope-fixture-east", "tags": ["tag:envelope-ci"]},
+                    *fixture_tailnet_devices(),
+                    {
+                        "id": "fabricated-target",
+                        "hostname": "envelope-fixture-west-target-a",
+                        "tags": ["tag:envelope-ci"],
+                        "advertisedRoutes": [],
+                        "enabledRoutes": [],
+                    },
                 ]
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -5609,119 +8918,50 @@ class SSMAndCleanupTest(unittest.TestCase):
             manifest = appliance.new_manifest(config, artifact_identity(root), "123456789012")
             mark_manifest_applied(manifest)
             manifest["phase"] = "readiness_started"
+            manifest["readiness_started_at"] = "2026-08-20T12:00:00Z"
+            manifest["readiness_claim_id"] = "123e4567-e89b-42d3-a456-426614174000"
             store = appliance.ManifestStore(config, BackendAWS(config), root / "run")
             store.write(manifest, upload=False)
-            identifiers = appliance.record_ready_devices(API(), store, manifest)
-            self.assertEqual(identifiers, {"west": "node-west", "east": "node-east"})
-            persisted = json.loads(store.path.read_text())
-            self.assertEqual(persisted["tailnet"]["device_ids"], identifiers)
-            self.assertEqual(persisted["phase"], "ready")
+            with self.assertRaisesRegex(appliance.LifecycleError, "targets must not be Tailnet devices"):
+                appliance.record_ready_devices(API(), store, manifest)
 
-    def test_replacement_retires_exact_recorded_and_numeric_retry_nodes(self):
-        class API:
-            def __init__(self):
-                self.deleted = []
-                self.devices = [
-                    {"id": "west-old", "hostname": "envelope-fixture-west", "tags": ["tag:envelope-ci"]},
-                    {"id": "west-retry", "hostname": "envelope-fixture-west-1", "tags": ["tag:envelope-ci"]},
-                    {"id": "east", "hostname": "envelope-fixture-east", "tags": ["tag:envelope-ci"]},
-                    {"id": "wrong-tag", "hostname": "envelope-fixture-west-2", "tags": ["tag:other"]},
-                ]
-
-            def list_devices(self):
-                return self.devices
-
-            def delete_device(self, device_id):
-                self.deleted.append(device_id)
-                self.devices = [device for device in self.devices if device["id"] != device_id]
-
-        class Store:
-            def __init__(self):
-                self.writes = []
-
-            def write(self, manifest):
-                self.writes.append(copy.deepcopy(manifest))
-
-        api, store = API(), Store()
+    def test_numeric_retry_matching_never_shadows_an_exact_az_hostname(self):
         manifest = {
             "tailnet": {
-                "expected_hostnames": ["envelope-fixture-west", "envelope-fixture-east"],
+                "expected_hostnames": [
+                    "envelope-fixture-west-transport-a",
+                    "envelope-fixture-west-transport-a-1",
+                ],
+                "device_roles": {
+                    "envelope-fixture-west-transport-a": "transport-router",
+                    "envelope-fixture-west-transport-a-1": "transport-router",
+                },
                 "tag": "tag:envelope-ci",
-                "nodes_expected": True,
-                "device_ids": {"west": "west-old", "east": "east"},
             }
         }
-        retired = appliance.retire_replacement_devices(
-            api, store, manifest, "aws_instance.envelope_west"
+        devices = [
+            {
+                "id": "exact-a-1",
+                "hostname": "envelope-fixture-west-transport-a-1",
+                "tags": ["tag:envelope-ci"],
+            },
+            {
+                "id": "retry-a-1",
+                "hostname": "envelope-fixture-west-transport-a-1-1",
+                "tags": ["tag:envelope-ci"],
+            },
+        ]
+
+        scoped = appliance.scoped_run_devices(devices, manifest, include_numeric_suffixes=True)
+
+        self.assertEqual(
+            [device["id"] for device in scoped["envelope-fixture-west-transport-a"]],
+            [],
         )
-        self.assertEqual(retired, ["west-old", "west-retry"])
-        self.assertEqual(api.deleted, retired)
-        self.assertEqual(manifest["tailnet"]["device_ids"], {"east": "east"})
-        self.assertEqual(manifest["phase"], "replacement_device_retired")
-        self.assertEqual([device["id"] for device in api.devices], ["east", "wrong-tag"])
-
-    def test_replacement_retirement_retry_uses_only_durable_ids(self):
-        class API:
-            def __init__(self):
-                self.deleted = []
-                self.devices = [
-                    {"id": "new-west", "hostname": "envelope-fixture-west", "tags": ["tag:envelope-ci"]},
-                    {"id": "east", "hostname": "envelope-fixture-east", "tags": ["tag:envelope-ci"]},
-                ]
-
-            def list_devices(self):
-                return self.devices
-
-            def delete_device(self, device_id):
-                self.deleted.append(device_id)
-                self.devices = [device for device in self.devices if device["id"] != device_id]
-
-        manifest = {
-            "tailnet": {
-                "expected_hostnames": ["envelope-fixture-west", "envelope-fixture-east"],
-                "tag": "tag:envelope-ci",
-                "nodes_expected": True,
-                "device_ids": {"east": "east"},
-                "replacement_retirement": {"site": "west", "device_ids": ["old-west", "west-retry"]},
-            }
-        }
-        api = API()
-        with self.assertRaisesRegex(appliance.LifecycleError, "left a run-scoped site node"):
-            appliance.retire_replacement_devices(api, mock.Mock(), manifest, "aws_instance.envelope_west")
-        self.assertEqual(api.deleted, [])
-        self.assertEqual([device["id"] for device in api.devices], ["new-west", "east"])
-
-    def test_cleanup_uses_pending_retirement_ids_and_one_current_replacement(self):
-        class API:
-            def __init__(self):
-                self.deleted = []
-                self.devices = [
-                    {"id": "old-west", "hostname": "envelope-fixture-west-1", "tags": ["tag:envelope-ci"]},
-                    {"id": "new-west", "hostname": "envelope-fixture-west", "tags": ["tag:envelope-ci"]},
-                    {"id": "east", "hostname": "envelope-fixture-east", "tags": ["tag:envelope-ci"]},
-                ]
-
-            def list_devices(self):
-                return self.devices
-
-            def delete_device(self, device_id):
-                self.deleted.append(device_id)
-                self.devices = [device for device in self.devices if device["id"] != device_id]
-
-        manifest = {
-            "tailnet": {
-                "expected_hostnames": ["envelope-fixture-west", "envelope-fixture-east"],
-                "tag": "tag:envelope-ci",
-                "nodes_expected": True,
-                "device_ids": {"east": "east"},
-                "replacement_retirement": {"site": "west", "device_ids": ["old-west", "already-absent"]},
-            }
-        }
-        api = API()
-        selected = appliance.cleanup_tailnet_devices(api, manifest, dry_run=False)
-        self.assertEqual(selected, ["already-absent", "east", "new-west", "old-west"])
-        self.assertEqual(api.deleted, selected)
-        self.assertEqual(api.devices, [])
+        self.assertEqual(
+            [device["id"] for device in scoped["envelope-fixture-west-transport-a-1"]],
+            ["exact-a-1", "retry-a-1"],
+        )
 
     def test_backend_cleanup_deletes_only_exact_run_key_versions(self):
         class FakeAWS:
@@ -5851,7 +9091,7 @@ class SSMAndCleanupTest(unittest.TestCase):
             with self.assertRaisesRegex(appliance.ConcurrentLifecycleError, "cleanup is not authorized"):
                 appliance.cleanup(
                     config,
-                    collision,
+                    appliance.ImmediateAwsCLIAdapter(collision),
                     object(),
                     object(),
                     root / "collision",
@@ -5918,7 +9158,7 @@ class SSMAndCleanupTest(unittest.TestCase):
             with self.assertRaisesRegex(appliance.LifecycleError, "active E2E claim"):
                 appliance.cleanup(
                     config,
-                    aws,
+                    appliance.ImmediateAwsCLIAdapter(aws),
                     Unused(),
                     Unused(),
                     root / "loser",
@@ -5930,6 +9170,61 @@ class SSMAndCleanupTest(unittest.TestCase):
             self.assertEqual(aws.writes, [])
             self.assertEqual(aws.remote, winner_payload)
             self.assertEqual(json.loads(aws.remote)["phase"], "e2e_running")
+
+            replacement = copy.deepcopy(manifest)
+            replacement["phase"] = "e2e_replacement_ready"
+            replacement["e2e"]["replacement"] = {
+                "address": 'aws_instance.envelope_target_west["a"]',
+                "old_instance_id": "i-0123456789abcdef0",
+                "started_at": "2026-08-20T12:01:00Z",
+            }
+            winner.write(replacement, if_match=aws.etag)
+            replacement_payload = bytes(aws.remote)
+            aws.writes.clear()
+            with self.assertRaisesRegex(appliance.LifecycleError, "active E2E claim"):
+                appliance.cleanup(
+                    config,
+                    appliance.ImmediateAwsCLIAdapter(aws),
+                    Unused(),
+                    Unused(),
+                    root / "replacement-loser",
+                    root / "terraform",
+                    recover=True,
+                    dry_run=False,
+                    skip_destroy=False,
+                )
+            self.assertEqual(aws.writes, [])
+            self.assertEqual(aws.remote, replacement_payload)
+
+            terminal = copy.deepcopy(manifest)
+            terminal["phase"] = "cleanup_started"
+            terminal["e2e"].update(
+                {
+                    "finished_at": "2026-08-20T12:05:00Z",
+                    "passed": False,
+                }
+            )
+            terminal["cleanup_claim_id"] = "223e4567-e89b-42d3-a456-426614174000"
+            terminal["cleanup_claimed_at"] = (
+                dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            )
+            winner.write(terminal, if_match=aws.etag)
+            cleanup_payload = bytes(aws.remote)
+            aws.writes.clear()
+            with self.assertRaisesRegex(appliance.ConcurrentLifecycleError, "another cleanup owner"):
+                appliance.cleanup(
+                    config,
+                    appliance.ImmediateAwsCLIAdapter(aws),
+                    Unused(),
+                    Unused(),
+                    root / "cleanup-loser",
+                    root / "terraform",
+                    recover=True,
+                    dry_run=False,
+                    skip_destroy=False,
+                )
+            self.assertEqual(aws.writes, [])
+            self.assertEqual(aws.remote, cleanup_payload)
 
     def test_expired_e2e_orphan_is_cleanable_only_by_janitor_recovery(self):
         class JanitorAWS:
@@ -5978,7 +9273,7 @@ class SSMAndCleanupTest(unittest.TestCase):
             ), mock.patch.object(appliance, "audit_run_resources", return_value=[]):
                 result = appliance.cleanup(
                     config,
-                    aws,
+                    appliance.ImmediateAwsCLIAdapter(aws),
                     object(),
                     UnusedRunner(),
                     root / "janitor",
@@ -6032,7 +9327,7 @@ class SSMAndCleanupTest(unittest.TestCase):
             aws = RecoveryAWS(remote)
             result = appliance.cleanup(
                 config,
-                aws,
+                appliance.ImmediateAwsCLIAdapter(aws),
                 FakeTailscale(),
                 UnusedRunner(),
                 run_dir,
@@ -6169,7 +9464,11 @@ class SSMAndCleanupTest(unittest.TestCase):
         class API:
             def __init__(self):
                 self.devices = [
-                    {"id": "west-node", "hostname": "envelope-fixture-west", "tags": ["tag:envelope-ci"]}
+                    {
+                        "id": "west-node",
+                        "hostname": "envelope-fixture-west-transport-a",
+                        "tags": ["tag:envelope-ci"],
+                    }
                 ]
                 self.deleted = []
                 self.revoked = []
@@ -6200,6 +9499,7 @@ class SSMAndCleanupTest(unittest.TestCase):
             manifest["tailnet"]["nodes_expected"] = True
             mark_manifest_apply_started(manifest)
             manifest.pop("apply_claimed_at")
+            manifest.pop("apply_claim_id")
             manifest["phase"] = "apply_failed"
             store = appliance.ManifestStore(config, aws, root / "run")
             store.write(manifest)
@@ -6209,7 +9509,7 @@ class SSMAndCleanupTest(unittest.TestCase):
                 with self.assertRaisesRegex(appliance.LifecycleError, "Terraform destroy.*injected destroy failure"):
                     appliance.cleanup(
                         config,
-                        aws,
+                        appliance.ImmediateAwsCLIAdapter(aws),
                         api,
                         UnusedRunner(),
                         store.run_dir,
@@ -6255,10 +9555,7 @@ class SSMAndCleanupTest(unittest.TestCase):
             def list_devices(self):
                 if not self.nodes_expected:
                     return []
-                return [
-                    {"id": "west", "hostname": "envelope-fixture-west", "tags": ["tag:envelope-ci"]},
-                    {"id": "east", "hostname": "envelope-fixture-east", "tags": ["tag:envelope-ci"]},
-                ]
+                return fixture_tailnet_devices()
 
         class UnusedRunner:
             def run(self, *args, **kwargs):
@@ -6291,7 +9588,7 @@ class SSMAndCleanupTest(unittest.TestCase):
                     run_dir = root / f"recover-{phase}"
                     result = appliance.cleanup(
                         config,
-                        RecoveryAWS(payload),
+                        appliance.ImmediateAwsCLIAdapter(RecoveryAWS(payload)),
                         API(phase == "apply_started"),
                         UnusedRunner(),
                         run_dir,
@@ -6380,6 +9677,28 @@ class SSMAndCleanupTest(unittest.TestCase):
             self.assertEqual(rotated["tailnet"]["pending_revoke_key_ids"], [])
             self.assertNotIn("rotation", rotated["tailnet"])
 
+            replacement_manifest = copy.deepcopy(manifest)
+            replacement_manifest["phase"] = "e2e_replacement_ready"
+            replacement_manifest["e2e"] = {
+                "claim_id": "123e4567-e89b-42d3-a456-426614174000",
+                "output_sha256": "d" * 64,
+                "started_at": "2026-08-20T12:00:00Z",
+                "replacement": {
+                    "address": 'aws_instance.envelope_target_west["a"]',
+                    "old_instance_id": "i-0123456789abcdef0",
+                    "started_at": "2026-08-20T12:01:00Z",
+                },
+            }
+            replacement_aws = RotationAWS(False)
+            replacement_store = appliance.ManifestStore(
+                config, replacement_aws, root / "replacement"
+            )
+            replacement_store.write(replacement_manifest)
+            with self.assertRaisesRegex(appliance.LifecycleError, "fully ready deployment"):
+                appliance.rotate_auth_key(
+                    config, replacement_aws, RotationAPI(), replacement_store.run_dir
+                )
+
     def test_key_rotation_rolls_back_write_when_post_write_verification_fails(self):
         class VerificationFailureAWS:
             def __init__(self, failing_region):
@@ -6465,6 +9784,7 @@ class SSMAndCleanupTest(unittest.TestCase):
             manifest = appliance.new_manifest(config, artifact_identity(root), "123456789012")
             manifest["tailnet"]["auth_key_id"] = "old-key"
             manifest["tailnet"]["rotation"] = {
+                "claim_id": "123e4567-e89b-42d3-a456-426614174000",
                 "description": "Envelope acceptance envelope-fixture rotation-1",
                 "new_key_id": None,
                 "updated_sites": [],
@@ -6498,16 +9818,10 @@ class CloudInitSandboxTest(unittest.TestCase):
             "artifact_revision": "a" * 40,
             "artifact_version": "fixture.1",
             "artifact_architecture": "amd64",
-            "tailscale_version": "1.80.3",
-            "tun_name": "envelope0",
-            "tailscale_iface": "tailscale0",
-            "underlay_iface": "ens5",
             "config_version": "2",
-            "routing_mode": "manage",
-            "local_site_cidrs": "10.10.0.0/16",
-            "remote_site_cidrs": "10.20.0.0/16",
-            "routing_table_id": "100",
-            "routing_rule_priority": "100",
+            "mode": "packet-return",
+            "udp_bind": "0.0.0.0:6081",
+            "max_inner_packet_size": "1280",
         }
 
     def test_rendered_scripts_and_embedded_assets_have_valid_shell_syntax(self):
@@ -6527,32 +9841,32 @@ class CloudInitSandboxTest(unittest.TestCase):
                         subprocess.run(["bash", "-n"], input=body[1], text=True, check=True, capture_output=True)
         bootstrap = render_template(templates[1], self.template_values(digest))
         self.assertIn("ENVELOPE_CONFIG_VERSION=2", bootstrap)
-        self.assertIn("ENVELOPE_LOCAL_SITE_CIDRS=10.10.0.0/16", bootstrap)
-        self.assertIn("ENVELOPE_REMOTE_SITE_CIDRS=10.20.0.0/16", bootstrap)
-        self.assertNotIn("ENVELOPE_GWLB_RETURN_CIDRS", bootstrap)
-        self.assertNotIn("ENVELOPE_LOCAL_DELIVERY_CIDRS", bootstrap)
-        self.assertNotIn("ENVELOPE_REMOTE_TAILNET_CIDRS", bootstrap)
-        self.assertNotIn("ENVELOPE_TCP_FLOW_TIMEOUT", bootstrap)
-        self.assertIn("After=cloud-final.service network-online.target tailscaled.service", bootstrap)
-        self.assertIn('"$binary" -t mangle -A FORWARD -j ENVELOPE-MSS', bootstrap)
-        self.assertIn("snat", appliance.redact("snat"))
+        self.assertIn("ENVELOPE_MODE=packet-return", bootstrap)
+        self.assertIn("ENVELOPE_UDP_BIND=0.0.0.0:6081", bootstrap)
+        self.assertIn("ENVELOPE_MAX_INNER_PACKET_SIZE=1280", bootstrap)
+        for obsolete in (
+            "ENVELOPE_TUN_NAME",
+            "ENVELOPE_TAILSCALE_IFACE",
+            "ENVELOPE_LOCAL_SITE_CIDRS",
+            "ENVELOPE_REMOTE_SITE_CIDRS",
+            "ENVELOPE_ROUTING_MODE",
+            "ENVELOPE_ROUTING_TABLE_ID",
+            "ENVELOPE_ROUTING_RULE_PRIORITY",
+            "tailscaled.service",
+            "envelope-host-network",
+            "ENVELOPE-MSS",
+        ):
+            self.assertNotIn(obsolete, bootstrap)
+        self.assertIn("After=network-online.target", bootstrap)
+        self.assertIn("CapabilityBoundingSet=CAP_NET_RAW", bootstrap)
+        self.assertNotIn("CAP_NET_ADMIN", bootstrap)
 
-    def test_service_preflight_is_read_only_and_root_oneshot_owns_every_host_mutation(self):
+    def test_packet_return_service_preflight_is_read_only_and_target_has_no_host_routing(self):
         rendered = render_template(
             ROOT / "example/terraform/cloud-init/bootstrap.sh.tftpl", self.template_values("a" * 64)
         )
-        host = re.search(
-            r"cat >/usr/local/sbin/envelope-host-network <<'HOST_NETWORK'\n(.*?)\nHOST_NETWORK",
-            rendered,
-            flags=re.DOTALL,
-        ).group(1)
         preflight = re.search(
             r"cat >/usr/local/sbin/envelope-preflight <<'PREFLIGHT'\n(.*?)\nPREFLIGHT",
-            rendered,
-            flags=re.DOTALL,
-        ).group(1)
-        host_unit = re.search(
-            r"cat >/etc/systemd/system/envelope-host-network.service <<'HOST_UNIT'\n(.*?)\nHOST_UNIT",
             rendered,
             flags=re.DOTALL,
         ).group(1)
@@ -6561,55 +9875,28 @@ class CloudInitSandboxTest(unittest.TestCase):
             rendered,
             flags=re.DOTALL,
         ).group(1)
-        for mutation in (
-            "/usr/sbin/sysctl -q -w \"$setting\"",
-            "sysctl -q -w",
-            "nft flush ruleset",
-            '"$binary" -A',
+        self.assertIn("grep -Fqx", preflight)
+        self.assertIn('"$sha256_bin" -c -', preflight)
+        for prohibited in (
+            "tailscale",
+            "sysctl",
+            "iptables",
+            "nft ",
+            " route ",
+            "envelope0",
+            "FORWARD",
+            "TCPMSS",
         ):
-            self.assertIn(mutation, host)
-        self.assertNotIn("sysctl --system", host)
-        self.assertNotIn("sysctl --system", preflight)
-        self.assertNotIn(" -w ", preflight)
-        self.assertNotIn("nft flush", preflight)
-        self.assertNotIn("/usr/local/sbin/envelope-host-network", preflight)
-        self.assertIn("User=root", host_unit)
-        self.assertIn("Before=envelope.service", host_unit)
-        self.assertIn("Environment=XTABLES_LOCKFILE=/run/envelope-host-network/xtables.lock", host_unit)
-        self.assertIn("RuntimeDirectory=envelope-host-network", host_unit)
-        self.assertIn("RuntimeDirectoryMode=0700", host_unit)
-        self.assertEqual(
-            re.findall(r"^ReadWritePaths=.*$", host_unit, re.MULTILINE),
-            ["ReadWritePaths=/run/envelope-host-network"],
-        )
-        self.assertIn("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW", host_unit)
-        self.assertIn("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW", host_unit)
+            self.assertNotIn(prohibited, preflight)
         self.assertIn("User=envelope", service_unit)
         self.assertIn("Group=envelope", service_unit)
         self.assertNotRegex(service_unit, r"(?m)^User=root$")
-        self.assertIn("ExecStartPre=+/usr/local/sbin/envelope-preflight", service_unit)
+        self.assertIn("ExecStartPre=/usr/local/sbin/envelope-preflight", service_unit)
         self.assertIn("ExecStart=/usr/local/bin/envelope", service_unit)
-        self.assertIn("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW", service_unit)
-        self.assertIn("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW", service_unit)
+        self.assertIn("CapabilityBoundingSet=CAP_NET_RAW", service_unit)
+        self.assertIn("AmbientCapabilities=CAP_NET_RAW", service_unit)
+        self.assertNotIn("CAP_NET_ADMIN", service_unit)
         self.assertIn("ProtectKernelTunables=yes", service_unit)
-        self.assertIn("net.ipv4.conf.default.rp_filter = 0", rendered)
-        self.assertIn("net.ipv4.conf.*.rp_filter = 0", rendered)
-        self.assertIn('"net.ipv4.conf.$envelope.rp_filter=0"', host)
-        self.assertIn('"net.ipv4.conf.$iface.rp_filter=0"', host)
-        self.assertIn('"$save_bin" -t "$table"', preflight)
-        self.assertNotIn('rules=$("$save_bin")', preflight)
-        self.assertIn('route show table main match "$cidr"', preflight)
-        self.assertNotIn('route get "$cidr" iif \'envelope0\'', preflight)
-        self.assertIn('route show table 52 "$cidr"', preflight)
-        self.assertNotIn("(.Self.AllowedIPs // [])", preflight)
-        self.assertIn('"$envelope $underlay"', host)
-        self.assertIn('"$envelope $tailscale"', host)
-        self.assertNotIn('"$tailscale $envelope"', host)
-        self.assertIn("'envelope0 ens5'", preflight)
-        self.assertIn("'envelope0 tailscale0'", preflight)
-        self.assertNotIn("'ens5 tailscale0'", preflight)
-        self.assertNotIn("'tailscale0 ens5'", preflight)
-        self.assertNotIn("'tailscale0 envelope0'", preflight)
 
     def test_vendored_tailscale_module_has_only_exact_package_installation_before_auth(self):
         module = ROOT / "example/terraform/modules/tailscale-cloudinit"
@@ -6660,6 +9947,7 @@ class CloudInitSandboxTest(unittest.TestCase):
                 "snat_subnet_routes": "false",
                 "netfilter_mode": "off",
                 "timeout": "2m",
+                "pre_setup_gate": "",
             },
         )
         for rendered in (rendered_install, rendered_setup):
@@ -6715,7 +10003,7 @@ class CloudInitSandboxTest(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"known-good-old-artifact")
             self.assertIn("disable --now envelope.service", service_log.read_text())
 
-    def test_service_preflight_rejects_backend_and_route_withdrawal(self):
+    def test_packet_return_preflight_requires_exact_runtime_and_artifact_identity(self):
         rendered = render_template(
             ROOT / "example/terraform/cloud-init/bootstrap.sh.tftpl", self.template_values("a" * 64)
         )
@@ -6726,175 +10014,218 @@ class CloudInitSandboxTest(unittest.TestCase):
         )
         self.assertIsNotNone(match)
         preflight = match.group(1)
-        with tempfile.TemporaryDirectory() as temporary:
-            root = pathlib.Path(temporary)
-
-            def executable(name: str, body: str) -> str:
-                path = root / name
-                path.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + body)
-                path.chmod(0o755)
-                return str(path)
-
-            tailscale = executable(
-                "tailscale",
-                """
-if [[ ${1:-} == version ]]; then printf '%s\n' '1.80.3'; exit 0; fi
-printf '{"Version":"1.80.3","TUN":true,"BackendState":"%s","Health":[],"Self":{"AllowedIPs":[]},"Peer":{"fixture":{"PrimaryRoutes":["10.20.0.0/16"]}}}\n' "$BACKEND_STATE"
-""",
-            )
-            ip = executable(
-                "ip",
-                """
-cidr=${@: -1}
-if [[ $* == *"route show table main match"* ]]; then
-  if [[ $LOCAL_ROUTES_READY == true ]]; then
-    printf '[{"dst":"%s","dev":"ens5","type":"unicast"}]\n' "$cidr"
-  else
-    printf '%s\n' '[]'
-  fi
-elif [[ $ROUTES_READY == true ]]; then
-  printf '[{"dst":"%s","dev":"tailscale0","type":"unicast"}]\n' "$cidr"
-else
-  printf '%s\n' '[]'
-fi
-""",
-            )
-            timeout = executable("timeout", "shift\nexec \"$@\"\n")
-            success = executable("success", "exit 0\n")
-            sha = executable("sha256", "cat >/dev/null\nexit 0\n")
-            sysctl = executable(
-                "sysctl",
-                """
-case "${@: -1}" in
-  net.ipv4.ip_forward|net.ipv6.conf.all.forwarding) printf '%s\n' 1 ;;
-  net.ipv4.conf.envelope0.rp_filter) printf '%s\n' 0 ;;
-  net.ipv4.conf.*.rp_filter) printf '%s\n' 0 ;;
-  *) exit 1 ;;
-esac
-""",
-            )
-            filter_rules = """*filter
--P INPUT ACCEPT
--P FORWARD ACCEPT
--P OUTPUT ACCEPT
--N ENVELOPE-FORWARD
--A FORWARD -j ENVELOPE-FORWARD
--A ENVELOPE-FORWARD -i envelope0 -o ens5 -j ACCEPT
--A ENVELOPE-FORWARD -i envelope0 -o tailscale0 -j ACCEPT
-COMMIT
-"""
-            mangle_rules = """*mangle
--N ENVELOPE-MSS
--A FORWARD -j ENVELOPE-MSS
--A ENVELOPE-MSS -i envelope0 -o ens5 -p tcp -j TCPMSS
--A ENVELOPE-MSS -i envelope0 -o tailscale0 -p tcp -j TCPMSS
-COMMIT
-"""
-            save_body = """
-printf '%s %s\n' "${0##*/}" "$*" >>"$SAVE_LOG"
-table=${@: -1}
-binary=${0##*/}
-if [[ -n ${DENIED_TABLE:-} && "$table" == "$DENIED_TABLE" ]]; then
-  printf 'Permission denied while opening xtables lock\nsecond line %0400d\n' 0 >&2
-  exit 1
-fi
-if [[ -n ${EXTRA_ERROR_TABLE:-} && "$table" == "$EXTRA_ERROR_TABLE" ]]; then
-  printf '%s v1.8.9 (legacy): Cannot initialize: Table does not exist (do you need to insmod?)\nunexpected extra stderr\n' "$binary" >&2
-  exit 1
-fi
-if [[ "$table" == security || ( -n ${MISSING_TABLE:-} && "$table" == "$MISSING_TABLE" ) ]]; then
-  printf '%s v1.8.9 (legacy): Cannot initialize: Table does not exist (do you need to insmod?)\n' "$binary" >&2
-  exit 1
-fi
-cat "$RULES_DIR/$table"
-"""
-            save = executable("iptables-save", save_body)
-            save6 = executable("ip6tables-save", save_body)
-            nft = executable("nft", "printf '%s\n' '{\"nftables\":[{\"metainfo\":{}}]}'\n")
-            rules_dir = root / "rules"
-            rules_dir.mkdir()
-            (rules_dir / "filter").write_text(filter_rules)
-            (rules_dir / "mangle").write_text(mangle_rules)
-            for table in ("raw", "nat", "security"):
-                (rules_dir / table).write_text(f"*{table}\nCOMMIT\n")
-            env = {
-                **os.environ,
-                "TAILSCALE_BIN": tailscale,
-                "TIMEOUT_BIN": timeout,
-                "JQ_BIN": shutil.which("jq") or "/usr/bin/jq",
-                "IP_BIN": ip,
-                "SYSTEMCTL_BIN": success,
-                "SYSCTL_BIN": sysctl,
-                "IPTABLES_SAVE_BIN": save,
-                "IP6TABLES_SAVE_BIN": save6,
-                "NFT_BIN": nft,
-                "SHA256_BIN": sha,
-                "ENVELOPE_BIN": str(root / "envelope"),
-                "SLEEP_BIN": success,
-                "PREFLIGHT_MAX_ATTEMPTS": "1",
-                "PREFLIGHT_RETRY_SECONDS": "0",
-                "BACKEND_STATE": "Running",
-                "ROUTES_READY": "true",
-                "LOCAL_ROUTES_READY": "true",
-                "RULES_DIR": str(rules_dir),
-                "SAVE_LOG": str(root / "save.log"),
-                "MISSING_TABLE": "",
-                "DENIED_TABLE": "",
-                "EXTRA_ERROR_TABLE": "",
-            }
-            save_log = pathlib.Path(env["SAVE_LOG"])
-            save_log.write_text("")
-            healthy = subprocess.run(["bash"], input=preflight, text=True, env=env, capture_output=True)
-            self.assertEqual(healthy.returncode, 0, healthy.stderr)
-            expected_tables = [
-                f"{binary} -t {table}"
-                for binary in ("iptables-save", "ip6tables-save")
-                for table in ("raw", "mangle", "nat", "filter", "security")
-            ]
-            self.assertEqual(save_log.read_text().splitlines(), expected_tables)
-
-            for name, overrides, table, detail in (
-                ("absent filter", {"MISSING_TABLE": "filter"}, "filter", "Table does not exist"),
-                ("absent mangle", {"MISSING_TABLE": "mangle"}, "mangle", "Table does not exist"),
-                ("optional table permission error", {"DENIED_TABLE": "raw"}, "raw", "Permission denied"),
-                ("optional table extra stderr", {"EXTRA_ERROR_TABLE": "nat"}, "nat", "unexpected extra stderr"),
-            ):
-                with self.subTest(name=name):
-                    save_log.write_text("")
-                    failed = subprocess.run(
-                        ["bash"], input=preflight, text=True, env={**env, **overrides}, capture_output=True
-                    )
-                    self.assertNotEqual(failed.returncode, 0)
-                    self.assertEqual(
-                        save_log.read_text().splitlines(),
-                        [
-                            f"iptables-save -t {candidate}"
-                            for candidate in ("raw", "mangle", "nat", "filter", "security")
-                        ],
-                    )
-                    diagnostic = next(
-                        line for line in failed.stderr.splitlines() if line.startswith("legacy firewall inspection failed:")
-                    )
-                    self.assertIn(f"binary=iptables-save table={table} status=1", diagnostic)
-                    self.assertIn(detail, diagnostic)
-                    self.assertLessEqual(len(diagnostic), 400)
-                    if name == "optional table permission error":
-                        self.assertIn("lock second line", diagnostic)
-
-            for name, overrides in {
-                "backend": {"BACKEND_STATE": "Stopped"},
-                "route withdrawal": {"ROUTES_READY": "false"},
-                "local delivery withdrawal": {"LOCAL_ROUTES_READY": "false"},
-            }.items():
-                with self.subTest(name=name):
-                    failed = subprocess.run(
-                        ["bash"], input=preflight, text=True, env={**env, **overrides}, capture_output=True
-                    )
-                    self.assertNotEqual(failed.returncode, 0)
-                    self.assertIn("timed out", failed.stderr)
+        for expected in (
+            "ENVELOPE_CONFIG_VERSION=2",
+            "ENVELOPE_MODE=packet-return",
+            "ENVELOPE_UDP_BIND=0.0.0.0:6081",
+            "ENVELOPE_MAX_INNER_PACKET_SIZE=1280",
+            "ENVELOPE_DEPLOYED_ARTIFACT_SHA256=" + "a" * 64,
+            "ENVELOPE_DEPLOYED_ARTIFACT_REVISION=" + "a" * 40,
+        ):
+            self.assertIn(expected, preflight)
+        self.assertIn("sha256sum", rendered)
+        self.assertNotIn("tailscale", preflight)
+        self.assertNotIn("route", preflight)
+        self.assertNotIn("iptables", preflight)
 
 
 class DeploymentOutputTest(unittest.TestCase):
+    def test_complete_output_rejects_plan_time_unknowns_and_partial_id_shapes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+
+            missing_value = symmetric_deployment_document(config)
+            missing_value["symmetric_topology"].pop("value")
+            with self.assertRaisesRegex(
+                appliance.LifecycleError,
+                "complete symmetric deployment output contract",
+            ):
+                appliance.validate_symmetric_deployment_output(missing_value, config)
+
+            for output_name, mutate in (
+                (
+                    "vpc_ids",
+                    lambda value: value.pop("east"),
+                ),
+                (
+                    "gwlb_endpoint_ids",
+                    lambda value: value["west"].pop("b"),
+                ),
+                (
+                    "flow_log_evidence",
+                    lambda value: value["west"].pop("flow_log_id"),
+                ),
+            ):
+                with self.subTest(partial_output=output_name):
+                    changed = symmetric_deployment_document(config)
+                    mutate(changed[output_name]["value"])
+                    with self.assertRaisesRegex(
+                        appliance.LifecycleError,
+                        f"{output_name} does not contain a complete concrete output value",
+                    ):
+                        appliance.validate_symmetric_deployment_output(changed, config)
+
+    def test_complete_output_requires_packet_return_and_exact_transport_member_shape(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            document = symmetric_deployment_document(config)
+            appliance.validate_symmetric_deployment_output(document, config)
+
+            obsolete_runtime = copy.deepcopy(document)
+            obsolete_runtime["envelope_runtime_config"]["value"]["west"]["tun_name"] = "envelope0"
+            with self.assertRaisesRegex(appliance.LifecycleError, "canonical packet-return"):
+                appliance.validate_symmetric_deployment_output(obsolete_runtime, config)
+
+            missing_eni = copy.deepcopy(document)
+            missing_eni["symmetric_topology"]["value"]["sites"]["west"][
+                "transport_router_fleet"
+            ][0].pop("network_interface_id")
+            with self.assertRaisesRegex(appliance.LifecycleError, "transport_router_fleet has an invalid member"):
+                appliance.validate_symmetric_deployment_output(missing_eni, config)
+
+            duplicate_route_table = copy.deepcopy(document)
+            west_routers = duplicate_route_table["symmetric_topology"]["value"]["sites"]["west"][
+                "transport_router_fleet"
+            ]
+            west_routers[1]["gwlbe_route_table_id"] = west_routers[0]["gwlbe_route_table_id"]
+            with self.assertRaisesRegex(appliance.LifecycleError, "transport fleets contain duplicate identities"):
+                appliance.validate_symmetric_deployment_output(duplicate_route_table, config)
+
+    def test_complete_output_requires_all_instance_roles_to_be_globally_disjoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            cases = {
+                "secondary target": "i-target-east-b",
+                "transport router": "i-transport-west-b",
+            }
+            for name, duplicate_id in cases.items():
+                with self.subTest(name=name):
+                    document = symmetric_deployment_document(config)
+                    document["workload_instances"]["value"]["west"]["initiator"][
+                        "instance_id"
+                    ] = duplicate_id
+                    with self.assertRaisesRegex(
+                        appliance.LifecycleError, "globally disjoint"
+                    ):
+                        appliance.validate_symmetric_deployment_output(
+                            document, config
+                        )
+
+    def test_complete_output_rejects_new_contract_mutations_after_apply(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            document = symmetric_deployment_document(config)
+
+            for output_name in (
+                "transport_router_readiness_expectations",
+                "route_failover",
+            ):
+                with self.subTest(missing=output_name):
+                    changed = copy.deepcopy(document)
+                    changed.pop(output_name)
+                    with self.assertRaisesRegex(
+                        appliance.LifecycleError,
+                        "complete symmetric deployment output contract",
+                    ):
+                        appliance.validate_symmetric_deployment_output(changed, config)
+
+            readiness_mutations = {
+                "schema": lambda site: site.update({"config_version": 3}),
+                "schema type": lambda site: site.update({"config_version": 2.0}),
+                "CIDR": lambda site: site["local_site_cidrs"].append(
+                    "10.99.0.0/24"
+                ),
+                "policy": lambda site: site["local_policy_rules"][0].update(
+                    {"table": "52"}
+                ),
+                "firewall": lambda site: site["filter_forward_rules"][0].update(
+                    {"target": "ACCEPT"}
+                ),
+                "MSS": lambda site: site["mss_rules"][0].update(
+                    {"tcp_flags": "SYN SYN"}
+                ),
+                "mangle policy": lambda site: site.update(
+                    {"mangle_forward_policy": "DROP"}
+                ),
+                "recovery marker": lambda site: site.update(
+                    {"recovery_marker": "/tmp/stale"}
+                ),
+                "full policy rules": lambda site: site["ipv4_policy_rules"][0].update(
+                    {"table": "main"}
+                ),
+                "remote route table": lambda site: site.update(
+                    {"remote_route_table": 53}
+                ),
+                "contract SHA": lambda site: site.update(
+                    {"contract_sha256": "f" * 64}
+                ),
+            }
+            for name, mutate in readiness_mutations.items():
+                with self.subTest(readiness=name):
+                    changed = copy.deepcopy(document)
+                    mutate(
+                        changed["transport_router_readiness_expectations"]["value"][
+                            "sites"
+                        ]["west"]
+                    )
+                    with self.assertRaisesRegex(
+                        appliance.LifecycleError,
+                        "transport-router readiness expectations",
+                    ):
+                        appliance.validate_symmetric_deployment_output(changed, config)
+
+            for field in (
+                "mutation_timeout_seconds",
+                "restoration_timeout_seconds",
+                "recovery_timeout_seconds",
+            ):
+                with self.subTest(bound=field):
+                    changed = copy.deepcopy(document)
+                    changed["route_failover"]["value"][field] += 1
+                    with self.assertRaisesRegex(
+                        appliance.LifecycleError,
+                        "route_failover output",
+                    ):
+                        appliance.validate_symmetric_deployment_output(changed, config)
+
+            changed = copy.deepcopy(document)
+            changed["route_failover"]["value"]["mutation_timeout_seconds"] = 120.0
+            with self.assertRaisesRegex(
+                appliance.LifecycleError, "route_failover output"
+            ):
+                appliance.validate_symmetric_deployment_output(changed, config)
+
+            for field, value in (
+                ("route_table_id", "rtb-wrong"),
+                ("initial_network_interface_id", "eni-transport-west-b"),
+            ):
+                with self.subTest(route_identity=field):
+                    changed = copy.deepcopy(document)
+                    changed["route_failover"]["value"]["sites"]["west"]["a"][
+                        field
+                    ] = value
+                    with self.assertRaisesRegex(
+                        appliance.LifecycleError,
+                        "route_failover output",
+                    ):
+                        appliance.validate_symmetric_deployment_output(changed, config)
+
+            changed = copy.deepcopy(document)
+            changed["cost_profile"]["value"]["nat_topology_limit"][
+                "expanded_for_ha"
+            ] = True
+            with self.assertRaisesRegex(
+                appliance.LifecycleError, "symmetric HA cost profile"
+            ):
+                appliance.validate_symmetric_deployment_output(changed, config)
+
+            changed = copy.deepcopy(document)
+            changed["cost_profile"]["value"]["resource_counts"]["flow_log_iam_roles"] = True
+            with self.assertRaisesRegex(
+                appliance.LifecycleError, "symmetric HA cost profile"
+            ):
+                appliance.validate_symmetric_deployment_output(changed, config)
+
     def test_parses_deterministic_role_aware_workloads_and_preserves_existing_maps(self):
         document = deployment_document()
         instances, target_groups, workloads = appliance.deployment_values(document)
@@ -7019,6 +10350,228 @@ class DeploymentOutputTest(unittest.TestCase):
 
 
 class ReadinessTest(unittest.TestCase):
+    def test_live_gwlbe_routes_match_config_bound_source_owners_and_output_allowlist(self):
+        class RouteAWS:
+            def __init__(self, responses):
+                self.responses = responses
+                self.calls = []
+
+            def json(self, args, *, region=None):
+                self.calls.append((list(args), region))
+                if args[:2] == ["ec2", "describe-network-interfaces"]:
+                    return {
+                        "NetworkInterfaces": copy.deepcopy(
+                            self.responses[region]["NetworkInterfaces"]
+                        )
+                    }
+                if args[:2] == ["ec2", "describe-route-tables"]:
+                    return {
+                        "RouteTables": copy.deepcopy(
+                            self.responses[region]["RouteTables"]
+                        )
+                    }
+                raise AssertionError(args)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            deployment = symmetric_deployment_document(config)
+            aws = RouteAWS(live_gwlbe_route_tables(config, deployment))
+            appliance.validate_live_gwlbe_routes(config, aws, deployment)
+
+        self.assertEqual(
+            aws.calls,
+            [
+                (
+                    [
+                        "ec2",
+                        "describe-network-interfaces",
+                        "--network-interface-ids",
+                        "eni-transport-west-a",
+                        "eni-transport-west-b",
+                    ],
+                    "us-west-2",
+                ),
+                (
+                    [
+                        "ec2",
+                        "describe-route-tables",
+                        "--route-table-ids",
+                        "rtb-gwlbe-west-a",
+                        "rtb-gwlbe-west-b",
+                    ],
+                    "us-west-2",
+                ),
+                (
+                    [
+                        "ec2",
+                        "describe-network-interfaces",
+                        "--network-interface-ids",
+                        "eni-transport-east-a",
+                        "eni-transport-east-b",
+                    ],
+                    "us-east-1",
+                ),
+                (
+                    [
+                        "ec2",
+                        "describe-route-tables",
+                        "--route-table-ids",
+                        "rtb-gwlbe-east-a",
+                        "rtb-gwlbe-east-b",
+                    ],
+                    "us-east-1",
+                ),
+            ],
+        )
+
+    def test_live_gwlbe_routes_fail_closed_on_route_or_owner_drift(self):
+        class RouteAWS:
+            def __init__(self, responses):
+                self.responses = responses
+
+            def json(self, args, *, region=None):
+                if args[:2] == ["ec2", "describe-network-interfaces"]:
+                    return {
+                        "NetworkInterfaces": copy.deepcopy(
+                            self.responses[region]["NetworkInterfaces"]
+                        )
+                    }
+                if args[:2] == ["ec2", "describe-route-tables"]:
+                    return {
+                        "RouteTables": copy.deepcopy(
+                            self.responses[region]["RouteTables"]
+                        )
+                    }
+                raise AssertionError(args)
+
+        def first_west_remote(responses):
+            return responses["us-west-2"]["RouteTables"][0]["Routes"][1]
+
+        mutations = {
+            "wrong allowlisted ENI": lambda responses: first_west_remote(
+                responses
+            ).update({"NetworkInterfaceId": "eni-transport-west-b"}),
+            "missing prefix": lambda responses: responses["us-west-2"][
+                "RouteTables"
+            ][0]["Routes"].pop(),
+            "duplicate prefix": lambda responses: responses["us-west-2"][
+                "RouteTables"
+            ][0]["Routes"].append(copy.deepcopy(first_west_remote(responses))),
+            "intersecting supernet": lambda responses: responses["us-west-2"][
+                "RouteTables"
+            ][0]["Routes"].append(
+                {
+                    "DestinationCidrBlock": "10.20.0.0/16",
+                    "NetworkInterfaceId": "eni-transport-west-a",
+                    "Origin": "CreateRoute",
+                    "State": "active",
+                }
+            ),
+            "wrong VPC": lambda responses: responses["us-west-2"][
+                "RouteTables"
+            ][0].update({"VpcId": "vpc-east-fixture"}),
+            "foreign route table": lambda responses: responses["us-west-2"][
+                "RouteTables"
+            ][0].update({"RouteTableId": "rtb-gwlbe-foreign"}),
+            "ENI attached to wrong owner": lambda responses: responses["us-west-2"][
+                "NetworkInterfaces"
+            ][0]["Attachment"].update({"InstanceId": "i-transport-west-b"}),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            deployment = symmetric_deployment_document(config)
+            for name, mutate in mutations.items():
+                with self.subTest(name=name):
+                    responses = live_gwlbe_route_tables(config, deployment)
+                    mutate(responses)
+                    with self.assertRaisesRegex(
+                        appliance.LifecycleError, "live (?:GWLBE route|transport ENI)"
+                    ):
+                        appliance.validate_live_gwlbe_routes(
+                            config, RouteAWS(responses), deployment
+                        )
+
+    def test_wait_and_record_checks_live_routes_before_ready_persistence(self):
+        class Store:
+            remote_etag = '"fixture-etag"'
+
+            def __init__(self, manifest):
+                self.manifest = copy.deepcopy(manifest)
+
+            def recover(self):
+                return copy.deepcopy(self.manifest)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            deployment = symmetric_deployment_document(config)
+            manifest = appliance.new_manifest(
+                config, artifact_identity(root), "123456789012"
+            )
+            mark_manifest_applied(manifest)
+            manifest["phase"] = "applied"
+            manifest["deployment"] = copy.deepcopy(deployment)
+            store = Store(manifest)
+            phases = []
+
+            def persist(target, _original, candidate, **_kwargs):
+                phases.append(candidate["phase"])
+                target.manifest = copy.deepcopy(candidate)
+                return "written"
+
+            ready = mock.Mock()
+            with mock.patch.object(
+                appliance, "ManifestStore", return_value=store
+            ), mock.patch.object(
+                appliance, "persist_manifest_transition", side_effect=persist
+            ), mock.patch.object(
+                appliance, "wait_deployment"
+            ), mock.patch.object(
+                appliance,
+                "validate_live_gwlbe_routes",
+                side_effect=appliance.LifecycleError("injected live route drift"),
+            ), mock.patch.object(appliance, "record_ready_devices", ready):
+                with self.assertRaisesRegex(
+                    appliance.LifecycleError, "injected live route drift"
+                ):
+                    appliance.wait_and_record(
+                        config,
+                        object(),
+                        object(),
+                        root / "run",
+                        deployment,
+                        timeout_seconds=5,
+                    )
+
+        ready.assert_not_called()
+        self.assertEqual(phases, ["readiness_started", "readiness_failed"])
+
+    def test_deployment_wait_requires_complete_current_outputs(self):
+        class UnusedAWS:
+            def json(self, args, *, region=None):
+                raise AssertionError(args)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            for output_name in (
+                "transport_router_readiness_expectations",
+                "route_failover",
+            ):
+                with self.subTest(output=output_name):
+                    document = symmetric_deployment_document(config)
+                    document.pop(output_name)
+                    with self.assertRaisesRegex(
+                        appliance.LifecycleError,
+                        "complete symmetric deployment output contract",
+                    ):
+                        appliance.wait_deployment(
+                            config,
+                            UnusedAWS(),
+                            document,
+                            timeout_seconds=5,
+                            sleep=lambda _: None,
+                        )
+
     def test_symmetric_target_fleets_must_match_configured_azs_and_target_groups(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = make_config(pathlib.Path(temporary))
@@ -7051,7 +10604,7 @@ class ReadinessTest(unittest.TestCase):
                     with self.assertRaises(appliance.LifecycleError):
                         appliance.deployment_target_fleets(document, config, target_groups)
 
-    def test_deployment_wait_requires_two_appliances_four_workloads_and_two_targets(self):
+    def test_deployment_wait_separates_four_targets_four_transports_and_four_workloads(self):
         class FakeAWS:
             def __init__(self):
                 self.online = []
@@ -7066,7 +10619,8 @@ class ReadinessTest(unittest.TestCase):
                     return {"InstanceInformationList": [{"PingStatus": "Online"}]}
                 if operation == "send-command":
                     instance_id = args[args.index("--instance-ids") + 1]
-                    inner.readiness_commands.append((region, instance_id))
+                    payload = json.loads(args[args.index("--parameters") + 1])
+                    inner.readiness_commands.append((region, instance_id, payload["commands"]))
                     return {"Command": {"CommandId": f"command-{instance_id}"}}
                 if operation == "get-command-invocation":
                     return {"Status": "Success"}
@@ -7076,7 +10630,7 @@ class ReadinessTest(unittest.TestCase):
                     return {
                         "TargetHealthDescriptions": [
                             {
-                                "Target": {"Id": f"i-appliance-{site}" + ("-b" if az_key == "b" else "")},
+                                "Target": {"Id": f"i-target-{site}-{az_key}"},
                                 "TargetHealth": {"State": "healthy"},
                             }
                             for az_key in ("a", "b")
@@ -7090,7 +10644,7 @@ class ReadinessTest(unittest.TestCase):
             appliance.wait_deployment(
                 config,
                 aws,
-                deployment_document(),
+                symmetric_deployment_document(config),
                 timeout_seconds=5,
                 sleep=lambda _: None,
             )
@@ -7098,8 +10652,14 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(
             aws.online,
             [
-                ("us-west-2", "i-appliance-west"),
-                ("us-east-1", "i-appliance-east"),
+                ("us-west-2", "i-target-west-a"),
+                ("us-west-2", "i-target-west-b"),
+                ("us-east-1", "i-target-east-a"),
+                ("us-east-1", "i-target-east-b"),
+                ("us-west-2", "i-transport-west-a"),
+                ("us-west-2", "i-transport-west-b"),
+                ("us-east-1", "i-transport-east-a"),
+                ("us-east-1", "i-transport-east-b"),
                 ("us-west-2", "i-workload-west-initiator"),
                 ("us-west-2", "i-workload-west-responder"),
                 ("us-east-1", "i-workload-east-initiator"),
@@ -7107,12 +10667,27 @@ class ReadinessTest(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            aws.readiness_commands,
-            [("us-west-2", "i-appliance-west"), ("us-east-1", "i-appliance-east")],
+            [(region, instance_id) for region, instance_id, _commands in aws.readiness_commands],
+            [
+                ("us-west-2", "i-target-west-a"),
+                ("us-west-2", "i-target-west-b"),
+                ("us-east-1", "i-target-east-a"),
+                ("us-east-1", "i-target-east-b"),
+                ("us-west-2", "i-transport-west-a"),
+                ("us-west-2", "i-transport-west-b"),
+                ("us-east-1", "i-transport-east-a"),
+                ("us-east-1", "i-transport-east-b"),
+            ],
+        )
+        self.assertTrue(
+            all(commands == appliance.READINESS_COMMANDS for _, _, commands in aws.readiness_commands[:4])
+        )
+        self.assertTrue(
+            all("PrimaryRoutes" in "\n".join(commands) for _, _, commands in aws.readiness_commands[4:])
         )
         self.assertEqual([region for region, _ in aws.targets], ["us-west-2", "us-east-1"])
 
-    def test_failure_collects_nested_bounded_diagnostics_for_all_six_nodes(self):
+    def test_failure_collects_nested_bounded_diagnostics_for_targets_transport_and_workloads(self):
         secret = "fixture-readiness-secret"
 
         class FakeAWS:
@@ -7155,7 +10730,7 @@ class ReadinessTest(unittest.TestCase):
                     appliance.wait_deployment(
                         config,
                         FakeAWS(),
-                        deployment_document(),
+                        symmetric_deployment_document(config),
                         timeout_seconds=5,
                         evidence_path=evidence,
                         sleep=lambda _: None,
@@ -7163,11 +10738,22 @@ class ReadinessTest(unittest.TestCase):
 
             serialized = evidence.read_text()
             payload = json.loads(serialized)
-            self.assertEqual(len(collected), 6)
+            self.assertEqual(len(collected), 10)
             self.assertTrue(all(commands is None for _, _, commands in collected[:2]))
             self.assertTrue(
-                all(commands == appliance.WORKLOAD_DIAGNOSTIC_COMMANDS for _, _, commands in collected[2:])
+                all(
+                    commands == appliance.TRANSPORT_DIAGNOSTIC_COMMANDS
+                    for _, _, commands in collected[2:6]
+                )
             )
+            self.assertTrue(
+                all(
+                    commands == appliance.WORKLOAD_DIAGNOSTIC_COMMANDS
+                    for _, _, commands in collected[6:]
+                )
+            )
+            self.assertEqual(set(payload["transport"]), {"west", "east"})
+            self.assertEqual(set(payload["transport"]["west"]), {"a", "b"})
             self.assertEqual(set(payload["workloads"]), {"west", "east"})
             self.assertEqual(set(payload["workloads"]["west"]), {"initiator", "responder"})
             self.assertEqual(payload["target_health"]["west"][0]["target_state"], "unhealthy")
@@ -7212,13 +10798,172 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("signal=KILL 120s", commands)
         self.assertIn("sleep 2", commands)
         self.assertIn("curl --fail --silent --show-error", commands)
-        self.assertIn("for unit in tailscaled.service envelope-host-network.service envelope.service", commands)
+        self.assertIn("systemctl is-active envelope.service", commands)
+        self.assertNotIn("tailscale", commands.lower())
+        self.assertNotIn("host-network", commands)
         subprocess.run(["bash", "-n"], input=commands, text=True, capture_output=True, check=True)
         inner = appliance.READINESS_COMMANDS[2].split("'ENVELOPE_READINESS'\n", 1)[1].split(
             "\nENVELOPE_READINESS\n", 1
         )[0]
         subprocess.run(["bash", "-n"], input=inner, text=True, capture_output=True, check=True)
         self.assertNotIn("get-parameter", commands)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            transport_commands = appliance.transport_readiness_commands(config, "west", "a")
+        transport = "\n".join(transport_commands)
+        self.assertIn("tailscaled.service", transport)
+        self.assertIn("envelope-transport-router-network.service", transport)
+        self.assertNotIn("envelope-ingress-router-network.service", transport)
+        self.assertIn("PrimaryRoutes", transport)
+        self.assertIn("tailscale debug prefs", transport)
+        self.assertIn("10.20.1.0/24", transport)
+        self.assertIn("10.20.2.0/24", transport)
+        self.assertIn("10.10.1.0/24", transport)
+        self.assertIn("10.10.2.0/24", transport)
+        self.assertIn("envelope-fixture-west-transport-a", transport)
+        self.assertNotIn("envelope-fixture-west-transport-b", transport)
+        self.assertIn("envelope-fixture-east-transport-a", transport)
+        self.assertIn("envelope-fixture-east-transport-b", transport)
+        self.assertNotIn("expected_local_owners", transport)
+        self.assertNotIn("-ingress-", transport)
+        self.assertNotIn("envelope.service", transport)
+        self.assertNotIn("get-parameter", transport)
+        subprocess.run(["bash", "-n"], input=transport, text=True, capture_output=True, check=True)
+        transport_inner = transport_commands[2].split("'TRANSPORT_READINESS'\n", 1)[1].split(
+            "\nTRANSPORT_READINESS\n", 1
+        )[0]
+        subprocess.run(["bash", "-n"], input=transport_inner, text=True, capture_output=True, check=True)
+
+    @unittest.skipUnless(shutil.which("jq"), "jq is required for embedded readiness-filter coverage")
+    def test_transport_readiness_requires_remote_owners_and_rejects_local_claims(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(pathlib.Path(temporary))
+            command = appliance.transport_readiness_commands(config, "west", "a")[2]
+        match = re.search(r"/usr/bin/jq .*? '\n(.*?)\n    ' <<<", command, re.DOTALL)
+        self.assertIsNotNone(match)
+        jq_filter = match.group(1)
+        expected_self = "envelope-fixture-west-transport-a"
+        expected_local = ["10.10.1.0/24", "10.10.2.0/24"]
+        expected_remote = ["10.20.1.0/24", "10.20.2.0/24"]
+        expected_self_prefix = expected_local[0]
+        expected_remote_owners = {
+            expected_remote[0]: "envelope-fixture-east-transport-a",
+            expected_remote[1]: "envelope-fixture-east-transport-b",
+        }
+        prefs = {
+            "RouteAll": True,
+            "NoSNAT": True,
+            "AdvertiseRoutes": [expected_self_prefix],
+        }
+
+        def accepted(status, observed_prefs=None):
+            completed = subprocess.run(
+                [
+                    shutil.which("jq"),
+                    "-e",
+                    "--arg",
+                    "expected_self",
+                    expected_self,
+                    "--arg",
+                    "expected_self_prefix",
+                    expected_self_prefix,
+                    "--argjson",
+                    "expected_local",
+                    json.dumps(expected_local),
+                    "--argjson",
+                    "expected_remote",
+                    json.dumps(expected_remote),
+                    "--argjson",
+                    "expected_remote_owners",
+                    json.dumps(expected_remote_owners),
+                    "--argjson",
+                    "prefs",
+                    json.dumps(prefs if observed_prefs is None else observed_prefs),
+                    jq_filter,
+                ],
+                input=json.dumps(status),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            return completed.returncode == 0
+
+        status = {
+            "BackendState": "Running",
+            "Self": {"Online": True, "HostName": expected_self},
+            "Peer": {
+                "east-a": {
+                    "Online": True,
+                    "HostName": expected_remote_owners[expected_remote[0]],
+                    "PrimaryRoutes": [expected_remote[0]],
+                },
+                "east-b": {
+                    "Online": True,
+                    "HostName": expected_remote_owners[expected_remote[1]],
+                    "PrimaryRoutes": [expected_remote[1]],
+                },
+                "west-b": {
+                    "Online": True,
+                    "HostName": "envelope-fixture-west-transport-b",
+                    "PrimaryRoutes": [],
+                },
+            },
+        }
+        self.assertTrue(accepted(status))
+        unrelated = copy.deepcopy(status)
+        unrelated["Peer"]["east-a"]["PrimaryRoutes"].append("10.99.0.0/24")
+        self.assertTrue(accepted(unrelated))
+        selected_sibling = copy.deepcopy(status)
+        selected_sibling["Peer"]["west-b"]["PrimaryRoutes"] = [expected_local[1]]
+        self.assertFalse(accepted(selected_sibling))
+
+        for advertised_routes in (
+            [],
+            [expected_self_prefix, expected_self_prefix],
+            [expected_self_prefix, expected_local[1]],
+        ):
+            invalid_prefs = {**prefs, "AdvertiseRoutes": advertised_routes}
+            with self.subTest(advertised_routes=advertised_routes):
+                self.assertFalse(accepted(status, invalid_prefs))
+
+        for mutation in (
+            "missing",
+            "duplicate",
+            "offline",
+            "wrong-site",
+            "swapped-owner",
+            "local-sibling",
+            "local-self",
+        ):
+            invalid = copy.deepcopy(status)
+            if mutation == "missing":
+                invalid["Peer"]["east-b"]["PrimaryRoutes"] = []
+            elif mutation == "duplicate":
+                invalid["Peer"]["east-b"]["PrimaryRoutes"].append(expected_remote[0])
+            elif mutation == "offline":
+                invalid["Peer"]["east-a"]["Online"] = False
+            elif mutation == "wrong-site":
+                invalid["Peer"]["east-a"]["HostName"] = (
+                    "envelope-fixture-west-transport-b"
+                )
+            elif mutation == "swapped-owner":
+                east_a = invalid["Peer"]["east-a"]
+                east_b = invalid["Peer"]["east-b"]
+                east_a["HostName"], east_b["HostName"] = (
+                    east_b["HostName"],
+                    east_a["HostName"],
+                )
+            elif mutation == "local-sibling":
+                invalid["Peer"]["west-b"]["PrimaryRoutes"] = [expected_local[1]]
+            elif mutation == "local-self":
+                invalid["Peer"]["west-a"] = {
+                    "Online": True,
+                    "HostName": expected_self,
+                    "PrimaryRoutes": [expected_local[0]],
+                }
+            with self.subTest(mutation=mutation):
+                self.assertFalse(accepted(invalid))
 
     def test_readiness_payload_has_remote_execution_timeout_and_cancels_on_local_deadline(self):
         class FakeAWS:

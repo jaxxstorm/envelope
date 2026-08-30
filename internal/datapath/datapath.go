@@ -6,8 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/http"
-	"os"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,16 +15,9 @@ import (
 	"github.com/jaxxstorm/envelope/internal/config"
 	"github.com/jaxxstorm/envelope/internal/geneve"
 	"github.com/jaxxstorm/envelope/internal/metrics"
-	"github.com/jaxxstorm/envelope/internal/tun"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 )
-
-type TunDevice interface {
-	Read([]byte) (int, error)
-	Write([]byte) (int, error)
-	Close() error
-}
 
 type tlvLogEntry struct {
 	Class  uint16 `json:"class"`
@@ -35,17 +27,23 @@ type tlvLogEntry struct {
 }
 
 const (
-	maxLoggedTLVs             = 16
-	maxLoggedOptionValueBytes = 16
-	redactedOptionValue       = "[REDACTED]"
+	maxLoggedTLVs              = 16
+	maxLoggedOptionValueBytes  = 16
+	redactedOptionValue        = "[REDACTED]"
+	defaultReceiverRetryDelay  = 100 * time.Millisecond
+	defaultSenderRecoveryTries = 3
+	defaultSenderRecoveryDelay = time.Second
 )
 
 var ErrDatapathRunning = errors.New("datapath is already running")
 
 var (
-	ErrReceiveLoopTerminated = errors.New("receive loop terminated unexpectedly")
-	ErrTunLoopTerminated     = errors.New("TUN loop terminated unexpectedly")
+	ErrReceiveLoopTerminated     = errors.New("receive loop terminated unexpectedly")
+	ErrReceiverPersistentFailure = errors.New("persistent receiver failure")
+	ErrSenderRecoveryFailed      = errors.New("packet sender recovery exhausted")
 )
+
+type packetSenderFactory func(int) (PacketSender, error)
 
 type Datapath struct {
 	cfg     *config.Config
@@ -53,14 +51,20 @@ type Datapath struct {
 	debug   bool
 	metrics *metrics.Metrics
 
-	receiver PacketReceiver
-	tun      TunDevice
+	receiver  PacketReceiver
+	senderMu  sync.Mutex
+	sender    PacketSender
+	newSender packetSenderFactory
 
 	udpPool *bufferpool.Pool
-	tunPool *bufferpool.Pool
 
 	once *logOnce
-	live *livenessTracker
+	live *readinessTracker
+
+	senderRecovery      chan struct{}
+	senderRecoveryDelay time.Duration
+	senderRecoveryTries int
+	receiverRetryWait   func(context.Context)
 
 	initialized atomic.Bool
 	closing     atomic.Bool
@@ -71,49 +75,61 @@ type Datapath struct {
 }
 
 func New(cfg *config.Config, log *zap.Logger, metricSet *metrics.Metrics) (*Datapath, error) {
+	return newWithPacketIOFactories(cfg, log, metricSet, newPacketReceiver, newPacketSender)
+}
+
+func newWithPacketIOFactories(
+	cfg *config.Config,
+	log *zap.Logger,
+	metricSet *metrics.Metrics,
+	openReceiver func(string) (PacketReceiver, error),
+	openSender packetSenderFactory,
+) (*Datapath, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate datapath configuration: %w", err)
 	}
-	receiver, err := newPacketReceiver(cfg.UDPBind)
+	receiver, err := openReceiver(cfg.UDPBind)
 	if err != nil {
 		return nil, err
 	}
-	tunDev, err := tun.Open(cfg.TunName, cfg.TunMTU)
+	sender, err := openSender(cfg.MaxOuterPacketSize())
 	if err != nil {
 		_ = receiver.Close()
 		return nil, err
 	}
-	return newDatapath(cfg, log, metricSet, receiver, tunDev), nil
+	return newDatapath(cfg, log, metricSet, receiver, sender, openSender), nil
 }
 
-func NewWithDevices(cfg *config.Config, log *zap.Logger, metricSet *metrics.Metrics, receiver PacketReceiver, tunDev TunDevice) *Datapath {
-	return newDatapath(cfg, log, metricSet, receiver, tunDev)
+func newWithPacketIO(cfg *config.Config, log *zap.Logger, metricSet *metrics.Metrics, receiver PacketReceiver, sender PacketSender) *Datapath {
+	return newDatapath(cfg, log, metricSet, receiver, sender, nil)
 }
 
-func newDatapath(cfg *config.Config, log *zap.Logger, metricSet *metrics.Metrics, receiver PacketReceiver, tunDev TunDevice) *Datapath {
+func newDatapath(cfg *config.Config, log *zap.Logger, metricSet *metrics.Metrics, receiver PacketReceiver, sender PacketSender, newSender packetSenderFactory) *Datapath {
 	if log == nil {
 		log = zap.NewNop()
 	}
 	dp := &Datapath{
-		cfg:      cfg,
-		log:      log,
-		debug:    log.Core().Enabled(zap.DebugLevel),
-		metrics:  metricSet,
-		receiver: receiver,
-		tun:      tunDev,
-		udpPool:  bufferpool.New(cfg.MaxUDPReceiveSize()),
-		tunPool:  bufferpool.New(cfg.TunMTU + 1),
-		once:     newLogOnce(),
-		live:     newLivenessTracker(cfg.PersistentErrorThreshold, metricSet),
+		cfg:                 cfg,
+		log:                 log,
+		debug:               log.Core().Enabled(zap.DebugLevel),
+		metrics:             metricSet,
+		receiver:            receiver,
+		sender:              sender,
+		newSender:           newSender,
+		udpPool:             bufferpool.New(cfg.MaxUDPReceiveSize()),
+		once:                newLogOnce(),
+		live:                newReadinessTracker(cfg.PersistentErrorThreshold, metricSet),
+		senderRecovery:      make(chan struct{}, 1),
+		senderRecoveryDelay: defaultSenderRecoveryDelay,
+		senderRecoveryTries: defaultSenderRecoveryTries,
 	}
-	dp.initialized.Store(true)
 	return dp
 }
 
 func (d *Datapath) Close() {
-	d.closing.Store(true)
-	d.initialized.Store(false)
 	d.runMu.Lock()
+	d.closing.Store(true)
+	d.clearReadinessLocked()
 	if d.runCancel != nil {
 		d.runCancel()
 	}
@@ -126,36 +142,30 @@ func (d *Datapath) closeDevices() {
 		if d.receiver != nil {
 			_ = d.receiver.Close()
 		}
-		if d.tun != nil {
-			_ = d.tun.Close()
+		d.senderMu.Lock()
+		sender := d.sender
+		d.sender = nil
+		d.senderMu.Unlock()
+		if sender != nil {
+			_ = sender.Close()
 		}
 	})
 }
 
 func (d *Datapath) Ready() bool {
-	return d.initialized.Load() && d.live != nil && d.live.Healthy()
+	return d.initialized.Load() && d.live != nil && d.live.Ready()
 }
 
 func (d *Datapath) HealthReason() string {
 	if !d.initialized.Load() || d.live == nil {
-		return "not_initialized"
+		return "target_not_initialized"
 	}
 	return d.live.Reason()
 }
 
-func (d *Datapath) HealthHandler(w http.ResponseWriter, _ *http.Request) {
-	if !d.Ready() {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = fmt.Fprintf(w, "not ready: %s", d.HealthReason())
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("ok"))
-}
-
 func (d *Datapath) Run(ctx context.Context) error {
 	d.runMu.Lock()
-	if !d.initialized.Load() {
+	if d.closing.Load() || ctx.Err() != nil {
 		d.runMu.Unlock()
 		return nil
 	}
@@ -166,15 +176,21 @@ func (d *Datapath) Run(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	d.runCancel = cancel
 	d.running = true
+	d.initialized.Store(true)
+	d.live.Initialize(metrics.ReadinessComponentReceiver)
+	d.live.Initialize(metrics.ReadinessComponentValidation)
+	d.live.Initialize(metrics.ReadinessComponentSender)
 	d.runMu.Unlock()
 
 	g, groupCtx := errgroup.WithContext(runCtx)
 	g.Go(func() error {
-		return d.runLoop(groupCtx, metrics.LivenessComponentReceive, ErrReceiveLoopTerminated, d.ingressLoop)
+		return d.runLoop(groupCtx, metrics.ReadinessComponentReceiver, ErrReceiveLoopTerminated, d.ingressLoop)
 	})
-	g.Go(func() error {
-		return d.runLoop(groupCtx, "", ErrTunLoopTerminated, d.egressLoop)
-	})
+	if d.newSender != nil {
+		g.Go(func() error {
+			return d.senderRecoveryLoop(groupCtx)
+		})
+	}
 	closed := make(chan struct{})
 	go func() {
 		<-groupCtx.Done()
@@ -185,10 +201,19 @@ func (d *Datapath) Run(ctx context.Context) error {
 	cancel()
 	<-closed
 	d.runMu.Lock()
+	d.closing.Store(true)
+	d.clearReadinessLocked()
 	d.runCancel = nil
 	d.running = false
 	d.runMu.Unlock()
 	return err
+}
+
+func (d *Datapath) clearReadinessLocked() {
+	d.initialized.Store(false)
+	if d.live != nil {
+		d.live.Shutdown()
+	}
 }
 
 func (d *Datapath) runLoop(ctx context.Context, component string, termination error, loop func(context.Context) error) error {
@@ -202,7 +227,7 @@ func (d *Datapath) runLoop(ctx context.Context, component string, termination er
 	if err == nil {
 		return termination
 	}
-	return fmt.Errorf("%w: %v", termination, err)
+	return fmt.Errorf("%w: %w", termination, err)
 }
 
 func (d *Datapath) ingressLoop(ctx context.Context) error {
@@ -212,11 +237,16 @@ func (d *Datapath) ingressLoop(ctx context.Context) error {
 				if ctx.Err() != nil || d.closing.Load() {
 					return nil
 				}
-				return fmt.Errorf("%w: %v", ErrReceiveLoopTerminated, err)
+				return err
 			}
-			d.live.Failure(metrics.LivenessComponentReceive)
 			if d.once.ShouldLog("receive_deadline") {
 				d.log.Warn("packet receive deadline failed", zap.Error(err))
+			}
+			if err := d.handleReceiverFailure(ctx, "set read deadline", err); err != nil {
+				return err
+			}
+			if ctx.Err() != nil {
+				return nil
 			}
 			continue
 		}
@@ -224,21 +254,22 @@ func (d *Datapath) ingressLoop(ctx context.Context) error {
 		n, metadata, err := d.receiver.ReadPacket(buf)
 		if err != nil {
 			d.udpPool.Put(buf)
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
 				if ctx.Err() != nil {
 					return nil
 				}
-				d.live.Success(metrics.LivenessComponentReceive)
+				d.live.Success(metrics.ReadinessComponentReceiver)
 				continue
 			}
 			if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
 				if ctx.Err() != nil || d.closing.Load() {
 					return nil
 				}
-				return fmt.Errorf("%w: %v", ErrReceiveLoopTerminated, err)
+				return err
 			}
 			if errors.Is(err, ErrPacketTruncated) {
-				d.live.Success(metrics.LivenessComponentReceive)
+				d.live.Success(metrics.ReadinessComponentReceiver)
 				d.recordReceiveDrop(metrics.ReceiveDropReasonDatagramTruncated)
 				continue
 			}
@@ -247,21 +278,41 @@ func (d *Datapath) ingressLoop(ctx context.Context) error {
 			} else if errors.Is(err, ErrPacketInfoMissing) {
 				d.recordReceiveDrop(metrics.ReceiveDropReasonPacketInfo)
 			}
-			d.live.Failure(metrics.LivenessComponentReceive)
 			if d.once.ShouldLog("receive") {
 				d.log.Warn("packet receive failed", zap.Error(err))
 			}
+			if err := d.handleReceiverFailure(ctx, "read packet", err); err != nil {
+				return err
+			}
+			if ctx.Err() != nil {
+				return nil
+			}
 			continue
 		}
-		d.live.Success(metrics.LivenessComponentReceive)
+		d.live.Success(metrics.ReadinessComponentReceiver)
 		d.processIngress(buf[:n], metadata)
 		d.udpPool.Put(buf)
 	}
 }
 
+func (d *Datapath) handleReceiverFailure(ctx context.Context, operation string, err error) error {
+	if d.live.Failure(metrics.ReadinessComponentReceiver) {
+		return fmt.Errorf("%w: %s failed %d consecutive times: %w", ErrReceiverPersistentFailure, operation, d.cfg.PersistentErrorThreshold, err)
+	}
+	if d.receiverRetryWait != nil {
+		d.receiverRetryWait(ctx)
+		return nil
+	}
+	timer := time.NewTimer(defaultReceiverRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+	return nil
+}
+
 func (d *Datapath) processIngress(packet []byte, metadata PacketMetadata) {
-	d.metrics.GeneveRxPackets.Inc()
-	d.metrics.GeneveRxBytes.Add(float64(len(packet)))
 	if !validPacketMetadata(metadata) {
 		d.rejectProfile(metrics.ProfileReasonOuterIPv4, ErrInvalidOuterPacket, "outer")
 		return
@@ -287,77 +338,135 @@ func (d *Datapath) processIngress(packet []byte, metadata PacketMetadata) {
 		d.rejectProfile(profileValidationReason(err), err, "profile")
 		return
 	}
-	if len(payload) > d.cfg.TunMTU {
+	if len(payload) > d.cfg.MaxInnerPacketSize {
 		d.metrics.Drops.Inc()
 		d.metrics.MTUDrops.WithLabelValues(mtuDropFamily(payload), metrics.MTUDropDirectionIngress).Inc()
 		if d.once.ShouldLog("mtu_ingress") {
-			d.log.Warn("ingress packet exceeds MTU", zap.Int("size", len(payload)), zap.Int("mtu", d.cfg.TunMTU))
+			d.log.Warn("inner packet exceeds configured maximum", zap.Int("size", len(payload)), zap.Int("maximum", d.cfg.MaxInnerPacketSize))
 		}
 		return
 	}
 	if err := validateInnerPacket(payload); err != nil {
-		d.rejectUnsupported(err, true)
+		d.rejectInner()
 		return
 	}
+	d.metrics.GeneveRxPackets.Inc()
+	d.metrics.GeneveRxBytes.Add(float64(len(packet)))
 	if d.cfg.GeneveTLVParse && d.cfg.HasTLVAllowlist() && len(header.Options) > 0 {
 		d.logAllowedTLVs(header.Options)
 	}
 
-	if err := writeTunPacket(d.tun, payload); err != nil {
-		d.live.Failure(metrics.LivenessComponentTunWrite)
-		d.metrics.DecapErrors.Inc()
+	out := d.udpPool.Get()
+	n, err := geneve.Encode(out, header, payload)
+	if err != nil {
+		d.metrics.GWLBReturnBuildFailures.Inc()
 		d.metrics.Drops.Inc()
-		if d.once.ShouldLog("tun_write") {
-			d.log.Warn("tun write failed", zap.Error(err))
-		}
+		d.udpPool.Put(out)
 		return
 	}
-	d.live.Success(metrics.LivenessComponentTunWrite)
-	d.metrics.TunTxPackets.Inc()
+	request := SendRequest{
+		Source:      netip.AddrPortFrom(metadata.Local.Addr().Unmap(), metadata.Peer.Port()),
+		Destination: netip.AddrPortFrom(metadata.Peer.Addr().Unmap(), awsGenevePort),
+		IfIndex:     metadata.IfIndex,
+		Payload:     out[:n],
+	}
+	if err := d.sendPacket(request); err != nil {
+		if d.live.Failure(metrics.ReadinessComponentSender) {
+			d.requestSenderRecovery()
+		}
+		d.metrics.GWLBSendFailures.Inc()
+		d.metrics.Drops.Inc()
+		if d.once.ShouldLog("packet_send") {
+			d.log.Warn("AWS-compliant packet send failed", zap.Error(err))
+		}
+		d.udpPool.Put(out)
+		return
+	}
+	d.live.Success(metrics.ReadinessComponentSender)
+	d.metrics.GeneveTxPackets.Inc()
+	d.metrics.GeneveTxBytes.Add(float64(n))
 	if d.debug {
 		fields := []zap.Field{
-			zap.String("direction", "gwlb_to_tun"),
-			zap.String("peer", metadata.Peer.String()),
-			zap.String("local", metadata.Local.String()),
-			zap.Int("ifindex", metadata.IfIndex),
-			zap.Int("geneve_size", len(packet)),
+			zap.String("direction", "gwlb_return"),
+			zap.String("source", request.Source.String()),
+			zap.String("destination", request.Destination.String()),
+			zap.Int("ifindex", request.IfIndex),
 			zap.Int("inner_size", len(payload)),
+			zap.Int("geneve_size", n),
 			zap.Int("options_len", len(header.Options)),
 		}
-		d.log.Debug("packet in", fields...)
+		d.log.Debug("packet returned", fields...)
+	}
+	d.udpPool.Put(out)
+}
+
+func (d *Datapath) sendPacket(request SendRequest) error {
+	d.senderMu.Lock()
+	defer d.senderMu.Unlock()
+	if d.sender == nil {
+		return net.ErrClosed
+	}
+	return d.sender.SendPacket(request)
+}
+
+func (d *Datapath) requestSenderRecovery() {
+	if d.newSender == nil {
+		return
+	}
+	select {
+	case d.senderRecovery <- struct{}{}:
+	default:
 	}
 }
 
-func (d *Datapath) egressLoop(ctx context.Context) error {
+func (d *Datapath) senderRecoveryLoop(ctx context.Context) error {
 	for {
-		if ctx.Err() != nil {
+		select {
+		case <-ctx.Done():
 			return nil
+		case <-d.senderRecovery:
 		}
-		buf, n, err := readTunPacket(d.tun, d.tunPool)
-		if err != nil {
-			if errors.Is(err, os.ErrClosed) || errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
-				if ctx.Err() != nil || d.closing.Load() {
-					return nil
-				}
-				return fmt.Errorf("%w: %v", ErrTunLoopTerminated, err)
-			}
-			if d.once.ShouldLog("tun_read") {
-				d.log.Warn("tun read failed", zap.Error(err))
-			}
-			continue
-		}
-		d.processEgress(buf[:n])
-		d.tunPool.Put(buf)
-	}
-}
 
-func (d *Datapath) processEgress(payload []byte) {
-	d.metrics.TunRxPackets.Inc()
-	d.metrics.SymmetricUnexpectedEgress.Inc()
-	if d.once.ShouldLog("unexpected_tun_egress") {
-		d.log.Warn("unexpected TUN egress dropped", zap.Int("inner_size", len(payload)))
+		var lastErr error
+		for attempt := 1; attempt <= d.senderRecoveryTries; attempt++ {
+			if attempt > 1 {
+				timer := time.NewTimer(d.senderRecoveryDelay)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return nil
+				case <-timer.C:
+				}
+			}
+
+			replacement, err := d.newSender(d.cfg.MaxOuterPacketSize())
+			if err != nil {
+				lastErr = err
+				d.metrics.SenderReinitializations.WithLabelValues(metrics.SenderReinitializationFailed).Inc()
+				continue
+			}
+			d.senderMu.Lock()
+			if d.closing.Load() || ctx.Err() != nil {
+				d.senderMu.Unlock()
+				_ = replacement.Close()
+				return nil
+			}
+			previous := d.sender
+			d.sender = replacement
+			d.senderMu.Unlock()
+			if previous != nil {
+				_ = previous.Close()
+			}
+			d.metrics.SenderReinitializations.WithLabelValues(metrics.SenderReinitializationOK).Inc()
+			d.live.Success(metrics.ReadinessComponentSender)
+			d.log.Info("raw packet sender reinitialized", zap.Int("attempt", attempt))
+			lastErr = nil
+			break
+		}
+		if lastErr != nil {
+			return fmt.Errorf("%w after %d attempts: %v", ErrSenderRecoveryFailed, d.senderRecoveryTries, lastErr)
+		}
 	}
-	d.metrics.Drops.Inc()
 }
 
 func mtuDropFamily(packet []byte) string {
@@ -381,7 +490,6 @@ func validPacketMetadata(metadata PacketMetadata) bool {
 }
 
 func (d *Datapath) rejectProfile(reason string, err error, logKey string) {
-	d.metrics.DecapErrors.Inc()
 	d.metrics.Drops.Inc()
 	d.metrics.GWLBProfileRejections.WithLabelValues(reason).Inc()
 	if d.once.ShouldLog("profile_" + logKey + "_" + reason) {
@@ -389,17 +497,12 @@ func (d *Datapath) rejectProfile(reason string, err error, logKey string) {
 	}
 }
 
-func (d *Datapath) rejectUnsupported(err error, ingress bool) {
-	reason := unsupportedReason(err)
-	d.metrics.GWLBUnsupportedInner.WithLabelValues(reason).Inc()
+func (d *Datapath) rejectInner() {
+	d.metrics.GWLBInnerValidationFailures.WithLabelValues(metrics.InnerValidationReasonMalformed).Inc()
 	d.metrics.Drops.Inc()
-	if ingress {
-		d.metrics.DecapErrors.Inc()
-	}
 }
 
 func (d *Datapath) recordReceiveDrop(reason string) {
-	d.metrics.DecapErrors.Inc()
 	d.metrics.Drops.Inc()
 	d.metrics.GWLBReceiveDrops.WithLabelValues(reason).Inc()
 }
@@ -469,6 +572,8 @@ func optionValidationReason(err error) string {
 		return metrics.OptionValidationReasonAWSLength
 	case errors.Is(err, geneve.ErrAWSOptionCardinality):
 		return metrics.OptionValidationReasonAWSCardinality
+	case errors.Is(err, geneve.ErrAWSOptionReserved):
+		return metrics.OptionValidationReasonAWSReserved
 	default:
 		return metrics.OptionValidationReasonStructural
 	}
@@ -486,20 +591,5 @@ func profileValidationReason(err error) string {
 		return metrics.ProfileReasonOptionReserved
 	default:
 		return metrics.ProfileReasonOptions
-	}
-}
-
-func unsupportedReason(err error) string {
-	switch {
-	case errors.Is(err, ErrIPv4Fragment):
-		return metrics.UnsupportedReasonIPv4Fragment
-	case errors.Is(err, ErrIPv6Fragment):
-		return metrics.UnsupportedReasonIPv6Fragment
-	case errors.Is(err, ErrIPv6Extension):
-		return metrics.UnsupportedReasonIPv6Extension
-	case errors.Is(err, ErrTransportTruncated):
-		return metrics.UnsupportedReasonTransportTruncated
-	default:
-		return metrics.UnsupportedReasonMalformed
 	}
 }

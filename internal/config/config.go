@@ -7,65 +7,46 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/alecthomas/kong"
 	"github.com/jaxxstorm/envelope/internal/geneve"
 )
 
-type RoutingMode string
-
 const (
-	RoutingModeOff        RoutingMode = "off"
-	RoutingModeManage     RoutingMode = "manage"
-	RoutingModeVerify     RoutingMode = "verify"
-	TailscaleRouteTableID             = 52
-	maxIPv4UDPPayloadSize             = 65507
-	configVersion                     = 2
+	packetReturnMode      = "packet-return"
+	maxIPv4UDPPayloadSize = 65507
+	configVersion         = 2
+	geneveTLVHeaderLen    = 4
+	// The mandatory AWS flow cookie is one four-byte TLV header plus four data bytes.
+	minAWSGeneveOptionsMaxSize = geneveTLVHeaderLen + geneve.AWSFlowCookieLength
 )
 
 type Config struct {
-	ConfigVersion            int                        `name:"config-version" help:"Symmetric target configuration version" default:"2" env:"ENVELOPE_CONFIG_VERSION"`
-	UDPBind                  string                     `help:"UDP bind address for GENEVE" default:":6081" env:"ENVELOPE_UDP_BIND"`
-	VNI                      *uint32                    `help:"GENEVE VNI; the AWS GWLB profile requires 0" env:"ENVELOPE_VNI"`
-	TunName                  string                     `help:"TUN device name" default:"envelope0" env:"ENVELOPE_TUN_NAME"`
-	TunMTU                   int                        `help:"TUN MTU for inner L3 packets" default:"1280" env:"ENVELOPE_TUN_MTU"`
-	TailscaleIface           string                     `help:"Tailscale interface name used for host routing checks" default:"tailscale0" env:"ENVELOPE_TAILSCALE_IFACE"`
-	UnderlayIface            string                     `name:"underlay-interface" help:"Appliance underlay interface used for host routing checks" env:"ENVELOPE_UNDERLAY_INTERFACE"`
-	RoutingMode              RoutingMode                `help:"Routing integration mode" default:"off" enum:"off,manage,verify" env:"ENVELOPE_ROUTING_MODE"`
-	LocalSiteCIDRs           []string                   `name:"local-site-cidrs" help:"Local site CIDRs delivered through the post-inspection VPC path" sep:"," env:"ENVELOPE_LOCAL_SITE_CIDRS"`
-	RemoteSiteCIDRs          []string                   `name:"remote-site-cidrs" help:"Remote site CIDRs forwarded through Tailscale" sep:"," env:"ENVELOPE_REMOTE_SITE_CIDRS"`
-	RoutingTableID           int                        `help:"Linux routing table ID used for policy routes" default:"100" env:"ENVELOPE_ROUTING_TABLE_ID"`
-	RoutingRulePriority      int                        `help:"Linux rule priority used for policy routes" default:"100" env:"ENVELOPE_ROUTING_RULE_PRIORITY"`
-	MetricsAddr              string                     `help:"Metrics/health bind address" default:":9090" env:"ENVELOPE_METRICS_ADDR"`
-	LogLevel                 string                     `help:"Log level" default:"info" enum:"debug,info,warn,error" env:"ENVELOPE_LOG_LEVEL"`
-	GWLBReturnCIDRs          []string                   `kong:"-"`
-	LocalDeliveryCIDRs       []string                   `kong:"-"`
-	RemoteTailnetCIDRs       []string                   `kong:"-"`
-	FlowCapacity             int                        `kong:"-"`
-	TCPFlowTimeout           time.Duration              `kong:"-"`
-	UDPFlowTimeout           time.Duration              `kong:"-"`
-	OtherFlowTimeout         time.Duration              `kong:"-"`
-	PersistentErrorThreshold int                        `help:"Consecutive component errors before readiness fails" default:"3" env:"ENVELOPE_PERSISTENT_ERROR_THRESHOLD"`
-	GeneveOptionsMaxBytes    int                        `help:"Max total GENEVE options size in bytes" default:"252" env:"ENVELOPE_GENEVE_OPTIONS_MAX_BYTES"`
-	GeneveTLVParse           bool                       `help:"Enable allowlisted GENEVE TLV value logging" default:"false" env:"ENVELOPE_GENEVE_TLV_PARSE"`
-	GeneveTLVAllowlist       []string                   `help:"GENEVE TLV value-log allowlist as class:seven-bit-type (hex or decimal), comma-separated" sep:"," env:"ENVELOPE_GENEVE_TLV_ALLOWLIST"`
-	localSiteCIDRs           []string                   `kong:"-"`
-	remoteSiteCIDRs          []string                   `kong:"-"`
-	tlvAllowlist             map[geneve.TLVKey]struct{} `kong:"-"`
+	ConfigVersion            int      `name:"config-version" help:"GWLB packet-return target configuration version" default:"2" env:"ENVELOPE_CONFIG_VERSION"`
+	Mode                     string   `help:"Target runtime mode" default:"packet-return" enum:"packet-return" env:"ENVELOPE_MODE"`
+	UDPBind                  string   `help:"UDP bind address for GENEVE" default:":6081" env:"ENVELOPE_UDP_BIND"`
+	VNI                      *uint32  `help:"GENEVE VNI; the AWS GWLB profile requires 0" env:"ENVELOPE_VNI"`
+	MaxInnerPacketSize       int      `help:"Maximum accepted inner IP packet size in bytes" default:"1280" env:"ENVELOPE_MAX_INNER_PACKET_SIZE"`
+	MetricsAddr              string   `help:"Metrics/health bind address" default:":9090" env:"ENVELOPE_METRICS_ADDR"`
+	LogLevel                 string   `help:"Log level" default:"info" enum:"debug,info,warn,error" env:"ENVELOPE_LOG_LEVEL"`
+	PersistentErrorThreshold int      `help:"Consecutive receiver or sender errors before persistent-failure handling" default:"3" env:"ENVELOPE_PERSISTENT_ERROR_THRESHOLD"`
+	GeneveOptionsMaxBytes    int      `help:"Max total GENEVE options size in bytes" default:"252" env:"ENVELOPE_GENEVE_OPTIONS_MAX_BYTES"`
+	GeneveTLVParse           bool     `help:"Enable allowlisted GENEVE TLV value logging" default:"false" env:"ENVELOPE_GENEVE_TLV_PARSE"`
+	GeneveTLVAllowlist       []string `help:"GENEVE TLV value-log allowlist as class:seven-bit-type (hex or decimal), comma-separated" sep:"," env:"ENVELOPE_GENEVE_TLV_ALLOWLIST"`
+
+	tlvAllowlist map[geneve.TLVKey]struct{} `kong:"-"`
 }
 
-func Parse(args []string) (*Config, error) {
-	if err := rejectLegacyEnvironmentVariables(); err != nil {
+// ParseTarget parses the production version 2 packet-return configuration.
+func ParseTarget(args []string) (*Config, error) {
+	if err := rejectObsoleteTargetArguments(args); err != nil {
 		return nil, err
 	}
-	cfg := &Config{
-		FlowCapacity:     65536,
-		TCPFlowTimeout:   350 * time.Second,
-		UDPFlowTimeout:   120 * time.Second,
-		OtherFlowTimeout: 120 * time.Second,
+	if err := rejectObsoleteTargetEnvironmentVariables(); err != nil {
+		return nil, err
 	}
-	parser, err := kong.New(cfg, kong.Name("envelope"), kong.Description("Envelope GENEVE <-> TUN datapath"))
+	cfg := &Config{}
+	parser, err := kong.New(cfg, kong.Name("envelope"), kong.Description("Envelope AWS GWLB packet-return target"))
 	if err != nil {
 		return nil, err
 	}
@@ -83,53 +64,25 @@ func (c *Config) Validate() error {
 	if c.ConfigVersion != configVersion {
 		errs = append(errs, fmt.Errorf("unsupported config version %d; expected %d", c.ConfigVersion, configVersion))
 	}
-	if c.RoutingMode == "" {
-		c.RoutingMode = RoutingModeOff
+	if c.Mode != packetReturnMode {
+		errs = append(errs, fmt.Errorf("unsupported target mode %q; expected %q", c.Mode, packetReturnMode))
 	}
-	if c.RoutingMode != RoutingModeOff && c.RoutingMode != RoutingModeManage && c.RoutingMode != RoutingModeVerify {
-		errs = append(errs, fmt.Errorf("unsupported routing mode %q", c.RoutingMode))
-	}
-	c.localSiteCIDRs = nil
-	c.remoteSiteCIDRs = nil
 	if c.UDPBind == "" {
 		errs = append(errs, errors.New("udp bind address is required"))
 	} else if err := validateAWSUDPBind(c.UDPBind); err != nil {
 		errs = append(errs, err)
 	}
-	if c.TunName == "" {
-		errs = append(errs, errors.New("tun name is required"))
-	} else if err := validateInterfaceName("tun name", c.TunName); err != nil {
-		errs = append(errs, err)
-	}
-	if c.TunMTU <= 0 {
-		errs = append(errs, fmt.Errorf("tun MTU must be positive (got %d)", c.TunMTU))
-	}
-	if err := validateRoutingTableID(c.RoutingTableID); err != nil {
-		errs = append(errs, err)
-	}
-	if c.RoutingRulePriority <= 0 {
-		errs = append(errs, fmt.Errorf("routing rule priority must be positive (got %d)", c.RoutingRulePriority))
+	if c.MaxInnerPacketSize <= 0 {
+		errs = append(errs, fmt.Errorf("max inner packet size must be positive (got %d)", c.MaxInnerPacketSize))
 	}
 	if c.MetricsAddr == "" {
 		errs = append(errs, errors.New("metrics address is required"))
 	}
-	if c.FlowCapacity <= 0 {
-		errs = append(errs, errors.New("flow capacity must be positive"))
-	}
-	if c.TCPFlowTimeout <= 0 {
-		errs = append(errs, errors.New("tcp flow timeout must be positive"))
-	}
-	if c.UDPFlowTimeout <= 0 {
-		errs = append(errs, errors.New("udp flow timeout must be positive"))
-	}
-	if c.OtherFlowTimeout <= 0 {
-		errs = append(errs, errors.New("other flow timeout must be positive"))
-	}
 	if c.PersistentErrorThreshold <= 0 {
 		errs = append(errs, errors.New("persistent error threshold must be positive"))
 	}
-	if c.GeneveOptionsMaxBytes <= 0 {
-		errs = append(errs, fmt.Errorf("geneve options max bytes must be positive (got %d)", c.GeneveOptionsMaxBytes))
+	if c.GeneveOptionsMaxBytes < minAWSGeneveOptionsMaxSize {
+		errs = append(errs, fmt.Errorf("geneve options max bytes must be >= %d to hold the mandatory AWS flow-cookie TLV (got %d)", minAWSGeneveOptionsMaxSize, c.GeneveOptionsMaxBytes))
 	}
 	if c.GeneveOptionsMaxBytes > geneve.MaxOptionsLen {
 		errs = append(errs, fmt.Errorf("geneve options max bytes must be <= %d", geneve.MaxOptionsLen))
@@ -137,58 +90,12 @@ func (c *Config) Validate() error {
 	if c.GeneveOptionsMaxBytes%4 != 0 {
 		errs = append(errs, fmt.Errorf("geneve options max bytes must be a multiple of 4 (got %d)", c.GeneveOptionsMaxBytes))
 	}
+	maxInnerPacketSize := maxIPv4UDPPayloadSize - geneve.BaseHeaderLen - c.EffectiveGeneveOptionsMax()
+	if c.MaxInnerPacketSize > maxInnerPacketSize {
+		errs = append(errs, fmt.Errorf("max inner packet size %d exceeds the IPv4 UDP packet limit", c.MaxInnerPacketSize))
+	}
 	if c.VNI != nil && *c.VNI != 0 {
 		errs = append(errs, errors.New("vni must be 0 for the AWS GWLB profile"))
-	}
-	roles := []struct {
-		name       string
-		configured []string
-		effective  *[]string
-	}{
-		{name: "local-site-cidrs", configured: c.LocalSiteCIDRs, effective: &c.localSiteCIDRs},
-		{name: "remote-site-cidrs", configured: c.RemoteSiteCIDRs, effective: &c.remoteSiteCIDRs},
-	}
-	rolesValid := true
-	for _, role := range roles {
-		cidrs, err := normalizeCIDRs(role.name, role.configured)
-		if err != nil {
-			errs = append(errs, err)
-			rolesValid = false
-			continue
-		}
-		*role.effective = cidrs
-	}
-	if rolesValid {
-		if err := validateDisjointCIDRRoles(roles); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if c.TailscaleIface != "" {
-		if err := validateInterfaceName("tailscale interface name", c.TailscaleIface); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if c.TunName != "" && c.TailscaleIface != "" && c.TunName == c.TailscaleIface {
-		errs = append(errs, fmt.Errorf("envelope and tailscale interface names must be distinct (both are %q)", c.TunName))
-	}
-	if c.UnderlayIface != "" {
-		if err := validateInterfaceName("underlay interface name", c.UnderlayIface); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if c.RoutingMode != RoutingModeOff {
-		if c.TailscaleIface == "" {
-			errs = append(errs, errors.New("tailscale interface name is required when routing mode is enabled"))
-		}
-		if c.UnderlayIface == "" {
-			errs = append(errs, errors.New("underlay interface is required when routing mode is enabled"))
-		}
-	}
-	if c.RoutingMode != RoutingModeOff && len(c.localSiteCIDRs) == 0 {
-		errs = append(errs, errors.New("local site cidrs are required when routing mode is enabled"))
-	}
-	if c.RoutingMode != RoutingModeOff && len(c.remoteSiteCIDRs) == 0 {
-		errs = append(errs, errors.New("remote site cidrs are required when routing mode is enabled"))
 	}
 	if len(c.GeneveTLVAllowlist) > 0 {
 		allow, err := parseTLVAllowlist(c.GeneveTLVAllowlist)
@@ -202,7 +109,7 @@ func (c *Config) Validate() error {
 }
 
 func (c *Config) EffectiveGeneveOptionsMax() int {
-	if c.GeneveOptionsMaxBytes <= 0 || c.GeneveOptionsMaxBytes > geneve.MaxOptionsLen {
+	if c.GeneveOptionsMaxBytes < minAWSGeneveOptionsMaxSize || c.GeneveOptionsMaxBytes > geneve.MaxOptionsLen {
 		return geneve.MaxOptionsLen
 	}
 	return c.GeneveOptionsMaxBytes
@@ -220,28 +127,8 @@ func (c *Config) HasTLVAllowlist() bool {
 	return len(c.tlvAllowlist) > 0
 }
 
-func (c *Config) EffectiveLocalSiteCIDRs() []string {
-	return cloneStrings(c.localSiteCIDRs)
-}
-
-func (c *Config) EffectiveRemoteSiteCIDRs() []string {
-	return cloneStrings(c.remoteSiteCIDRs)
-}
-
-func (c *Config) EffectiveGWLBReturnCIDRs() []string {
-	return cloneStrings(c.GWLBReturnCIDRs)
-}
-
-func (c *Config) EffectiveLocalDeliveryCIDRs() []string {
-	return cloneStrings(c.LocalDeliveryCIDRs)
-}
-
-func (c *Config) EffectiveRemoteTailnetCIDRs() []string {
-	return cloneStrings(c.RemoteTailnetCIDRs)
-}
-
 func (c *Config) MaxUDPPacketSize() int {
-	return c.TunMTU + geneve.BaseHeaderLen + c.EffectiveGeneveOptionsMax()
+	return c.MaxInnerPacketSize + geneve.BaseHeaderLen + c.EffectiveGeneveOptionsMax()
 }
 
 func (c *Config) MaxUDPReceiveSize() int {
@@ -266,88 +153,38 @@ func validateAWSUDPBind(bind string) error {
 	return nil
 }
 
-func normalizeCIDRs(role string, entries []string) ([]string, error) {
-	out := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		cidr := strings.TrimSpace(entry)
-		if cidr == "" {
-			continue
-		}
-		_, ipNet, err := net.ParseCIDR(cidr)
-		if err != nil {
-			return nil, fmt.Errorf("invalid %s entry %q", role, cidr)
-		}
-		out = append(out, ipNet.String())
+func rejectObsoleteTargetArguments(args []string) error {
+	obsolete := map[string]struct{}{
+		"--tun-name": {}, "--tun-mtu": {}, "--tailscale-iface": {}, "--underlay-interface": {},
+		"--routing-mode": {}, "--routing-table-id": {}, "--routing-rule-priority": {},
+		"--local-site-cidrs": {}, "--remote-site-cidrs": {},
+		"--gwlb-return-cidrs": {}, "--local-delivery-cidrs": {}, "--remote-tailnet-cidrs": {},
+		"--flow-capacity": {}, "--tcp-flow-timeout": {}, "--udp-flow-timeout": {}, "--other-flow-timeout": {},
+		"--protected-cidrs": {}, "--flow-timeout": {},
 	}
-	return out, nil
-}
-
-func validateDisjointCIDRRoles(roles []struct {
-	name       string
-	configured []string
-	effective  *[]string
-}) error {
-	type roleCIDR struct {
-		role  string
-		value string
-		net   *net.IPNet
-	}
-	var entries []roleCIDR
-	for _, role := range roles {
-		for _, value := range *role.effective {
-			_, network, _ := net.ParseCIDR(value)
-			entries = append(entries, roleCIDR{role: role.name, value: value, net: network})
+	for _, arg := range args {
+		name := arg
+		if index := strings.IndexByte(name, '='); index >= 0 {
+			name = name[:index]
 		}
-	}
-	var errs []error
-	for i := range entries {
-		for j := i + 1; j < len(entries); j++ {
-			left, right := entries[i], entries[j]
-			if (left.net.IP.To4() == nil) != (right.net.IP.To4() == nil) {
-				continue
-			}
-			if left.net.Contains(right.net.IP) || right.net.Contains(left.net.IP) {
-				errs = append(errs, fmt.Errorf("CIDR overlap: %s %q conflicts with %s %q", left.role, left.value, right.role, right.value))
-			}
+		if _, found := obsolete[name]; found {
+			return fmt.Errorf("obsolete packet-return target flag %s is not supported by config version 2", name)
 		}
-	}
-	return errors.Join(errs...)
-}
-
-func validateInterfaceName(field, name string) error {
-	if len(name) > 15 || strings.ContainsAny(name, "/ \t\r\n") || name == "." || name == ".." {
-		return fmt.Errorf("%s %q is not a valid Linux interface name", field, name)
 	}
 	return nil
 }
 
-func validateRoutingTableID(table int) error {
-	switch table {
-	case 0:
-		return errors.New("routing table id 0 is reserved for unspec")
-	case TailscaleRouteTableID:
-		return fmt.Errorf("routing table id %d is owned by Tailscale", table)
-	case 253:
-		return errors.New("routing table id 253 is reserved for default")
-	case 254:
-		return errors.New("routing table id 254 is reserved for main")
-	case 255:
-		return errors.New("routing table id 255 is reserved for local")
-	}
-	if table < 0 || table > 252 {
-		return fmt.Errorf("routing table id must be between 1 and 252 excluding %d (got %d)", TailscaleRouteTableID, table)
-	}
-	return nil
-}
-
-func cloneStrings(values []string) []string {
-	out := make([]string, len(values))
-	copy(out, values)
-	return out
-}
-
-func rejectLegacyEnvironmentVariables() error {
+func rejectObsoleteTargetEnvironmentVariables() error {
 	for _, name := range []string{
+		"ENVELOPE_TUN_NAME",
+		"ENVELOPE_TUN_MTU",
+		"ENVELOPE_TAILSCALE_IFACE",
+		"ENVELOPE_UNDERLAY_INTERFACE",
+		"ENVELOPE_ROUTING_MODE",
+		"ENVELOPE_ROUTING_TABLE_ID",
+		"ENVELOPE_ROUTING_RULE_PRIORITY",
+		"ENVELOPE_LOCAL_SITE_CIDRS",
+		"ENVELOPE_REMOTE_SITE_CIDRS",
 		"ENVELOPE_GWLB_RETURN_CIDRS",
 		"ENVELOPE_LOCAL_DELIVERY_CIDRS",
 		"ENVELOPE_REMOTE_TAILNET_CIDRS",
@@ -355,9 +192,11 @@ func rejectLegacyEnvironmentVariables() error {
 		"ENVELOPE_TCP_FLOW_TIMEOUT",
 		"ENVELOPE_UDP_FLOW_TIMEOUT",
 		"ENVELOPE_OTHER_FLOW_TIMEOUT",
+		"ENVELOPE_PROTECTED_CIDRS",
+		"ENVELOPE_FLOW_TIMEOUT",
 	} {
 		if _, set := os.LookupEnv(name); set {
-			return fmt.Errorf("legacy environment variable %s is not supported", name)
+			return fmt.Errorf("obsolete packet-return target environment variable %s is not supported by config version 2", name)
 		}
 	}
 	return nil

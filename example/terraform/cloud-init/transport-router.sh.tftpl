@@ -1,0 +1,837 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2016 # Terraform replaces these single-quoted template expressions.
+set -euo pipefail
+umask 077
+
+dnf install -y iproute iptables-legacy jq nftables
+
+for service in firewalld.service nftables.service iptables.service ip6tables.service; do
+  if systemctl is-active --quiet "$service"; then
+    printf 'conflicting host firewall service is active: %s\n' "$service" >&2
+    exit 1
+  fi
+done
+
+if command -v alternatives >/dev/null 2>&1; then
+  alternatives --set iptables /usr/sbin/iptables-legacy >/dev/null 2>&1 || true
+  alternatives --set ip6tables /usr/sbin/ip6tables-legacy >/dev/null 2>&1 || true
+fi
+
+if ! /usr/sbin/iptables --version | grep -Fq '(legacy)' || ! /usr/sbin/ip6tables --version | grep -Fq '(legacy)'; then
+  printf '%s\n' 'legacy iptables and ip6tables are required' >&2
+  exit 1
+fi
+for binary in /usr/bin/flock /usr/bin/jq /usr/bin/mktemp /usr/bin/mv /usr/bin/rm /usr/bin/sleep /usr/sbin/ip \
+  /usr/sbin/iptables /usr/sbin/ip6tables /usr/sbin/iptables-save \
+  /usr/sbin/ip6tables-save /usr/sbin/nft /usr/sbin/sysctl; do
+  test -x "$binary"
+done
+
+install -d -m 0755 /etc/envelope /usr/local/sbin /var/lib/envelope
+cat >/etc/envelope/transport-router-readiness-expectations.json <<'READINESS_EXPECTATIONS'
+${readiness_expectations_json}
+READINESS_EXPECTATIONS
+chmod 0644 /etc/envelope/transport-router-readiness-expectations.json
+
+cat >/usr/local/sbin/envelope-transport-router-network <<'HOST_NETWORK'
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+readonly mode="$${1:-activate}"
+readonly underlay='${underlay_interface}'
+readonly tailscale='${tailscale_interface}'
+readonly local_site_cidrs_json='${local_site_cidrs_json}'
+readonly remote_site_cidrs_json='${remote_site_cidrs_json}'
+readonly approved_maximum_tcp_mss='${approved_maximum_tcp_mss}'
+readonly policy_rule_priority_base='${policy_rule_priority_base}'
+readonly readiness_expectations_json='${readiness_expectations_json}'
+readonly contract_sha256='${contract_sha256}'
+readonly forward_chain='ENVELOPE-TRANSPORT-FORWARD'
+readonly mss_chain='ENVELOPE-TRANSPORT-MSS'
+readonly local_route_table=main
+readonly remote_route_table=52
+readonly firewall_state=/var/lib/envelope/transport-router-firewall.owner
+readonly policy_state=/var/lib/envelope/transport-router-policy-rules.owner
+readonly readiness_marker=/var/lib/envelope/transport-router-network.ready
+readonly runtime_state=/var/lib/envelope/transport-router-network.state.json
+readonly recovery_marker=/var/lib/envelope/transport-router-network.configured
+firewall_was_owned=false
+
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+fail_closed_on_error() {
+  local status=$?
+  if (( status != 0 )); then
+    /usr/sbin/sysctl -q -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
+    /usr/sbin/sysctl -q -w net.ipv6.conf.all.forwarding=0 >/dev/null 2>&1 || true
+    /usr/sbin/sysctl -q -w net.ipv6.conf.default.forwarding=0 >/dev/null 2>&1 || true
+    /usr/bin/rm -f "$readiness_marker" "$runtime_state"
+  fi
+}
+trap fail_closed_on_error EXIT
+/usr/bin/rm -f "$readiness_marker" "$runtime_state"
+
+/usr/bin/jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' \
+  <<<"$local_site_cidrs_json" >/dev/null || fail 'local-site CIDR contract is invalid'
+/usr/bin/jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' \
+  <<<"$remote_site_cidrs_json" >/dev/null || fail 'remote-site CIDR contract is invalid'
+expected_owned_policy_rules=$(/usr/bin/jq -cn \
+  --argjson cidrs "$local_site_cidrs_json" \
+  --arg interface "$tailscale" \
+  --argjson base "$policy_rule_priority_base" \
+  '$cidrs | to_entries | map({priority: ($base + .key), input: $interface, source: "all", destination: .value, fwmark: 0, table: "main", action: "lookup"})')
+expected_ipv4_policy_rules=$(/usr/bin/jq -cn \
+  --argjson owned "$expected_owned_policy_rules" '
+    [{priority: 0, input: "all", source: "all", destination: "all", fwmark: 0, fwmask: 0, table: "local", action: "lookup"}] +
+    ($owned | map(. + {fwmask: 0})) +
+    [
+      {priority: 5210, input: "all", source: "all", destination: "all", fwmark: 524288, fwmask: 16711680, table: "main", action: "lookup"},
+      {priority: 5230, input: "all", source: "all", destination: "all", fwmark: 524288, fwmask: 16711680, table: "default", action: "lookup"},
+      {priority: 5250, input: "all", source: "all", destination: "all", fwmark: 524288, fwmask: 16711680, table: "none", action: "unreachable"},
+      {priority: 5270, input: "all", source: "all", destination: "all", fwmark: 0, fwmask: 0, table: "52", action: "lookup"},
+      {priority: 32766, input: "all", source: "all", destination: "all", fwmark: 0, fwmask: 0, table: "main", action: "lookup"},
+      {priority: 32767, input: "all", source: "all", destination: "all", fwmark: 0, fwmask: 0, table: "default", action: "lookup"}
+    ]')
+
+/usr/bin/jq -e \
+  --argjson local "$local_site_cidrs_json" \
+  --argjson remote "$remote_site_cidrs_json" \
+  --argjson maximum "$approved_maximum_tcp_mss" \
+  --argjson priority_base "$policy_rule_priority_base" \
+  --argjson policy_rules "$expected_ipv4_policy_rules" \
+  '.local_site_cidrs == $local and
+   .remote_site_cidrs == $remote and
+   .approved_maximum_tcp_mss == $maximum and
+   .ipv4_forwarding == true and
+   .ipv6_forwarding == false and
+   .filter_forward_policy == "DROP" and
+   .mangle_forward_policy == "ACCEPT" and
+   .ipv6_filter_forward_policy == "DROP" and
+   .ipv6_mangle_forward_policy == "ACCEPT" and
+   .policy_rule_priority_base == $priority_base and
+   .ipv4_policy_rules == $policy_rules and
+   .local_route_table == "main" and
+   .remote_route_table == 52 and
+   .readiness_marker == "/var/lib/envelope/transport-router-network.ready" and
+   .runtime_state == "/var/lib/envelope/transport-router-network.state.json" and
+   .recovery_marker == "/var/lib/envelope/transport-router-network.configured" and
+   .nat_rules == []' \
+  <<<"$readiness_expectations_json" >/dev/null || fail 'rendered readiness expectations contradict the transport contract'
+
+mapfile -t local_site_cidrs < <(/usr/bin/jq -r '.[]' <<<"$local_site_cidrs_json")
+mapfile -t remote_site_cidrs < <(/usr/bin/jq -r '.[]' <<<"$remote_site_cidrs_json")
+
+interface_mtu() {
+  local iface=$1 mtu
+  [[ -r "/sys/class/net/$iface/mtu" ]] || fail "required interface is not ready: $iface"
+  read -r mtu <"/sys/class/net/$iface/mtu"
+  [[ "$mtu" =~ ^[0-9]+$ ]] || fail "interface MTU is not numeric: $iface"
+  (( mtu >= 576 && mtu <= 65535 )) || fail "interface MTU is outside the reviewed range: $iface"
+  printf '%s\n' "$mtu"
+}
+
+assert_empty_nft_ruleset() {
+  /usr/sbin/nft -j list ruleset |
+    /usr/bin/jq -e '.nftables | length == 1 and .[0].metainfo != null' >/dev/null ||
+    fail 'unrelated nftables state exists; refusing to replace it'
+}
+
+assert_no_nat() {
+  local binary=$1 rules
+  rules=$("$binary" --wait 10 -t nat -S 2>/dev/null) ||
+    fail "cannot inspect $binary NAT state"
+  if grep -Eq -- '^-A ' <<<"$rules"; then
+    fail 'transport router must not contain NAT rules'
+  fi
+}
+
+assert_owned_hook() {
+  local binary=$1 table=$2 expected_policy=$3 expected=$4 require_hook=$5 rules
+  local policy_count=0 append_count=0
+  local -a table_args=()
+  if [[ "$table" != filter ]]; then table_args=(-t "$table"); fi
+  rules=$("$binary" --wait 10 "$${table_args[@]}" -S FORWARD) ||
+    fail "cannot inspect $binary $table FORWARD state"
+  while IFS= read -r rule; do
+    case "$rule" in
+      -P\ FORWARD\ *)
+        ((policy_count += 1))
+        if [[ -n "$expected_policy" && "$rule" != "-P FORWARD $expected_policy" ]]; then
+          fail "unexpected $binary $table FORWARD policy; expected $expected_policy"
+        fi
+        ;;
+      "$expected") ((append_count += 1)) ;;
+      -A\ *) fail "unrelated $binary $table FORWARD state exists; refusing to flush it" ;;
+    esac
+  done <<<"$rules"
+  (( policy_count == 1 )) || fail "$binary $table FORWARD must have exactly one built-in policy"
+  if [[ -z "$expected" ]]; then
+    (( append_count == 0 )) || fail "unexpected owned $binary $table FORWARD hook exists"
+  elif [[ "$require_hook" == true ]]; then
+    (( append_count == 1 )) || fail "owned $binary $table FORWARD hook is missing"
+  else
+    (( append_count <= 1 )) || fail "duplicate owned $binary $table FORWARD hooks exist"
+  fi
+}
+
+chain_exists() {
+  local binary=$1 table=$2 chain=$3
+  local -a table_args=()
+  if [[ "$table" != filter ]]; then table_args=(-t "$table"); fi
+  "$binary" --wait 10 "$${table_args[@]}" -nL "$chain" >/dev/null 2>&1
+}
+
+configure_chain() {
+  local binary=$1 table=$2 chain=$3
+  local -a table_args=()
+  if [[ "$table" != filter ]]; then table_args=(-t "$table"); fi
+  if chain_exists "$binary" "$table" "$chain"; then
+    "$binary" --wait 10 "$${table_args[@]}" -F "$chain"
+  else
+    "$binary" --wait 10 "$${table_args[@]}" -N "$chain"
+  fi
+}
+
+claim_firewall_state() {
+  local observed
+  if [[ -e "$firewall_state" ]]; then
+    read -r observed <"$firewall_state"
+    [[ "$observed" == "$contract_sha256" ]] || fail 'owned firewall state belongs to a different transport contract'
+    firewall_was_owned=true
+    return
+  fi
+  if chain_exists /usr/sbin/iptables filter "$forward_chain" ||
+    chain_exists /usr/sbin/iptables mangle "$mss_chain" ||
+    chain_exists /usr/sbin/ip6tables filter "$forward_chain"; then
+    fail 'unclaimed transport firewall chains already exist'
+  fi
+  printf '%s\n' "$contract_sha256" >"$firewall_state"
+  chmod 0600 "$firewall_state"
+}
+
+stage_firewall() {
+  /usr/sbin/sysctl -q -w net.ipv4.ip_forward=0
+  /usr/sbin/sysctl -q -w net.ipv6.conf.all.forwarding=0
+  /usr/sbin/sysctl -q -w net.ipv6.conf.default.forwarding=0
+
+  assert_empty_nft_ruleset
+  assert_no_nat /usr/sbin/iptables
+  assert_no_nat /usr/sbin/ip6tables
+  assert_owned_hook /usr/sbin/iptables filter "" "-A FORWARD -j $forward_chain" false
+  assert_owned_hook /usr/sbin/iptables mangle "" "-A FORWARD -j $mss_chain" false
+  assert_owned_hook /usr/sbin/ip6tables filter "" "-A FORWARD -j $forward_chain" false
+  assert_owned_hook /usr/sbin/ip6tables mangle "" "" false
+  claim_firewall_state
+
+  if [[ "$firewall_was_owned" == true ]]; then
+    assert_owned_hook /usr/sbin/iptables filter DROP "-A FORWARD -j $forward_chain" false
+    assert_owned_hook /usr/sbin/iptables mangle ACCEPT "-A FORWARD -j $mss_chain" false
+    assert_owned_hook /usr/sbin/ip6tables filter DROP "-A FORWARD -j $forward_chain" false
+    assert_owned_hook /usr/sbin/ip6tables mangle ACCEPT "" false
+  fi
+
+  /usr/sbin/iptables --wait 10 -P FORWARD DROP
+  /usr/sbin/iptables --wait 10 -t mangle -P FORWARD ACCEPT
+  /usr/sbin/ip6tables --wait 10 -P FORWARD DROP
+  /usr/sbin/ip6tables --wait 10 -t mangle -P FORWARD ACCEPT
+  assert_owned_hook /usr/sbin/iptables filter DROP "-A FORWARD -j $forward_chain" false
+  assert_owned_hook /usr/sbin/iptables mangle ACCEPT "-A FORWARD -j $mss_chain" false
+  assert_owned_hook /usr/sbin/ip6tables filter DROP "-A FORWARD -j $forward_chain" false
+  assert_owned_hook /usr/sbin/ip6tables mangle ACCEPT "" false
+  configure_chain /usr/sbin/iptables filter "$forward_chain"
+  configure_chain /usr/sbin/iptables mangle "$mss_chain"
+  configure_chain /usr/sbin/ip6tables filter "$forward_chain"
+
+  if ! /usr/sbin/iptables --wait 10 -C FORWARD -j "$forward_chain" 2>/dev/null; then
+    /usr/sbin/iptables --wait 10 -A FORWARD -j "$forward_chain"
+  fi
+  if ! /usr/sbin/iptables --wait 10 -t mangle -C FORWARD -j "$mss_chain" 2>/dev/null; then
+    /usr/sbin/iptables --wait 10 -t mangle -A FORWARD -j "$mss_chain"
+  fi
+  if ! /usr/sbin/ip6tables --wait 10 -C FORWARD -j "$forward_chain" 2>/dev/null; then
+    /usr/sbin/ip6tables --wait 10 -A FORWARD -j "$forward_chain"
+  fi
+  assert_owned_hook /usr/sbin/iptables filter DROP "-A FORWARD -j $forward_chain" true
+  assert_owned_hook /usr/sbin/iptables mangle ACCEPT "-A FORWARD -j $mss_chain" true
+  assert_owned_hook /usr/sbin/ip6tables filter DROP "-A FORWARD -j $forward_chain" true
+  assert_owned_hook /usr/sbin/ip6tables mangle ACCEPT "" true
+  assert_no_nat /usr/sbin/iptables
+  assert_no_nat /usr/sbin/ip6tables
+  assert_empty_nft_ruleset
+}
+
+normalized_ipv4_policy_rules() {
+  local rules_json
+  rules_json=$(/usr/sbin/ip -j -details -4 rule show) || return 1
+  /usr/bin/jq -ce '
+    def prefix($address; $length):
+      if (($address // "all") == "all") then "all"
+      elif (($address | tostring) | contains("/")) then ($address | tostring)
+      elif $length == null then "\($address)/32"
+      else "\($address)/\($length)"
+      end;
+    def mark_number:
+      if . == null then 0
+      elif type == "number" then .
+      else
+        tostring as $text |
+        if ($text | test("^0x[0-9a-fA-F]+$")) then
+          reduce ($text[2:] | ascii_downcase | explode[]) as $digit
+            (0; . * 16 + (if $digit <= 57 then $digit - 48 else $digit - 87 end))
+        elif ($text | test("^[0-9]+$")) then ($text | tonumber)
+        else error("invalid policy-rule mark")
+        end
+      end;
+    def table_name:
+      if . == null then "none"
+      else tostring as $table |
+        if ($table == "255" or $table == "local") then "local"
+        elif ($table == "254" or $table == "main") then "main"
+        elif ($table == "253" or $table == "default") then "default"
+        elif ($table == "52" or $table == "tailscale") then "52"
+        else $table
+        end
+      end;
+    ["priority", "src", "srclen", "dst", "dstlen", "fwmark", "fwmask", "iif", "table", "action", "protocol"] as $allowed |
+    if all(.[]; ((keys - $allowed) | length) == 0) then
+      map({
+        priority: (.priority | tonumber),
+        input: (.iif // "all"),
+        source: prefix(.src; .srclen),
+        destination: prefix(.dst; .dstlen),
+        fwmark: (.fwmark | mark_number),
+        fwmask: (.fwmask | mark_number),
+        table: (.table | table_name),
+        action: (if .action == null then "lookup" else .action end)
+      })
+    else error("unsupported policy-rule selector")
+    end
+  ' <<<"$rules_json"
+}
+
+validate_policy_rules() {
+  local require_all=$1 live_rules
+  live_rules=$(normalized_ipv4_policy_rules) ||
+    fail 'unrelated or conflicting IPv4 policy rule state exists'
+  /usr/bin/jq -ne \
+    --argjson live "$live_rules" \
+    --argjson expected "$expected_ipv4_policy_rules" \
+    --argjson owned "$expected_owned_policy_rules" \
+    --argjson require_all "$require_all" '
+      ($owned | map(.priority)) as $owned_priorities |
+      ([
+        $live[] as $actual |
+        ([ $expected[] | select(. == $actual) ] | length) == 1
+      ] | all) and
+      ([
+        $expected[] as $wanted |
+        ([ $live[] | select(. == $wanted) ] | length) as $count |
+        if (($owned_priorities | index($wanted.priority)) != null) then
+          if $require_all then $count == 1 else $count <= 1 end
+        else $count == 1
+        end
+      ] | all)
+    ' >/dev/null || fail 'IPv4 policy rules do not match the complete reviewed rule set'
+}
+
+reconcile_policy_rules() {
+  local observed rules_json index priority count
+  validate_policy_rules false
+  rules_json=$(normalized_ipv4_policy_rules) || fail 'cannot inspect IPv4 policy rules'
+  if [[ -e "$policy_state" ]]; then
+    read -r observed <"$policy_state"
+    [[ "$observed" == "$contract_sha256" ]] || fail 'owned IPv4 policy rules belong to a different transport contract'
+  else
+    if /usr/bin/jq -e --argjson expected "$expected_owned_policy_rules" '
+      . as $rules |
+      [ $rules[] as $rule | [ $expected[] | select(.priority == $rule.priority) ] | length > 0 ] | any
+    ' <<<"$rules_json" >/dev/null; then
+      fail 'unclaimed IPv4 policy rules conflict with the reviewed transport priorities'
+    fi
+    printf '%s\n' "$contract_sha256" >"$policy_state"
+    chmod 0600 "$policy_state"
+  fi
+
+  for index in "$${!local_site_cidrs[@]}"; do
+    priority=$((policy_rule_priority_base + index))
+    count=$(/usr/bin/jq -r --argjson priority "$priority" \
+      '[.[] | select(.priority == $priority)] | length' <<<"$rules_json")
+    if (( count == 0 )); then
+      /usr/sbin/ip -4 rule add priority "$priority" iif "$tailscale" \
+        to "$${local_site_cidrs[$index]}" lookup main
+    elif (( count != 1 )); then
+      fail "owned IPv4 policy priority is ambiguous: $priority"
+    fi
+  done
+  validate_policy_rules true
+  printf '%s\n' "$contract_sha256" >"$policy_state"
+  chmod 0600 "$policy_state"
+}
+
+route_query() {
+  local table=$1 selector=$2 prefix=$3
+  /usr/sbin/ip -j -details -4 route show table "$table" "$selector" "$prefix" 2>/dev/null
+}
+
+assert_no_route_intersection() {
+  local table=$1 prefix=$2 descendants covering
+  descendants=$(route_query "$table" root "$prefix") ||
+    fail "cannot inspect IPv4 route table $table"
+  covering=$(route_query "$table" match "$prefix") ||
+    fail "cannot inspect IPv4 route table $table"
+  /usr/bin/jq -e 'length == 0' <<<"$descendants" >/dev/null &&
+    /usr/bin/jq -e 'length == 0' <<<"$covering" >/dev/null ||
+    fail 'route-table state intersects a protected prefix before its reviewed decision'
+}
+
+assert_optional_local_tailnet_route() {
+  local prefix=$1 descendants covering
+  descendants=$(route_query "$remote_route_table" root "$prefix") ||
+    fail 'cannot inspect local-prefix descendants in the Tailscale route table'
+  covering=$(route_query "$remote_route_table" match "$prefix") ||
+    fail 'cannot inspect local-prefix covering routes in the Tailscale route table'
+  for routes in "$descendants" "$covering"; do
+    /usr/bin/jq -e --arg prefix "$prefix" --arg interface "$tailscale" '
+      length <= 1 and all(.[];
+        (.dst // "") == $prefix and
+        (.dev // "") == $interface and
+        (.type // "unicast") == "unicast" and
+        (.from // "all") == "all"
+      )
+    ' <<<"$routes" >/dev/null ||
+      fail 'local prefix has an unreviewed Tailscale route-table intersection'
+  done
+}
+
+assert_local_main_route() {
+  local prefix=$1 descendants covering
+  descendants=$(route_query "$local_route_table" root "$prefix") ||
+    fail 'cannot inspect local protected routes in main table'
+  covering=$(route_query "$local_route_table" match "$prefix") ||
+    fail 'cannot inspect local protected routes in main table'
+  /usr/bin/jq -e --arg prefix "$prefix" '
+    all(.[];
+      (.dst // "default") == $prefix and
+      (.from // "all") == "all"
+    )
+  ' <<<"$descendants" >/dev/null ||
+    fail 'interior or source-specific main-table route affects local protected prefix'
+  /usr/bin/jq -e --arg interface "$underlay" '
+    def prefix_length:
+      (.dst // "default") as $destination |
+      if $destination == "default" then 0
+      elif ($destination | contains("/")) then ($destination | split("/")[1] | tonumber)
+      else 32
+      end;
+    . as $routes |
+    ($routes | map(prefix_length) | max) as $longest |
+    [$routes[] | select(prefix_length == $longest)] as $winners |
+    all($routes[]; (.from // "all") == "all") and
+    ($routes | length) > 0 and
+    ($winners | length) == 1 and
+    ($winners[0].dev // "") == $interface and
+    ($winners[0].type // "unicast") == "unicast"
+  ' <<<"$covering" >/dev/null || fail 'main-table route does not select the underlay for a complete local protected prefix'
+}
+
+remote_routes_ready() {
+  local prefix descendants covering
+  for prefix in "$${remote_site_cidrs[@]}"; do
+    descendants=$(route_query "$remote_route_table" root "$prefix") || return 1
+    covering=$(route_query "$remote_route_table" match "$prefix") || return 1
+    /usr/bin/jq -e --arg prefix "$prefix" --arg interface "$tailscale" '
+      length == 1 and
+      (.[0].dst // "") == $prefix and
+      (.[0].dev // "") == $interface and
+      (.[0].type // "unicast") == "unicast" and
+      (.[0].from // "all") == "all"
+    ' <<<"$descendants" >/dev/null || return 1
+    /usr/bin/jq -e --arg prefix "$prefix" --arg interface "$tailscale" '
+      length == 1 and
+      (.[0].dst // "") == $prefix and
+      (.[0].dev // "") == $interface and
+      (.[0].type // "unicast") == "unicast" and
+      (.[0].from // "all") == "all"
+    ' <<<"$covering" >/dev/null || return 1
+  done
+}
+
+validate_protected_routes() {
+  local prefix
+  for prefix in "$${local_site_cidrs[@]}"; do
+    assert_no_route_intersection local "$prefix"
+    assert_optional_local_tailnet_route "$prefix"
+    assert_local_main_route "$prefix"
+  done
+  for prefix in "$${remote_site_cidrs[@]}"; do
+    assert_no_route_intersection local "$prefix"
+  done
+}
+
+stage_firewall
+if [[ "$mode" == stage ]]; then
+  trap - EXIT
+  exit 0
+fi
+[[ "$mode" == activate ]] || fail "unsupported transport network mode: $mode"
+[[ -f "$recovery_marker" ]] || fail 'transport recovery marker is absent'
+
+for ((attempt = 1; attempt <= 120; attempt++)); do
+  if [[ -e "/sys/class/net/$underlay" && -e "/sys/class/net/$tailscale" ]]; then
+    break
+  fi
+  /usr/bin/sleep 1
+done
+[[ -e "/sys/class/net/$underlay" ]] || fail 'configured transport underlay interface does not exist'
+[[ -e "/sys/class/net/$tailscale" ]] || fail 'tailscale0 must be live before transport firewall setup'
+
+reconcile_policy_rules
+for ((attempt = 1; attempt <= 120; attempt++)); do
+  if remote_routes_ready; then break; fi
+  /usr/bin/sleep 1
+done
+remote_routes_ready || fail 'exact remote-site routes are not live in Tailscale table 52'
+validate_protected_routes
+
+underlay_mtu=$(interface_mtu "$underlay")
+tailscale_mtu=$(interface_mtu "$tailscale")
+path_mtu=$underlay_mtu
+if (( tailscale_mtu < path_mtu )); then path_mtu=$tailscale_mtu; fi
+live_mtu_allowance=$((path_mtu - 40))
+ipv4_mss=$live_mtu_allowance
+if (( approved_maximum_tcp_mss < ipv4_mss )); then ipv4_mss=$approved_maximum_tcp_mss; fi
+(( ipv4_mss >= 536 && ipv4_mss <= approved_maximum_tcp_mss )) ||
+  fail 'derived IPv4 MSS is outside the reviewed range'
+
+for local_cidr in "$${local_site_cidrs[@]}"; do
+  for remote_cidr in "$${remote_site_cidrs[@]}"; do
+    /usr/sbin/iptables --wait 10 -A "$forward_chain" \
+      -i "$underlay" -o "$tailscale" -s "$local_cidr" -d "$remote_cidr" -j ACCEPT
+    /usr/sbin/iptables --wait 10 -A "$forward_chain" \
+      -i "$tailscale" -o "$underlay" -s "$remote_cidr" -d "$local_cidr" -j ACCEPT
+    /usr/sbin/iptables --wait 10 -t mangle -A "$mss_chain" \
+      -i "$underlay" -o "$tailscale" -s "$local_cidr" -d "$remote_cidr" \
+      -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$ipv4_mss"
+    /usr/sbin/iptables --wait 10 -t mangle -A "$mss_chain" \
+      -i "$tailscale" -o "$underlay" -s "$remote_cidr" -d "$local_cidr" \
+      -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$ipv4_mss"
+  done
+done
+/usr/sbin/iptables --wait 10 -t mangle -A "$mss_chain" -j RETURN
+
+assert_no_nat /usr/sbin/iptables
+assert_no_nat /usr/sbin/ip6tables
+assert_empty_nft_ruleset
+assert_owned_hook /usr/sbin/iptables filter DROP "-A FORWARD -j $forward_chain" true
+assert_owned_hook /usr/sbin/iptables mangle ACCEPT "-A FORWARD -j $mss_chain" true
+assert_owned_hook /usr/sbin/ip6tables filter DROP "-A FORWARD -j $forward_chain" true
+assert_owned_hook /usr/sbin/ip6tables mangle ACCEPT "" true
+for setting in \
+  'net.ipv4.conf.all.rp_filter=0' \
+  'net.ipv4.conf.default.rp_filter=0'; do
+  /usr/sbin/sysctl -q -w "$setting"
+done
+for iface in "$underlay" "$tailscale"; do
+  /usr/sbin/sysctl -q -w "net.ipv4.conf.$iface.rp_filter=0"
+done
+/usr/sbin/sysctl -q -w net.ipv6.conf.all.forwarding=0
+/usr/sbin/sysctl -q -w net.ipv6.conf.default.forwarding=0
+
+validate_policy_rules true
+remote_routes_ready || fail 'remote-site routes changed before readiness publication'
+validate_protected_routes
+live_ipv4_policy_rules=$(normalized_ipv4_policy_rules) || fail 'cannot publish live IPv4 policy rules'
+
+state_tmp=$(/usr/bin/mktemp /var/lib/envelope/.transport-router-network.state.XXXXXX)
+/usr/bin/jq -cn \
+  --arg contract_sha256 "$contract_sha256" \
+  --argjson expectations "$readiness_expectations_json" \
+  --argjson policy_rules "$expected_owned_policy_rules" \
+  --argjson ipv4_policy_rules "$live_ipv4_policy_rules" \
+  --argjson underlay_mtu "$underlay_mtu" \
+  --argjson tailscale_mtu "$tailscale_mtu" \
+  --argjson path_mtu "$path_mtu" \
+  --argjson live_mtu_allowance "$live_mtu_allowance" \
+  --argjson tcp_mss "$ipv4_mss" '
+    {
+      ready: true,
+      contract_sha256: $contract_sha256,
+      local_site_cidrs: $expectations.local_site_cidrs,
+      remote_site_cidrs: $expectations.remote_site_cidrs,
+      local_policy_rules: $policy_rules,
+      ipv4_policy_rules: $ipv4_policy_rules,
+      policy_rule_priority_base: $expectations.policy_rule_priority_base,
+      local_route_table: $expectations.local_route_table,
+      remote_route_table: $expectations.remote_route_table,
+      recovery_marker: $expectations.recovery_marker,
+      forward_rules: $expectations.forward_rules,
+      mss_rules: [$expectations.mss_rules[] + {mss: $tcp_mss}],
+      filter_forward_policy: $expectations.filter_forward_policy,
+      mangle_forward_policy: $expectations.mangle_forward_policy,
+      filter_forward_rules: $expectations.filter_forward_rules,
+      mangle_forward_rules: $expectations.mangle_forward_rules,
+      mss_terminal_rules: $expectations.mss_terminal_rules,
+      underlay_mtu: $underlay_mtu,
+      tailscale_mtu: $tailscale_mtu,
+      path_mtu: $path_mtu,
+      live_mtu_allowance: $live_mtu_allowance,
+      approved_maximum_tcp_mss: $expectations.approved_maximum_tcp_mss,
+      tcp_mss: $tcp_mss,
+      ipv4_forwarding: true,
+      ipv6_forwarding: false,
+      ipv6_filter_forward_policy: $expectations.ipv6_filter_forward_policy,
+      ipv6_mangle_forward_policy: $expectations.ipv6_mangle_forward_policy,
+      ipv6_filter_forward_rules: $expectations.ipv6_filter_forward_rules,
+      ipv6_forward_rules: $expectations.ipv6_forward_rules,
+      ipv6_mangle_forward_rules: $expectations.ipv6_mangle_forward_rules,
+      nat_rules: [],
+      no_nat: true
+    }
+  ' >"$state_tmp"
+chmod 0600 "$state_tmp"
+/usr/bin/mv -f "$state_tmp" "$runtime_state"
+
+# IPv4 forwarding is the final state transition after routes and packet policy are exact.
+/usr/sbin/sysctl -q -w net.ipv4.ip_forward=1
+[[ $(/usr/sbin/sysctl -n net.ipv4.ip_forward) == 1 ]] || fail 'IPv4 forwarding did not activate'
+touch "$readiness_marker"
+trap - EXIT
+HOST_NETWORK
+chmod 0755 /usr/local/sbin/envelope-transport-router-network
+
+advertisement_epoch_file=/var/lib/envelope/transport-advertisements.epoch
+[[ ! -L "$advertisement_epoch_file" ]]
+if [[ ! -e "$advertisement_epoch_file" ]]; then
+  read -r advertisement_epoch </proc/sys/kernel/random/uuid
+  [[ "$advertisement_epoch" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+  printf '%s\n' "$advertisement_epoch" >"$advertisement_epoch_file"
+  chmod 0600 "$advertisement_epoch_file"
+fi
+[[ -f "$advertisement_epoch_file" && ! -L "$advertisement_epoch_file" ]]
+
+cat >/usr/local/sbin/envelope-transport-advertisements <<'HOST_ADVERTISEMENTS'
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+readonly operation="$${1:-}"
+readonly allowlist_json='${local_site_cidrs_json}'
+readonly state=/var/lib/envelope/transport-advertisements.state.json
+readonly lock=/var/lib/envelope/transport-advertisements.lock
+readonly epoch_file=/var/lib/envelope/transport-advertisements.epoch
+readonly initialized_marker=/var/lib/envelope/transport-advertisements.initialized
+
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+validate_routes() {
+  local routes_json=$1
+  /usr/bin/jq -e --argjson allowed "$allowlist_json" '
+    type == "array" and length == (unique | length) and
+    all(.[]; type == "string" and ($allowed | index(.) != null))
+  ' <<<"$routes_json" >/dev/null || fail 'advertisement routes are outside the immutable site allowlist'
+}
+
+actual_routes() {
+  /usr/bin/tailscale debug prefs |
+    /usr/bin/jq -c '(.AdvertiseRoutes // []) | sort'
+}
+
+write_state() {
+  local generation=$1 routes_json=$2 service=$3 mode=$4 temporary
+  temporary=$(/usr/bin/mktemp /var/lib/envelope/.transport-advertisements.XXXXXX)
+  /usr/bin/jq -cn \
+    --arg generation "$generation" \
+    --argjson routes "$routes_json" \
+    --arg service "$service" \
+    --arg mode "$mode" \
+    '{generation: $generation, routes: ($routes | sort), service: $service, mode: $mode}' >"$temporary"
+  chmod 0600 "$temporary"
+  /usr/bin/mv -f "$temporary" "$state"
+}
+
+verify_actual() {
+  local routes_json=$1 service=$2 mode=$3 unit_state
+  unit_state=$(systemctl is-enabled tailscaled.service 2>/dev/null || true)
+  if [[ "$service" == running ]]; then
+    [[ "$unit_state" != masked* ]]
+    systemctl is-active --quiet tailscaled.service
+    /usr/bin/jq -e --argjson expected "$routes_json" '
+      .RouteAll == true and .NoSNAT == true and
+      (((.AdvertiseRoutes // []) | sort) == ($expected | sort))
+    ' < <(/usr/bin/tailscale debug prefs) >/dev/null
+    systemctl is-active --quiet envelope-transport-router-network.service
+  else
+    ! systemctl is-active --quiet tailscaled.service
+    if [[ "$mode" == abrupt ]]; then
+      [[ "$unit_state" == masked ]]
+    else
+      [[ "$unit_state" != masked* ]]
+    fi
+  fi
+}
+
+exec 9>"$lock"
+/usr/bin/flock -x 9
+
+[[ -f "$epoch_file" && ! -L "$epoch_file" ]] || fail 'advertisement epoch is absent or unsafe'
+read -r epoch <"$epoch_file"
+[[ "$epoch" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
+  fail 'advertisement epoch is invalid'
+readonly initial_generation="initial-$epoch"
+
+if [[ ! -f "$state" ]]; then
+  [[ ! -e "$initialized_marker" && ! -L "$initialized_marker" ]] || fail 'advertisement state was lost after initialization'
+  systemctl is-active --quiet tailscaled.service || fail 'tailscaled must be running for first advertisement initialization'
+  initial_service=running
+  initial_routes=$(actual_routes)
+  validate_routes "$initial_routes"
+  /usr/bin/jq -e 'length > 0' <<<"$initial_routes" >/dev/null || fail 'initial advertisements are empty'
+  write_state "$initial_generation" "$initial_routes" "$initial_service" normal
+  touch "$initialized_marker"
+fi
+[[ -f "$initialized_marker" && ! -L "$initialized_marker" ]] || fail 'advertisement initialization marker is absent or unsafe'
+
+/usr/bin/jq -e --arg initial "$initial_generation" '
+  type == "object" and keys == ["generation", "mode", "routes", "service"] and
+  (.generation == $initial or (.generation | test("^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"))) and
+  (.routes | type == "array") and
+  (.service == "running" or .service == "stopped") and
+  (.mode == "normal" or .mode == "graceful" or .mode == "abrupt")
+' "$state" >/dev/null || fail 'advertisement generation state is invalid'
+validate_routes "$(/usr/bin/jq -c '.routes' "$state")"
+
+if [[ "$operation" == inspect ]]; then
+  recorded_routes=$(/usr/bin/jq -c '.routes | sort' "$state")
+  recorded_service=$(/usr/bin/jq -r '.service' "$state")
+  recorded_mode=$(/usr/bin/jq -r '.mode' "$state")
+  verify_actual "$recorded_routes" "$recorded_service" "$recorded_mode" ||
+    fail 'recorded advertisement state differs from the live service or preferences'
+  /usr/bin/jq -c '{success: true, payload: .}' "$state"
+  exit 0
+fi
+[[ "$operation" == apply && $# == 6 ]] || fail 'usage: envelope-transport-advertisements inspect|apply generation predecessors-json routes-json running|stopped normal|graceful|abrupt'
+
+readonly generation=$2
+readonly predecessors_json=$3
+readonly routes_json=$4
+readonly desired_service=$5
+readonly desired_mode=$6
+[[ "$generation" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || fail 'advertisement generation is invalid'
+/usr/bin/jq -e 'type == "array" and length > 0 and length == (unique | length) and all(.[]; type == "string" and length > 0)' \
+  <<<"$predecessors_json" >/dev/null || fail 'advertisement predecessor generations are invalid'
+validate_routes "$routes_json"
+[[ "$desired_service" == running || "$desired_service" == stopped ]] || fail 'advertisement service state is invalid'
+[[ "$desired_mode" == normal || "$desired_mode" == graceful || "$desired_mode" == abrupt ]] || fail 'advertisement transition mode is invalid'
+if [[ "$desired_service" == running ]]; then
+  /usr/bin/jq -e 'length > 0' <<<"$routes_json" >/dev/null || fail 'a running transport router must advertise at least one prefix'
+  [[ "$desired_mode" == normal ]] || fail 'a running transport router must use normal mode'
+else
+  /usr/bin/jq -e 'length == 0' <<<"$routes_json" >/dev/null || fail 'a stopped transport router must withdraw every prefix'
+  [[ "$desired_mode" == graceful || "$desired_mode" == abrupt ]] || fail 'a stopped transport router requires an explicit failure mode'
+fi
+
+current_generation=$(/usr/bin/jq -r '.generation' "$state")
+current_routes=$(/usr/bin/jq -c '.routes | sort' "$state")
+current_service=$(/usr/bin/jq -r '.service' "$state")
+current_mode=$(/usr/bin/jq -r '.mode' "$state")
+desired_routes=$(/usr/bin/jq -c 'sort' <<<"$routes_json")
+if [[ "$current_generation" == "$generation" ]]; then
+  [[ "$current_routes" == "$desired_routes" && "$current_service" == "$desired_service" && "$current_mode" == "$desired_mode" ]] ||
+    fail 'an existing advertisement generation has different desired state'
+  verify_actual "$desired_routes" "$desired_service" "$desired_mode"
+  /usr/bin/jq -c '{success: true, payload: .}' "$state"
+  exit 0
+fi
+/usr/bin/jq -e --arg current "$current_generation" 'index($current) != null' \
+  <<<"$predecessors_json" >/dev/null || fail 'stale advertisement generation was fenced'
+
+if [[ "$desired_service" == running ]]; then
+  systemctl unmask tailscaled.service
+  systemctl start tailscaled.service
+  for _attempt in $(seq 1 30); do
+    if /usr/bin/tailscale status --json 2>/dev/null | /usr/bin/jq -e '.BackendState == "Running"' >/dev/null; then
+      break
+    fi
+    /usr/bin/sleep 2
+  done
+  /usr/bin/tailscale status --json | /usr/bin/jq -e '.BackendState == "Running"' >/dev/null
+  routes_csv=$(/usr/bin/jq -r 'join(",")' <<<"$desired_routes")
+  /usr/bin/tailscale set --accept-routes=true --snat-subnet-routes=false --advertise-routes="$routes_csv"
+  systemctl restart envelope-transport-router-network.service
+else
+  if [[ "$desired_mode" == graceful ]]; then
+    /usr/bin/tailscale set --advertise-routes=
+    /usr/bin/jq -e '((.AdvertiseRoutes // []) | length) == 0' \
+      < <(/usr/bin/tailscale debug prefs) >/dev/null
+    systemctl stop tailscaled.service
+  else
+    systemctl mask tailscaled.service
+    systemctl kill --kill-who=main --signal=SIGKILL tailscaled.service >/dev/null 2>&1 || true
+    systemctl stop tailscaled.service
+  fi
+fi
+verify_actual "$desired_routes" "$desired_service" "$desired_mode"
+write_state "$generation" "$desired_routes" "$desired_service" "$desired_mode"
+/usr/bin/jq -c '{success: true, payload: .}' "$state"
+HOST_ADVERTISEMENTS
+chmod 0755 /usr/local/sbin/envelope-transport-advertisements
+
+cat >/etc/sysctl.d/90-envelope-transport-router.conf <<'SYSCTL'
+net.ipv4.ip_forward = 0
+net.ipv6.conf.all.forwarding = 0
+net.ipv6.conf.default.forwarding = 0
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
+net.ipv4.conf.${underlay_interface}.rp_filter = 0
+SYSCTL
+
+cat >/etc/systemd/system/envelope-transport-router-network.service <<'HOST_UNIT'
+[Unit]
+Description=Envelope transport-router host-network contract
+After=network-online.target tailscaled.service
+Wants=network-online.target
+Requires=tailscaled.service
+PartOf=tailscaled.service
+# The first tailscaled start precedes tailscale up; activation creates this persistent recovery gate.
+ConditionPathExists=/var/lib/envelope/transport-router-network.configured
+
+[Service]
+Type=oneshot
+User=root
+Environment=XTABLES_LOCKFILE=/run/envelope-transport-router-network/xtables.lock
+ExecStart=/usr/local/sbin/envelope-transport-router-network activate
+ExecReload=/usr/local/sbin/envelope-transport-router-network activate
+ExecStop=/usr/sbin/sysctl -q -w net.ipv4.ip_forward=0
+ExecStop=/usr/sbin/sysctl -q -w net.ipv6.conf.all.forwarding=0
+ExecStop=/usr/sbin/sysctl -q -w net.ipv6.conf.default.forwarding=0
+ExecStop=/usr/bin/rm -f /var/lib/envelope/transport-router-network.ready /var/lib/envelope/transport-router-network.state.json
+RemainAfterExit=yes
+TimeoutStartSec=270s
+RuntimeDirectory=envelope-transport-router-network
+RuntimeDirectoryMode=0700
+# iptables-legacy opens a raw control socket while applying the firewall contract.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectSystem=strict
+ReadWritePaths=/run/envelope-transport-router-network /var/lib/envelope
+
+[Install]
+WantedBy=tailscaled.service
+HOST_UNIT
+
+systemctl daemon-reload
+systemctl enable envelope-transport-router-network.service
+/usr/local/sbin/envelope-transport-router-network stage
+touch /var/lib/envelope/transport-router-network.installed

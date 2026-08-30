@@ -18,31 +18,64 @@ The artifact is not permission to deploy a live topology manually.
 
 ## Local Validation
 
-Run unit and static documentation checks:
+Run unit, fixture, and static documentation checks:
 
 ```bash
 go test ./...
+python3 scripts/verify_geneve_fixtures.py
 python3 scripts/test_docs.py
 ```
 
-The component wire smoke test creates a local fake-TUN setup and injects a synthetic GWLB-shaped packet:
+These checks do not contact AWS, create a GWLBE, connect to a Tailnet, model two sites, or test failover.
+
+On Linux, run the local component wire smoke exactly as follows:
 
 ```bash
 sudo ./scripts/component_wire_smoke.sh
 ```
 
-This does not contact AWS, create a GWLB endpoint, connect to a Tailnet, model two sites, or test failover.
+The wrapper builds the target, sends synthetic AWS-profile TCP, UDP, ICMP, and fragmented-inner GENEVE packets, verifies exactly one byte-identical packet turnaround for each, rejects malformed metadata, and confirms that forwarding, routes, and interfaces were not changed. The wrapper requires root with effective `CAP_NET_RAW` and does not support a non-root file-capability invocation; run it with the exact `sudo` command above. It does not need `CAP_NET_ADMIN`. This is a local component check, not AWS, Tailnet, multi-AZ, transport-router, or failover acceptance.
 
-## Host Integration
+## Run The Target Component
 
-Symmetric targets need `CAP_NET_ADMIN` for `envelope0` and supported host-route validation or management. The protected Amazon Linux service also receives `CAP_NET_RAW` solely for continuous read-only legacy firewall inspection; normal symmetric forwarding does not emit raw packets.
+On Linux, start the version-2 packet-turnaround target as root for a direct development run:
 
-`routing-mode=off` is datapath-only. `verify` validates host prerequisites without changing them. `manage` validates the configured symmetric path and reconciles only its documented routing ownership. For either enabled mode, provide version 2 with disjoint `local-site-cidrs` and `remote-site-cidrs`; a target must deliver the first to its local post-inspection VPC path and the second to `tailscale0`.
+```bash
+sudo ./bin/envelope \
+  --config-version=2 \
+  --udp-bind=0.0.0.0:6081 \
+  --max-inner-packet-size=1280 \
+  --metrics-addr=127.0.0.1:9090
+```
 
-Do not configure a target as a Tailscale ingress router. Ingress routers are a separate fleet that advertises the exact local-site CIDRs without SNAT and routes Tailnet-arriving local traffic through its local GWLBE.
+This component validates each accepted AWS-profile packet and immediately returns it to the sending GWLB identity. It does not create a TUN, run Tailscale, enable Linux forwarding, or configure a local-versus-remote route path. Local startup alone is not a useful end-to-end traffic test.
+
+## Target And Transport Roles
+
+The target parser retains version `2` and rejects obsolete target forwarding inputs, including directional fields, target site CIDRs, TUN settings, Tailscale settings, and routing modes. There is no compatibility mode or alternate version-2 behavior.
+
+Dedicated Tailscale transport routers own inner site transit. At baseline, each ready router advertises exactly one assigned workload prefix; the per-site assignments are non-empty, pairwise disjoint, and exactly cover local workload CIDRs. Every router remains forwarding-capable for bounded takeover of all local prefixes, accepts every exact remote-site route, disables subnet-route SNAT, preserves source addresses, forwards both interface directions, and uses its subnet's same-AZ GWLBE route for local-site delivery. Transport-router forwarding, reverse-path, firewall, MSS, source/destination-check, route, and ENI readiness are separate from target health.
+
+On every router, Tailscale table 52 contains exactly the opposite site's exact workload prefixes and no local-site prefix. Every opposite-site observer selects each protected remote prefix's configured stable-node `PrimaryRoutes` owner, while no same-site observer reports a protected local `PrimaryRoutes` claim. Every local prefix, whether self- or sibling-owned in the singleton advertisement map, remains on `main` and the VPC underlay. The higher-priority `iif tailscale0` local-prefix rules make every router capable of delivering all local prefixes during normal and takeover paths. Mandatory source-prefix owner/ENI coupling is derived from singleton advertisements, control-plane stable identities, and opposite-site observations and binds the selected owner to its protected instance ID and primary ENI.
+
+Failed protected run `ha25` proved this route shape by showing exactly the two opposite-site workload routes and only opposite-site serving paths on every router. It did not pass acceptance and does not turn these development instructions into a protected-run procedure.
+
+The installed target systemd service runs as an unprivileged user with ambient `CAP_NET_RAW`; it does not need `CAP_NET_ADMIN`. The transport-router host-network unit, `envelope-transport-router-network.service`, runs as root with `CAP_NET_ADMIN` and `CAP_NET_RAW`, but configures only forwarding sysctls, its exact fail-closed firewall chains, and MSS clamping. Terraform publishes the expected host contract as the separate `transport_router_readiness_expectations` output; that output is not a live readiness result. Protected readiness separately observes Tailscale peer expiry and bounded pings, exact policy and prefix route chains, EC2 source/destination checks, ENI identity, and same-AZ GWLBE routes.
+
+## Secretless Linux Integration
+
+On an Ubuntu Linux host with Docker, run the required local separated-role harness:
+
+```bash
+./scripts/integration_headscale_two_peer.sh
+```
+
+The harness uses digest-pinned Headscale `0.25.1` and Tailscale `1.80.3` images and runtime-generated preauthorization keys. It starts both directions of TCP, UDP, and ICMP under one six-flow barrier, correlates source and destination target turnaround IDs and hashes from packet events, derives the destination transport-router identity from the observed underlay source MAC, and sends non-initial IPv4 fragments from each source workload through both targets and the transport routers to the peer workload.
+
+For host networking, the harness extracts, renders, executes, and hash-checks the production `envelope-transport-router-network.service` `ExecStart` script. It does not reproduce systemd PID 1 ordering or sandbox enforcement, the cloud-init package installation environment, credentialed stable-node ownership, stable-node-to-protected-instance binding, GWLBE owner-ENI coupling, AWS route replacement, or durable CAS/lease recovery after interruption. It therefore cannot prove the protected ownership or recovery contract. `python3 scripts/verify_systemd_units.py` covers rendered unit syntax in a disposable Ubuntu image; protected acceptance owns the remaining live checks.
 
 ## Protected AWS Runs
 
-The AWS profile is billable and requires a protected environment. The version-2 protected lifecycle, target drain operations, ingress-router failure exercises, and evidence verifier are not yet documented as executable operations. Do not adapt old configuration files or run old commands for the new topology.
+The AWS profile is billable and requires a protected environment. No corrected version-2 live acceptance result is documented yet. Do not adapt old configuration files, state, evidence, or commands for the new topology.
 
-Use the [AWS appliance runbook](aws-appliance-runbook.md) and [two-region E2E runbook](aws-two-region-e2e-runbook.md) to understand the required safety boundary, topology, cost review, and bounded-failover claims.
+The checked-in acceptance planning values are a `$4.00/hour` fixed estimate and a `$5.00/hour` fixed ceiling for the two-site, two-AZ HA profile. They exclude variable charges and are not current-price or spending approval. The profile has one shared NAT in each site's single management subnet, so private management and bootstrap egress is not multi-AZ even though the inspected transit topology spans two AZs. Use the [AWS appliance runbook](aws-appliance-runbook.md) and [two-region E2E runbook](aws-two-region-e2e-runbook.md) to understand the required route graph, protected-runner ENI failover and restoration, current cost review, and non-hitless availability boundary.

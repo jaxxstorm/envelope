@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import queue
 import socket
@@ -213,6 +214,1002 @@ def protected_output() -> dict[str, Any]:
     }
 
 
+def fixture_live_tailnet_hostnames() -> list[str]:
+    return [
+        f"fixture-live-{site}-transport-{az_key}"
+        for site in ("west", "east")
+        for az_key in ("a", "b")
+    ]
+
+
+def lifecycle_sites() -> dict[str, dict[str, Any]]:
+    return {
+        "west": {
+            "region": "us-west-2",
+            "target_az_keys": ["a", "b"],
+            "transport_router_az_keys": ["a", "b"],
+        },
+        "east": {
+            "region": "us-east-1",
+            "target_az_keys": ["a", "b"],
+            "transport_router_az_keys": ["a", "b"],
+        },
+    }
+
+
+def route_failover_topology() -> e2e.SymmetricTopologyV2:
+    def site(
+        name: str,
+        region: str,
+        local_prefix: str,
+        remote_prefix: str,
+        ids: tuple[str, str, str, str, str, str, str, str],
+    ) -> dict[str, Any]:
+        target_one, target_two, router_one, router_two, eni_one, eni_two, table_one, table_two = ids
+        target_group = (
+            f"arn:aws:elasticloadbalancing:{region}:123456789012:"
+            f"targetgroup/{name}/0123456789abcdef"
+        )
+        return {
+            "region": region,
+            "local_site_cidrs": [f"{local_prefix}.1.0/24", f"{local_prefix}.2.0/24"],
+            "remote_site_cidrs": [f"{remote_prefix}.1.0/24", f"{remote_prefix}.2.0/24"],
+            "target_fleet": [
+                {
+                    "region": region,
+                    "az_key": "a",
+                    "instance_id": target_one,
+                    "target_group_arn": target_group,
+                },
+                {
+                    "region": region,
+                    "az_key": "b",
+                    "instance_id": target_two,
+                    "target_group_arn": target_group,
+                },
+            ],
+            "transport_router_fleet": [
+                {
+                    "region": region,
+                    "az_key": "a",
+                    "instance_id": router_one,
+                    "network_interface_id": eni_one,
+                    "gwlbe_route_table_id": table_one,
+                    "advertised_prefix": f"{local_prefix}.1.0/24",
+                },
+                {
+                    "region": region,
+                    "az_key": "b",
+                    "instance_id": router_two,
+                    "network_interface_id": eni_two,
+                    "gwlbe_route_table_id": table_two,
+                    "advertised_prefix": f"{local_prefix}.2.0/24",
+                },
+            ],
+        }
+
+    return e2e.parse_symmetric_topology_v2(
+        {
+            "config_version": 2,
+            "run_id": "fixture-live",
+            "route_failover": {
+                "mutation_timeout_seconds": 30,
+                "restoration_timeout_seconds": 30,
+                "recovery_timeout_seconds": 10,
+                "initial_transport_router_az_by_gwlbe_az": {
+                    "west": {"a": "a", "b": "b"},
+                    "east": {"a": "a", "b": "b"},
+                },
+            },
+            "sites": {
+                "west": site(
+                    "west",
+                    "us-west-2",
+                    "10.10",
+                    "10.20",
+                    (
+                        "i-6123456789abcdef0",
+                        "i-7123456789abcdef0",
+                        "i-8123456789abcdef0",
+                        "i-9123456789abcdef0",
+                        "eni-8123456789abcdef0",
+                        "eni-9123456789abcdef0",
+                        "rtb-8123456789abcdef0",
+                        "rtb-9123456789abcdef0",
+                    ),
+                ),
+                "east": site(
+                    "east",
+                    "us-east-1",
+                    "10.20",
+                    "10.10",
+                    (
+                        "i-a123456789abcdef0",
+                        "i-b123456789abcdef0",
+                        "i-c123456789abcdef0",
+                        "i-d123456789abcdef0",
+                        "eni-c123456789abcdef0",
+                        "eni-d123456789abcdef0",
+                        "rtb-c123456789abcdef0",
+                        "rtb-d123456789abcdef0",
+                    ),
+                ),
+            },
+        }
+    )
+
+
+def terraform_route_failover_value(topology: e2e.SymmetricTopologyV2) -> dict[str, Any]:
+    return {
+        "config_version": 2,
+        **topology.route_failover.approved_bounds(),
+        "same_az_preferred": {
+            site: all(
+                gwlbe_az == router_az
+                for gwlbe_az, router_az in topology.route_failover.initial_transport_router_az_by_gwlbe_az[
+                    site
+                ].items()
+            )
+            for site in e2e.SITES
+        },
+        "sites": {
+            site: {
+                gwlbe_az: {
+                    "route_table_id": next(
+                        member.gwlbe_route_table_id
+                        for member in topology.site(site).transport_router_fleet
+                        if member.az_key == gwlbe_az
+                    ),
+                    "source_workload_prefix": next(
+                        member.advertised_prefix
+                        for member in topology.site(site).transport_router_fleet
+                        if member.az_key == gwlbe_az
+                    ),
+                    "remote_site_cidrs": sorted(topology.site(site).remote_site_cidrs),
+                    "initial_transport_router_az_key": router_az,
+                    "initial_network_interface_id": next(
+                        member.network_interface_id
+                        for member in topology.site(site).transport_router_fleet
+                        if member.az_key == router_az
+                    ),
+                }
+                for gwlbe_az, router_az in topology.route_failover.initial_transport_router_az_by_gwlbe_az[
+                    site
+                ].items()
+            }
+            for site in e2e.SITES
+        },
+    }
+
+
+def terraform_transport_readiness_value(
+    topology: e2e.SymmetricTopologyV2, maximum_tcp_mss: int = 1240
+) -> dict[str, Any]:
+    load_profile = SimpleNamespace(maximum_tcp_mss=maximum_tcp_mss)
+    sites: dict[str, Any] = {}
+    for site in e2e.SITES:
+        contract = e2e._transport_router_contract(topology, site, load_profile)
+        sites[site] = {**contract, "contract_sha256": e2e._contract_sha256(contract)}
+    return {"config_version": 2, "sites": sites}
+
+
+def terraform_symmetric_cost_value(
+    topology: e2e.SymmetricTopologyV2,
+) -> dict[str, Any]:
+    return {
+        "profile": "symmetric-gwlb-ha-v2",
+        "estimated_fixed_hourly_usd": 1.5,
+        "approved_max_hourly_usd": 2.0,
+        "resource_counts": {
+            "gwlbe_endpoints": 4,
+            "target_instances": {"west": 2, "east": 2},
+            "transport_routers": {"west": 2, "east": 2},
+            "workload_instances": 4,
+            "nat_gateways": 2,
+            "elastic_ips": 2,
+            "gateway_load_balancers": 2,
+            "vpc_flow_logs": 2,
+            "cloudwatch_log_groups": 2,
+            "flow_log_iam_roles": 1,
+            "iam_roles": {
+                "target": 2,
+                "workload": 2,
+                "transport": 2,
+                "flow_log": 1,
+            },
+            "iam_instance_profiles": {
+                "target": 2,
+                "workload": 2,
+                "transport": 2,
+            },
+        },
+        "route_failover_bounds": topology.route_failover.approved_bounds(),
+        "nat_topology_limit": {
+            "gateways_per_site": 1,
+            "expanded_for_ha": False,
+            "placement": "one shared NAT gateway in each site's single management subnet",
+            "limitation": (
+                "private egress is not multi-AZ within a site and remains outside the protected data path"
+            ),
+        },
+    }
+
+
+def terraform_artifact_identity_value(run_id: str) -> dict[str, str]:
+    return {
+        "bucket": f"{run_id}-123456789012-us-west-2-artifact",
+        "key": f"artifacts/{'b' * 40}/envelope-linux-amd64",
+        "sha256": "a" * 64,
+        "architecture": "amd64",
+        "ec2_arch": "x86_64",
+        "revision": "b" * 40,
+        "version": "fixture",
+    }
+
+
+def route_failover_output() -> dict[str, Any]:
+    document = protected_output()
+    topology = route_failover_topology()
+    document.pop("instance_ids")
+    document["artifact_identity"] = {
+        "value": terraform_artifact_identity_value(topology.run_id)
+    }
+    document["symmetric_topology"] = {"value": topology.as_dict()}
+    document["route_failover"] = {"value": terraform_route_failover_value(topology)}
+    document["transport_router_readiness_expectations"] = {
+        "value": terraform_transport_readiness_value(topology)
+    }
+    document["gwlb_target_group_arns"]["value"] = {
+        site: topology.site(site).target_fleet[0].target_group_arn for site in e2e.SITES
+    }
+    document["envelope_runtime_config"]["value"] = {
+        site: {
+            "config_version": 2,
+            "mode": "packet-return",
+            "udp_bind": "0.0.0.0:6081",
+            "max_inner_packet_size": 1280,
+            "artifact_sha256": "a" * 64,
+            "artifact_revision": "b" * 40,
+        }
+        for site in e2e.SITES
+    }
+    document["cost_profile"]["value"] = terraform_symmetric_cost_value(topology)
+    return document
+
+
+def coordinated_route_replacement_fixture(
+    deployment: e2e.SymmetricProtectedDeployment,
+    failed: e2e.SymmetricFleetMember,
+    selected_alternate: e2e.SymmetricFleetMember,
+    probe: Mapping[str, Any],
+    mode: str,
+) -> dict[str, Any]:
+    topology = deployment.topology
+    site = topology.site(failed.site)
+    prefixes = list(site.remote_site_cidrs)
+    node_hashes = {
+        member.instance_id: hashlib.sha256(
+            f"node-{member.site}-{member.az_key}".encode()
+        ).hexdigest()
+        for topology_site in e2e.SITES
+        for member in topology.site(topology_site).transport_router_fleet
+    }
+
+    def snapshot(target_eni: str) -> dict[str, Any]:
+        return {
+            "route_table_id": failed.gwlbe_route_table_id,
+            "vpc_id": deployment.vpc_ids[failed.site],
+            "ownership": {
+                "EnvelopeRun": topology.run_id,
+                "ManagedBy": "terraform",
+                "Profile": "symmetric-gwlb-ha-v2",
+                "Role": "gwlbe",
+                "ZoneKey": failed.az_key,
+            },
+            "routes": [
+                {
+                    "destination_cidr_block": prefix,
+                    "network_interface_id": target_eni,
+                    "origin": "CreateRoute",
+                    "route_state": "active",
+                }
+                for prefix in prefixes
+            ],
+        }
+
+    def ownership_observation(owners: Mapping[str, str]) -> dict[str, Any]:
+        return {
+            "quiet_window_seconds": topology.route_failover.quiet_window_seconds,
+            "observers": [
+                {
+                    "observer_instance_id": observer.instance_id,
+                    "owners": [
+                        {
+                            "prefix": prefix,
+                            "owner_instance_id": instance_id,
+                            "owner_node_id_sha256": node_hashes[instance_id],
+                        }
+                        for prefix, instance_id in sorted(owners.items())
+                    ],
+                    "command": None,
+                }
+                for observer in topology.site(
+                    e2e._opposite(failed.site)
+                ).transport_router_fleet
+            ],
+        }
+
+    def member_value(member: e2e.SymmetricFleetMember) -> dict[str, Any]:
+        return {
+            "instance_id": member.instance_id,
+            "network_interface_id": member.network_interface_id,
+            "baseline_advertisements": [member.advertised_prefix],
+            "state_before": {
+                "advertisements": {
+                    "generation": f"initial-{member.site}-{member.az_key}",
+                    "routes": [member.advertised_prefix],
+                    "service": "running",
+                    "mode": "normal",
+                },
+                "command": None,
+            },
+            "node_id_sha256": node_hashes[member.instance_id],
+        }
+
+    baseline_owners = {
+        member.advertised_prefix: member.instance_id
+        for member in site.transport_router_fleet
+    }
+    transferred_owners = dict(baseline_owners)
+    transferred_owners[failed.advertised_prefix] = selected_alternate.instance_id
+    forward_generation = "33333333-4444-4555-8666-777777777777"
+    restore_generation = "44444444-5555-4666-8777-888888888888"
+
+    def advertisement_record(member: e2e.SymmetricFleetMember) -> dict[str, Any]:
+        return {
+            "advertisements": {
+                "generation": restore_generation,
+                "routes": [member.advertised_prefix],
+                "service": "running",
+                "mode": "normal",
+            },
+            "command": None,
+        }
+
+    restored_current = advertisement_record(failed)
+    restored_alternate = advertisement_record(selected_alternate)
+    return {
+        "route_table_id": failed.gwlbe_route_table_id,
+        "gwlbe_az_key": failed.az_key,
+        "source_prefix": failed.advertised_prefix,
+        "prefixes": prefixes,
+        "current": member_value(failed),
+        "alternate": member_value(selected_alternate),
+        "bounds": {
+            "approved_inputs": topology.route_failover.approved_bounds(),
+            "effective": {
+                "mutation_timeout_seconds": topology.route_failover.mutation_timeout_seconds,
+                "restoration_timeout_seconds": topology.route_failover.restoration_timeout_seconds,
+                **topology.route_failover.derived_bounds(),
+            },
+            "derivation": {
+                "settlement_timeout_seconds": "recovery_timeout_seconds",
+                "quiet_window_seconds": "min(10,max(1,restoration_timeout_seconds//10))",
+                "owner_lease_seconds": (
+                    "max(mutation_timeout_seconds,restoration_timeout_seconds,"
+                    "recovery_timeout_seconds,165,45)+quiet_window_seconds+15"
+                ),
+            },
+        },
+        "before": snapshot(failed.network_interface_id),
+        "advertisements": {
+            "forward_generation": forward_generation,
+            "restore_generation": restore_generation,
+            "failure_mode": mode,
+            "alternate_expansion": {
+                "advertisements": {
+                    "generation": forward_generation,
+                    "routes": sorted(
+                        {
+                            selected_alternate.advertised_prefix,
+                            failed.advertised_prefix,
+                        }
+                    ),
+                    "service": "running",
+                    "mode": "normal",
+                },
+                "command": None,
+            },
+            "current_withdrawal": {
+                "advertisements": {
+                    "generation": forward_generation,
+                    "routes": [],
+                    "service": "stopped",
+                    "mode": mode,
+                },
+                "command": None,
+            },
+        },
+        "ownership": {
+            "before": ownership_observation(baseline_owners),
+            "transferred": ownership_observation(transferred_owners),
+        },
+        "after": snapshot(selected_alternate.network_interface_id),
+        "probe": dict(probe),
+        "restoration": {
+            "status": "verified",
+            "advertisements": {
+                "status": "verified",
+                "current": restored_current,
+                "alternate": restored_alternate,
+                "verification": {
+                    "current": copy.deepcopy(restored_current),
+                    "alternate": copy.deepcopy(restored_alternate),
+                },
+                "failures": [],
+            },
+            "ownership": {
+                "status": "verified",
+                "observation": ownership_observation(baseline_owners),
+            },
+            "routes": {
+                "status": "verified",
+                "attempted_prefixes": prefixes,
+                "api_failures": [],
+                "settled_prefixes": prefixes,
+                "quiet_window_seconds": topology.route_failover.quiet_window_seconds,
+                "snapshot": snapshot(failed.network_interface_id),
+            },
+        },
+        "restored": True,
+    }
+
+
+def symmetric_route_evidence() -> dict[str, Any]:
+    deployment = e2e.parse_symmetric_protected_deployment_output(route_failover_output())
+    topology = deployment.topology
+    endpoints = {site: dict(values) for site, values in deployment.endpoint_ids.items()}
+    node_hashes = {
+        member.instance_id: hashlib.sha256(
+            f"node-{member.site}-{member.az_key}".encode()
+        ).hexdigest()
+        for site in e2e.SITES
+        for member in topology.site(site).transport_router_fleet
+    }
+
+    def turnaround(target_id: str) -> dict[str, Any]:
+        return {
+            "target_id": target_id,
+            "metrics": {
+                "geneve_rx_packets_delta": 1.0,
+                "geneve_tx_packets_delta": 1.0,
+                "geneve_options_validation_errors_delta": 0.0,
+                "gwlb_profile_rejections_total_delta": 0.0,
+                "gwlb_receive_drops_total_delta": 0.0,
+                "gwlb_inner_validation_failures_total_delta": 0.0,
+                "gwlb_return_build_failures_total_delta": 0.0,
+                "gwlb_send_failures_total_delta": 0.0,
+                "drops_delta": 0.0,
+                "gwlb_target_ready": 1.0,
+                "components_ready": {"receiver": 1.0, "validation": 1.0, "sender": 1.0},
+            },
+            "fidelity": {
+                "observed": True,
+                "target_id": target_id,
+                "capture_sha256": "1" * 64,
+                "capture_frame_count": 2,
+                "raw_pcap_deleted": True,
+                "pairs": [
+                    {
+                        "direction": "request",
+                        "ingress_frame_sha256": "2" * 64,
+                        "return_frame_sha256": "3" * 64,
+                        "inner_packet_sha256": "4" * 64,
+                        "ordered_options_sha256": "5" * 64,
+                        "flow_cookie_sha256": "6" * 64,
+                        "vni": 0,
+                        "outer_tuple_swapped": True,
+                        "return_source_port_preserved": True,
+                    }
+                ],
+            },
+        }
+
+    def traversal_probe(site: e2e.Site, role: e2e.WorkloadRole, protocol: str) -> dict[str, Any]:
+        destination = e2e._opposite(site)
+        source = topology.site(site)
+        peer = topology.site(destination)
+        az_key = "a" if role == "initiator" else "b"
+        destination_az_key = "b" if role == "initiator" else "a"
+        source_router = next(
+            member
+            for member in source.transport_router_fleet
+            if member.az_key == az_key
+        )
+        destination_router = next(
+            member
+            for member in peer.transport_router_fleet
+            if member.az_key == destination_az_key
+        )
+        source_target = source.target_fleet[0]
+        destination_target = peer.target_fleet[0]
+        return {
+            "protocol": protocol,
+            "source_role": role,
+            "destination_role": e2e._opposite_workload_role(role),
+            "source_az_key": az_key,
+            "destination_az_key": destination_az_key,
+            "source_gwlbe_id": endpoints[site][az_key],
+            "destination_gwlbe_id": endpoints[destination][destination_router.az_key],
+            "source_target_id": source_target.instance_id,
+            "destination_target_id": destination_target.instance_id,
+            "source_transport_router_id": source_router.instance_id,
+            "source_transport_eni_id": source_router.network_interface_id,
+            "destination_transport_router_id": destination_router.instance_id,
+            "geneve_return_proof": {
+                "source": turnaround(source_target.instance_id),
+                "destination": turnaround(destination_target.instance_id),
+            },
+            "source_preserved": True,
+        }
+
+    current, alternate = topology.west.transport_router_fleet
+    graceful_failed, graceful_alternate = topology.east.transport_router_fleet
+    assert current.gwlbe_route_table_id is not None
+    assert current.network_interface_id is not None
+    assert alternate.network_interface_id is not None
+
+    def snapshot(
+        owner: e2e.SymmetricFleetMember, target_eni: str
+    ) -> dict[str, Any]:
+        return {
+            "route_table_id": owner.gwlbe_route_table_id,
+            "vpc_id": deployment.vpc_ids[owner.site],
+            "ownership": {
+                "EnvelopeRun": topology.run_id,
+                "ManagedBy": "terraform",
+                "Profile": "symmetric-gwlb-ha-v2",
+                "Role": "gwlbe",
+                "ZoneKey": owner.az_key,
+            },
+            "routes": [
+                {
+                    "destination_cidr_block": prefix,
+                    "network_interface_id": target_eni,
+                    "origin": "CreateRoute",
+                    "route_state": "active",
+                }
+                for prefix in topology.site(owner.site).remote_site_cidrs
+            ],
+        }
+
+    graceful_probe = {
+        "succeeded": True,
+        "protocol": "udp",
+        "source_transport_router_id": current.instance_id,
+        "source_transport_eni_id": current.network_interface_id,
+        "destination_transport_router_id": graceful_alternate.instance_id,
+        "new_flows": new_flow_evidence(
+            destination_transport_router_id=graceful_alternate.instance_id
+        ),
+    }
+    abrupt_probe = {
+        "succeeded": True,
+        "protocol": "udp",
+        "source_transport_router_id": alternate.instance_id,
+        "source_transport_eni_id": alternate.network_interface_id,
+        "destination_transport_router_id": graceful_alternate.instance_id,
+        "new_flows": new_flow_evidence(
+            source_transport_router_id=alternate.instance_id,
+            source_transport_eni_id=alternate.network_interface_id,
+        ),
+    }
+    def owner_observation(
+        owner_site: e2e.SymmetricSiteTopology,
+        owners: Mapping[str, str],
+    ) -> dict[str, Any]:
+        return {
+            "quiet_window_seconds": topology.route_failover.quiet_window_seconds,
+            "observers": [
+                {
+                    "observer_instance_id": observer.instance_id,
+                    "owners": [
+                        {
+                            "prefix": prefix,
+                            "owner_instance_id": instance_id,
+                            "owner_node_id_sha256": node_hashes[instance_id],
+                        }
+                        for prefix, instance_id in sorted(owners.items())
+                    ],
+                    "command": None,
+                }
+                for observer in topology.site(
+                    e2e._opposite(owner_site.site)
+                ).transport_router_fleet
+            ],
+        }
+
+    def route_replacement(
+        failed: e2e.SymmetricFleetMember,
+        selected_alternate: e2e.SymmetricFleetMember,
+        probe: Mapping[str, Any],
+        mode: str,
+    ) -> dict[str, Any]:
+        site = topology.site(failed.site)
+        prefixes = list(site.remote_site_cidrs)
+        baseline_owners = {
+            member.advertised_prefix: member.instance_id
+            for member in site.transport_router_fleet
+        }
+        transferred_owners = dict(baseline_owners)
+        transferred_owners[failed.advertised_prefix] = selected_alternate.instance_id
+        forward_generation = "33333333-4444-4555-8666-777777777777"
+        restore_generation = "44444444-5555-4666-8777-888888888888"
+
+        def member_value(member: e2e.SymmetricFleetMember) -> dict[str, Any]:
+            return {
+                "instance_id": member.instance_id,
+                "network_interface_id": member.network_interface_id,
+                "baseline_advertisements": [member.advertised_prefix],
+                "state_before": {
+                    "advertisements": {
+                        "generation": f"initial-{member.site}-{member.az_key}",
+                        "routes": [member.advertised_prefix],
+                        "service": "running",
+                        "mode": "normal",
+                    },
+                    "command": None,
+                },
+                "node_id_sha256": node_hashes[member.instance_id],
+            }
+
+        def advertisement_record(member: e2e.SymmetricFleetMember) -> dict[str, Any]:
+            return {
+                "advertisements": {
+                    "generation": restore_generation,
+                    "routes": [member.advertised_prefix],
+                    "service": "running",
+                    "mode": "normal",
+                },
+                "command": None,
+            }
+
+        restored_current = advertisement_record(failed)
+        restored_alternate = advertisement_record(selected_alternate)
+
+        return {
+            "route_table_id": failed.gwlbe_route_table_id,
+            "gwlbe_az_key": failed.az_key,
+            "source_prefix": failed.advertised_prefix,
+            "prefixes": prefixes,
+            "current": member_value(failed),
+            "alternate": member_value(selected_alternate),
+            "bounds": {
+                "approved_inputs": topology.route_failover.approved_bounds(),
+                "effective": {
+                    "mutation_timeout_seconds": 30,
+                    "restoration_timeout_seconds": 30,
+                    **topology.route_failover.derived_bounds(),
+                },
+                "derivation": {
+                    "settlement_timeout_seconds": "recovery_timeout_seconds",
+                    "quiet_window_seconds": "min(10,max(1,restoration_timeout_seconds//10))",
+                    "owner_lease_seconds": (
+                        "max(mutation_timeout_seconds,restoration_timeout_seconds,"
+                        "recovery_timeout_seconds,165,45)+quiet_window_seconds+15"
+                    ),
+                },
+            },
+            "before": snapshot(failed, failed.network_interface_id),
+            "advertisements": {
+                "forward_generation": forward_generation,
+                "restore_generation": restore_generation,
+                "failure_mode": mode,
+                "alternate_expansion": {
+                    "advertisements": {
+                        "generation": forward_generation,
+                        "routes": sorted(
+                            {
+                                selected_alternate.advertised_prefix,
+                                failed.advertised_prefix,
+                            }
+                        ),
+                        "service": "running",
+                        "mode": "normal",
+                    },
+                    "command": None,
+                },
+                "current_withdrawal": {
+                    "advertisements": {
+                        "generation": forward_generation,
+                        "routes": [],
+                        "service": "stopped",
+                        "mode": mode,
+                    },
+                    "command": None,
+                },
+            },
+            "ownership": {
+                "before": owner_observation(site, baseline_owners),
+                "transferred": owner_observation(site, transferred_owners),
+            },
+            "after": snapshot(failed, selected_alternate.network_interface_id),
+            "probe": dict(probe),
+            "restoration": {
+                "status": "verified",
+                "advertisements": {
+                    "status": "verified",
+                    "current": restored_current,
+                    "alternate": restored_alternate,
+                    "verification": {
+                        "current": copy.deepcopy(restored_current),
+                        "alternate": copy.deepcopy(restored_alternate),
+                    },
+                    "failures": [],
+                },
+                "ownership": {
+                    "status": "verified",
+                    "observation": owner_observation(site, baseline_owners),
+                },
+                "routes": {
+                    "status": "verified",
+                    "attempted_prefixes": prefixes,
+                    "api_failures": [],
+                    "settled_prefixes": prefixes,
+                    "quiet_window_seconds": topology.route_failover.quiet_window_seconds,
+                    "snapshot": snapshot(failed, failed.network_interface_id),
+                },
+            },
+            "restored": True,
+        }
+
+    graceful_route_replacement = route_replacement(
+        graceful_failed, graceful_alternate, graceful_probe, "graceful"
+    )
+    abrupt_route_replacement = route_replacement(
+        current, alternate, abrupt_probe, "abrupt"
+    )
+    target = topology.west.target_fleet[0]
+    target_alternate = topology.west.target_fleet[1]
+    readiness = {
+        "config_version": 2,
+        "tailnet_policy_valid": True,
+        "transport_router_contract_sha256": {
+            site: deployment.transport_router_readiness_expectations[site][
+                "contract_sha256"
+            ]
+            for site in e2e.SITES
+        },
+        "sites": {
+            site: {
+                "route_domains": {"workload": True, "transport": True, "target": True},
+                "targets": {
+                    member.instance_id: {
+                        "ready": True,
+                        "target_group_arn": member.target_group_arn,
+                        "registration_port": 6081,
+                        "process_generation_sha256": "7" * 64,
+                    }
+                    for member in topology.site(site).target_fleet
+                },
+                "transport_routers": {
+                    member.instance_id: {
+                        "ready": True,
+                        "node_identity_ready": True,
+                        "network_interface_id": member.network_interface_id,
+                        "contract_sha256": deployment.transport_router_readiness_expectations[
+                            site
+                        ]["contract_sha256"],
+                        "tailnet_node_id_sha256": node_hashes[member.instance_id],
+                        "advertised_prefix": member.advertised_prefix,
+                        "primary_route_ownership": {
+                            "observed_at": "2026-08-20T11:59:59Z",
+                            "remote": [
+                                {
+                                    "prefix": prefix,
+                                    "owner_instance_id": topology.site(
+                                        e2e._opposite(site)
+                                    ).transport_router_for_prefix(prefix).instance_id,
+                                    "online": True,
+                                }
+                                for index, prefix in enumerate(
+                                    topology.site(site).remote_site_cidrs
+                                )
+                            ],
+                            "local": [],
+                        },
+                    }
+                    for member in topology.site(site).transport_router_fleet
+                },
+            }
+            for site in e2e.SITES
+        },
+    }
+    return {
+        "schema": e2e.SYMMETRIC_EVIDENCE_SCHEMA,
+        "kind": e2e.SYMMETRIC_EVIDENCE_KIND,
+        "run_id": topology.run_id,
+        "generated_at": "2026-08-20T12:00:00Z",
+        "status": "passed",
+        "topology": topology.as_dict(),
+        "endpoint_ids": endpoints,
+        "preflight": readiness,
+        "cold_initiation": [
+            {
+                "source_site": site,
+                "destination_site": e2e._opposite(site),
+                "source_role": "initiator" if site == "west" else "responder",
+                "destination_role": "responder" if site == "west" else "initiator",
+                "protocol": protocol,
+                "source_az_key": "a" if site == "west" else "b",
+                "source_gwlbe_id": endpoints[site]["a" if site == "west" else "b"],
+                "dispatch_monotonic_ns": 100 + index,
+                "succeeded": True,
+            }
+            for index, (site, protocol) in enumerate(
+                (site, protocol) for site in e2e.SITES for protocol in e2e.PROTOCOLS
+            )
+        ],
+        "traversals": [
+            {
+                "source_site": site,
+                "destination_site": e2e._opposite(site),
+                "probes": [
+                    traversal_probe(site, role, protocol)
+                    for role in e2e.WORKLOAD_ROLES
+                    for protocol in e2e.PROTOCOLS
+                ],
+            }
+            for site in e2e.SITES
+        ],
+        "recoveries": [
+            {
+                "kind": "target-process",
+                "site": "west",
+                "failed_id": target.instance_id,
+                "alternate_id": target_alternate.instance_id,
+                "new_flow_succeeded": True,
+                "new_flows": new_flow_evidence(),
+                "recovery_duration_ms": 10,
+            },
+            {
+                "kind": "target-instance",
+                "site": "west",
+                "failed_id": target.instance_id,
+                "alternate_id": target_alternate.instance_id,
+                "replacement_id": "i-ff23456789abcdef",
+                "replacement_ready": True,
+                "old_process_generation_sha256": "7" * 64,
+                "replacement_process_generation_sha256": "8" * 64,
+                "target_group_arn": target.target_group_arn,
+                "registration_port": 6081,
+                "drain_state": "draining",
+                "drain_duration_ms": 5,
+                "new_flow_succeeded": True,
+                "new_flows": new_flow_evidence(),
+                "recovery_duration_ms": 20,
+            },
+            {
+                "kind": "transport-router",
+                "site": "west",
+                "failed_id": current.instance_id,
+                "alternate_id": alternate.instance_id,
+                "new_flow_succeeded": True,
+                "new_flows": abrupt_probe["new_flows"],
+                "recovery_duration_ms": 30,
+            },
+        ],
+        "transport": {
+            "target_process": failure_transport_evidence(
+                target.instance_id, "target-process"
+            ),
+            "target_instance": failure_transport_evidence(
+                target.instance_id, "target-instance"
+            ),
+            "transport_router": {
+                "graceful": failure_transport_evidence(
+                    graceful_failed.instance_id, "router-graceful"
+                ),
+                "abrupt": failure_transport_evidence(
+                    current.instance_id, "router-abrupt"
+                ),
+            },
+        },
+        "transport_router": {
+            "graceful": {
+                "control_plane": "tailnet-and-gwlbe-route",
+                "failed_id": graceful_failed.instance_id,
+                "alternate_id": graceful_alternate.instance_id,
+                "probe": graceful_probe,
+                "new_flows": graceful_probe["new_flows"],
+                "new_flow_succeeded": True,
+                "recovery_duration_ms": 15,
+                "route_replacement": graceful_route_replacement,
+                "restored": True,
+            },
+            "abrupt": {
+                "control_plane": "tailnet-and-gwlbe-route",
+                "failed_id": current.instance_id,
+                "alternate_id": alternate.instance_id,
+                "probe": abrupt_probe,
+                "new_flows": abrupt_probe["new_flows"],
+                "new_flow_succeeded": True,
+                "recovery_duration_ms": 30,
+                "route_replacement": abrupt_route_replacement,
+                "restored": True,
+            },
+        },
+        "health_transitions": [
+            {
+                "kind": "target-process",
+                "member_id": target.instance_id,
+                "states": ["healthy", "unavailable", "healthy"],
+            },
+            {
+                "kind": "target-instance",
+                "member_id": target.instance_id,
+                "states": ["healthy", "draining", "replaced"],
+            },
+            {
+                "kind": "transport-router",
+                "member_id": current.instance_id,
+                "states": ["healthy", "unavailable", "healthy"],
+            },
+        ],
+        "cost": deployment.cost_evidence(),
+        "lifecycle": {
+            "claimed": True,
+            "drift_precheck": "clean",
+            "drift_postcheck": "clean",
+            "finish": "passed",
+            "cleanup": "complete",
+        },
+        "residual_audit": {"passed": True, "owned_resources_remaining": 0},
+        "diagnostics": {},
+        "failure": None,
+    }
+
+
+def failure_transport_evidence(failed_id: str, label: str) -> dict[str, Any]:
+    def stream(protocol: str) -> dict[str, Any]:
+        return {
+            "protocol": protocol,
+            "flow_id": f"fixture-{label}-{protocol}",
+            "outcome": "resumed",
+            "one_socket": True,
+            "analysis_available": True,
+            "sent_markers": 10,
+            "received_markers": 9,
+            "lost_markers": 1,
+            "loss_percent": 10.0,
+            "maximum_interruption_ms": 100,
+            "threshold_ms": 30_000,
+            "within_threshold": True,
+        }
+
+    return {
+        "failed_ids": {"tcp": failed_id, "udp": failed_id},
+        "tcp": stream("tcp"),
+        "udp": stream("udp"),
+        "receivers": {
+            "tcp_sessions": 1,
+            "tcp_duplicates": 0,
+            "udp_sessions": 1,
+            "udp_duplicates": 0,
+        },
+    }
+
+
+def new_flow_evidence(**path_fields: Any) -> dict[str, Any]:
+    return {
+        protocol: {
+            "succeeded": True,
+            "path": {"protocol": protocol, **path_fields},
+        }
+        for protocol in e2e.TRANSPORT_PROTOCOLS
+    }
+
+
 def ready_lifecycle_manifest(deployment: Mapping[str, Any]) -> dict[str, Any]:
     source = {
         "revision": "b" * 40,
@@ -241,9 +1238,15 @@ def ready_lifecycle_manifest(deployment: Mapping[str, Any]) -> dict[str, Any]:
             "auth_key_id": "key-id",
             "key_generation": 1,
             "pending_revoke_key_ids": [],
-            "expected_hostnames": ["fixture-live-west", "fixture-live-east"],
+            "expected_hostnames": fixture_live_tailnet_hostnames(),
             "nodes_expected": True,
-            "device_ids": {"west": "device-west", "east": "device-east"},
+            "device_ids": {
+                hostname: f"device-{index}"
+                for index, hostname in enumerate(fixture_live_tailnet_hostnames(), start=1)
+            },
+            "device_roles": {
+                hostname: "transport-router" for hostname in fixture_live_tailnet_hostnames()
+            },
         },
     }
 
@@ -276,6 +1279,60 @@ class DurableManifestStore:
             self.write_hook(self, value, if_match)
             return
         self.commit(value, if_match)
+
+
+class DurableRouteTransactions:
+    def __init__(self, value: Mapping[str, Any] | None = None) -> None:
+        self.value = copy.deepcopy(value)
+        self.revision = '"route-etag-0"'
+        self.writes: list[dict[str, Any]] = []
+        self.finalized: list[dict[str, Any]] = []
+        self.fail_next_update = False
+
+    def load_route_transaction(self) -> tuple[dict[str, Any], str] | None:
+        if self.value is None:
+            return None
+        return copy.deepcopy(self.value), self.revision
+
+    def create_route_transaction(self, value: Mapping[str, Any]) -> str:
+        if self.value is not None:
+            raise e2e.ConcurrentRunError("fixture route transaction already exists")
+        self.value = copy.deepcopy(dict(value))
+        return self._commit()
+
+    def update_route_transaction(
+        self, value: Mapping[str, Any], *, expected_revision: str
+    ) -> str:
+        if self.fail_next_update:
+            self.fail_next_update = False
+            raise e2e.ConcurrentRunError("fixture route transaction CAS collision")
+        if self.value is None or expected_revision != self.revision:
+            raise e2e.ConcurrentRunError("fixture route transaction CAS collision")
+        self.value = copy.deepcopy(dict(value))
+        return self._commit()
+
+    def finalize_route_transaction(
+        self,
+        transaction_id: str,
+        summary: Mapping[str, Any],
+        *,
+        expected_revision: str,
+    ) -> str:
+        if (
+            self.value is None
+            or self.value.get("transaction_id") != transaction_id
+            or expected_revision != self.revision
+        ):
+            raise e2e.ConcurrentRunError("fixture route transaction finalization collision")
+        self.finalized.append(copy.deepcopy(dict(summary)))
+        self.value = None
+        return self._commit()
+
+    def _commit(self) -> str:
+        if self.value is not None:
+            self.writes.append(copy.deepcopy(self.value))
+        self.revision = f'"route-etag-{len(self.writes) + len(self.finalized)}"'
+        return self.revision
 
 
 class DeploymentParsingTest(unittest.TestCase):
@@ -378,7 +1435,7 @@ class ProtectedDeploymentParsingTest(unittest.TestCase):
             "profile": "symmetric-gwlb-ha-v2",
             "resource_counts": {
                 "target_instances": {"west": 2, "east": 2},
-                "ingress_routers": {"west": 2, "east": 2},
+                "transport_routers": {"west": 2, "east": 2},
                 "workload_instances": 4,
                 "vpc_flow_logs": 2,
                 "cloudwatch_log_groups": 2,
@@ -515,6 +1572,2454 @@ class FakeClock:
         self.value += seconds
 
 
+class FakeAdvertisementControl:
+    def __init__(
+        self, topology: e2e.SymmetricTopologyV2, clock: FakeClock
+    ) -> None:
+        self.topology = topology
+        self.clock = clock
+        self.node_ids_by_instance = {
+            member.instance_id: f"node-{member.site}-{member.az_key}"
+            for site in e2e.SITES
+            for member in topology.site(site).transport_router_fleet
+        }
+        self.states = {
+            member.instance_id: {
+                "generation": f"initial-{member.site}-{member.az_key}",
+                "routes": [member.advertised_prefix],
+                "service": "running",
+                "mode": "normal",
+            }
+            for site in e2e.SITES
+            for member in topology.site(site).transport_router_fleet
+        }
+        self.operations: list[dict[str, Any]] = []
+        self.apply_count = 0
+        self.fail_before_apply: int | None = None
+        self.fail_after_apply: int | None = None
+
+    def inspect(self, member: e2e.SymmetricFleetMember) -> dict[str, Any]:
+        return {
+            "advertisements": copy.deepcopy(self.states[member.instance_id]),
+            "command": None,
+        }
+
+    def apply(
+        self,
+        member: e2e.SymmetricFleetMember,
+        routes: Any,
+        *,
+        service: str,
+        mode: str,
+        generation: str,
+        predecessors: Any,
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        del timeout_seconds
+        self.apply_count += 1
+        if self.fail_before_apply == self.apply_count:
+            raise RuntimeError("injected advertisement failure before mutation")
+        current = self.states[member.instance_id]
+        if current["generation"] != generation and current["generation"] not in predecessors:
+            raise e2e.ResilienceError("fixture fenced a stale advertisement generation")
+        state = {
+            "generation": generation,
+            "routes": sorted(routes),
+            "service": service,
+            "mode": mode,
+        }
+        self.states[member.instance_id] = state
+        self.operations.append(
+            {
+                "instance_id": member.instance_id,
+                "advertisements": copy.deepcopy(state),
+            }
+        )
+        if self.fail_after_apply == self.apply_count:
+            raise RuntimeError("injected ambiguous advertisement completion")
+        return {"advertisements": copy.deepcopy(state), "command": None}
+
+    def wait_ownership(
+        self,
+        site: str,
+        expected_owner_instance_ids: Mapping[str, str],
+        *,
+        timeout_seconds: float,
+        quiet_window_seconds: float,
+    ) -> dict[str, Any]:
+        if timeout_seconds < quiet_window_seconds:
+            raise TimeoutError("fixture ownership deadline is too short")
+        self.clock.sleep(quiet_window_seconds)
+        return {
+            "quiet_window_seconds": quiet_window_seconds,
+            "observers": [
+                {
+                    "observer_instance_id": observer.instance_id,
+                    "owners": [
+                        {
+                            "prefix": prefix,
+                            "owner_instance_id": owner,
+                            "owner_node_id_sha256": hashlib.sha256(
+                                self.node_ids_by_instance[owner].encode()
+                            ).hexdigest(),
+                        }
+                        for prefix, owner in sorted(
+                            expected_owner_instance_ids.items()
+                        )
+                    ],
+                    "command": None,
+                }
+                for observer in self.topology.site(
+                    e2e._opposite(site)
+                ).transport_router_fleet
+            ],
+        }
+
+
+class RouteTableAWS:
+    def __init__(self, topology: e2e.SymmetricTopologyV2) -> None:
+        self.topology = topology
+        self.current, self.alternate = topology.west.transport_router_fleet
+        self.route_table_owner = self.current
+        assert self.current.gwlbe_route_table_id is not None
+        assert self.current.network_interface_id is not None
+        assert self.alternate.network_interface_id is not None
+        self.routes = {
+            prefix: self.current.network_interface_id
+            for prefix in topology.west.remote_site_cidrs
+        }
+        self.calls: list[tuple[list[str], str | None]] = []
+        self.forward_calls = 0
+        self.fail_forward_call: int | None = None
+        self.fail_restore_prefix: str | None = None
+        self.ambiguous_restore_prefix: str | None = None
+        self.ignore_forward = False
+        self.response_route_table_id = self.current.gwlbe_route_table_id
+        self.run_tag = topology.run_id
+        self.interface_instance_overrides: dict[str, str] = {}
+        self.restore_visibility_failures: dict[str, int] = {}
+        self.restoration_started = False
+
+    def json(
+        self,
+        args: list[str],
+        *,
+        region: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        assert timeout_seconds is not None and timeout_seconds > 0
+        self.calls.append((list(args), region))
+        operation = args[1]
+        if operation == "describe-route-tables":
+            visible_routes = dict(self.routes)
+            for prefix, failures in list(self.restore_visibility_failures.items()):
+                if (
+                    self.restoration_started
+                    and failures > 0
+                    and visible_routes.get(prefix) == self.current.network_interface_id
+                ):
+                    visible_routes[prefix] = self.alternate.network_interface_id
+                    self.restore_visibility_failures[prefix] = failures - 1
+            return {
+                "RouteTables": [
+                    {
+                        "RouteTableId": self.response_route_table_id,
+                        "VpcId": "vpc-0123456789abcdef0",
+                        "Tags": [
+                            {"Key": "EnvelopeRun", "Value": self.run_tag},
+                            {"Key": "ManagedBy", "Value": "terraform"},
+                            {"Key": "Profile", "Value": "symmetric-gwlb-ha-v2"},
+                            {"Key": "Role", "Value": "gwlbe"},
+                            {"Key": "ZoneKey", "Value": self.route_table_owner.az_key},
+                        ],
+                        "Associations": [
+                            {
+                                "SubnetId": "subnet-8123456789abcdef0",
+                                "Main": False,
+                                "AssociationState": {"State": "associated"},
+                            }
+                        ],
+                        "Routes": [
+                            {
+                                "DestinationCidrBlock": prefix,
+                                "NetworkInterfaceId": target,
+                                "Origin": "CreateRoute",
+                                "State": "active",
+                            }
+                            for prefix, target in visible_routes.items()
+                        ],
+                    }
+                ]
+            }
+        if operation == "describe-network-interfaces":
+            members = {
+                member.network_interface_id: member
+                for member in self.topology.west.transport_router_fleet
+            }
+            requested = args[args.index("--network-interface-ids") + 1 :]
+            return {
+                "NetworkInterfaces": [
+                    {
+                        "NetworkInterfaceId": interface_id,
+                        "VpcId": "vpc-0123456789abcdef0",
+                        "Status": "in-use",
+                        "Attachment": {
+                            "InstanceId": self.interface_instance_overrides.get(
+                                interface_id, members[interface_id].instance_id
+                            ),
+                            "DeviceIndex": 0,
+                            "Status": "attached",
+                        },
+                    }
+                    for interface_id in requested
+                ]
+            }
+        if operation == "replace-route":
+            prefix = args[args.index("--destination-cidr-block") + 1]
+            target = args[args.index("--network-interface-id") + 1]
+            if target == self.alternate.network_interface_id:
+                self.forward_calls += 1
+                if self.fail_forward_call == self.forward_calls:
+                    raise RuntimeError("injected partial route replacement failure")
+                if not self.ignore_forward:
+                    self.routes[prefix] = target
+                return {}
+            if target == self.current.network_interface_id:
+                self.restoration_started = True
+                if self.fail_restore_prefix == prefix:
+                    raise RuntimeError("injected route restoration failure")
+                self.routes[prefix] = target
+                if self.ambiguous_restore_prefix == prefix:
+                    raise RuntimeError("injected ambiguous route restoration completion")
+                return {}
+            raise AssertionError(f"unexpected route target {target}")
+        raise AssertionError(f"unexpected fake AWS operation {operation}")
+
+    @property
+    def mutation_calls(self) -> list[list[str]]:
+        return [args for args, _region in self.calls if args[1] == "replace-route"]
+
+
+class GWLBERouteFailoverTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.topology = route_failover_topology()
+        self.current, self.alternate = self.topology.west.transport_router_fleet
+        self.vpc_ids = {
+            "west": "vpc-0123456789abcdef0",
+            "east": "vpc-1123456789abcdef0",
+        }
+
+    @staticmethod
+    def authority(
+        current: e2e.SymmetricFleetMember,
+        alternate: e2e.SymmetricFleetMember,
+        prefixes: tuple[str, ...],
+        route_table_owner: e2e.SymmetricFleetMember,
+    ) -> dict[str, Any]:
+        return {
+            "authorized": True,
+            "ownership_verified": True,
+            "cleanup_authorized": True,
+            "claim_id": "11111111-2222-4333-8444-555555555555",
+            "route_table_id": route_table_owner.gwlbe_route_table_id,
+            "prefixes": list(prefixes),
+            "source_prefix": current.advertised_prefix,
+            "current_network_interface_id": current.network_interface_id,
+            "alternate_network_interface_id": alternate.network_interface_id,
+        }
+
+    def failover(
+        self,
+        temporary: str,
+        aws: RouteTableAWS,
+        *,
+        authorize: Any = None,
+        environment: Mapping[str, str] | None = None,
+        durability: DurableRouteTransactions | None = None,
+    ) -> tuple[e2e.GWLBERouteFailover, FakeClock, list[str], pathlib.Path]:
+        clock = FakeClock()
+        ready: list[str] = []
+        evidence_path = pathlib.Path(temporary) / "gwlbe-route-replacement.json"
+        transaction = e2e.GWLBERouteFailover(
+            self.topology,
+            self.vpc_ids,
+            aws,
+            authorize=authorize or self.authority,
+            durability=durability or DurableRouteTransactions(),
+            verify_ready=lambda member: ready.append(member.instance_id),
+            advertisement_control=FakeAdvertisementControl(self.topology, clock),
+            evidence_path=evidence_path,
+            environment=environment
+            if environment is not None
+            else {
+                "ENVELOPE_E2E_APPROVED_RUN_ID": self.topology.run_id,
+                "GITHUB_EVENT_NAME": "workflow_dispatch",
+            },
+            monotonic=clock,
+            sleep=clock.sleep,
+            api_timeout_seconds=1,
+        )
+        return transaction, clock, ready, evidence_path
+
+    def successful_probe(self, _remaining: float) -> Mapping[str, Any]:
+        return {
+            "source_transport_router_id": self.alternate.instance_id,
+            "source_transport_eni_id": self.alternate.network_interface_id,
+            "succeeded": True,
+        }
+
+    def assert_original_routes(self, aws: RouteTableAWS) -> None:
+        self.assertEqual(
+            aws.routes,
+            {
+                prefix: self.current.network_interface_id
+                for prefix in self.topology.west.remote_site_cidrs
+            },
+        )
+
+    def test_lease_and_stream_reservations_cover_long_transaction_components(self) -> None:
+        failover = self.topology.route_failover
+        prefix_count = len(self.topology.west.remote_site_cidrs)
+
+        self.assertGreaterEqual(
+            failover.owner_lease_seconds,
+            e2e.TRANSPORT_ROUTER_READINESS_RESERVATION_SECONDS
+            + failover.quiet_window_seconds
+            + e2e.ROUTE_OWNER_LEASE_MARGIN_SECONDS,
+        )
+        self.assertLessEqual(
+            failover.restoration_reservation_seconds(prefix_count),
+            e2e.DEFAULT_TIMEOUTS.cleanup,
+        )
+        self.assertLessEqual(
+            2
+            * (
+                failover.transaction_reservation_seconds(prefix_count)
+                + e2e.STREAM_MUTATION_OVERHEAD_SECONDS
+            ),
+            e2e.DEFAULT_TIMEOUTS.hard_timeout,
+        )
+
+    def pending_journal(
+        self,
+        aws: RouteTableAWS,
+        *,
+        claim_id: str = "11111111-2222-4333-8444-555555555555",
+        owner: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        def snapshot(target: str) -> dict[str, Any]:
+            return {
+                "route_table_id": self.current.gwlbe_route_table_id,
+                "vpc_id": self.vpc_ids["west"],
+                "ownership": {
+                    "EnvelopeRun": self.topology.run_id,
+                    "ManagedBy": "terraform",
+                    "Profile": "symmetric-gwlb-ha-v2",
+                    "Role": "gwlbe",
+                    "ZoneKey": self.current.az_key,
+                },
+                "routes": [
+                    {
+                        "destination_cidr_block": prefix,
+                        "network_interface_id": target,
+                        "origin": "CreateRoute",
+                        "route_state": "active",
+                    }
+                    for prefix in self.topology.west.remote_site_cidrs
+                ],
+            }
+
+        identity = e2e._route_runner_identity()
+        identity["pid"] = 99_999_999
+        return {
+            "schema": e2e.ROUTE_JOURNAL_SCHEMA,
+            "kind": e2e.ROUTE_JOURNAL_KIND,
+            "run_id": self.topology.run_id,
+            "claim_id": claim_id,
+            "transaction_id": "22222222-3333-4444-8555-666666666666",
+            "owner": dict(owner or identity),
+            "lease_expires_at": "2026-08-20T12:01:00Z",
+            "site": "west",
+            "gwlbe_az_key": self.current.az_key,
+            "started_at": "2026-08-20T12:00:00Z",
+            "status": "alternate-active",
+            "route_table_id": self.current.gwlbe_route_table_id,
+            "source_prefix": self.current.advertised_prefix,
+            "prefixes": list(self.topology.west.remote_site_cidrs),
+            "current": {
+                "instance_id": self.current.instance_id,
+                "network_interface_id": self.current.network_interface_id,
+                "baseline_advertisements": [self.current.advertised_prefix],
+                "state_before": {
+                    "advertisements": {
+                        "generation": "initial-west-a",
+                        "routes": [self.current.advertised_prefix],
+                        "service": "running",
+                        "mode": "normal",
+                    },
+                    "command": None,
+                },
+                "node_id_sha256": hashlib.sha256(b"node-west-a").hexdigest(),
+            },
+            "alternate": {
+                "instance_id": self.alternate.instance_id,
+                "network_interface_id": self.alternate.network_interface_id,
+                "baseline_advertisements": [self.alternate.advertised_prefix],
+                "state_before": {
+                    "advertisements": {
+                        "generation": "initial-west-b",
+                        "routes": [self.alternate.advertised_prefix],
+                        "service": "running",
+                        "mode": "normal",
+                    },
+                    "command": None,
+                },
+                "node_id_sha256": hashlib.sha256(b"node-west-b").hexdigest(),
+            },
+            "interfaces": [],
+            "before": snapshot(self.current.network_interface_id),
+            "advertisements": {
+                "forward_generation": "33333333-4444-4555-8666-777777777777",
+                "restore_generation": "44444444-5555-4666-8777-888888888888",
+                "failure_mode": "abrupt",
+                "alternate_expansion": None,
+                "current_withdrawal": None,
+            },
+            "ownership": {"before": {}, "transferred": {}},
+            "mutation": {
+                "attempted_prefixes": list(self.topology.west.remote_site_cidrs),
+                "completed_prefixes": list(self.topology.west.remote_site_cidrs),
+                "ambiguous_calls": [],
+            },
+            "after": snapshot(self.alternate.network_interface_id),
+            "probe": None,
+            "restoration": {
+                "status": "not-started",
+                "advertisements": {"status": "not-started"},
+                "ownership": {"status": "not-started"},
+                "routes": {"status": "not-started"},
+            },
+            "failure": None,
+        }
+
+    def test_authorized_replacement_records_before_after_and_verified_restoration(self) -> None:
+        aws = RouteTableAWS(self.topology)
+        with tempfile.TemporaryDirectory() as temporary:
+            transaction, _clock, ready, evidence_path = self.failover(temporary, aws)
+            result = transaction.replace(
+                self.current,
+                self.alternate,
+                probe=self.successful_probe,
+                timeout_seconds=10,
+                restoration_timeout_seconds=10,
+            )
+            journal = json.loads(evidence_path.read_text())
+            evidence_mode = stat.S_IMODE(evidence_path.stat().st_mode)
+            durability = transaction.durability
+
+        self.assertTrue(result["restored"])
+        self.assertEqual(
+            ready,
+            [
+                self.current.instance_id,
+                self.alternate.instance_id,
+                self.current.instance_id,
+                self.alternate.instance_id,
+            ],
+        )
+        self.assertEqual(len(aws.mutation_calls), 4)
+        self.assert_original_routes(aws)
+        self.assertEqual(journal["status"], "restored")
+        self.assertEqual(
+            {route["network_interface_id"] for route in journal["before"]["routes"]},
+            {self.current.network_interface_id},
+        )
+        self.assertEqual(
+            {route["network_interface_id"] for route in journal["after"]["routes"]},
+            {self.alternate.network_interface_id},
+        )
+        self.assertEqual(journal["restoration"]["status"], "verified")
+        self.assertEqual(
+            [
+                operation["advertisements"]["service"]
+                for operation in transaction.advertisement_control.operations
+            ],
+            ["running", "stopped", "running", "running"],
+        )
+        self.assertEqual(
+            transaction.advertisement_control.operations[0]["advertisements"][
+                "routes"
+            ],
+            sorted(
+                {
+                    self.current.advertised_prefix,
+                    self.alternate.advertised_prefix,
+                }
+            ),
+        )
+        self.assertEqual(evidence_mode, 0o600)
+        self.assertIsInstance(durability, DurableRouteTransactions)
+        self.assertIsNone(durability.value)
+        self.assertEqual(len(durability.finalized), 1)
+        self.assertTrue(
+            all("lease_expires_at" in value for value in durability.writes)
+        )
+
+    def test_ambiguous_advertisement_completion_restores_and_fences_late_forward(self) -> None:
+        aws = RouteTableAWS(self.topology)
+        with tempfile.TemporaryDirectory() as temporary:
+            transaction, _clock, _ready, evidence_path = self.failover(
+                temporary, aws
+            )
+            control = transaction.advertisement_control
+            control.fail_after_apply = 1
+            with self.assertRaisesRegex(
+                RuntimeError, "ambiguous advertisement completion"
+            ):
+                transaction.replace(
+                    self.current,
+                    self.alternate,
+                    probe=self.successful_probe,
+                    timeout_seconds=10,
+                    restoration_timeout_seconds=10,
+                )
+            journal = json.loads(evidence_path.read_text())
+
+        self.assert_original_routes(aws)
+        self.assertEqual(journal["restoration"]["status"], "verified")
+        self.assertEqual(
+            journal["restoration"]["advertisements"]["status"], "verified"
+        )
+        self.assertEqual(
+            journal["restoration"]["ownership"]["status"], "verified"
+        )
+        self.assertEqual(journal["restoration"]["routes"]["status"], "verified")
+        with self.assertRaisesRegex(e2e.ResilienceError, "stale"):
+            control.apply(
+                self.alternate,
+                [
+                    self.current.advertised_prefix,
+                    self.alternate.advertised_prefix,
+                ],
+                service="running",
+                mode="normal",
+                generation=journal["advertisements"]["forward_generation"],
+                predecessors=[
+                    journal["alternate"]["state_before"]["advertisements"][
+                        "generation"
+                    ]
+                ],
+                timeout_seconds=10,
+            )
+
+    def test_restoration_keeps_alternate_coverage_and_routes_when_current_cannot_start(self) -> None:
+        aws = RouteTableAWS(self.topology)
+        with tempfile.TemporaryDirectory() as temporary:
+            transaction, _clock, _ready, evidence_path = self.failover(
+                temporary, aws
+            )
+            control = transaction.advertisement_control
+            control.fail_before_apply = 3
+            with self.assertRaisesRegex(
+                e2e.RouteRestorationError,
+                "advertisements and ownership before routes",
+            ):
+                transaction.replace(
+                    self.current,
+                    self.alternate,
+                    probe=self.successful_probe,
+                    timeout_seconds=10,
+                    restoration_timeout_seconds=10,
+                )
+            journal = json.loads(evidence_path.read_text())
+
+        self.assertEqual(
+            set(aws.routes.values()), {self.alternate.network_interface_id}
+        )
+        self.assertEqual(len(aws.mutation_calls), 2)
+        self.assertEqual(journal["status"], "restoration-failed")
+        self.assertEqual(journal["restoration"]["routes"]["status"], "failed")
+        self.assertEqual(
+            [operation["advertisements"]["service"] for operation in control.operations],
+            ["running", "stopped"],
+        )
+        self.assertEqual(
+            control.states[self.alternate.instance_id]["routes"],
+            sorted(
+                {
+                    self.current.advertised_prefix,
+                    self.alternate.advertised_prefix,
+                }
+            ),
+        )
+
+    def test_initial_transport_router_selection_rejects_cross_az_routes(self) -> None:
+        raw_topology = self.topology.as_dict()
+        raw_topology["route_failover"]["initial_transport_router_az_by_gwlbe_az"][
+            "west"
+        ] = {"a": "b", "b": "a"}
+        with self.assertRaisesRegex(e2e.DeploymentError, "same transport-router AZ"):
+            e2e.parse_symmetric_topology_v2(raw_topology)
+
+    def test_requires_protected_runner_and_exact_durable_authority(self) -> None:
+        cases = {
+            "unprotected": ({}, self.authority),
+            "durable-denial": (
+                {
+                    "ENVELOPE_E2E_APPROVED_RUN_ID": self.topology.run_id,
+                    "GITHUB_EVENT_NAME": "workflow_dispatch",
+                },
+                lambda *_args: {"authorized": False},
+            ),
+        }
+        for name, (environment, authority) in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                aws = RouteTableAWS(self.topology)
+                transaction, _clock, _ready, _path = self.failover(
+                    temporary,
+                    aws,
+                    authorize=authority,
+                    environment=environment,
+                )
+                with self.assertRaises(e2e.E2EError):
+                    transaction.replace(
+                        self.current,
+                        self.alternate,
+                        probe=self.successful_probe,
+                        timeout_seconds=10,
+                        restoration_timeout_seconds=10,
+                    )
+                self.assertEqual(aws.mutation_calls, [])
+
+    def test_rejects_wrong_route_table_ownership_before_mutation(self) -> None:
+        mutations = {
+            "run ownership": lambda aws: setattr(aws, "run_tag", "another-run"),
+            "route identity": lambda aws: setattr(
+                aws, "response_route_table_id", "rtb-fffffffffffffffff"
+            ),
+            "ENI ownership": lambda aws: aws.interface_instance_overrides.update(
+                {self.alternate.network_interface_id: "i-ff23456789abcdef"}
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                aws = RouteTableAWS(self.topology)
+                mutate(aws)
+                transaction, _clock, _ready, _path = self.failover(temporary, aws)
+                with self.assertRaises(e2e.ResilienceError):
+                    transaction.replace(
+                        self.current,
+                        self.alternate,
+                        probe=self.successful_probe,
+                        timeout_seconds=10,
+                        restoration_timeout_seconds=10,
+                    )
+                self.assertEqual(aws.mutation_calls, [])
+
+    def test_rejects_wrong_prefix_current_target_and_alternate_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            aws = RouteTableAWS(self.topology)
+            del aws.routes[self.topology.west.remote_site_cidrs[-1]]
+            transaction, _clock, _ready, _path = self.failover(temporary, aws)
+            with self.assertRaisesRegex(e2e.ResilienceError, "route"):
+                transaction.replace(
+                    self.current,
+                    self.alternate,
+                    probe=self.successful_probe,
+                    timeout_seconds=10,
+                    restoration_timeout_seconds=10,
+                )
+            self.assertEqual(aws.mutation_calls, [])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            aws = RouteTableAWS(self.topology)
+            aws.routes[self.topology.west.remote_site_cidrs[0]] = "eni-fffffffffffffffff"
+            transaction, _clock, _ready, _path = self.failover(temporary, aws)
+            with self.assertRaisesRegex(e2e.ResilienceError, "current ENI"):
+                transaction.replace(
+                    self.current,
+                    self.alternate,
+                    probe=self.successful_probe,
+                    timeout_seconds=10,
+                    restoration_timeout_seconds=10,
+                )
+            self.assertEqual(aws.mutation_calls, [])
+
+        foreign = self.topology.east.transport_router_fleet[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            aws = RouteTableAWS(self.topology)
+            transaction, _clock, _ready, _path = self.failover(temporary, aws)
+            with self.assertRaisesRegex(e2e.ResilienceError, "alternate"):
+                transaction.replace(
+                    self.current,
+                    foreign,
+                    probe=self.successful_probe,
+                    timeout_seconds=10,
+                    restoration_timeout_seconds=10,
+                )
+            self.assertEqual(aws.mutation_calls, [])
+
+    def test_partial_mutation_rolls_back_every_prefix(self) -> None:
+        aws = RouteTableAWS(self.topology)
+        aws.fail_forward_call = 2
+        with tempfile.TemporaryDirectory() as temporary:
+            transaction, _clock, _ready, evidence_path = self.failover(temporary, aws)
+            with self.assertRaisesRegex(e2e.AmbiguousRouteMutationError, "ambiguous"):
+                transaction.replace(
+                    self.current,
+                    self.alternate,
+                    probe=self.successful_probe,
+                    timeout_seconds=10,
+                    restoration_timeout_seconds=10,
+                )
+            journal = json.loads(evidence_path.read_text())
+
+        self.assert_original_routes(aws)
+        self.assertEqual(journal["status"], "restored-after-failure")
+        self.assertEqual(
+            journal["restoration"]["routes"]["attempted_prefixes"],
+            list(self.topology.west.remote_site_cidrs),
+        )
+
+    def test_cas_collision_before_forward_call_never_selects_alternate(self) -> None:
+        aws = RouteTableAWS(self.topology)
+        durability = DurableRouteTransactions()
+        durability.fail_next_update = True
+        with tempfile.TemporaryDirectory() as temporary:
+            transaction, _clock, _ready, _path = self.failover(
+                temporary, aws, durability=durability
+            )
+            with self.assertRaisesRegex(e2e.ConcurrentRunError, "CAS collision"):
+                transaction.replace(
+                    self.current,
+                    self.alternate,
+                    probe=self.successful_probe,
+                    timeout_seconds=10,
+                    restoration_timeout_seconds=10,
+                )
+
+        alternate_calls = [
+            args
+            for args in aws.mutation_calls
+            if args[args.index("--network-interface-id") + 1]
+            == self.alternate.network_interface_id
+        ]
+        self.assertEqual(alternate_calls, [])
+        self.assert_original_routes(aws)
+
+    def test_restoration_requires_a_repeated_quiet_visibility_window(self) -> None:
+        aws = RouteTableAWS(self.topology)
+        first_prefix = self.topology.west.remote_site_cidrs[0]
+        aws.restore_visibility_failures[first_prefix] = 3
+        with tempfile.TemporaryDirectory() as temporary:
+            transaction, clock, _ready, path = self.failover(temporary, aws)
+            result = transaction.replace(
+                self.current,
+                self.alternate,
+                probe=self.successful_probe,
+                timeout_seconds=10,
+                restoration_timeout_seconds=10,
+            )
+            journal = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertTrue(result["restored"])
+        self.assertGreaterEqual(clock.value, 5)
+        self.assertEqual(
+            journal["restoration"]["routes"]["settled_prefixes"],
+            list(self.topology.west.remote_site_cidrs),
+        )
+
+    def test_reconcile_restores_each_persisted_mutation_phase(self) -> None:
+        statuses = (
+            "authorized",
+            "alternate-advertising",
+            "ownership-converging",
+            "ownership-transferred",
+            "failed-before-restoration",
+            "ambiguous-forward-call",
+            "alternate-active",
+            "probe-passed",
+            "recovery-claimed",
+            "restoring",
+            "restoration-failed",
+            "restored",
+            "restored-after-failure",
+            "reconciled-after-crash",
+        )
+        for status in statuses:
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
+                aws = RouteTableAWS(self.topology)
+                if status not in {
+                    "authorized",
+                    "restored",
+                    "restored-after-failure",
+                    "reconciled-after-crash",
+                }:
+                    aws.routes = {
+                        prefix: self.alternate.network_interface_id
+                        for prefix in self.topology.west.remote_site_cidrs
+                    }
+                journal = self.pending_journal(aws, owner=e2e._route_runner_identity())
+                journal["status"] = status
+                journal["lease_expires_at"] = "2099-08-20T12:01:00Z"
+                durability = DurableRouteTransactions(journal)
+                transaction, _clock, _ready, _path = self.failover(
+                    temporary, aws, durability=durability
+                )
+
+                result = transaction.reconcile(restoration_timeout_seconds=10)
+
+                self.assertTrue(result["restored"])
+                self.assertIsNone(durability.value)
+                self.assert_original_routes(aws)
+
+    def test_timeout_and_interruption_restore_original_routes(self) -> None:
+        failures = (TimeoutError("probe deadline"), KeyboardInterrupt("runner interrupted"))
+        for failure in failures:
+            with self.subTest(category=type(failure).__name__), tempfile.TemporaryDirectory() as temporary:
+                aws = RouteTableAWS(self.topology)
+                transaction, _clock, _ready, evidence_path = self.failover(temporary, aws)
+
+                def fail_probe(_remaining: float, error: BaseException = failure) -> Mapping[str, Any]:
+                    raise error
+
+                with self.assertRaises(type(failure)):
+                    transaction.replace(
+                        self.current,
+                        self.alternate,
+                        probe=fail_probe,
+                        timeout_seconds=10,
+                        restoration_timeout_seconds=10,
+                    )
+                journal = json.loads(evidence_path.read_text())
+                self.assert_original_routes(aws)
+                self.assertEqual(journal["status"], "restored-after-failure")
+                self.assertEqual(journal["failure"]["category"], type(failure).__name__)
+
+    def test_route_convergence_timeout_uses_fresh_restoration_deadline(self) -> None:
+        aws = RouteTableAWS(self.topology)
+        aws.ignore_forward = True
+        probe = mock.Mock(side_effect=AssertionError("probe must wait for route convergence"))
+        with tempfile.TemporaryDirectory() as temporary:
+            transaction, clock, _ready, evidence_path = self.failover(temporary, aws)
+            with self.assertRaisesRegex(TimeoutError, "converge"):
+                transaction.replace(
+                    self.current,
+                    self.alternate,
+                    probe=probe,
+                    timeout_seconds=7,
+                    restoration_timeout_seconds=7,
+                )
+            journal = json.loads(evidence_path.read_text())
+
+        probe.assert_not_called()
+        self.assertGreaterEqual(clock.value, 7)
+        self.assert_original_routes(aws)
+        self.assertEqual(journal["restoration"]["status"], "verified")
+        self.assertEqual(journal["status"], "restored-after-failure")
+
+    def test_restoration_failure_overrides_probe_failure_and_reports_residual_route(self) -> None:
+        aws = RouteTableAWS(self.topology)
+        failed_prefix = self.topology.west.remote_site_cidrs[0]
+        aws.fail_restore_prefix = failed_prefix
+        with tempfile.TemporaryDirectory() as temporary:
+            transaction, _clock, _ready, evidence_path = self.failover(temporary, aws)
+
+            def timeout_probe(_remaining: float) -> Mapping[str, Any]:
+                raise TimeoutError("probe deadline")
+
+            with self.assertRaises(e2e.RouteRestorationError) as raised:
+                transaction.replace(
+                    self.current,
+                    self.alternate,
+                    probe=timeout_probe,
+                    timeout_seconds=10,
+                    restoration_timeout_seconds=10,
+                )
+            journal = json.loads(evidence_path.read_text())
+
+        self.assertIn("after TimeoutError", str(raised.exception))
+        self.assertIsInstance(raised.exception.__cause__, TimeoutError)
+        self.assertEqual(aws.routes[failed_prefix], self.alternate.network_interface_id)
+        self.assertEqual(journal["status"], "restoration-failed")
+        self.assertEqual(journal["restoration"]["status"], "failed")
+        self.assertEqual(
+            {
+                value["prefix"]
+                for value in journal["restoration"]["routes"]["api_failures"]
+            },
+            {failed_prefix},
+        )
+
+    def test_ambiguous_restoration_call_does_not_finalize_after_matching_observation(self) -> None:
+        aws = RouteTableAWS(self.topology)
+        failed_prefix = self.topology.west.remote_site_cidrs[0]
+        aws.ambiguous_restore_prefix = failed_prefix
+        durability = DurableRouteTransactions()
+        with tempfile.TemporaryDirectory() as temporary:
+            transaction, _clock, _ready, evidence_path = self.failover(
+                temporary, aws, durability=durability
+            )
+            with self.assertRaises(e2e.RouteRestorationError):
+                transaction.replace(
+                    self.current,
+                    self.alternate,
+                    probe=self.successful_probe,
+                    timeout_seconds=10,
+                    restoration_timeout_seconds=10,
+                )
+            journal = json.loads(evidence_path.read_text())
+
+        self.assert_original_routes(aws)
+        self.assertEqual(journal["status"], "restoration-failed")
+        self.assertEqual(journal["restoration"]["routes"]["status"], "failed")
+        self.assertEqual(
+            [failure["prefix"] for failure in journal["restoration"]["routes"]["api_failures"]],
+            [failed_prefix],
+        )
+        self.assertIsNotNone(durability.value)
+        self.assertEqual(durability.finalized, [])
+
+    def test_restoration_aborts_before_mutation_when_initial_lease_cas_is_lost(self) -> None:
+        class LoseInitialRestorationCAS(DurableRouteTransactions):
+            def update_route_transaction(self, value, *, expected_revision):
+                if value.get("status") == "restoring":
+                    raise e2e.ConcurrentRunError("injected restoration ownership loss")
+                return super().update_route_transaction(
+                    value, expected_revision=expected_revision
+                )
+
+        aws = RouteTableAWS(self.topology)
+        durability = LoseInitialRestorationCAS()
+        with tempfile.TemporaryDirectory() as temporary:
+            transaction, _clock, _ready, _path = self.failover(
+                temporary, aws, durability=durability
+            )
+            with self.assertRaisesRegex(e2e.ConcurrentRunError, "ownership loss"):
+                transaction.replace(
+                    self.current,
+                    self.alternate,
+                    probe=self.successful_probe,
+                    timeout_seconds=10,
+                    restoration_timeout_seconds=10,
+                )
+
+        self.assertEqual(len(transaction.advertisement_control.operations), 2)
+        self.assertFalse(aws.restoration_started)
+        self.assertTrue(
+            all(target == self.alternate.network_interface_id for target in aws.routes.values())
+        )
+
+    def test_loss_after_first_restoration_mutation_stops_all_later_mutations(self) -> None:
+        class LoseDuringRestoration(DurableRouteTransactions):
+            def update_route_transaction(self, value, *, expected_revision):
+                restoration = value.get("restoration")
+                advertisements = (
+                    restoration.get("advertisements")
+                    if isinstance(restoration, Mapping)
+                    else None
+                )
+                if (
+                    isinstance(advertisements, Mapping)
+                    and advertisements.get("current") is not None
+                    and advertisements.get("alternate") is None
+                ):
+                    raise e2e.ConcurrentRunError("injected loss during restoration")
+                return super().update_route_transaction(
+                    value, expected_revision=expected_revision
+                )
+
+        aws = RouteTableAWS(self.topology)
+        durability = LoseDuringRestoration()
+        with tempfile.TemporaryDirectory() as temporary:
+            transaction, _clock, _ready, _path = self.failover(
+                temporary, aws, durability=durability
+            )
+            with self.assertRaisesRegex(e2e.ConcurrentRunError, "during restoration"):
+                transaction.replace(
+                    self.current,
+                    self.alternate,
+                    probe=self.successful_probe,
+                    timeout_seconds=10,
+                    restoration_timeout_seconds=10,
+                )
+
+        self.assertEqual(len(transaction.advertisement_control.operations), 3)
+        self.assertFalse(aws.restoration_started)
+        self.assertTrue(
+            all(target == self.alternate.network_interface_id for target in aws.routes.values())
+        )
+
+    def test_durable_claim_authorizer_rejects_wrong_ownership_and_allowlist(self) -> None:
+        manifest = {
+            "phase": "e2e_running",
+            "deployment": {},
+            "e2e": {
+                "claim_id": "11111111-2222-4333-8444-555555555555",
+                "output_sha256": "a" * 64,
+                "started_at": "2026-08-20T12:00:00Z",
+            },
+        }
+        adapter = object.__new__(e2e.ProtectedLifecycleAdapter)
+        adapter.manifest = copy.deepcopy(manifest)
+        adapter._ownership_state = "running-owned"
+        adapter._claim_etag = '"etag"'
+        adapter.config = SimpleNamespace(run_id=self.topology.run_id, sites=lifecycle_sites())
+        adapter._authoritative_recover = lambda: (copy.deepcopy(manifest), '"etag"')
+        deployment = SimpleNamespace(topology=self.topology, output_sha256="a" * 64)
+
+        with mock.patch.object(e2e, "parse_symmetric_protected_deployment_output", return_value=deployment):
+            authorized = adapter.authorize_gwlbe_route_replacement(
+                self.current,
+                self.alternate,
+                self.topology.west.remote_site_cidrs,
+                self.current,
+            )
+            self.assertTrue(authorized["cleanup_authorized"])
+            with self.assertRaisesRegex(e2e.ResilienceError, "prefixes"):
+                adapter.authorize_gwlbe_route_replacement(
+                    self.current,
+                    self.alternate,
+                    self.topology.west.remote_site_cidrs[:-1],
+                    self.current,
+                )
+
+        replacement_manifest = copy.deepcopy(manifest)
+        replacement_manifest["e2e"]["replacement"] = {
+            "address": 'aws_instance.envelope_target_west["a"]',
+            "old_instance_id": "i-6123456789abcdef0",
+            "started_at": "2026-08-20T12:01:00Z",
+            "finished_at": "2026-08-20T12:02:00Z",
+            "new_output_sha256": "b" * 64,
+        }
+        adapter.manifest = replacement_manifest
+        adapter._authoritative_recover = lambda: (copy.deepcopy(replacement_manifest), '"etag"')
+        replacement_deployment = SimpleNamespace(topology=self.topology, output_sha256="b" * 64)
+        with mock.patch.object(
+            e2e,
+            "parse_symmetric_protected_deployment_output",
+            return_value=replacement_deployment,
+        ):
+            self.assertTrue(
+                adapter.authorize_gwlbe_route_replacement(
+                    self.current,
+                    self.alternate,
+                    self.topology.west.remote_site_cidrs,
+                    self.current,
+                )["authorized"]
+            )
+
+        adapter._ownership_state = "unclaimed"
+        with self.assertRaises(e2e.ClaimPersistenceError):
+            adapter.authorize_gwlbe_route_replacement(
+                self.current,
+                self.alternate,
+                self.topology.west.remote_site_cidrs,
+                self.current,
+            )
+
+    def test_route_calls_delegate_timeout_to_native_aws_api(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+
+            class NativeTimeoutAWS:
+                timeout: float | None = None
+
+                def json(self, _args, *, region=None, timeout_seconds=None):
+                    self.timeout = timeout_seconds
+                    raise TimeoutError("native child was killed and reaped")
+
+            aws = NativeTimeoutAWS()
+            transaction = e2e.GWLBERouteFailover(
+                self.topology,
+                self.vpc_ids,
+                aws,
+                authorize=self.authority,
+                durability=DurableRouteTransactions(),
+                verify_ready=lambda _member: None,
+                advertisement_control=FakeAdvertisementControl(
+                    self.topology, FakeClock()
+                ),
+                evidence_path=root / "journal.json",
+                api_timeout_seconds=0.05,
+            )
+            with self.assertRaisesRegex(TimeoutError, "native"):
+                transaction._aws_json(
+                    ["ec2", "replace-route"],
+                    region="us-west-2",
+                    deadline=time.monotonic() + 1,
+                    operation="injected native route mutation",
+                )
+            self.assertEqual(aws.timeout, 0.05)
+
+    def test_native_route_timeout_kills_and_reaps_before_late_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            executable = root / "aws"
+            marker = root / "late-route-mutation"
+            executable.write_text(
+                "#!/bin/sh\nsleep 0.3\nprintf late >\"$ROUTE_LATE_MARKER\"\nprintf '{}\\n'\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o700)
+            transaction = e2e.GWLBERouteFailover(
+                self.topology,
+                self.vpc_ids,
+                e2e.AwsCLI(e2e.SubprocessRunner()),
+                authorize=self.authority,
+                durability=DurableRouteTransactions(),
+                verify_ready=lambda _member: None,
+                advertisement_control=FakeAdvertisementControl(
+                    self.topology, FakeClock()
+                ),
+                evidence_path=root / "journal.json",
+                api_timeout_seconds=0.05,
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "PATH": f"{root}:{os.environ['PATH']}",
+                    "ROUTE_LATE_MARKER": str(marker),
+                },
+                clear=False,
+            ):
+                with self.assertRaisesRegex(TimeoutError, "native"):
+                    transaction._aws_json(
+                        ["ec2", "replace-route"],
+                        region="us-west-2",
+                        deadline=time.monotonic() + 1,
+                        operation="injected native route mutation",
+                    )
+                time.sleep(0.4)
+            self.assertFalse(marker.exists())
+
+    def test_restart_adopts_exact_dead_claim_and_restores_durable_journal(self) -> None:
+        raw = route_failover_output()
+        deployment = e2e.parse_symmetric_protected_deployment_output(raw)
+        manifest = ready_lifecycle_manifest(raw)
+        claim_id = "11111111-2222-4333-8444-555555555555"
+        manifest["phase"] = "e2e_running"
+        abandoned = self.pending_journal(RouteTableAWS(self.topology))
+        abandoned["owner"]["host_sha256"] = "f" * 64
+        manifest["e2e"] = {
+            "claim_id": claim_id,
+            "output_sha256": deployment.output_sha256,
+            "started_at": "2026-08-20T12:00:00Z",
+            "route_transaction": abandoned,
+        }
+        aws = RouteTableAWS(self.topology)
+        aws.routes = {
+            prefix: self.alternate.network_interface_id
+            for prefix in self.topology.west.remote_site_cidrs
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = pathlib.Path(temporary)
+            journal_path = run_dir / "gwlbe-route-replacement.json"
+            store = DurableManifestStore(manifest)
+            adapter = object.__new__(e2e.ProtectedLifecycleAdapter)
+            adapter.store = store
+            adapter.config = SimpleNamespace(run_id=self.topology.run_id, sites=lifecycle_sites())
+            adapter.aws = aws
+            adapter.runner = SimpleNamespace()
+            adapter.run_dir = run_dir
+            adapter.terraform_dir = ROOT / "example" / "terraform"
+            adapter.manifest = None
+            adapter._ownership_state = "unclaimed"
+            adapter._claim_etag = None
+            adapter._claim_original_manifest = None
+            adapter._claim_original_etag = None
+            adapter._last_persistence_resolution = "none"
+            claim = adapter.claim(raw, deployment)
+            self.assertTrue(claim["route_recovery_required"])
+            with self.assertRaisesRegex(
+                e2e.ClaimPersistenceError, "passing acceptance"
+            ):
+                adapter.finish(True)
+            deferred = adapter.finish(False)
+            self.assertEqual(deferred["finish"], "deferred-route-recovery")
+            self.assertEqual(store.value["phase"], "e2e_running")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ENVELOPE_E2E_APPROVED_RUN_ID": self.topology.run_id,
+                    "GITHUB_EVENT_NAME": "workflow_dispatch",
+                },
+                clear=False,
+            ), mock.patch.object(
+                e2e, "build_tailscale", return_value=SimpleNamespace()
+            ), mock.patch.object(
+                e2e,
+                "protected_cleanup",
+                return_value={"final_residual_count": 0},
+            ), mock.patch.object(
+                e2e.AwsSymmetricLiveOperations,
+                "_advertisement_control",
+                return_value=FakeAdvertisementControl(self.topology, FakeClock()),
+            ):
+                result = adapter.cleanup()
+            persisted = json.loads(journal_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(result["route_recovery_before_cleanup"]["restored"])
+        self.assert_original_routes(aws)
+        self.assertEqual(persisted["status"], "reconciled-after-crash")
+        self.assertEqual(persisted["restoration"]["status"], "verified")
+        self.assertEqual(store.value["phase"], "e2e_failed")
+        self.assertNotIn("route_transaction", store.value["e2e"])
+
+    def test_restart_rejects_unexpired_cross_host_lease_without_cas_write(self) -> None:
+        raw = route_failover_output()
+        deployment = e2e.parse_symmetric_protected_deployment_output(raw)
+        manifest = ready_lifecycle_manifest(raw)
+        journal = self.pending_journal(RouteTableAWS(self.topology))
+        journal["owner"]["host_sha256"] = "f" * 64
+        journal["lease_expires_at"] = "2099-08-20T12:01:00Z"
+        manifest["phase"] = "e2e_running"
+        manifest["e2e"] = {
+            "claim_id": journal["claim_id"],
+            "output_sha256": deployment.output_sha256,
+            "started_at": "2026-08-20T12:00:00Z",
+            "route_transaction": journal,
+        }
+        store = DurableManifestStore(manifest)
+        adapter = object.__new__(e2e.ProtectedLifecycleAdapter)
+        adapter.store = store
+        adapter.config = SimpleNamespace(run_id=self.topology.run_id, sites=lifecycle_sites())
+        adapter.manifest = None
+        adapter._ownership_state = "unclaimed"
+        adapter._claim_etag = None
+        adapter._claim_original_manifest = None
+        adapter._claim_original_etag = None
+        adapter._last_persistence_resolution = "none"
+
+        with self.assertRaises(e2e.ConcurrentRunError):
+            adapter.claim(raw, deployment)
+
+        self.assertEqual(store.writes, [])
+        self.assertEqual(store.value, manifest)
+
+    def test_expired_lease_adoption_loses_safely_to_a_cas_rival(self) -> None:
+        raw = route_failover_output()
+        deployment = e2e.parse_symmetric_protected_deployment_output(raw)
+        manifest = ready_lifecycle_manifest(raw)
+        journal = self.pending_journal(RouteTableAWS(self.topology))
+        journal["owner"]["host_sha256"] = "e" * 64
+        manifest["phase"] = "e2e_running"
+        manifest["e2e"] = {
+            "claim_id": journal["claim_id"],
+            "output_sha256": deployment.output_sha256,
+            "started_at": "2026-08-20T12:00:00Z",
+            "route_transaction": journal,
+        }
+        store = DurableManifestStore(manifest)
+
+        def rival(target, value, if_match):
+            competing = copy.deepcopy(value)
+            competing["e2e"]["route_transaction"]["owner"]["host_sha256"] = "d" * 64
+            target.commit(competing, if_match)
+            raise e2e.LifecycleError("injected CAS response race")
+
+        store.write_hook = rival
+        adapter = object.__new__(e2e.ProtectedLifecycleAdapter)
+        adapter.store = store
+        adapter.config = SimpleNamespace(run_id=self.topology.run_id, sites=lifecycle_sites())
+        adapter.manifest = None
+        adapter._ownership_state = "unclaimed"
+        adapter._claim_etag = None
+        adapter._claim_original_manifest = None
+        adapter._claim_original_etag = None
+        adapter._last_persistence_resolution = "none"
+
+        with self.assertRaises(e2e.ConcurrentRunError):
+            adapter.claim(raw, deployment)
+
+        self.assertEqual(adapter._ownership_state, "competing")
+
+    def test_recovery_claim_acquisition_rethrows_protected_control_flow(self) -> None:
+        raw = route_failover_output()
+        deployment = e2e.parse_symmetric_protected_deployment_output(raw)
+        for control in (
+            e2e.ProtectedHardTimeout("recovery claim hard deadline"),
+            e2e.ProtectedTermination("recovery claim termination"),
+        ):
+            with self.subTest(category=type(control).__name__):
+                manifest = ready_lifecycle_manifest(raw)
+                journal = self.pending_journal(RouteTableAWS(self.topology))
+                journal["owner"]["host_sha256"] = "e" * 64
+                manifest["phase"] = "e2e_running"
+                manifest["e2e"] = {
+                    "claim_id": journal["claim_id"],
+                    "output_sha256": deployment.output_sha256,
+                    "started_at": "2026-08-20T12:00:00Z",
+                    "route_transaction": journal,
+                }
+                store = DurableManifestStore(manifest)
+
+                def interrupt(_target, _value, _if_match, error=control):
+                    raise error
+
+                store.write_hook = interrupt
+                adapter = object.__new__(e2e.ProtectedLifecycleAdapter)
+                adapter.store = store
+                adapter.config = SimpleNamespace(
+                    run_id=self.topology.run_id, sites=lifecycle_sites()
+                )
+                adapter.manifest = None
+                adapter._ownership_state = "unclaimed"
+                adapter._claim_etag = None
+                adapter._claim_original_manifest = None
+                adapter._claim_original_etag = None
+                adapter._last_persistence_resolution = "none"
+
+                with self.assertRaises(type(control)) as raised:
+                    adapter.claim(raw, deployment)
+
+                self.assertIs(raised.exception, control)
+                self.assertEqual(store.recover_count, 1)
+                self.assertEqual(store.value, manifest)
+
+    def test_restart_rejects_ambiguous_journal_owner_without_mutation(self) -> None:
+        aws = RouteTableAWS(self.topology)
+        foreign_owner = e2e._route_runner_identity()
+        foreign_owner["host_sha256"] = "f" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            durability = DurableRouteTransactions(
+                self.pending_journal(aws, owner=foreign_owner)
+            )
+            transaction, _clock, _ready, _path = self.failover(
+                temporary, aws, durability=durability
+            )
+            with self.assertRaises(e2e.AmbiguousOwnershipError):
+                transaction.reconcile(restoration_timeout_seconds=10)
+        self.assertEqual(aws.mutation_calls, [])
+
+    def test_local_journal_without_manifest_transaction_is_not_authority(self) -> None:
+        aws = RouteTableAWS(self.topology)
+        with tempfile.TemporaryDirectory() as temporary:
+            transaction, _clock, _ready, path = self.failover(temporary, aws)
+            path.write_text(
+                json.dumps(self.pending_journal(aws)) + "\n", encoding="utf-8"
+            )
+
+            result = transaction.reconcile(restoration_timeout_seconds=10)
+
+        self.assertEqual(result, {"required": False, "restored": True})
+        self.assertEqual(aws.mutation_calls, [])
+
+    def test_route_timeout_bounds_reject_invalid_values_before_mutation(self) -> None:
+        for timeout, restoration in ((0, 1), (7201, 1), (1, 0), (1, 7201)):
+            with self.subTest(timeout=timeout, restoration=restoration), tempfile.TemporaryDirectory() as temporary:
+                aws = RouteTableAWS(self.topology)
+                transaction, _clock, _ready, _path = self.failover(temporary, aws)
+                with self.assertRaisesRegex(e2e.ResilienceError, "between 0 and 7200"):
+                    transaction.replace(
+                        self.current,
+                        self.alternate,
+                        probe=self.successful_probe,
+                        timeout_seconds=timeout,
+                        restoration_timeout_seconds=restoration,
+                    )
+                self.assertEqual(aws.mutation_calls, [])
+
+    def test_route_journal_and_embedded_probe_redact_credentials(self) -> None:
+        aws = RouteTableAWS(self.topology)
+        with tempfile.TemporaryDirectory() as temporary:
+            transaction, _clock, _ready, path = self.failover(temporary, aws)
+
+            def probe(_remaining):
+                return {
+                    **self.successful_probe(1),
+                    "token": "tskey-fixture-sensitive-value",
+                }
+
+            result = transaction.replace(
+                self.current,
+                self.alternate,
+                probe=probe,
+                timeout_seconds=10,
+                restoration_timeout_seconds=10,
+            )
+            journal = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result["probe"]["token"], "[REDACTED]")
+        self.assertEqual(journal["probe"]["token"], "[REDACTED]")
+        self.assertEqual(e2e.scan_evidence(result), [])
+        self.assertEqual(e2e.scan_evidence(journal), [])
+
+
+class RouteMutationAuthorityTest(unittest.TestCase):
+    def test_transport_router_graceful_and_abrupt_failures_have_no_aws_route_command(self) -> None:
+        topology = route_failover_topology()
+        commands: list[str] = []
+
+        class Adapter:
+            @staticmethod
+            def owned(member, run_id):
+                return True
+
+            @staticmethod
+            def command(member, command):
+                commands.append(command)
+                return {}
+
+        lifecycle = e2e.SymmetricLifecycle(topology, Adapter(), dry_run=False)
+        member = topology.west.transport_router_fleet[0]
+        lifecycle.fail_transport_router(member, graceful=True)
+        lifecycle.fail_transport_router(member, graceful=False)
+
+        self.assertIn("--advertise-routes=", commands[0])
+        self.assertIn("systemctl stop tailscaled.service", commands[0])
+        self.assertIn("--signal=SIGKILL", commands[1])
+        self.assertIn("systemctl stop tailscaled.service", commands[1])
+        self.assertFalse(any("aws " in command or "replace-route" in command for command in commands))
+
+    def test_transport_observations_are_fresh_but_mutating_retries_are_deduplicated(self) -> None:
+        topology = route_failover_topology()
+        member = topology.west.transport_router_fleet[0]
+
+        class Base:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            def _execute(self, target, command, **kwargs):
+                self.calls.append({"target": target, "command": command, **kwargs})
+                return SimpleNamespace(
+                    stdout='{"success":true,"payload":{}}\n',
+                    summary=lambda: {"status": "Success"},
+                )
+
+        operations = object.__new__(e2e.AwsSymmetricLiveOperations)
+        operations.base = Base()
+        inspect = "/usr/local/sbin/envelope-transport-advertisements inspect"
+        observe = "python3 -c 'observe ownership'"
+        mutate = (
+            "/usr/local/sbin/envelope-transport-advertisements apply "
+            "11111111-2222-4333-8444-555555555555 '[\"initial\"]' '[\"10.0.0.0/24\"]' running normal"
+        )
+        for command in (inspect, inspect, observe, observe, mutate, mutate):
+            operations._execute_transport_control(
+                member,
+                command,
+                timeout_seconds=30,
+                comment="fixture transport control",
+            )
+
+        tokens = [call["client_token"] for call in operations.base.calls]
+        self.assertEqual(tokens[:4], [None, None, None, None])
+        self.assertIsNotNone(tokens[4])
+        self.assertEqual(tokens[4], tokens[5])
+
+    def test_ownership_observers_require_running_online_nonexpired_stable_peers(self) -> None:
+        topology = route_failover_topology()
+        node_ids = {
+            member.instance_id: f"node-{member.site}-{member.az_key}"
+            for site in e2e.SITES
+            for member in topology.site(site).transport_router_fleet
+        }
+        expected_owners = {
+            member.advertised_prefix: member.instance_id
+            for member in topology.west.transport_router_fleet
+        }
+        expected_nodes = {
+            prefix: node_ids[instance_id]
+            for prefix, instance_id in expected_owners.items()
+        }
+        commands: list[str] = []
+
+        def execute(_member, command, **_kwargs):
+            commands.append(command)
+            return {
+                "success": True,
+                "payload": {"owners": dict(expected_nodes)},
+            }
+
+        control = e2e.TailnetAdvertisementControl(
+            topology,
+            execute,
+            node_ids,
+            monotonic=FakeClock(),
+        )
+        observations = control._observe_ownership_once(
+            "west", expected_owners, timeout_seconds=30
+        )
+
+        self.assertEqual(len(observations), 2)
+        self.assertEqual(len(commands), 2)
+        for command in commands:
+            self.assertIn('status.get("BackendState")!="Running"', command)
+            self.assertIn('self_status.get("Online") is not True', command)
+            self.assertIn('self_status.get("Expired") is not False', command)
+            self.assertIn('by_id[expected_id].get("Online") is not True', command)
+            self.assertIn('by_id[expected_id].get("Expired") is not False', command)
+
+    def test_target_and_router_roles_must_deny_runner_route_actions(self) -> None:
+        topology = route_failover_topology()
+
+        class IAM:
+            def __init__(self, *, allowed: bool = False) -> None:
+                self.allowed = allowed
+                self.calls: list[list[str]] = []
+
+            def json(self, args: list[str], *, region: str | None = None) -> dict[str, Any]:
+                self.calls.append(list(args))
+                if args[:2] == ["iam", "get-instance-profile"]:
+                    name = args[-1]
+                    return {
+                        "InstanceProfile": {
+                            "Arn": f"arn:aws:iam::123456789012:instance-profile/{name}",
+                            "InstanceProfileName": name,
+                            "Roles": [
+                                {
+                                    "Arn": f"arn:aws:iam::123456789012:role/{name}",
+                                    "RoleName": name,
+                                }
+                            ],
+                        }
+                    }
+                if args[:2] == ["iam", "simulate-principal-policy"]:
+                    start = args.index("--action-names") + 1
+                    finish = args.index("--resource-arns")
+                    decision = "allowed" if self.allowed else "implicitDeny"
+                    return {
+                        "EvaluationResults": [
+                            {"EvalActionName": action, "EvalDecision": decision}
+                            for action in args[start:finish]
+                        ]
+                    }
+                raise AssertionError(args)
+
+        deployment = SimpleNamespace(topology=topology)
+        denied = IAM()
+        operations = object.__new__(e2e.AwsSymmetricLiveOperations)
+        operations.config = SimpleNamespace(run_id=topology.run_id)
+        operations.aws = denied
+        operations._route_mutation_denied_profiles = set()
+        for member, role_name in (
+            (topology.west.target_fleet[0], "runtime"),
+            (topology.west.transport_router_fleet[0], "transport"),
+        ):
+            profile_name = f"{topology.run_id}-west-{role_name}"
+            operations._verify_no_route_mutation_authority(
+                deployment,
+                member,
+                {
+                    "IamInstanceProfile": {
+                        "Arn": f"arn:aws:iam::123456789012:instance-profile/{profile_name}"
+                    }
+                },
+            )
+        simulations = [args for args in denied.calls if args[:2] == ["iam", "simulate-principal-policy"]]
+        self.assertEqual(len(simulations), 2)
+        self.assertTrue(all(action in simulations[0] for action in e2e.ROUTE_MUTATION_ACTIONS))
+
+        allowed = IAM(allowed=True)
+        operations.aws = allowed
+        operations._route_mutation_denied_profiles = set()
+        member = topology.west.target_fleet[0]
+        profile_name = f"{topology.run_id}-west-runtime"
+        with self.assertRaisesRegex(e2e.ReadinessError, "unexpectedly permits"):
+            operations._verify_no_route_mutation_authority(
+                deployment,
+                member,
+                {
+                    "IamInstanceProfile": {
+                        "Arn": f"arn:aws:iam::123456789012:instance-profile/{profile_name}"
+                    }
+                },
+            )
+
+    def test_concrete_transport_recovery_orchestrates_tailnet_and_gwlbe_controls(self) -> None:
+        deployment = e2e.parse_symmetric_protected_deployment_output(route_failover_output())
+        topology = deployment.topology
+        current, alternate = topology.west.transport_router_fleet
+        graceful_alternate, graceful_failed = topology.east.transport_router_fleet
+        aws = RouteTableAWS(topology)
+        clock = FakeClock()
+        commands: list[tuple[str, str]] = []
+
+        class Adapter:
+            @staticmethod
+            def owned(_member, _run_id):
+                return True
+
+            @staticmethod
+            def command(member, command):
+                commands.append((member.instance_id, command))
+                return {}
+
+        class Lifecycle(DurableRouteTransactions):
+            @staticmethod
+            def authorize_gwlbe_route_replacement(
+                route_current, route_alternate, prefixes, route_table_owner
+            ):
+                return GWLBERouteFailoverTest.authority(
+                    route_current, route_alternate, prefixes, route_table_owner
+                )
+
+        operations = object.__new__(e2e.AwsSymmetricLiveOperations)
+        operations.config = SimpleNamespace(run_id=topology.run_id)
+        operations.aws = aws
+        operations.run_dir = pathlib.Path("/tmp/not-used")
+        operations.lifecycle = Lifecycle()
+        operations.base = SimpleNamespace(monotonic=clock, sleep=clock.sleep)
+        operations.adapter = Adapter()
+        operations._verify_transport_router = mock.Mock()
+        operations._restore_transport_router = mock.Mock()
+        operations._advertisement_control = mock.Mock(
+            return_value=FakeAdvertisementControl(topology, clock)
+        )
+        operations._measure_tcp_udp_failure = lambda _tcp, _udp, **kwargs: (
+            kwargs["mutate_and_restore"](),
+            failure_transport_evidence(current.instance_id, "router-measurement"),
+        )
+
+        ledger = e2e.FlowLedger(topology.run_id)
+        graceful_flow = ledger.allocate(
+            "udp",
+            deployment.workloads.target("west", "initiator"),
+            deployment.workloads.target("east", "responder"),
+            destination_port=5201,
+            purpose="graceful-transport",
+            generation=ledger.begin_generation("graceful-transport"),
+        )
+        abrupt_flow = ledger.allocate(
+            "udp",
+            deployment.workloads.target("west", "initiator"),
+            deployment.workloads.target("east", "responder"),
+            destination_port=5201,
+            purpose="abrupt-transport",
+            generation=ledger.begin_generation("abrupt-transport"),
+        )
+        graceful_tcp_flow = ledger.allocate(
+            "tcp",
+            deployment.workloads.target("west", "initiator"),
+            deployment.workloads.target("east", "responder"),
+            destination_port=5201,
+            purpose="graceful-transport-tcp",
+            generation=ledger.begin_generation("graceful-transport-tcp"),
+        )
+        abrupt_tcp_flow = ledger.allocate(
+            "tcp",
+            deployment.workloads.target("west", "initiator"),
+            deployment.workloads.target("east", "responder"),
+            destination_port=5201,
+            purpose="abrupt-transport-tcp",
+            generation=ledger.begin_generation("abrupt-transport-tcp"),
+        )
+
+        def path(_deployment, flow, *, timeout_seconds, exclude_targets=None):
+            del timeout_seconds, exclude_targets
+            if flow.purpose.startswith("graceful-transport"):
+                return {
+                    "protocol": flow.protocol,
+                    "source_transport_router_id": current.instance_id,
+                    "source_transport_eni_id": current.network_interface_id,
+                    "destination_transport_router_id": graceful_alternate.instance_id,
+                }
+            return {
+                "protocol": flow.protocol,
+                "source_transport_router_id": alternate.instance_id,
+                "source_transport_eni_id": alternate.network_interface_id,
+                "destination_transport_router_id": graceful_alternate.instance_id,
+            }
+
+        operations._wait_probe_path = path
+        def coordinated_replace(
+            _transaction,
+            failed,
+            selected_alternate,
+            *,
+            probe,
+            failure_mode,
+            **_kwargs,
+        ):
+            observed = probe(10)
+            snapshot = {
+                "routes": [
+                    {
+                        "destination_cidr_block": "10.0.0.0/24",
+                        "network_interface_id": failed.network_interface_id,
+                        "origin": "CreateRoute",
+                        "route_state": "active",
+                    }
+                ]
+            }
+            return {
+                "probe": observed,
+                "restored": True,
+                "before": snapshot,
+                "after": {
+                    "routes": [
+                        {
+                            **snapshot["routes"][0],
+                            "network_interface_id": selected_alternate.network_interface_id,
+                        }
+                    ]
+                },
+                "restoration": {"status": "verified"},
+                "failure_mode": failure_mode,
+            }
+
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+            os.environ,
+            {
+                "ENVELOPE_E2E_APPROVED_RUN_ID": topology.run_id,
+                "GITHUB_EVENT_NAME": "workflow_dispatch",
+            },
+            clear=False,
+        ), mock.patch.object(
+            e2e.GWLBERouteFailover,
+            "replace",
+            autospec=True,
+            side_effect=coordinated_replace,
+        ) as replace:
+            operations.run_dir = pathlib.Path(temporary)
+            result = operations.run_transport_router_recovery(
+                deployment,
+                graceful_failed,
+                current,
+                graceful_flow,
+                abrupt_flow,
+                graceful_tcp_flow,
+                abrupt_tcp_flow,
+                graceful_tcp_flow,
+                graceful_flow,
+                abrupt_tcp_flow,
+                abrupt_flow,
+                timeout_seconds=30,
+            )
+
+        self.assertEqual(
+            result["graceful"]["control_plane"], "tailnet-and-gwlbe-route"
+        )
+        self.assertEqual(
+            result["abrupt"]["control_plane"], "tailnet-and-gwlbe-route"
+        )
+        self.assertEqual(result["recovery"]["kind"], "transport-router")
+        self.assertTrue(result["abrupt"]["route_replacement"]["restored"])
+        self.assertEqual(result["abrupt"]["route_replacement"]["before"]["routes"][0]["route_state"], "active")
+        self.assertEqual(result["abrupt"]["route_replacement"]["after"]["routes"][0]["route_state"], "active")
+        self.assertEqual(
+            result["abrupt"]["route_replacement"]["restoration"]["status"],
+            "verified",
+        )
+        self.assertEqual(operations._restore_transport_router.call_count, 0)
+        self.assertEqual(
+            [call.kwargs["failure_mode"] for call in replace.call_args_list],
+            ["graceful", "abrupt"],
+        )
+        self.assertFalse(any("aws " in command for _member, command in commands))
+
+
+class SymmetricRouteEvidenceTest(unittest.TestCase):
+    def test_detailed_route_and_packet_turnaround_evidence_strictly_verifies(self) -> None:
+        document = symmetric_route_evidence()
+        validated = e2e.validate_symmetric_evidence(document)
+        self.assertEqual(validated, document)
+        self.assertEqual(validated["schema"], 3)
+        self.assertTrue(
+            all(
+                identity["primary_route_ownership"]["local"] == []
+                for site in e2e.SITES
+                for identity in validated["preflight"]["sites"][site][
+                    "transport_routers"
+                ].values()
+            )
+        )
+        self.assertEqual(e2e.verify_live_evidence(document), document)
+
+    def test_schema_rejects_route_identity_state_bounds_probe_and_fidelity_tampering(self) -> None:
+        def duplicate_stable_hash(value: dict[str, Any]) -> None:
+            west = list(value["preflight"]["sites"]["west"]["transport_routers"].values())
+            west[1]["tailnet_node_id_sha256"] = west[0]["tailnet_node_id_sha256"]
+
+        def add_local_owner(value: dict[str, Any]) -> None:
+            topology = e2e.parse_symmetric_topology_v2(value["topology"])
+            observer, sibling = topology.west.transport_router_fleet
+            value["preflight"]["sites"]["west"]["transport_routers"][
+                observer.instance_id
+            ]["primary_route_ownership"]["local"] = [
+                {
+                    "prefix": sibling.advertised_prefix,
+                    "owner_instance_id": sibling.instance_id,
+                    "online": True,
+                }
+            ]
+
+        mutations = {
+            "route table": lambda value: value["transport_router"]["abrupt"][
+                "route_replacement"
+            ].update({"route_table_id": "rtb-fffffffffffffffff"}),
+            "prefix": lambda value: value["transport_router"]["abrupt"][
+                "route_replacement"
+            ]["prefixes"].pop(),
+            "current ENI": lambda value: value["transport_router"]["abrupt"][
+                "route_replacement"
+            ]["current"].update({"network_interface_id": "eni-fffffffffffffffff"}),
+            "alternate state": lambda value: value["transport_router"]["abrupt"][
+                "route_replacement"
+            ]["after"]["routes"][0].update({"route_state": "blackhole"}),
+            "restoration": lambda value: value["transport_router"]["abrupt"][
+                "route_replacement"
+            ]["restoration"].update({"status": "failed"}),
+            "advertisement transfer routes": lambda value: value["transport_router"][
+                "abrupt"
+            ]["route_replacement"]["advertisements"]["alternate_expansion"][
+                "advertisements"
+            ]["routes"].pop(),
+            "generation identity": lambda value: value["transport_router"]["abrupt"][
+                "route_replacement"
+            ]["advertisements"].update(
+                {
+                    "restore_generation": value["transport_router"]["abrupt"][
+                        "route_replacement"
+                    ]["advertisements"]["forward_generation"]
+                }
+            ),
+            "restored advertisement component": lambda value: value[
+                "transport_router"
+            ]["abrupt"]["route_replacement"]["restoration"]["advertisements"][
+                "current"
+            ]["advertisements"].update({"routes": []}),
+            "ownership stable hash": lambda value: value["transport_router"][
+                "abrupt"
+            ]["route_replacement"]["ownership"]["transferred"]["observers"][0][
+                "owners"
+            ][0].update({"owner_node_id_sha256": "0" * 64}),
+            "ownership observer binding": lambda value: value["transport_router"][
+                "abrupt"
+            ]["route_replacement"]["ownership"]["transferred"]["observers"][0].update(
+                {"observer_instance_id": "i-ff23456789abcdef"}
+            ),
+            "local preflight owner": add_local_owner,
+            "duplicate stable node hash": duplicate_stable_hash,
+            "bound": lambda value: value["transport_router"]["abrupt"][
+                "route_replacement"
+            ]["bounds"].update({"mutation_timeout_seconds": 0}),
+            "GWLBE probe": lambda value: value["transport_router"]["abrupt"]["probe"].update(
+                {"source_transport_eni_id": "eni-fffffffffffffffff"}
+            ),
+            "control plane": lambda value: value["transport_router"]["graceful"].update(
+                {"control_plane": "gwlbe-route"}
+            ),
+            "target metric": lambda value: value["traversals"][0]["probes"][0][
+                "geneve_return_proof"
+            ]["source"]["metrics"].update({"gwlb_target_ready": 0}),
+            "packet fidelity": lambda value: value["traversals"][0]["probes"][0][
+                "geneve_return_proof"
+            ]["source"]["fidelity"].update({"observed": False}),
+            "missing TCP new flow": lambda value: value["recoveries"][0][
+                "new_flows"
+            ].pop("tcp"),
+            "UDP loss arithmetic": lambda value: value["transport"][
+                "target_instance"
+            ]["udp"].update({"loss_percent": 11.0}),
+            "router stream identity": lambda value: value["transport"][
+                "transport_router"
+            ]["abrupt"]["failed_ids"].update({"tcp": "i-ff23456789abcdef"}),
+            "residual audit": lambda value: value["residual_audit"].update(
+                {"owned_resources_remaining": 1}
+            ),
+        }
+        for name, mutate in mutations.items():
+            candidate = copy.deepcopy(symmetric_route_evidence())
+            mutate(candidate)
+            with self.subTest(name=name), self.assertRaises(e2e.EvidenceError):
+                e2e.validate_symmetric_evidence(candidate)
+
+    def test_route_evidence_redacts_or_rejects_credentials(self) -> None:
+        candidate = symmetric_route_evidence()
+        candidate["transport_router"]["abrupt"]["probe"]["token"] = "tskey-secret-value"
+        with self.assertRaisesRegex(e2e.EvidenceError, "unsafe evidence"):
+            e2e.validate_symmetric_evidence(candidate)
+
+
+class SymmetricRoleReadinessTest(unittest.TestCase):
+    def test_packet_turnaround_proof_uses_current_metrics_and_fidelity_shape(self) -> None:
+        def snapshot(rx: float, tx: float, failures: float) -> e2e.MetricSnapshot:
+            return e2e.MetricSnapshot(
+                "generation-1",
+                (
+                    e2e.MetricSeries("geneve_rx_packets", (), rx),
+                    e2e.MetricSeries("geneve_tx_packets", (), tx),
+                    e2e.MetricSeries("geneve_options_validation_errors", (), 0),
+                    e2e.MetricSeries("gwlb_profile_rejections_total", (), 0),
+                    e2e.MetricSeries("gwlb_receive_drops_total", (), 0),
+                    e2e.MetricSeries("gwlb_inner_validation_failures_total", (), 0),
+                    e2e.MetricSeries("gwlb_return_build_failures_total", (), 0),
+                    e2e.MetricSeries("gwlb_send_failures_total", (), failures),
+                    e2e.MetricSeries("drops", (), 0),
+                    e2e.MetricSeries("gwlb_target_ready", (), 1),
+                    *(
+                        e2e.MetricSeries(
+                            "gwlb_target_component_ready",
+                            (("component", component),),
+                            1,
+                        )
+                        for component in ("receiver", "validation", "sender")
+                    ),
+                ),
+            )
+
+        operations = object.__new__(e2e.AwsSymmetricLiveOperations)
+        before = {"i-6123456789abcdef0": snapshot(10, 10, 0)}
+        after = {"i-6123456789abcdef0": snapshot(11, 11, 0)}
+        fidelity = symmetric_route_evidence()["traversals"][0]["probes"][0][
+            "geneve_return_proof"
+        ]["source"]["fidelity"]
+        proof = operations._geneve_return_proof(
+            before,
+            after,
+            "i-6123456789abcdef0",
+            fidelity,
+        )
+        self.assertEqual(
+            proof["metrics"]["components_ready"],
+            {"receiver": 1, "validation": 1, "sender": 1},
+        )
+        self.assertTrue(proof["fidelity"]["observed"])
+        self.assertTrue(proof["fidelity"]["raw_pcap_deleted"])
+
+        failed = {"i-6123456789abcdef0": snapshot(11, 11, 1)}
+        with self.assertRaises(e2e.MetricAssertionError):
+            operations._geneve_return_proof(
+                before, failed, "i-6123456789abcdef0", fidelity
+            )
+
+    def test_target_requires_source_dest_check_and_current_packet_return_metrics(self) -> None:
+        topology = route_failover_topology()
+        member = topology.west.target_fleet[0]
+        commands: list[str] = []
+        operations = object.__new__(e2e.AwsSymmetricLiveOperations)
+        operations.config = SimpleNamespace(
+            run_id=topology.run_id,
+            sites={
+                "west": {
+                    "azs": {member.az_key: f"us-west-2{member.az_key}"},
+                    "target_subnet_cidrs": {
+                        member.az_key: "10.10.9.0/24"
+                    },
+                }
+            },
+        )
+        instance = {
+            "State": {"Name": "running"},
+            "SourceDestCheck": True,
+            "SubnetId": "subnet-0123456789abcdef0",
+            "Placement": {"AvailabilityZone": f"us-west-2{member.az_key}"},
+            "NetworkInterfaces": [
+                {
+                    "NetworkInterfaceId": "eni-0123456789abcdef0",
+                    "SubnetId": "subnet-0123456789abcdef0",
+                    "Status": "in-use",
+                    "SourceDestCheck": True,
+                    "Attachment": {"DeviceIndex": 0, "Status": "attached"},
+                }
+            ],
+            "Tags": {
+                "EnvelopeRun": topology.run_id,
+                "Role": "target",
+                "Site": member.site,
+                "ZoneKey": member.az_key,
+            },
+        }
+        operations._describe_instance = lambda _member: instance
+        operations._verify_primary_network_binding = mock.Mock()
+
+        def execute(_target, command, **_kwargs):
+            commands.append(command)
+            return {
+                "ready": True,
+                "envelope_active": True,
+                "health_ready": True,
+                "geneve_receive_ready": True,
+                "geneve_validation_ready": True,
+                "geneve_send_ready": True,
+                "metrics_ready": True,
+                "target_isolated": True,
+                "pid": 42,
+                "process_generation_sha256": "9" * 64,
+            }
+
+        operations.base = SimpleNamespace(
+            _tags=lambda value: value["Tags"],
+            _execute_json=execute,
+        )
+        deployment = SimpleNamespace(
+            runtime={
+                "west": {
+                    "artifact_sha256": "a" * 64,
+                    "artifact_revision": "b" * 40,
+                }
+            }
+        )
+        operations._verify_target(deployment, member, timeout_seconds=30)
+        self.assertIn("gwlb_target_ready", commands[0])
+        self.assertIn("gwlb_target_component_ready", commands[0])
+        self.assertIn("receiver validation sender", commands[0])
+        for metric in (
+            "geneve_rx_packets",
+            "geneve_rx_bytes",
+            "geneve_tx_packets",
+            "geneve_tx_bytes",
+            "geneve_options_validation_errors",
+            "gwlb_profile_rejections_total",
+            "gwlb_receive_drops_total",
+            "gwlb_inner_validation_failures_total",
+            "gwlb_return_build_failures_total",
+            "gwlb_send_failures_total",
+            "drops",
+        ):
+            self.assertIn(metric, commands[0])
+        for obsolete in ("tun_", "routing_", "decap_errors", "encap_errors"):
+            self.assertIn(obsolete, commands[0])
+        self.assertNotIn("datapath_component_healthy", commands[0])
+
+        instance["SourceDestCheck"] = False
+        with self.assertRaisesRegex(e2e.ReadinessError, "source/destination checking"):
+            operations._verify_target(deployment, member, timeout_seconds=30)
+
+    def test_transport_requires_disabled_source_dest_check_and_explicit_role(self) -> None:
+        topology = route_failover_topology()
+        member = topology.west.transport_router_fleet[0]
+        operations = object.__new__(e2e.AwsSymmetricLiveOperations)
+        operations.config = SimpleNamespace(
+            run_id=topology.run_id,
+            sites={
+                "west": {
+                    "azs": {"a": "us-west-2a"},
+                    "transport_subnet_cidrs": {"a": "10.10.3.0/24"},
+                }
+            },
+        )
+        instance = {
+            "State": {"Name": "running"},
+            "SourceDestCheck": True,
+            "SubnetId": "subnet-8123456789abcdef0",
+            "Placement": {"AvailabilityZone": "us-west-2a"},
+            "NetworkInterfaces": [
+                {
+                    "NetworkInterfaceId": member.network_interface_id,
+                    "SubnetId": "subnet-8123456789abcdef0",
+                    "Status": "in-use",
+                    "SourceDestCheck": True,
+                    "Attachment": {"DeviceIndex": 0, "Status": "attached"},
+                }
+            ],
+            "Tags": {
+                "EnvelopeRun": topology.run_id,
+                "Role": "transport-router",
+                "Site": member.site,
+                "ZoneKey": member.az_key,
+            },
+        }
+        operations._describe_instance = lambda _member: instance
+        operations._verify_primary_network_binding = mock.Mock()
+        operations.base = SimpleNamespace(_tags=lambda value: value["Tags"])
+        with self.assertRaisesRegex(e2e.ReadinessError, "source/destination checking"):
+            operations._verify_transport_router(SimpleNamespace(topology=topology), member)
+
+        instance["SourceDestCheck"] = False
+        instance["NetworkInterfaces"][0]["SourceDestCheck"] = False
+        instance["Tags"]["Role"] = "tailnet-ingress"
+        with self.assertRaisesRegex(e2e.ReadinessError, "transport-router EC2"):
+            operations._verify_transport_router(SimpleNamespace(topology=topology), member)
+
+
+class RouteRestorationCleanupPrecedenceTest(unittest.TestCase):
+    def test_runner_requires_transport_recovery_contract_without_legacy_fallback(self) -> None:
+        string_constants = {
+            value
+            for value in e2e.SymmetricTwoRegionE2ERunner.run.__code__.co_consts
+            if isinstance(value, str)
+        }
+        self.assertIn("run_transport_router_recovery", string_constants)
+        self.assertNotIn("run_ingress_router_recovery", string_constants)
+
+    def test_startup_reconciliation_precedes_drift_and_stops_replay_before_cleanup(self) -> None:
+        raw = route_failover_output()
+        deployment = e2e.parse_symmetric_protected_deployment_output(raw)
+        calls: list[str] = []
+
+        class Lifecycle:
+            def claim(self, _raw, _deployment):
+                calls.append("claim")
+                return {
+                    "load_profile_approved_before_apply": True,
+                    "route_recovery_required": True,
+                }
+
+            def reconcile_gwlbe_route_replacement(self, _deployment, *, timeout_seconds):
+                calls.append(f"reconcile-{timeout_seconds}")
+                return {"required": True, "restored": True}
+
+            def verify_no_drift(self, _stage):
+                raise AssertionError("drift must not run before an interrupted acceptance is terminated")
+
+            def finish(self, passed):
+                calls.append(f"finish-{passed}")
+                return {"finish": "persisted", "acceptance": "failed"}
+
+            def cleanup(self):
+                calls.append("cleanup")
+                return {"final_residual_count": 0}
+
+        class Operations:
+            @staticmethod
+            def run_transport_router_recovery(*_args, **_kwargs):
+                raise AssertionError("transport exercise must not run after startup reconciliation")
+
+            @staticmethod
+            def collect_diagnostics(_deployment):
+                calls.append("diagnostics")
+                return {"collection": "complete"}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            result = e2e.SymmetricTwoRegionE2ERunner(
+                run_id="fixture-live",
+                raw_deployment=raw,
+                site_regions={"west": "us-west-2", "east": "us-east-1"},
+                lifecycle=Lifecycle(),
+                operations=Operations(),
+                evidence_path=pathlib.Path(temporary) / "evidence.json",
+            ).run()
+
+        self.assertEqual(result.exit_code, e2e.EXIT_ACCEPTANCE_FAILED)
+        self.assertEqual(result.evidence["failure"]["category"], "ResilienceError")
+        self.assertEqual(
+            calls,
+            [
+                "claim",
+                f"reconcile-{deployment.topology.route_failover.recovery_timeout_seconds}",
+                "diagnostics",
+                "finish-False",
+                "cleanup",
+            ],
+        )
+
+    def test_route_restoration_failure_still_cleans_up_and_cleanup_failure_wins(self) -> None:
+        raw = route_failover_output()
+        deployment = e2e.parse_symmetric_protected_deployment_output(raw)
+
+        class Lifecycle:
+            def __init__(self, cleanup_fails: bool) -> None:
+                self.cleanup_fails = cleanup_fails
+                self.cleanup_calls = 0
+
+            def claim(self, _raw, _deployment):
+                return {"load_profile_approved_before_apply": True}
+
+            def verify_no_drift(self, stage):
+                return {"clean": True, "stage": stage}
+
+            def finish(self, passed):
+                return {
+                    "finish": "persisted",
+                    "acceptance": "passed" if passed else "failed",
+                }
+
+            def cleanup(self):
+                self.cleanup_calls += 1
+                if self.cleanup_fails:
+                    raise e2e.LifecycleError("injected protected cleanup failure")
+                return {"final_residual_count": 0}
+
+        class Operations:
+            def verify_readiness(self, current, *, timeout_seconds):
+                return {
+                    "tailnet_policy_valid": True,
+                    "transport_router_contract_sha256": {
+                        site: current.transport_router_readiness_expectations[site][
+                            "contract_sha256"
+                        ]
+                        for site in e2e.SITES
+                    },
+                    "sites": {
+                        site: {
+                            "route_domains": {
+                                "workload": True,
+                                "transport": True,
+                                "target": True,
+                            },
+                            "targets": {
+                                member.instance_id: {
+                                    "ready": True,
+                                    "target_group_arn": member.target_group_arn,
+                                    "registration_port": 6081,
+                                    "process_generation_sha256": "7" * 64,
+                                }
+                                for member in current.topology.site(site).target_fleet
+                            },
+                            "transport_routers": {
+                                member.instance_id: {
+                                    "ready": True,
+                                    "node_identity_ready": True,
+                                    "network_interface_id": member.network_interface_id,
+                                    "contract_sha256": current.transport_router_readiness_expectations[
+                                        site
+                                    ]["contract_sha256"],
+                                    "tailnet_node_id_sha256": "8" * 64,
+                                    "advertised_prefix": member.advertised_prefix,
+                                    "primary_route_ownership": {
+                                        "observed_at": "2026-08-20T11:59:59Z",
+                                        "remote": [
+                                            {
+                                                "prefix": prefix,
+                                                "owner_instance_id": current.topology.site(
+                                                    e2e._opposite(site)
+                                                ).transport_router_for_prefix(
+                                                    prefix
+                                                ).instance_id,
+                                                "online": True,
+                                            }
+                                            for index, prefix in enumerate(
+                                                current.topology.site(site).remote_site_cidrs
+                                            )
+                                        ],
+                                        "local": [],
+                                    },
+                                }
+                                for member in current.topology.site(site).transport_router_fleet
+                            },
+                        }
+                        for site in e2e.SITES
+                    },
+                }
+
+            def run_cold_probe(self, current, flow, *, start_barrier, timeout_seconds):
+                assert flow.source.az_key is not None
+                return {
+                    "source_site": flow.source.site,
+                    "destination_site": flow.destination.site,
+                    "source_role": flow.source.role,
+                    "destination_role": flow.destination.role,
+                    "protocol": flow.protocol,
+                    "source_az_key": flow.source.az_key,
+                    "source_gwlbe_id": current.endpoint_ids[flow.source.site][flow.source.az_key],
+                    "dispatch_monotonic_ns": time.monotonic_ns(),
+                    "succeeded": True,
+                }
+
+            def run_traversal(self, current, source_site, flows, *, timeout_seconds):
+                source = current.topology.site(source_site)
+                destination = current.topology.site(e2e._opposite(source_site))
+                source_router = source.transport_router_fleet[0]
+                destination_router = destination.transport_router_fleet[0]
+                return {
+                    "source_site": source_site,
+                    "destination_site": e2e._opposite(source_site),
+                    "probes": [
+                        {
+                            "source_target_id": source.target_fleet[0].instance_id,
+                            "source_az_key": source.target_fleet[0].az_key,
+                            "source_transport_router_id": source_router.instance_id,
+                            "source_transport_eni_id": source_router.network_interface_id,
+                            "destination_transport_router_id": destination_router.instance_id,
+                        }
+                    ],
+                }
+
+            def run_target_process_recovery(
+                self,
+                current,
+                failed,
+                new_flow,
+                new_tcp_flow,
+                tcp_flow,
+                udp_flow,
+                *,
+                timeout_seconds,
+            ):
+                alternate = current.topology.site(failed.site).target_fleet[1]
+                return {
+                    "recovery": {
+                        "kind": "target-process",
+                        "site": failed.site,
+                        "failed_id": failed.instance_id,
+                        "alternate_id": alternate.instance_id,
+                        "new_flow_succeeded": True,
+                        "new_flows": new_flow_evidence(),
+                        "recovery_duration_ms": 1,
+                    },
+                    "health_transitions": [
+                        {
+                            "kind": "target-process",
+                            "member_id": failed.instance_id,
+                            "states": ["healthy", "unavailable", "healthy"],
+                        }
+                    ],
+                    "transport": failure_transport_evidence(
+                        failed.instance_id, "target-process"
+                    ),
+                }
+
+            def run_target_instance_recovery(
+                self,
+                current,
+                failed,
+                new_flow,
+                new_tcp_flow,
+                tcp_flow,
+                udp_flow,
+                *,
+                timeout_seconds,
+            ):
+                alternate = current.topology.site(failed.site).target_fleet[1]
+                return current, {
+                    "recovery": {
+                        "kind": "target-instance",
+                        "site": failed.site,
+                        "failed_id": failed.instance_id,
+                        "alternate_id": alternate.instance_id,
+                        "replacement_id": "i-ff23456789abcdef",
+                        "replacement_ready": True,
+                        "drain_state": "draining",
+                        "drain_duration_ms": 1,
+                        "new_flow_succeeded": True,
+                        "new_flows": new_flow_evidence(),
+                        "recovery_duration_ms": 1,
+                    },
+                    "health_transition": {
+                        "kind": "target-instance",
+                        "member_id": failed.instance_id,
+                        "states": ["healthy", "draining", "replaced"],
+                    },
+                    "transport": failure_transport_evidence(
+                        failed.instance_id, "target-instance"
+                    ),
+                }
+
+            def run_transport_router_recovery(self, *_args, **_kwargs):
+                raise e2e.RouteRestorationError("injected verified route restoration failure")
+
+            def collect_diagnostics(self, current):
+                return {"collection": "complete"}
+
+        for cleanup_fails in (False, True):
+            with self.subTest(cleanup_fails=cleanup_fails), tempfile.TemporaryDirectory() as temporary:
+                lifecycle = Lifecycle(cleanup_fails)
+                result = e2e.SymmetricTwoRegionE2ERunner(
+                    run_id=deployment.topology.run_id,
+                    raw_deployment=raw,
+                    site_regions={"west": "us-west-2", "east": "us-east-1"},
+                    lifecycle=lifecycle,
+                    operations=Operations(),
+                    evidence_path=pathlib.Path(temporary) / "evidence.json",
+                ).run()
+
+                self.assertEqual(lifecycle.cleanup_calls, 1)
+                if cleanup_fails:
+                    self.assertEqual(result.exit_code, e2e.EXIT_CLEANUP_FAILED)
+                    self.assertEqual(
+                        result.evidence["failure"]["category"],
+                        "LifecycleError",
+                        result.evidence,
+                    )
+
+                    self.assertEqual(
+                        result.evidence["diagnostics"]["acceptance_failure_before_cleanup"][
+                            "category"
+                        ],
+                        "RouteRestorationError",
+                    )
+                else:
+                    self.assertEqual(result.exit_code, e2e.EXIT_ACCEPTANCE_FAILED)
+                    self.assertEqual(
+                        result.evidence["failure"]["category"],
+                        "RouteRestorationError",
+                        result.evidence,
+                    )
+
+    def test_deferred_route_recovery_is_not_reported_as_a_terminal_finish(self) -> None:
+        raw = route_failover_output()
+
+        class Lifecycle:
+            @staticmethod
+            def claim(_raw, _deployment):
+                return {"load_profile_approved_before_apply": True}
+
+            @staticmethod
+            def reconcile_gwlbe_route_replacement(_deployment, *, timeout_seconds):
+                del timeout_seconds
+                return {"required": False, "restored": True}
+
+            @staticmethod
+            def verify_no_drift(_stage):
+                raise e2e.DriftError("injected precheck failure")
+
+            @staticmethod
+            def finish(_passed):
+                return {
+                    "finish": "deferred-route-recovery",
+                    "acceptance": "failed",
+                    "result_persistence": "active-route-transaction",
+                }
+
+            @staticmethod
+            def cleanup():
+                return {"final_residual_count": 0}
+
+        class Operations:
+            @staticmethod
+            def collect_diagnostics(_deployment):
+                return {"collection": "complete"}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            result = e2e.SymmetricTwoRegionE2ERunner(
+                run_id="fixture-live",
+                raw_deployment=raw,
+                site_regions={"west": "us-west-2", "east": "us-east-1"},
+                lifecycle=Lifecycle(),
+                operations=Operations(),
+                evidence_path=pathlib.Path(temporary) / "evidence.json",
+            ).run()
+
+        self.assertEqual(result.exit_code, e2e.EXIT_ACCEPTANCE_FAILED)
+        self.assertEqual(result.evidence["lifecycle"]["finish"], "failed")
+        self.assertEqual(
+            result.evidence["diagnostics"]["lifecycle_finish_deferred"][
+                "result_persistence"
+            ],
+            "active-route-transaction",
+        )
+
+    def test_unreservable_route_configuration_is_rejected_before_claim(self) -> None:
+        raw = route_failover_output()
+        for field in (
+            "mutation_timeout_seconds",
+            "restoration_timeout_seconds",
+            "recovery_timeout_seconds",
+        ):
+            raw["symmetric_topology"]["value"]["route_failover"][field] = 1000
+            raw["route_failover"]["value"][field] = 1000
+            raw["cost_profile"]["value"]["route_failover_bounds"][field] = 1000
+
+        class Lifecycle:
+            claim_calls = 0
+
+            @classmethod
+            def claim(cls, _raw, _deployment):
+                cls.claim_calls += 1
+                raise AssertionError("an unreservable configuration must not be claimed")
+
+            @staticmethod
+            def cleanup():
+                return {"final_residual_count": 0}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            result = e2e.SymmetricTwoRegionE2ERunner(
+                run_id="fixture-live",
+                raw_deployment=raw,
+                site_regions={"west": "us-west-2", "east": "us-east-1"},
+                lifecycle=Lifecycle(),
+                operations=SimpleNamespace(),
+                evidence_path=pathlib.Path(temporary) / "evidence.json",
+            ).run()
+
+        self.assertEqual(Lifecycle.claim_calls, 0)
+        self.assertEqual(result.evidence["failure"]["category"], "DeploymentError")
+        self.assertIn("reservation", result.evidence["failure"]["message"])
+
+
 class InvocationMissing(Exception):
     def __init__(self) -> None:
         super().__init__("eventual consistency")
@@ -527,9 +4032,17 @@ class ScriptedAWS:
         self.cancellation_polls = list(cancellation_polls or [])
         self.cancellation_requested = False
         self.calls: list[tuple[list[str], str | None]] = []
+        self.timeouts: list[float | None] = []
 
-    def json(self, args: list[str], *, region: str | None = None) -> dict[str, Any]:
+    def json(
+        self,
+        args: list[str],
+        *,
+        region: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         self.calls.append((list(args), region))
+        self.timeouts.append(timeout_seconds)
         operation = args[1]
         if operation == "send-command":
             return {"Command": {"CommandId": "11111111-2222-3333-4444-555555555555"}}
@@ -590,6 +4103,7 @@ class SSMRunnerTest(unittest.TestCase):
         self.assertEqual(parameters["executionTimeout"], ["2"])
         self.assertEqual(parameters["commands"], list(self.command.commands))
         self.assertEqual(self.command.timeout_seconds, 2)
+        self.assertEqual(aws.timeouts[0], 0.5)
 
         maximum = e2e.SSMCommand(self.target, ("true",), timeout_seconds=3600)
         runner.send(maximum, timeout_seconds=0.5)
@@ -597,6 +4111,20 @@ class SSMRunnerTest(unittest.TestCase):
         self.assertEqual(maximum_args[maximum_args.index("--timeout-seconds") + 1], "3600")
         maximum_parameters = json.loads(maximum_args[maximum_args.index("--parameters") + 1])
         self.assertEqual(maximum_parameters["executionTimeout"], ["3600"])
+
+        fenced = e2e.SSMCommand(
+            self.target,
+            ("true",),
+            client_token="env-1234567890abcdef",
+        )
+        runner.send(fenced, timeout_seconds=0.5)
+        fenced_args = aws.calls[2][0]
+        self.assertEqual(
+            fenced_args[fenced_args.index("--client-token") + 1],
+            fenced.client_token,
+        )
+        with self.assertRaisesRegex(e2e.SSMError, "client_token"):
+            e2e.SSMCommand(self.target, ("true",), client_token="unsafe token")
 
     def test_wait_timeout_requests_bounded_cancellation(self) -> None:
         aws = ScriptedAWS(
@@ -677,22 +4205,98 @@ class SSMRunnerTest(unittest.TestCase):
 
         self.assertEqual(clock.value, 0.5)
 
+    def test_protected_control_flow_during_cancellation_is_rethrown_unchanged(self) -> None:
+        for stage in ("cancel-command", "get-command-invocation"):
+            with self.subTest(stage=stage):
+                control = e2e.ProtectedHardTimeout(f"injected during {stage}")
+
+                class ControlFlowAWS(ScriptedAWS):
+                    def json(
+                        inner,
+                        args: list[str],
+                        *,
+                        region: str | None = None,
+                        timeout_seconds: float | None = None,
+                    ) -> dict[str, Any]:
+                        operation = args[1]
+                        if operation == stage and (
+                            operation == "cancel-command" or inner.cancellation_requested
+                        ):
+                            raise control
+                        return super().json(
+                            args,
+                            region=region,
+                            timeout_seconds=timeout_seconds,
+                        )
+
+                aws = ControlFlowAWS(
+                    [{"Status": "FutureStatus", "ResponseCode": -1}],
+                    cancellation_polls=[{"Status": "InProgress", "ResponseCode": -1}],
+                )
+                runner = e2e.SSMRunner(aws, api_timeout_seconds=0.5)
+
+                with self.assertRaises(e2e.ProtectedHardTimeout) as raised:
+                    runner.execute(
+                        self.command,
+                        send_timeout_seconds=0.5,
+                        wait_timeout_seconds=0.5,
+                        cancel_timeout_seconds=0.5,
+                    )
+                self.assertIs(raised.exception, control)
+
     def test_send_call_itself_is_bounded(self) -> None:
-        release = threading.Event()
-
         class HangingAWS:
-            def json(inner, args: list[str], *, region: str | None = None) -> dict[str, Any]:
-                release.wait(1)
-                return {"Command": {"CommandId": "late"}}
+            def json(
+                inner,
+                args: list[str],
+                *,
+                region: str | None = None,
+                timeout_seconds: float | None = None,
+            ) -> dict[str, Any]:
+                inner.timeout = timeout_seconds
+                raise TimeoutError("native child was killed and reaped")
 
-        runner = e2e.SSMRunner(HangingAWS(), api_timeout_seconds=0.02)
+        aws = HangingAWS()
+        runner = e2e.SSMRunner(aws, api_timeout_seconds=0.02)
         started = time.monotonic()
-        try:
-            with self.assertRaisesRegex(e2e.SSMTimeout, "send-command"):
-                runner.send(self.command, timeout_seconds=0.02)
-        finally:
-            release.set()
+        with self.assertRaisesRegex(e2e.SSMTimeout, "send-command"):
+            runner.send(self.command, timeout_seconds=0.02)
         self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(aws.timeout, 0.02)
+
+    def test_execute_failure_retains_only_bounded_redacted_invocation_streams(self) -> None:
+        class FailedSSM:
+            def execute(self, command, **_kwargs):
+                return e2e.SSMResult(
+                    command.target,
+                    "failed-command",
+                    "Failed",
+                    17,
+                    stdout="token=fixture-sensitive-value\n" + "x" * 30_000,
+                    stderr="tskey-fixture-sensitive-value",
+                )
+
+        operations = e2e.AwsLiveOperations(
+            SimpleNamespace(),
+            SimpleNamespace(),
+            pathlib.Path("/tmp/not-used"),
+            ssm=FailedSSM(),
+        )
+
+        with self.assertRaises(e2e.SSMError) as raised:
+            operations._execute(
+                self.target,
+                "false",
+                timeout_seconds=10,
+                comment="Envelope E2E retained failure output",
+            )
+
+        self.assertLessEqual(len(raised.exception.stdout), 24_000)
+        self.assertLessEqual(len(raised.exception.stderr), 24_000)
+        self.assertNotIn("fixture-sensitive-value", raised.exception.stdout)
+        self.assertNotIn("tskey-fixture-sensitive-value", raised.exception.stderr)
+        self.assertIn("[REDACTED", raised.exception.stdout)
+        self.assertIn("[REDACTED", raised.exception.stderr)
 
 
 class FlowLedgerTest(unittest.TestCase):
@@ -1330,6 +4934,78 @@ class PacketCaptureAssertionTest(unittest.TestCase):
         self.assertEqual(summary["flows"][0]["return_udp_source_port"], 40_000)
         self.assertEqual(summary["flows"][0]["return_udp_destination_port"], 6081)
         self.assertEqual(e2e.scan_evidence(summary), [])
+
+    def test_target_capture_correlates_identical_geneve_ingress_and_return(self) -> None:
+        assert self.flow.source_port is not None and self.flow.destination_port is not None
+        inner = ipv4_bytes(
+            self.flow.source.private_ip,
+            self.flow.destination.private_ip,
+            17,
+            udp_bytes(
+                self.flow.source.private_ip,
+                self.flow.destination.private_ip,
+                self.flow.source_port,
+                self.flow.destination_port,
+                b"turnaround",
+            ),
+        )
+        payload = geneve_packet(inner)
+        ingress = ipv4_bytes(
+            "192.0.2.10",
+            "198.51.100.20",
+            17,
+            udp_bytes("192.0.2.10", "198.51.100.20", 40_000, 6081, payload),
+        )
+        returned = ipv4_bytes(
+            "198.51.100.20",
+            "192.0.2.10",
+            17,
+            udp_bytes("198.51.100.20", "192.0.2.10", 40_000, 6081, payload),
+        )
+        capture = e2e.parse_packet_capture(
+            pcap_bytes([ethernet_ipv4(ingress), ethernet_ipv4(returned)])
+        )
+
+        evidence = e2e.correlate_geneve_turnaround_capture(
+            capture,
+            self.flow,
+            target_id="i-6123456789abcdef0",
+            raw_deleted=True,
+        )
+
+        self.assertTrue(evidence["observed"])
+        self.assertEqual(evidence["pairs"][0]["inner_packet_sha256"], hashlib.sha256(inner).hexdigest())
+        self.assertNotIn("ordered_options", evidence["pairs"][0])
+        self.assertEqual(e2e.scan_evidence(evidence), [])
+
+        changed = e2e.parse_packet_capture(
+            pcap_bytes(
+                [
+                    ethernet_ipv4(ingress),
+                    ethernet_ipv4(
+                        ipv4_bytes(
+                            "198.51.100.20",
+                            "192.0.2.10",
+                            17,
+                            udp_bytes(
+                                "198.51.100.20",
+                                "192.0.2.10",
+                                40_000,
+                                6081,
+                                geneve_packet(inner, options=geneve_options(b"\x00\x00\x00\x01")),
+                            ),
+                        )
+                    ),
+                ]
+            )
+        )
+        with self.assertRaisesRegex(e2e.WireAssertionError, "no correlated"):
+            e2e.correlate_geneve_turnaround_capture(
+                changed,
+                self.flow,
+                target_id="i-6123456789abcdef0",
+                raw_deleted=True,
+            )
 
     def test_reversed_udp_ports_and_changed_ordered_options_fail(self) -> None:
         reversed_ports = directional_capture_fixture(
@@ -3236,7 +6912,10 @@ class FakeRunAllLifecycle:
         return {"clean": True, "stage": stage}
 
     def finish(self, passed: bool) -> Mapping[str, Any]:
-        return {"acceptance": "passed" if passed else "failed"}
+        return {
+            "finish": "persisted",
+            "acceptance": "passed" if passed else "failed",
+        }
 
     def cleanup(self) -> Mapping[str, Any]:
         raise AssertionError("run-all must route cleanup through its one-attempt coordinator")
@@ -3251,6 +6930,8 @@ class FakeRunAllOperations:
 
     def _stage(self, name: str) -> None:
         self.calls.append(name)
+        if name != "e2e" and self.failure == f"{name}-concurrent":
+            raise e2e.ConcurrentLifecycleError(f"another lifecycle writer owns {name}")
         if self.failure == name and name != "e2e":
             if name == "wait":
                 diagnostics = self.root / "fixture-run" / "diagnostics.json"
@@ -3264,6 +6945,8 @@ class FakeRunAllOperations:
             raise TimeoutError("injected whole-run timeout")
         if name == "wait" and self.failure == "signal":
             raise InterruptedError("injected SIGTERM")
+        if name == "wait" and self.failure == "protected-timeout":
+            raise e2e.ProtectedHardTimeout("injected protected hard timeout")
 
     def build(self) -> Mapping[str, Any]:
         self._stage("build")
@@ -3365,6 +7048,38 @@ class FakeRunAllOperations:
                 evidence,
                 "durable E2E claim was not committed",
             )
+        if self.failure in {"e2e-cleanup-primary", "e2e-cleanup-success"}:
+            try:
+                lifecycle.cleanup()
+            except e2e.LifecycleError as cleanup_error:
+                diagnostics = {}
+                if self.failure == "e2e-cleanup-primary":
+                    diagnostics["acceptance_failure_before_cleanup"] = {
+                        "phase": "simultaneous-cold-initiation",
+                        "category": "ProbeError",
+                        "message": "injected cold probe failure",
+                    }
+                evidence = {
+                    "schema": e2e.SYMMETRIC_EVIDENCE_SCHEMA,
+                    "kind": e2e.SYMMETRIC_EVIDENCE_KIND,
+                    "run_id": "fixture-run",
+                    "status": "failed",
+                    "failure": {
+                        "phase": e2e.Phase.CLEANUP.value,
+                        "category": "LifecycleError",
+                        "message": str(cleanup_error),
+                    },
+                    "lifecycle": {"cleanup": "failed"},
+                    "diagnostics": diagnostics,
+                }
+                evidence_path.write_text(json.dumps(evidence) + "\n")
+                return e2e.LiveRunResult(
+                    e2e.EXIT_CLEANUP_FAILED,
+                    evidence_path,
+                    evidence,
+                    str(cleanup_error),
+                )
+            raise AssertionError("injected cleanup failure did not occur")
         lifecycle.cleanup()
         if self.failure == "e2e":
             evidence_path.write_text('{"status":"failed"}\n')
@@ -3380,9 +7095,70 @@ class FakeRunAllOperations:
     def cleanup(self) -> Mapping[str, Any]:
         self.calls.append("cleanup")
         self.cleanup_calls += 1
-        if self.failure == "cleanup":
+        if self.failure in {"cleanup", "e2e-cleanup-primary", "e2e-cleanup-success"}:
             raise e2e.LifecycleError("injected cleanup failure")
         return {"destroyed": True, "residual_audit": "clean"}
+
+
+class ProtectedControlFlowPropagationTest(unittest.TestCase):
+    def test_retry_loops_rethrow_the_exact_control_flow_object(self) -> None:
+        for control in (
+            e2e.ProtectedHardTimeout("hard deadline"),
+            e2e.ProtectedTermination("termination"),
+        ):
+            with self.subTest(control=type(control).__name__):
+                base = object.__new__(e2e.AwsLiveOperations)
+                base.monotonic = lambda: 0.0
+                base.sleep = mock.Mock()
+                with self.assertRaises(type(control)) as raised:
+                    base._wait_until(
+                        mock.Mock(side_effect=control),
+                        lambda _value: False,
+                        timeout_seconds=10,
+                        description="protected retry",
+                    )
+                self.assertIs(raised.exception, control)
+                base.sleep.assert_not_called()
+
+                symmetric = object.__new__(e2e.AwsSymmetricLiveOperations)
+                symmetric.base = SimpleNamespace(
+                    monotonic=lambda: 0.0,
+                    sleep=mock.Mock(),
+                )
+                symmetric._run_probe_with_path = mock.Mock(side_effect=control)
+                with self.assertRaises(type(control)) as raised:
+                    symmetric._wait_probe_path(
+                        SimpleNamespace(),
+                        SimpleNamespace(),
+                        timeout_seconds=10,
+                    )
+                self.assertIs(raised.exception, control)
+                symmetric.base.sleep.assert_not_called()
+
+    def test_manifest_result_write_does_not_reconcile_protected_control_flow(self) -> None:
+        control = e2e.ProtectedTermination("termination during manifest write")
+        lifecycle = object.__new__(e2e.ProtectedLifecycleAdapter)
+        lifecycle._ownership_state = "running-owned"
+        lifecycle._claim_etag = "etag-running"
+        lifecycle.manifest = {
+            "phase": "e2e_running",
+            "e2e": {"claim_id": "claim-fixture"},
+        }
+        lifecycle.store = SimpleNamespace(remote_etag="etag-running")
+        lifecycle._write_manifest = mock.Mock(side_effect=control)
+        lifecycle._reconcile_finish_write = mock.Mock()
+
+        with self.assertRaises(e2e.ProtectedTermination) as raised:
+            lifecycle.finish(False)
+
+        self.assertIs(raised.exception, control)
+        lifecycle._reconcile_finish_write.assert_not_called()
+
+    def test_owned_recovery_preserves_the_distinct_control_flow_type(self) -> None:
+        control = e2e.ProtectedHardTimeout("committed write interrupted")
+        with self.assertRaises(e2e.ProtectedHardTimeout) as raised:
+            e2e.ProtectedLifecycleAdapter._propagate_after_owned_recovery(control)
+        self.assertIs(raised.exception, control)
 
 
 class RunAllCoordinatorTest(unittest.TestCase):
@@ -3406,6 +7182,20 @@ class RunAllCoordinatorTest(unittest.TestCase):
         def cleanup_timeout(self, seconds: int) -> Any:
             self.cleanup_timeouts.append(seconds)
             yield
+
+    def test_lifecycle_proxies_expose_the_live_durable_manifest(self) -> None:
+        initial = {"phase": "ready", "tailnet": {"device_ids": {"node-a": "device-a"}}}
+        delegate = SimpleNamespace(manifest=initial)
+        run_all = e2e._RunAllLifecycleProxy(delegate, lambda: {"complete": True})
+        bounded = e2e._BoundedCleanupLifecycleProxy(delegate)
+
+        self.assertIs(run_all.manifest, initial)
+        self.assertIs(bounded.manifest, initial)
+
+        claimed = {"phase": "e2e_running", "tailnet": initial["tailnet"]}
+        delegate.manifest = claimed
+        self.assertIs(run_all.manifest, claimed)
+        self.assertIs(bounded.manifest, claimed)
 
     def run_coordinator(
         self, temporary: str, failure: str | None = None
@@ -3466,6 +7256,18 @@ class RunAllCoordinatorTest(unittest.TestCase):
 
         self.assertEqual(current_alarm, 0)
         self.assertEqual(alarms, [0, 120, 0, 30, 0, 120, 0])
+
+    def test_protected_timeout_reaches_the_outer_coordinator_and_runs_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result, operations, _contexts = self.run_coordinator(
+                temporary, "protected-timeout"
+            )
+
+        self.assertEqual(result.exit_code, e2e.EXIT_ACCEPTANCE_FAILED)
+        self.assertEqual(operations.cleanup_calls, 1)
+        self.assertEqual(
+            result.record["failure"]["category"], "ProtectedHardTimeout"
+        )
 
     def test_success_uses_one_lock_ordered_stages_and_exactly_one_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3578,6 +7380,65 @@ class RunAllCoordinatorTest(unittest.TestCase):
                 self.assertIn("ownership", result.record["cleanup"]["reason"])
                 self.assertEqual(contexts.cleanup_timeouts, [])
 
+    def test_late_lifecycle_conflict_never_destroys_the_winner(self) -> None:
+        for failure in ("plan-concurrent", "apply-concurrent", "wait-concurrent"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                result, operations, contexts = self.run_coordinator(temporary, failure)
+
+                self.assertEqual(result.exit_code, e2e.EXIT_ACCEPTANCE_FAILED)
+                self.assertEqual(result.record["failure"]["category"], "ConcurrentLifecycleError")
+                self.assertEqual(operations.cleanup_calls, 0)
+                self.assertFalse(result.record["cleanup"]["authorized"])
+                self.assertEqual(contexts.cleanup_timeouts, [])
+
+    def test_ownership_suppression_survives_failure_checkpoint_error(self) -> None:
+        persisted = e2e._write_private_json
+        injected = False
+
+        def checkpoint(path, value):
+            nonlocal injected
+            failure = value.get("failure")
+            if (
+                not injected
+                and isinstance(failure, Mapping)
+                and failure.get("category") == "ConcurrentRunError"
+            ):
+                injected = True
+                raise OSError("injected checkpoint failure")
+            persisted(path, value)
+
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            e2e, "_write_private_json", side_effect=checkpoint
+        ):
+            result, operations, contexts = self.run_coordinator(temporary, "e2e-concurrent")
+
+        self.assertTrue(injected)
+        self.assertEqual(result.record["failure"]["category"], "ConcurrentRunError")
+        self.assertEqual(operations.cleanup_calls, 0)
+        self.assertEqual(contexts.cleanup_timeouts, [])
+
+    def test_cleanup_runs_when_its_running_checkpoint_is_interrupted(self) -> None:
+        persisted = e2e._write_private_json
+        injected = False
+
+        def checkpoint(path, value):
+            nonlocal injected
+            cleanup = value.get("cleanup")
+            if not injected and isinstance(cleanup, Mapping) and cleanup.get("status") == "running":
+                injected = True
+                raise KeyboardInterrupt("injected cleanup checkpoint interrupt")
+            persisted(path, value)
+
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            e2e, "_write_private_json", side_effect=checkpoint
+        ):
+            result, operations, _contexts = self.run_coordinator(temporary)
+
+        self.assertTrue(injected)
+        self.assertEqual(result.exit_code, e2e.EXIT_OK)
+        self.assertEqual(operations.cleanup_calls, 1)
+        self.assertEqual(result.record["cleanup"]["status"], "passed")
+
     def test_nonblocking_or_inexact_inner_metadata_does_not_revoke_cleanup_authority(self) -> None:
         for failure in ("e2e-persistence", "e2e-concurrent-inexact"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
@@ -3599,6 +7460,39 @@ class RunAllCoordinatorTest(unittest.TestCase):
             self.assertEqual(result.record["cleanup"]["attempts"], 1)
             self.assertEqual(result.record["cleanup"]["status"], "failed")
             self.assertEqual(result.record["failure"]["stage"], e2e.RUN_ALL_STAGES[-1])
+
+    def test_cleanup_failure_retains_inner_acceptance_as_primary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result, operations, _contexts = self.run_coordinator(temporary, "e2e-cleanup-primary")
+
+        self.assertEqual(result.exit_code, e2e.EXIT_CLEANUP_FAILED)
+        self.assertEqual(operations.cleanup_calls, 1)
+        self.assertEqual(result.record["failure"]["stage"], e2e.RUN_ALL_STAGES[-1])
+        self.assertEqual(
+            result.record["primary_failure"],
+            {
+                "stage": e2e.RUN_ALL_STAGES[6],
+                "phase": "simultaneous-cold-initiation",
+                "category": "ProbeError",
+                "message": "injected cold probe failure",
+                "exit_code": e2e.EXIT_ACCEPTANCE_FAILED,
+                "artifacts": [
+                    {
+                        "kind": "evidence",
+                        "path": str(result.evidence_path),
+                        "exists": True,
+                    }
+                ],
+            },
+        )
+
+    def test_cleanup_failure_after_passing_acceptance_has_no_primary_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result, operations, _contexts = self.run_coordinator(temporary, "e2e-cleanup-success")
+
+        self.assertEqual(result.exit_code, e2e.EXIT_CLEANUP_FAILED)
+        self.assertEqual(operations.cleanup_calls, 1)
+        self.assertIsNone(result.record["primary_failure"])
 
     def test_build_command_uses_only_config_architecture_and_exact_manifest_parent(self) -> None:
         class RecordingRunner:
@@ -3755,6 +7649,136 @@ class RunAllCoordinatorTest(unittest.TestCase):
         )
         self.assertEqual(live.subcommand, "run-live")
 
+    def test_run_live_malformed_deployment_still_cleans_up_and_writes_schema_three(self) -> None:
+        cleanup_calls: list[str] = []
+
+        class Lifecycle:
+            def cleanup(self):
+                cleanup_calls.append("cleanup")
+                return {"final_residual_count": 0}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            run_root = root / "runs"
+            deployment = root / "malformed.json"
+            config = SimpleNamespace(
+                run_id="fixture-live",
+                expires_at=(dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=3))
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                oauth_environment_names=(),
+                sites={"west": {"region": "us-west-2"}, "east": {"region": "us-east-1"}},
+            )
+            args = e2e.build_parser().parse_args(
+                [
+                    "run-live",
+                    "--config",
+                    str(root / "config.json"),
+                    "--deployment",
+                    str(deployment),
+                    "--run-root",
+                    str(run_root),
+                    "--hard-timeout-seconds",
+                    "1200",
+                ]
+            )
+            with (
+                mock.patch.object(e2e.RunConfig, "load", return_value=config),
+                mock.patch.object(e2e, "validate_protected_execution"),
+                mock.patch.object(e2e, "SubprocessRunner", return_value=SimpleNamespace()),
+                mock.patch.object(e2e, "AwsCLI", return_value=SimpleNamespace()),
+                mock.patch.object(e2e, "ProtectedLifecycleAdapter", return_value=Lifecycle()),
+                mock.patch.object(e2e, "AwsSymmetricLiveOperations", return_value=SimpleNamespace()),
+                mock.patch.object(e2e, "_load_json", side_effect=e2e.E2EError("malformed deployment JSON")),
+                mock.patch.object(e2e, "lifecycle_lock", side_effect=lambda _path: contextlib.nullcontext()),
+                mock.patch.object(
+                    e2e,
+                    "hard_timeout",
+                    side_effect=lambda _seconds, **_kwargs: contextlib.nullcontext(),
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                exit_code = e2e._live_cli(args)
+
+            evidence_path = run_root / "fixture-live" / "aws-two-region-e2e-evidence.json"
+            evidence = json.loads(evidence_path.read_text())
+        self.assertEqual(exit_code, e2e.EXIT_ACCEPTANCE_FAILED)
+        self.assertEqual(cleanup_calls, ["cleanup"])
+        self.assertEqual(evidence["schema"], e2e.SYMMETRIC_EVIDENCE_SCHEMA)
+        self.assertEqual(evidence["failure"]["message"], "malformed deployment JSON")
+        self.assertEqual(evidence["lifecycle"]["cleanup"], "passed")
+
+    def test_run_live_control_flow_uses_the_separate_cleanup_reservation(self) -> None:
+        cleanup_calls: list[str] = []
+        control = e2e.ProtectedTermination("injected direct-live termination")
+
+        class Lifecycle:
+            def cleanup(self):
+                cleanup_calls.append("cleanup")
+                return {"final_residual_count": 0}
+
+        class Runner:
+            @staticmethod
+            def run():
+                raise control
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            config = SimpleNamespace(
+                run_id="fixture-live",
+                expires_at=(dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=3))
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                oauth_environment_names=(),
+                sites={
+                    "west": {"region": "us-west-2"},
+                    "east": {"region": "us-east-1"},
+                },
+            )
+            args = e2e.build_parser().parse_args(
+                [
+                    "run-live",
+                    "--config",
+                    str(root / "config.json"),
+                    "--deployment",
+                    str(root / "deployment.json"),
+                    "--run-root",
+                    str(root / "runs"),
+                    "--hard-timeout-seconds",
+                    "1200",
+                ]
+            )
+            with (
+                mock.patch.object(e2e.RunConfig, "load", return_value=config),
+                mock.patch.object(e2e, "validate_protected_execution"),
+                mock.patch.object(e2e, "SubprocessRunner", return_value=SimpleNamespace()),
+                mock.patch.object(e2e, "AwsCLI", return_value=SimpleNamespace()),
+                mock.patch.object(e2e, "ProtectedLifecycleAdapter", return_value=Lifecycle()),
+                mock.patch.object(e2e, "AwsSymmetricLiveOperations", return_value=SimpleNamespace()),
+                mock.patch.object(e2e, "SymmetricTwoRegionE2ERunner", return_value=Runner()),
+                mock.patch.object(e2e, "_load_json", return_value={}),
+                mock.patch.object(
+                    e2e, "lifecycle_lock", side_effect=lambda _path: contextlib.nullcontext()
+                ),
+                mock.patch.object(
+                    e2e,
+                    "hard_timeout",
+                    side_effect=lambda _seconds, **_kwargs: contextlib.nullcontext(),
+                ),
+                mock.patch.object(
+                    e2e,
+                    "cleanup_hard_timeout",
+                    side_effect=lambda _seconds: contextlib.nullcontext(),
+                ),
+            ):
+                with self.assertRaises(e2e.ProtectedTermination) as raised:
+                    e2e._live_cli(args)
+
+        self.assertIs(raised.exception, control)
+        self.assertEqual(cleanup_calls, ["cleanup"])
+
     def test_authorized_run_all_bootstrap_failures_write_only_a_minimal_private_record(self) -> None:
         approved = "fixture-run"
         trusted_environment = {
@@ -3903,9 +7927,7 @@ class ProtectedExecutionTest(unittest.TestCase):
         store = DurableManifestStore(ready_lifecycle_manifest(raw))
         adapter = object.__new__(e2e.ProtectedLifecycleAdapter)
         adapter.store = store
-        adapter.config = SimpleNamespace(
-            sites={"west": {"region": "us-west-2"}, "east": {"region": "us-east-1"}}
-        )
+        adapter.config = SimpleNamespace(run_id="fixture-live", sites=lifecycle_sites())
         adapter.aws = SimpleNamespace()
         adapter.runner = SimpleNamespace()
         adapter.run_dir = pathlib.Path(temporary).resolve()
@@ -3964,6 +7986,31 @@ class ProtectedExecutionTest(unittest.TestCase):
         e2e.validate_protected_execution(
             "fixture-live", {"ENVELOPE_E2E_APPROVED_RUN_ID": "fixture-live", "GITHUB_EVENT_NAME": "workflow_dispatch"}
         )
+
+    def test_manifest_requires_exactly_four_explicit_transport_nodes_and_no_targets(self) -> None:
+        expected = fixture_live_tailnet_hostnames()
+        self.assertEqual(len(expected), 4)
+        self.assertTrue(all("-transport-" in hostname for hostname in expected))
+        self.assertFalse(any("-target-" in hostname for hostname in expected))
+
+        for mutation in ("target-node", "wrong-role"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                raw, store, adapter = self.protected_adapter(temporary)
+                deployment = e2e.parse_protected_deployment_output(raw)
+                if mutation == "target-node":
+                    old = expected[0]
+                    replacement = "fixture-live-west-target-a"
+                    store.value["tailnet"]["expected_hostnames"][0] = replacement
+                    store.value["tailnet"]["device_ids"][replacement] = store.value["tailnet"][
+                        "device_ids"
+                    ].pop(old)
+                    store.value["tailnet"]["device_roles"][replacement] = store.value["tailnet"][
+                        "device_roles"
+                    ].pop(old)
+                else:
+                    store.value["tailnet"]["device_roles"][expected[0]] = "target"
+                with self.assertRaisesRegex(e2e.DeploymentError, "exactly four role-separated"):
+                    adapter.claim(raw, deployment)
 
     def test_timeout_and_sigterm_atomically_handoff_only_the_owned_claim(self) -> None:
         cleanup_timeouts: list[int] = []
@@ -4733,9 +8780,7 @@ class ProtectedExecutionTest(unittest.TestCase):
         def adapter(manifest: Mapping[str, Any]) -> e2e.ProtectedLifecycleAdapter:
             value = object.__new__(e2e.ProtectedLifecycleAdapter)
             value.store = Store(manifest)
-            value.config = SimpleNamespace(
-                sites={"west": {"region": "us-west-2"}, "east": {"region": "us-east-1"}}
-            )
+            value.config = SimpleNamespace(run_id="fixture-live", sites=lifecycle_sites())
             value.manifest = None
             return value
 

@@ -2,9 +2,9 @@
 
 ## Status
 
-This page describes the required acceptance boundary for the symmetric two-site GWLB topology. The protected lifecycle and schema-3 HA evidence verifier are implemented, but execution remains restricted to an approved protected environment and a fresh run-owned configuration.
+This page defines the required acceptance boundary for the corrected symmetric two-site GWLB topology. It does not record a successful live run. Protected run `ha25` failed acceptance but supplied the live route evidence used to correct the readiness contract below. Execution remains restricted to an approved protected environment and a fresh run-owned version-2 configuration after the implementation and static gates pass.
 
-Do not execute an earlier acceptance workflow, use direct Terraform commands, or reuse previous state, plans, evidence, or configuration. The earlier deployment contract is incompatible with version 2. Every run must start with a fresh approved run identity and use only the lifecycle that owns creation, evidence, and cleanup.
+Do not execute an earlier acceptance workflow, use direct Terraform commands, or reuse previous state, plans, evidence, or configuration. The rejected target-forwarding draft is incompatible with corrected version 2. Every run must start with a fresh approved run identity and use only the lifecycle that owns creation, route mutation, evidence, restoration, and cleanup.
 
 ## Acceptance Topology
 
@@ -12,33 +12,114 @@ Both sites use ordinary local workload CIDRs, so either site can cold-initiate T
 
 ```text
 source workload -> source-site GWLBE -> source-site GWLB -> source-site target
-  -> Tailscale -> destination-site ingress router
+  -> immediate return to source GWLB -> source GWLBE post-inspection route
+  -> selected source transport-router ENI -> Tailscale -> destination transport router
   -> destination-site GWLBE -> destination-site GWLB -> destination-site target
+  -> immediate return to destination GWLB -> destination GWLBE local route
   -> destination workload
 ```
 
-The remote ingress router is separate from the target fleet. It advertises the exact destination local-site CIDRs without subnet-route SNAT and routes received Tailnet traffic to its local GWLBE. The target decapsulates GENEVE into `envelope0`, sends local-site traffic to the post-inspection VPC path, and sends remote-site traffic to `tailscale0`. No normal inter-site path performs NAT or bypasses a local GWLB.
+Each target handles only the current AWS GENEVE packet and returns it exactly once with identical inner bytes, VNI, protocol metadata, ordered options, cookie, and packet-specific AWS tuple. It does not use a TUN, Tailscale, host forwarding, or retained flow identity.
+
+The dedicated transport routers are bidirectional. A source-site router receives post-inspection remote traffic through its selected ENI and forwards it through Tailscale without NAT. A destination-site router receives Tailnet traffic for a local-site CIDR and forwards it to the underlay, where its subnet route selects the same-AZ GWLBE. After each target turnaround, the GWLBE route table selects remote ENI transit or VPC local delivery.
 
 ## Required Profile
 
-- Two enabled availability zones per site.
+- Exactly two sites in distinct regions and two enabled availability zones per site.
 - A GWLBE and healthy-capable target path in every enabled AZ.
-- At least two AZ-spread ingress routers per site advertising identical exact local-site CIDRs.
+- At least two AZ-spread transport routers per site with distinct eligible ENIs.
+- Exactly one assigned workload-prefix advertisement per router at baseline; each site's per-router prefix sets are non-empty, pairwise disjoint, and exactly cover local workload CIDRs.
+- Every router remains forwarding-capable for bounded takeover of all local prefixes, accepts exact remote-site routes, disables subnet-route SNAT, and preserves source addresses.
+- Tailscale table 52 and serving paths contain only opposite-site workload prefixes; every local prefix stays on the main/VPC underlay.
 - Disjoint local-site and remote-site CIDRs, with each remote list equal to the peer's local list.
-- Separate workload, ingress, GWLBE, target, and management route domains.
-- An approved cost ceiling and short, explicit resource expiry before any future apply.
+- Separate workload, transport-router, GWLBE, target, and management route domains.
+- Workload remote routes and transport-router local routes through same-AZ GWLBE endpoints.
+- GWLBE post-inspection local delivery and one selected same-site transport-router ENI per exact remote prefix.
+- An approved fixed-cost ceiling and short, explicit resource expiry before any future infrastructure creation.
 
 The [Terraform topology shape](terraform-example.md) is illustrative only and deliberately omits a protected configuration. It is not a deployment instruction.
 
+## External Failover Input
+
+`symmetric_topology.route_failover` accepts exactly `mutation_timeout_seconds`, `restoration_timeout_seconds`, `recovery_timeout_seconds`, and `initial_transport_router_az_by_gwlbe_az`. The three timeout values are whole seconds from `1` through `7200`. The selection object has exactly `west` and `east` maps; each map covers every GWLBE AZ key, and every mapped transport-router AZ key must equal that GWLBE AZ key. Extra lifecycle timing fields or compatibility aliases are rejected.
+
+`initial_transport_router_az_by_gwlbe_az` is required same-AZ key equality, so no cross-AZ initial mapping is valid. It is declarative initial state, not a readiness election or an autonomous failover rule, and there is no separate owner input. For each AZ it derives both the transport-router fleet member's singleton `advertised_prefix` and the route output's `source_workload_prefix`; all exact remote-site routes in that source prefix's GWLBE table select the same owner's primary ENI. Settlement, quiet-window, and owner-lease timing is derived internally from reviewed external bounds and is not supplied by the operator.
+
+Terraform's `route_failover` output resolves those selections to route-table and ENI identities. The separate `transport_router_readiness_expectations` output describes the expected host contract; credentialed protected readiness must still prove the live Tailnet, host, AWS route, source/destination-check, and ENI state.
+
+## Preflight Boundary
+
+Before billable resources or live traffic, protected preflight must fail closed unless it proves:
+
+- Fresh version-2 configuration with no directional, compatibility, target TUN, target Tailscale, target site-CIDR, or host-routing fields.
+- Exact run ownership, durable cleanup authority, expiry, scoped credentials, artifact identity, and Tailnet policy.
+- Expected two-AZ target and transport-router fleets, route tables, endpoint identities, eligible ENIs, and initial route selections.
+- Target packet-receive, validation, and compliant-send readiness independent of transport readiness.
+- Both transport directions, no NAT, exact advertisements and accepted routes, source preservation, and local GWLBE routing.
+- Exact local policy rules and complete prefix route chains, non-expired serving peers with peer-bound bounded ping observations, and the live-MTU-derived MSS rule in both directions.
+- Every opposite-site observer selects each protected remote prefix's configured stable-node `PrimaryRoutes` owner, with stable-node identity bound to its protected transport-router instance ID.
+- On every router, Tailscale table 52 contains exactly the opposite site's exact workload prefixes and no local-site prefix; no same-site observer reports a protected local `PrimaryRoutes` claim.
+- Every local prefix, whether self- or sibling-owned in the singleton advertisement map, remains on `main` and the VPC underlay; the higher-priority `iif tailscale0` local-prefix rules make every router capable of delivering all local prefixes during normal and takeover paths.
+- Source-prefix owner/ENI coupling remains mandatory: it is derived from singleton advertisements, control-plane stable identities, and opposite-site observations and must agree with the protected instance ID and initial GWLBE owner ENI selected by the same-AZ map.
+- Fresh plan resource counts, a current fixed-cost estimate within the approved ceiling, and review of variable-cost exposure.
+
+No preflight result is evidence that live traffic or failover passed.
+
+Failed protected run `ha25` proved the corrected live route shape: each router installed exactly the two opposite-site workload routes in table 52 and formed only opposite-site serving paths. It invalidated the earlier same-site sibling table-52/`PrimaryRoutes` requirement but did not pass acceptance task 6.4.
+
 ## Evidence Expectations
 
-Protected acceptance proves bidirectional cold TCP, UDP, and ICMP flows through both sites' GWLBE/GWLB paths. It separately exercises target-process, target-instance, and ingress-router loss, proving that a new flow can use an alternate healthy target or router.
+Protected acceptance must prove simultaneous cold initiation from both sites for TCP, UDP, and ICMP without directional CIDR partitioning. For each direction, evidence must bind the source and destination GWLBE, GWLB target, transport router, and ENI identities and prove both target turnarounds. Preflight evidence records bounded per-prefix Tailnet ownership from every opposite-site observer, maps stable node IDs to protected transport-router instance IDs, proves local Tailnet routes and claims are absent, and verifies that each source-prefix owner agrees with the GWLBE ENI selection.
 
-Evidence must identify selected and succeeding targets and ingress routers, record health transitions and bounded recovery time, record the established TCP outcome and UDP loss, and complete an ownership-safe residual audit. Retained evidence must be redacted and pass the repository secret scan.
+Packet-level assertions must show exactly one immediate return for each valid ingress packet with byte-identical inner data, VNI, protocol metadata, ordered options, cookie, and the current packet's AWS outer tuple. Invalid packets must produce no send. The assertion must not infer turnaround solely from an application response or aggregate counter.
+
+The protected evidence boundary uses bounded Linux `AF_PACKET` captures on each target underlay. Capture processing retains only capture/frame counts, frame SHA-256 values, `inner_packet_sha256`, `ordered_options_sha256`, `flow_cookie_sha256`, VNI, and tuple/port assertion results. The raw PCAP is deleted, and retained evidence contains no raw application payload, ordered-option bytes, or flow-cookie value.
+
+The lifecycle must separately exercise:
+
+- Target process quiesce, AWS deregistration and drain, restart, and alternate-target new-flow recovery.
+- Target instance replacement and restored target-fleet readiness.
+- Graceful and abrupt transport-router loss through the single durable Tailnet-ownership and GWLBE-route transaction.
+- Protected-runner replacement of all affected exact GWLBE remote routes with the eligible alternate same-site ENI only after opposite-site stable ownership converges and local Tailnet routes remain absent.
+- Unconditional ordered restoration and verification of the original advertisements, opposite-site owner graph, local-route absence, and every original ENI route target.
+
+Evidence must record health transitions, the transferred source prefix, fenced forward and restore generations, stable-node hashes bound to protected instance IDs, before/transferred/restored owner graphs from every opposite-site observer, absence of same-site local Tailnet routes and claims, current-to-alternate-to-original ENI transitions, recovery duration, established TCP outcome, UDP sent/received/loss, all-component restoration of advertisements, ownership, and routes, cost values, and an ownership-safe residual audit. Retained evidence must be redacted and pass the repository secret scan. No corrected evidence bundle is documented as accepted yet.
+
+## ENI Route Exercise
+
+Only the protected runner owns this exercise. The current source-prefix owner and ENI are resolved together from `initial_transport_router_az_by_gwlbe_az`, singleton advertisements, control-plane stable identities, and opposite-site observations, not from observed readiness or a separate owner field. Before mutation, the runner verifies the durable run and cleanup claim, exact source prefix, route table and remote-prefix allowlists, current and alternate stable-node/instance/ENI bindings, deterministic singleton baselines, remote-only table 52, absence of local Tailnet routes and claims, and readiness. Graceful and abrupt failures both use one durable CAS/lease transaction in this order:
+
+1. Persist the authorized transaction and fenced forward/restore generations before any mutation.
+2. Temporarily expand the alternate advertisement to include the source prefix while retaining its own prefix.
+3. Withdraw or stop the current owner with the fenced forward generation.
+4. Wait through the quiet window for every opposite-site observer to select the alternate stable node for the transferred prefix while every unaffected owner stays fixed and local Tailnet routes remain absent.
+5. Replace every affected exact remote-prefix route in the GWLBE table with the alternate primary ENI and verify route convergence.
+6. Probe new TCP and UDP flows only after the owner graph and every affected ENI route agree.
+
+Normal overlap and duplicate primary ownership are forbidden. Temporary overlap is permitted only inside the persisted transfer, including the bounded interval between alternate expansion and current withdrawal.
+
+After success, probe failure, timeout, interruption, or partial mutation, restoration remains in that transaction and follows this order:
+
+1. Restart the original owner at its singleton baseline while the alternate still covers the transferred prefix.
+2. Remove the transferred prefix from the alternate, returning it to its singleton baseline.
+3. Wait for every opposite-site observer to converge on the complete baseline owner graph, verify local Tailnet routes remain absent, and reverify both routers.
+4. Restore all affected routes to the original ENI and hold the complete snapshot through the quiet verification window.
+
+The lifecycle cannot emit a terminal result or permit cleanup handoff to another phase while advertisements, ownership, or routes remain unrestored. If the runner disappears, the durable journal remains authoritative; only after lease expiry may a successor win the CAS recovery claim and complete restoration. Ambiguous ownership or unexpected route state fails closed, and restoration failure remains a failed acceptance result and reported residual. Targets and transport routers have no route-mutation authority.
+
+The Tailnet ownership transfer and GWLBE route replacements are coordinated but are not atomic. Evidence must identify each control-plane transition and prove their ordered agreement.
 
 ## Availability Limit
 
-The profile is designed for bounded new-flow recovery. It is not hitless. A target, instance, AZ, GWLB, or ingress-router failure can interrupt established TCP and lose UDP traffic while AWS and Tailscale control planes converge. Applications must provide retry behavior; acceptance records observed behavior rather than claiming uninterrupted transport.
+The profile is designed for bounded new-flow recovery. It is not hitless. A target process, instance, transport router, AZ, GWLB, GWLBE route, or Tailscale selection failure can interrupt established TCP and lose UDP traffic while AWS and Tailscale control planes converge. The coordinated ownership and route operation is not atomic, and neither target reassignment nor Tailnet convergence implies stateful transport continuity.
+
+Applications must provide retry behavior. Acceptance records observed recovery and packet loss against approved bounds; it does not promise uninterrupted transport or establish a production SLO.
+
+## Cost Boundary
+
+The approved planning assumptions are two sites with two AZs each, two GWLBs, four GWLBE endpoints, four `t3.medium` targets, four `t3.micro` transport routers, four `t3.micro` workloads, and one management NAT gateway and Elastic IP per VPC. The profile uses a `$4.00/hour` fixed estimate and a `$5.00/hour` approved fixed ceiling. Each NAT is shared from its site's single management subnet, so private management and bootstrap egress is not multi-AZ. This one-NAT-per-site limitation is outside the inspected inter-site route and is not covered by target or transport-router HA exercises.
+
+The estimate omits variable GWLB/GWLBE processing, NAT data, cross-AZ and inter-region transfer, log ingestion, storage, taxes, and price changes. Protected preflight must review a fresh saved plan and current regional prices rather than treating these values as a quote. The run expiry must reserve acceptance and cleanup time without exceeding the lifecycle's bounded new-run window, and cleanup starts immediately after the exercise.
 
 ## Protected-Run Safety
 
@@ -46,12 +127,14 @@ The profile is designed for bounded new-flow recovery. It is not hitless. A targ
 - Keep credentials out of config files, Terraform input, command arguments, plans, diagnostics, and logs.
 - Do not enable shell tracing around lifecycle tooling.
 - Do not retain or upload state, plans, raw packet captures, rendered user data, or unredacted diagnostics.
-- Cleanup must use exact run ownership and leave shared backend infrastructure untouched.
+- Cleanup must use exact run ownership, restore route mutations, remove run-owned resources, and leave shared backend infrastructure untouched.
 
-Use local/static validation before requesting a protected run:
+Use local and static validation before requesting a protected run:
 
 ```bash
 python3 scripts/test_docs.py
 python3 scripts/test_terraform_contract.py
+python3 scripts/test_transport_router_readiness.py
+python3 scripts/verify_systemd_units.py --source-only
 python3 scripts/secret_scan.py --root .
 ```

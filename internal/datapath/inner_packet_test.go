@@ -26,7 +26,7 @@ func TestInnerPacketValidation(t *testing.T) {
 	}
 }
 
-func TestUnsupportedInnerPacketMatrix(t *testing.T) {
+func TestInnerPacketFragmentsExtensionsAndTransportRemainOpaque(t *testing.T) {
 	baseIPv4 := innerIPv4UDP([4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, 1234, 443)
 	fragmentMF := append([]byte(nil), baseIPv4...)
 	binary.BigEndian.PutUint16(fragmentMF[6:8], 0x2000)
@@ -61,22 +61,55 @@ func TestUnsupportedInnerPacketMatrix(t *testing.T) {
 	ipv6ExtensionThenFragment[41] = 0
 
 	cases := []struct {
-		name    string
-		packet  []byte
-		wantErr error
+		name   string
+		packet []byte
 	}{
-		{name: "IPv4 MF", packet: fragmentMF, wantErr: ErrIPv4Fragment},
-		{name: "IPv4 offset", packet: fragmentOffset, wantErr: ErrIPv4Fragment},
-		{name: "truncated UDP", packet: truncatedUDP, wantErr: ErrTransportTruncated},
-		{name: "truncated TCP", packet: truncatedTCP, wantErr: ErrTransportTruncated},
-		{name: "IPv6 fragment", packet: ipv6Fragment, wantErr: ErrIPv6Fragment},
-		{name: "IPv6 extension", packet: ipv6Extension, wantErr: ErrIPv6Extension},
-		{name: "IPv6 extension then fragment", packet: ipv6ExtensionThenFragment, wantErr: ErrIPv6Fragment},
+		{name: "IPv4 MF", packet: fragmentMF},
+		{name: "IPv4 offset", packet: fragmentOffset},
+		{name: "short opaque UDP payload", packet: truncatedUDP},
+		{name: "short opaque TCP payload", packet: truncatedTCP},
+		{name: "IPv6 fragment", packet: ipv6Fragment},
+		{name: "IPv6 extension", packet: ipv6Extension},
+		{name: "IPv6 extension then fragment", packet: ipv6ExtensionThenFragment},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := validateInnerPacket(tc.packet); !errors.Is(err, tc.wantErr) {
-				t.Fatalf("got %v, want %v", err, tc.wantErr)
+			if err := validateInnerPacket(tc.packet); err != nil {
+				t.Fatalf("opaque packet rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestMalformedInnerPacketBounds(t *testing.T) {
+	validIPv4 := innerIPv4UDP([4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, 1234, 443)
+	badIPv4IHL := append([]byte(nil), validIPv4...)
+	badIPv4IHL[0] = 0x44
+	longIPv4IHL := append([]byte(nil), validIPv4...)
+	longIPv4IHL[0] = 0x4f
+	badIPv4Length := append([]byte(nil), validIPv4...)
+	binary.BigEndian.PutUint16(badIPv4Length[2:4], uint16(len(badIPv4Length)-1))
+
+	validIPv6 := innerIPv6UDP(1234, 443)
+	badIPv6Length := append([]byte(nil), validIPv6...)
+	binary.BigEndian.PutUint16(badIPv6Length[4:6], 7)
+
+	for _, tc := range []struct {
+		name   string
+		packet []byte
+	}{
+		{name: "empty", packet: nil},
+		{name: "unknown version", packet: []byte{0x70}},
+		{name: "short IPv4", packet: []byte{0x45}},
+		{name: "small IPv4 IHL", packet: badIPv4IHL},
+		{name: "IPv4 IHL beyond packet", packet: longIPv4IHL},
+		{name: "IPv4 total length mismatch", packet: badIPv4Length},
+		{name: "short IPv6", packet: []byte{0x60}},
+		{name: "IPv6 payload length mismatch", packet: badIPv6Length},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateInnerPacket(tc.packet); !errors.Is(err, ErrInnerMalformed) {
+				t.Fatalf("validation error = %v, want %v", err, ErrInnerMalformed)
 			}
 		})
 	}

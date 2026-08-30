@@ -8,6 +8,7 @@ const (
 	OptionValidationReasonSize           = "size"
 	OptionValidationReasonAWSLength      = "aws_length"
 	OptionValidationReasonAWSCardinality = "aws_cardinality"
+	OptionValidationReasonAWSReserved    = "aws_reserved"
 
 	ProfileReasonDecode         = "decode"
 	ProfileReasonOuterIPv4      = "outer_ipv4"
@@ -22,76 +23,51 @@ const (
 	ReceiveDropReasonControlTruncated  = "control_truncated"
 	ReceiveDropReasonPacketInfo        = "packet_info"
 
-	UnsupportedReasonMalformed          = "malformed"
-	UnsupportedReasonIPv4Fragment       = "ipv4_fragment"
-	UnsupportedReasonIPv6Fragment       = "ipv6_fragment"
-	UnsupportedReasonIPv6Extension      = "ipv6_extension"
-	UnsupportedReasonTransportTruncated = "transport_truncated"
+	InnerValidationReasonMalformed = "malformed"
 
-	LivenessComponentReceive  = "receive"
-	LivenessComponentTunWrite = "tun_write"
+	ReadinessComponentReceiver   = "receiver"
+	ReadinessComponentValidation = "validation"
+	ReadinessComponentSender     = "sender"
+	ReadinessStateReady          = "ready"
+	ReadinessStateNotReady       = "not_ready"
+	SenderReinitializationOK     = "success"
+	SenderReinitializationFailed = "failure"
 
-	RoutingFailureReasonInterface        = "interface"
-	RoutingFailureReasonBackend          = "backend"
-	RoutingFailureReasonRouteUnapproved  = "route_unapproved"
-	RoutingFailureReasonRouteUnavailable = "route_unavailable"
-	RoutingFailureReasonRouteUnaccepted  = "route_unaccepted"
-	RoutingFailureReasonRouteWithdrawn   = "route_withdrawn"
-	RoutingFailureReasonReturnRoute      = "return_route"
-	RoutingFailureReasonDeliveryRoute    = "delivery_route"
-	RoutingFailureReasonRemoteRoute      = "remote_route"
-	RoutingFailureReasonSysctl           = "sysctl"
-	RoutingFailureReasonForwarding       = RoutingFailureReasonSysctl
-	RoutingFailureReasonRPFilter         = "rp_filter"
-	RoutingFailureReasonFirewall         = "firewall"
-	RoutingFailureReasonMSS              = "mss"
-	RoutingFailureReasonApply            = "apply"
-	RoutingFailureReasonOwnership        = "ownership"
-	RoutingFailureReasonDrift            = "drift"
-	RoutingOwnershipCreated              = "created"
-	RoutingOwnershipPreserved            = "preserved"
-	RoutingOwnershipRemoved              = "removed"
-	RoutingOwnershipRolledBack           = "rolled_back"
-	RoutingOwnershipCleanupFailure       = "cleanup_failure"
-	MTUDropFamilyIPv4                    = "ipv4"
-	MTUDropFamilyIPv6                    = "ipv6"
-	MTUDropFamilyUnknown                 = "unknown"
-	MTUDropDirectionIngress              = "ingress"
+	MTUDropFamilyIPv4       = "ipv4"
+	MTUDropFamilyIPv6       = "ipv6"
+	MTUDropFamilyUnknown    = "unknown"
+	MTUDropDirectionIngress = "ingress"
 )
 
 type Metrics struct {
 	GeneveRxPackets               prometheus.Counter
 	GeneveRxBytes                 prometheus.Counter
-	DecapErrors                   prometheus.Counter
-	TunRxPackets                  prometheus.Counter
-	TunTxPackets                  prometheus.Counter
+	GeneveTxPackets               prometheus.Counter
+	GeneveTxBytes                 prometheus.Counter
 	Drops                         prometheus.Counter
 	GeneveOptionsValidationErrors *prometheus.CounterVec
 	GWLBProfileRejections         *prometheus.CounterVec
 	GWLBReceiveDrops              *prometheus.CounterVec
-	GWLBUnsupportedInner          *prometheus.CounterVec
-	SymmetricUnexpectedEgress     prometheus.Counter
-	DatapathComponentHealthy      *prometheus.GaugeVec
-	DatapathLivenessTransitions   *prometheus.CounterVec
+	GWLBReturnBuildFailures       prometheus.Counter
+	GWLBSendFailures              prometheus.Counter
+	GWLBInnerValidationFailures   *prometheus.CounterVec
+	TargetReady                   prometheus.Gauge
+	TargetComponentReady          *prometheus.GaugeVec
+	TargetReadinessTransitions    *prometheus.CounterVec
+	SenderReinitializations       *prometheus.CounterVec
 	MTUDrops                      *prometheus.CounterVec
-	RoutingApplyAttempts          prometheus.Counter
-	RoutingApplyFailures          prometheus.Counter
-	RoutingDriftRepairs           prometheus.Counter
-	RoutingValidationFailures     *prometheus.CounterVec
-	RoutingOwnershipDecisions     *prometheus.CounterVec
-	RoutingReady                  prometheus.Gauge
 }
 
-func New(reg prometheus.Registerer) *Metrics {
+// NewTarget registers the production packet-return target metrics.
+func NewTarget(reg prometheus.Registerer) *Metrics {
 	if reg == nil {
 		reg = prometheus.DefaultRegisterer
 	}
 	m := &Metrics{
-		GeneveRxPackets: prometheus.NewCounter(prometheus.CounterOpts{Name: "geneve_rx_packets", Help: "GENEVE packets received"}),
-		GeneveRxBytes:   prometheus.NewCounter(prometheus.CounterOpts{Name: "geneve_rx_bytes", Help: "GENEVE bytes received"}),
-		DecapErrors:     prometheus.NewCounter(prometheus.CounterOpts{Name: "decap_errors", Help: "GENEVE decapsulation errors"}),
-		TunRxPackets:    prometheus.NewCounter(prometheus.CounterOpts{Name: "tun_rx_packets", Help: "TUN packets read"}),
-		TunTxPackets:    prometheus.NewCounter(prometheus.CounterOpts{Name: "tun_tx_packets", Help: "TUN packets written"}),
+		GeneveRxPackets: prometheus.NewCounter(prometheus.CounterOpts{Name: "geneve_rx_packets", Help: "Valid AWS GENEVE packets received"}),
+		GeneveRxBytes:   prometheus.NewCounter(prometheus.CounterOpts{Name: "geneve_rx_bytes", Help: "Valid AWS GENEVE bytes received"}),
+		GeneveTxPackets: prometheus.NewCounter(prometheus.CounterOpts{Name: "geneve_tx_packets", Help: "Packet-scoped AWS GENEVE returns sent"}),
+		GeneveTxBytes:   prometheus.NewCounter(prometheus.CounterOpts{Name: "geneve_tx_bytes", Help: "Packet-scoped AWS GENEVE return bytes sent"}),
 		Drops:           prometheus.NewCounter(prometheus.CounterOpts{Name: "drops", Help: "Packets dropped"}),
 		GeneveOptionsValidationErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "geneve_options_validation_errors",
@@ -105,57 +81,53 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "gwlb_receive_drops_total",
 			Help: "Packets dropped at the receive boundary by reason",
 		}, []string{"reason"}),
-		GWLBUnsupportedInner: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "gwlb_unsupported_inner_total",
-			Help: "Unsupported inner packets by reason",
+		GWLBReturnBuildFailures: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "gwlb_return_build_failures_total",
+			Help: "Validated packet returns dropped because the GENEVE return could not be built",
+		}),
+		GWLBSendFailures: prometheus.NewCounter(prometheus.CounterOpts{Name: "gwlb_send_failures_total", Help: "AWS-compliant packet send failures"}),
+		GWLBInnerValidationFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gwlb_inner_validation_failures_total",
+			Help: "Inner IP framing and declared-length validation failures by reason",
 		}, []string{"reason"}),
-		SymmetricUnexpectedEgress: prometheus.NewCounter(prometheus.CounterOpts{Name: "symmetric_unexpected_egress_total", Help: "Unexpected TUN egress packets dropped in symmetric mode"}),
-		DatapathComponentHealthy: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "datapath_component_healthy",
-			Help: "Whether a persistent-error-tracked datapath component is healthy",
+		TargetReady: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "gwlb_target_ready",
+			Help: "Whether the packet-turnaround target is ready",
+		}),
+		TargetComponentReady: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "gwlb_target_component_ready",
+			Help: "Whether a required packet-turnaround component is initialized and ready",
 		}, []string{"component"}),
-		DatapathLivenessTransitions: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "datapath_liveness_transitions_total",
-			Help: "Datapath component liveness transitions",
+		TargetReadinessTransitions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gwlb_target_readiness_transitions_total",
+			Help: "Packet-turnaround component readiness transitions",
 		}, []string{"component", "state"}),
+		SenderReinitializations: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gwlb_sender_reinitializations_total",
+			Help: "Raw packet sender reinitialization attempts by result",
+		}, []string{"result"}),
 		MTUDrops: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gwlb_mtu_drops_total",
 			Help: "Oversized inner packets dropped by IP family and datapath direction",
 		}, []string{"family", "direction"}),
-		RoutingApplyAttempts: prometheus.NewCounter(prometheus.CounterOpts{Name: "routing_apply_attempts", Help: "Routing apply attempts"}),
-		RoutingApplyFailures: prometheus.NewCounter(prometheus.CounterOpts{Name: "routing_apply_failures", Help: "Routing apply failures"}),
-		RoutingDriftRepairs:  prometheus.NewCounter(prometheus.CounterOpts{Name: "routing_drift_repairs", Help: "Routing drift repairs"}),
-		RoutingValidationFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "routing_validation_failures_total",
-			Help: "Routing readiness validation failures by bounded reason",
-		}, []string{"reason"}),
-		RoutingOwnershipDecisions: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "routing_ownership_decisions_total",
-			Help: "Managed routing ownership decisions",
-		}, []string{"decision"}),
-		RoutingReady: prometheus.NewGauge(prometheus.GaugeOpts{Name: "routing_ready", Help: "Whether routing integration is currently ready"}),
 	}
 	reg.MustRegister(
 		m.GeneveRxPackets,
 		m.GeneveRxBytes,
-		m.DecapErrors,
-		m.TunRxPackets,
-		m.TunTxPackets,
+		m.GeneveTxPackets,
+		m.GeneveTxBytes,
 		m.Drops,
 		m.GeneveOptionsValidationErrors,
 		m.GWLBProfileRejections,
 		m.GWLBReceiveDrops,
-		m.GWLBUnsupportedInner,
-		m.SymmetricUnexpectedEgress,
-		m.DatapathComponentHealthy,
-		m.DatapathLivenessTransitions,
+		m.GWLBReturnBuildFailures,
+		m.GWLBSendFailures,
+		m.GWLBInnerValidationFailures,
+		m.TargetReady,
+		m.TargetComponentReady,
+		m.TargetReadinessTransitions,
+		m.SenderReinitializations,
 		m.MTUDrops,
-		m.RoutingApplyAttempts,
-		m.RoutingApplyFailures,
-		m.RoutingDriftRepairs,
-		m.RoutingValidationFailures,
-		m.RoutingOwnershipDecisions,
-		m.RoutingReady,
 	)
 	for _, reason := range []string{
 		OptionValidationReasonStructural,
@@ -163,6 +135,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		OptionValidationReasonSize,
 		OptionValidationReasonAWSLength,
 		OptionValidationReasonAWSCardinality,
+		OptionValidationReasonAWSReserved,
 	} {
 		m.GeneveOptionsValidationErrors.WithLabelValues(reason)
 	}
@@ -185,54 +158,21 @@ func New(reg prometheus.Registerer) *Metrics {
 	} {
 		m.GWLBReceiveDrops.WithLabelValues(reason)
 	}
-	for _, reason := range []string{
-		UnsupportedReasonMalformed,
-		UnsupportedReasonIPv4Fragment,
-		UnsupportedReasonIPv6Fragment,
-		UnsupportedReasonIPv6Extension,
-		UnsupportedReasonTransportTruncated,
-	} {
-		m.GWLBUnsupportedInner.WithLabelValues(reason)
-	}
+	m.GWLBInnerValidationFailures.WithLabelValues(InnerValidationReasonMalformed)
+	m.TargetReady.Set(0)
 	for _, component := range []string{
-		LivenessComponentReceive,
-		LivenessComponentTunWrite,
+		ReadinessComponentReceiver,
+		ReadinessComponentValidation,
+		ReadinessComponentSender,
 	} {
-		m.DatapathComponentHealthy.WithLabelValues(component).Set(1)
-		m.DatapathLivenessTransitions.WithLabelValues(component, "healthy")
-		m.DatapathLivenessTransitions.WithLabelValues(component, "unhealthy")
+		m.TargetComponentReady.WithLabelValues(component).Set(0)
+		m.TargetReadinessTransitions.WithLabelValues(component, ReadinessStateReady)
+		m.TargetReadinessTransitions.WithLabelValues(component, ReadinessStateNotReady)
 	}
+	m.SenderReinitializations.WithLabelValues(SenderReinitializationOK)
+	m.SenderReinitializations.WithLabelValues(SenderReinitializationFailed)
 	for _, family := range []string{MTUDropFamilyIPv4, MTUDropFamilyIPv6, MTUDropFamilyUnknown} {
 		m.MTUDrops.WithLabelValues(family, MTUDropDirectionIngress)
-	}
-	for _, reason := range []string{
-		RoutingFailureReasonInterface,
-		RoutingFailureReasonBackend,
-		RoutingFailureReasonRouteUnapproved,
-		RoutingFailureReasonRouteUnavailable,
-		RoutingFailureReasonRouteUnaccepted,
-		RoutingFailureReasonRouteWithdrawn,
-		RoutingFailureReasonReturnRoute,
-		RoutingFailureReasonDeliveryRoute,
-		RoutingFailureReasonRemoteRoute,
-		RoutingFailureReasonSysctl,
-		RoutingFailureReasonRPFilter,
-		RoutingFailureReasonFirewall,
-		RoutingFailureReasonMSS,
-		RoutingFailureReasonApply,
-		RoutingFailureReasonOwnership,
-		RoutingFailureReasonDrift,
-	} {
-		m.RoutingValidationFailures.WithLabelValues(reason)
-	}
-	for _, decision := range []string{
-		RoutingOwnershipCreated,
-		RoutingOwnershipPreserved,
-		RoutingOwnershipRemoved,
-		RoutingOwnershipRolledBack,
-		RoutingOwnershipCleanupFailure,
-	} {
-		m.RoutingOwnershipDecisions.WithLabelValues(decision)
 	}
 	return m
 }

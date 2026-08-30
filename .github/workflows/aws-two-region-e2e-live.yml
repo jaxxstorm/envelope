@@ -179,8 +179,9 @@ jobs:
           if [[ -e "$EVIDENCE_PATH" || -L "$EVIDENCE_PATH" ]]; then
             [[ -f "$EVIDENCE_PATH" && ! -L "$EVIDENCE_PATH" ]]
             python3 scripts/aws_two_region_e2e.py scan-evidence "$EVIDENCE_PATH"
+            # This workflow is the symmetric-v2 gate; legacy live bundles fail closed.
             jq --exit-status \
-              '.schema == 2 and .kind == "aws-two-region-live"' \
+              '.schema == 3 and .kind == "aws-symmetric-gwlb-ha-v2"' \
               "$EVIDENCE_PATH" >/dev/null
             python3 scripts/aws_two_region_e2e.py validate-evidence "$EVIDENCE_PATH"
             retained+=("$EVIDENCE_PATH")

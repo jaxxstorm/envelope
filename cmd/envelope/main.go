@@ -26,7 +26,7 @@ func main() {
 		fmt.Println(versionString())
 		return
 	}
-	cfg, err := config.Parse(os.Args[1:])
+	cfg, err := config.ParseTarget(os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

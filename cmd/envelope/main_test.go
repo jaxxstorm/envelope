@@ -1,9 +1,13 @@
 package main
 
 import (
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
+
+const cliHelpHelperEnv = "ENVELOPE_CLI_HELP_TEST"
 
 func TestParseLevel(t *testing.T) {
 	cases := map[string]string{
@@ -41,4 +45,37 @@ func TestVersionString(t *testing.T) {
 			t.Fatalf("versionString()=%q, missing %q", got, want)
 		}
 	}
+}
+
+func TestCLIHelpDescribesPacketReturnTarget(t *testing.T) {
+	command := exec.Command(os.Args[0], "-test.run=^TestCLIHelpHelper$")
+	command.Env = append(os.Environ(), cliHelpHelperEnv+"=1")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run help helper: %v\n%s", err, output)
+	}
+	help := strings.ToLower(string(output))
+	for _, required := range []string{"aws gwlb packet-return target", "--mode", "packet-return", "--max-inner-packet-size", "--udp-bind", "--metrics-addr"} {
+		if !strings.Contains(help, required) {
+			t.Fatalf("CLI help missing %q:\n%s", required, output)
+		}
+	}
+	for _, obsolete := range []string{
+		"geneve <-> tun", "--tun-name", "--tun-mtu", "--tailscale-iface", "--underlay-interface",
+		"--routing-mode", "--routing-table-id", "--routing-rule-priority", "--local-site-cidrs", "--remote-site-cidrs",
+		"--gwlb-return-cidrs", "--local-delivery-cidrs", "--remote-tailnet-cidrs", "--flow-capacity", "--tcp-flow-timeout",
+		"--protected-cidrs", "--flow-timeout",
+	} {
+		if strings.Contains(help, obsolete) {
+			t.Fatalf("CLI help retained obsolete text %q:\n%s", obsolete, output)
+		}
+	}
+}
+
+func TestCLIHelpHelper(t *testing.T) {
+	if os.Getenv(cliHelpHelperEnv) != "1" {
+		return
+	}
+	os.Args = []string{"envelope", "--help"}
+	main()
 }

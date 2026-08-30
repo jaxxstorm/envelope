@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import concurrent.futures
 import contextlib
 import copy
+import ctypes
 import dataclasses
 import datetime as dt
 import enum
@@ -18,16 +20,18 @@ import json
 import math
 import os
 import pathlib
-import queue
 import re
 import shlex
 import signal
+import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import uuid
+import urllib.parse
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Literal, Protocol, TypeAlias, cast
 
@@ -48,9 +52,18 @@ from aws_appliance import (
     terraform_apply,
     terraform_plan,
     terraform_verify_no_drift,
+    tailnet_preflight,
     redact,
     validate_canonical_utc_timestamp,
+    validate_manifest,
     wait_and_record,
+)
+from transport_router_readiness import (
+    MAX_PING_AGE_SECONDS,
+    MAX_PING_LATENCY_MILLISECONDS,
+    ReadinessError as StandaloneTransportReadinessError,
+    build_readiness_contract,
+    validate_readiness as validate_effective_transport_router_readiness,
 )
 
 
@@ -75,6 +88,62 @@ EXIT_CLEANUP_FAILED = 3
 RUN_ALL_HARD_TIMEOUT_SECONDS = 5400
 GWLBE_STABILIZATION_SECONDS = 300
 TERRAFORM_CORE_VERSION = "1.10.5"
+TRANSPORT_UNDERLAY_INTERFACE = "ens5"
+TRANSPORT_TAILSCALE_INTERFACE = "tailscale0"
+TRANSPORT_CONTROL_COMMAND_TIMEOUT_SECONDS = 30
+TRANSPORT_CONTROL_RESERVATION_SECONDS = 45
+TRANSPORT_ROUTER_READINESS_RESERVATION_SECONDS = 165
+ROUTE_OWNER_LEASE_MARGIN_SECONDS = 15
+STREAM_MUTATION_OVERHEAD_SECONDS = 30
+MAX_STREAM_MUTATION_RESERVATION_SECONDS = 3470
+
+
+def expected_tailnet_hostnames(config: RunConfig) -> list[str]:
+    """Return only the four dedicated transport-router Tailnet identities."""
+
+    return [
+        f"{config.run_id}-{site}-transport-{az_key}"
+        for site in SITES
+        for az_key in config.sites[site]["transport_router_az_keys"]
+    ]
+
+
+def _route_runner_identity() -> dict[str, Any]:
+    host_sha256 = hashlib.sha256(socket.gethostname().encode("utf-8")).hexdigest()
+    boot_id = "unavailable"
+    boot_id_path = pathlib.Path("/proc/sys/kernel/random/boot_id")
+    try:
+        candidate = boot_id_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        candidate = ""
+    if re.fullmatch(r"[0-9a-fA-F-]{16,64}", candidate):
+        boot_id = candidate.lower()
+    return {"pid": os.getpid(), "host_sha256": host_sha256, "boot_id": boot_id}
+
+
+def _route_process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _route_child_setup(parent_pid: int) -> None:
+    """Create a killable process group and prevent Linux route-call orphans."""
+
+    os.setsid()
+    if not sys.platform.startswith("linux"):
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGKILL) != 0:
+        os._exit(126)
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
 
 _VPC_ID_RE = re.compile(r"vpc-[0-9a-f]{8,17}")
 _VPCE_ID_RE = re.compile(r"vpce-[0-9a-f]{8,17}")
@@ -126,6 +195,22 @@ class SSMError(E2EError):
 
 class SSMTimeout(SSMError):
     pass
+
+
+class ProtectedHardTimeout(TimeoutError):
+    """Non-local hard deadline; only the outer coordinator may convert it to cleanup."""
+
+
+class ProtectedTermination(InterruptedError):
+    """SIGTERM control flow; only the outer coordinator may convert it to cleanup."""
+
+
+PROTECTED_CONTROL_FLOW = (ProtectedHardTimeout, ProtectedTermination)
+
+
+def _rethrow_protected_control_flow(error: BaseException) -> None:
+    if isinstance(error, PROTECTED_CONTROL_FLOW):
+        raise error
 
 
 class MetricError(E2EError):
@@ -197,7 +282,7 @@ class EvidenceVerificationError(EvidenceError):
 
 
 def _ownership_resolution(error: BaseException | None) -> str | None:
-    if isinstance(error, ConcurrentRunError):
+    if isinstance(error, (ConcurrentLifecycleError, ConcurrentRunError)):
         return "competing-claim"
     if isinstance(error, AmbiguousOwnershipError):
         return "ambiguous-ownership"
@@ -264,7 +349,7 @@ class TimeoutBudgets:
     tailscale_withdrawal: int = 180
     flow_log_capture: int = 420
     evidence: int = 30
-    cleanup: int = 900
+    cleanup: int = 1200
     hard_timeout: int = 5400
     probe_response: int = 30
     continuity_loss: int = 90
@@ -274,6 +359,8 @@ class TimeoutBudgets:
             value = getattr(self, field.name)
             if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 7200:
                 raise E2EError(f"timeout budget {field.name} must be an integer between 1 and 7200")
+        if self.hard_timeout + self.cleanup > 7200:
+            raise E2EError("hard_timeout plus protected cleanup must fit within 7200 seconds")
         minimum = (
             self.consume_deployment
             + 2 * self.drift_check
@@ -293,8 +380,8 @@ class TimeoutBudgets:
             return
         # Individual budgets are upper bounds and normally overlap waits, but the
         # hard limit must still leave cleanup a deterministic reservation.
-        if self.hard_timeout <= self.cleanup:
-            raise E2EError("hard_timeout must exceed the protected cleanup budget")
+        if self.hard_timeout < self.cleanup:
+            raise E2EError("hard_timeout must cover the protected cleanup budget")
 
     def as_dict(self) -> dict[str, int]:
         return {field.name: int(getattr(self, field.name)) for field in dataclasses.fields(self)}
@@ -1060,7 +1147,7 @@ def parse_protected_deployment_output(
     symmetric_cost = (
         cost.get("profile") == "symmetric-gwlb-ha-v2"
         and counts.get("target_instances") == {"west": 2, "east": 2}
-        and counts.get("ingress_routers") == {"west": 2, "east": 2}
+        and counts.get("transport_routers") == {"west": 2, "east": 2}
         and counts.get("workload_instances") == 4
         and counts.get("vpc_flow_logs") == 2
         and counts.get("cloudwatch_log_groups") == 2
@@ -1094,6 +1181,7 @@ class SSMCommand:
     commands: tuple[str, ...] = dataclasses.field(repr=False)
     timeout_seconds: int = 60
     comment: str = "Envelope two-region E2E"
+    client_token: str | None = None
 
     def __post_init__(self) -> None:
         commands = tuple(self.commands)
@@ -1111,6 +1199,11 @@ class SSMCommand:
             raise SSMError("SSM command comment must be 1-100 printable characters")
         if redact_runtime_text(self.comment) != self.comment:
             raise SSMError("SSM command comment must not contain credentials")
+        if self.client_token is not None and (
+            not isinstance(self.client_token, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", self.client_token) is None
+        ):
+            raise SSMError("SSM command client_token must be a safe 1-64 character identity")
         object.__setattr__(self, "commands", commands)
 
 
@@ -1147,8 +1240,22 @@ class SSMResult:
         }
 
 
+def _attach_ssm_output(error: BaseException, result: SSMResult) -> BaseException:
+    """Retain only the already-redacted bounded invocation output on an error."""
+
+    setattr(error, "stdout", result.stdout)
+    setattr(error, "stderr", result.stderr)
+    return error
+
+
 class AWSJSON(Protocol):
-    def json(self, args: list[str], *, region: str | None = None) -> dict[str, Any]: ...
+    def json(
+        self,
+        args: list[str],
+        *,
+        region: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]: ...
 
 
 _SSM_PENDING_STATUSES = {"Pending", "InProgress", "Delayed", "Cancelling"}
@@ -1175,31 +1282,6 @@ def _invocation_does_not_exist(error: BaseException) -> bool:
     raw_stderr = getattr(error, "raw_stderr", "")
     text = f"{type(error).__name__} {error} {raw_stderr}".lower()
     return "invocationdoesnotexist" in text or "invocation does not exist" in text
-
-
-def _bounded_call(call: Callable[[], dict[str, Any]], timeout_seconds: float, operation: str) -> dict[str, Any]:
-    if timeout_seconds <= 0:
-        raise SSMTimeout(f"{operation} has no time remaining")
-    outcome: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
-
-    def invoke() -> None:
-        try:
-            outcome.put((True, call()))
-        except BaseException as error:  # The caller re-raises only on its controlling thread.
-            outcome.put((False, error))
-
-    thread = threading.Thread(target=invoke, name="envelope-e2e-aws-call", daemon=True)
-    thread.start()
-    try:
-        ok, value = outcome.get(timeout=timeout_seconds)
-    except queue.Empty as error:
-        raise SSMTimeout(f"{operation} exceeded {timeout_seconds:g} seconds") from error
-    if not ok:
-        assert isinstance(value, BaseException)
-        raise value
-    if not isinstance(value, dict):
-        raise SSMError(f"{operation} returned a non-object response")
-    return value
 
 
 class SSMRunner:
@@ -1240,17 +1322,20 @@ class SSMRunner:
             str(max(30, min(command.timeout_seconds, 3600))),
             "--comment",
             command.comment,
-            "--parameters",
-            parameters,
         ]
+        if command.client_token is not None:
+            args.extend(("--client-token", command.client_token))
+        args.extend(("--parameters", parameters))
         try:
-            response = _bounded_call(
-                lambda: self.aws.json(args, region=command.target.region),
-                min(timeout_seconds, self.api_timeout_seconds),
-                "SSM send-command",
+            response = self.aws.json(
+                args,
+                region=command.target.region,
+                timeout_seconds=min(timeout_seconds, self.api_timeout_seconds),
             )
-        except SSMTimeout:
+        except PROTECTED_CONTROL_FLOW:
             raise
+        except TimeoutError as error:
+            raise SSMTimeout(f"SSM send-command exceeded its native timeout: {error}") from None
         except BaseException as error:
             raise SSMError(redact_runtime_text(f"SSM send-command failed: {error}")) from None
         command_value = response.get("Command")
@@ -1276,13 +1361,17 @@ class SSMRunner:
             if remaining <= 0:
                 raise SSMTimeout(f"SSM command {command_id} did not finish within {timeout_seconds:g} seconds")
             try:
-                response = _bounded_call(
-                    lambda: self.aws.json(args, region=target.region),
-                    min(remaining, self.api_timeout_seconds),
-                    "SSM get-command-invocation",
+                response = self.aws.json(
+                    args,
+                    region=target.region,
+                    timeout_seconds=min(remaining, self.api_timeout_seconds),
                 )
-            except SSMTimeout:
+            except PROTECTED_CONTROL_FLOW:
                 raise
+            except TimeoutError as error:
+                raise SSMTimeout(
+                    f"SSM get-command-invocation exceeded its native timeout: {error}"
+                ) from None
             except BaseException as error:
                 if not _invocation_does_not_exist(error):
                     raise SSMError(redact_runtime_text(f"SSM invocation polling failed: {error}")) from None
@@ -1319,12 +1408,15 @@ class SSMRunner:
     ) -> SSMResult:
         try:
             return self._poll(target, command_id, timeout_seconds=timeout_seconds)
+        except PROTECTED_CONTROL_FLOW:
+            raise
         except BaseException as wait_error:
             cancellation_request = "requested"
             try:
                 if not self.cancel(target, command_id, timeout_seconds=cancel_timeout_seconds):
                     cancellation_request = "not accepted"
             except BaseException as cancel_error:
+                _rethrow_protected_control_flow(cancel_error)
                 cancellation_request = redact_runtime_text(f"request failed: {cancel_error}")
             try:
                 terminal = self._poll(target, command_id, timeout_seconds=cancel_timeout_seconds)
@@ -1332,6 +1424,7 @@ class SSMRunner:
                     f"cancellation {cancellation_request}; terminal state {terminal.status} confirmed for {command_id}"
                 )
             except BaseException as confirmation_error:
+                _rethrow_protected_control_flow(confirmation_error)
                 cancellation = redact_runtime_text(
                     f"cancellation {cancellation_request}; terminal state unconfirmed for {command_id}: "
                     f"{confirmation_error}"
@@ -1348,13 +1441,15 @@ class SSMRunner:
     def cancel(self, target: RemoteTarget, command_id: str, *, timeout_seconds: float = 5.0) -> bool:
         args = ["ssm", "cancel-command", "--command-id", command_id, "--instance-ids", target.instance_id]
         try:
-            _bounded_call(
-                lambda: self.aws.json(args, region=target.region),
-                min(timeout_seconds, self.api_timeout_seconds),
-                "SSM cancel-command",
+            self.aws.json(
+                args,
+                region=target.region,
+                timeout_seconds=min(timeout_seconds, self.api_timeout_seconds),
             )
-        except SSMTimeout:
+        except PROTECTED_CONTROL_FLOW:
             raise
+        except TimeoutError as error:
+            raise SSMTimeout(f"SSM cancel-command exceeded its native timeout: {error}") from None
         except BaseException as error:
             if _invocation_does_not_exist(error):
                 return False
@@ -1638,7 +1733,9 @@ def ipv4(data, require_checksum=True):
     return ({"source_ip": str(ipaddress.ip_address(source)),
              "destination_ip": str(ipaddress.ip_address(destination)),
              "header_length": header_length, "total_length": total_length,
-             "checksum": "valid", "transport": transport_summary(protocol, payload, source, destination)},
+             "checksum": "valid",
+             "packet_sha256": hashlib.sha256(data[:total_length]).hexdigest(),
+             "transport": transport_summary(protocol, payload, source, destination)},
             payload)
 
 def geneve(payload):
@@ -1758,6 +1855,7 @@ def parse_pcap_bytes(data):
             raise RuntimeError("invalid pcap record length")
         value = inspect_frame(data[offset:offset + captured], link_type)
         if value is not None:
+            value["capture_index"] = len(frames)
             frames.append(value)
         offset += captured
         if len(frames) > 512:
@@ -1828,6 +1926,122 @@ def _capture_matches_flow(frame: Mapping[str, Any], flow: FlowRecord, *, reverse
         transport.get("source_port") == expected_source
         and transport.get("destination_port") == expected_destination
     )
+
+
+def correlate_geneve_turnaround_capture(
+    capture: Mapping[str, Any],
+    flow: FlowRecord,
+    *,
+    target_id: str,
+    raw_deleted: bool,
+) -> dict[str, Any]:
+    """Correlate target ingress/return pairs without retaining packet bytes or option values."""
+
+    frames = capture.get("frames")
+    if (
+        capture.get("success") is not True
+        or not isinstance(capture.get("file_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", cast(str, capture.get("file_sha256"))) is None
+        or not isinstance(frames, list)
+        or capture.get("frame_count") != len(frames)
+        or not raw_deleted
+        or _INSTANCE_ID_RE.fullmatch(target_id) is None
+    ):
+        raise WireAssertionError("target GENEVE capture summary or deletion proof is invalid")
+    pairs: list[dict[str, Any]] = []
+    for reverse, direction in ((False, "request"), (True, "reply")):
+        candidates = [
+            frame
+            for frame in frames
+            if isinstance(frame, Mapping)
+            and isinstance(frame.get("geneve"), Mapping)
+            and _capture_matches_flow(frame, flow, reverse=reverse)
+        ]
+        selected: tuple[Mapping[str, Any], Mapping[str, Any]] | None = None
+        for ingress in candidates:
+            for returned in candidates:
+                if ingress is returned:
+                    continue
+                ingress_index = ingress.get("capture_index")
+                return_index = returned.get("capture_index")
+                ingress_outer = ingress.get("outer")
+                return_outer = returned.get("outer")
+                ingress_geneve = ingress.get("geneve")
+                return_geneve = returned.get("geneve")
+                ingress_inner = _captured_inner(ingress)
+                return_inner = _captured_inner(returned)
+                if not all(
+                    isinstance(value, Mapping)
+                    for value in (
+                        ingress_outer,
+                        return_outer,
+                        ingress_geneve,
+                        return_geneve,
+                        ingress_inner,
+                        return_inner,
+                    )
+                ):
+                    continue
+                ingress_udp = cast(Mapping[str, Any], ingress_outer).get("transport")
+                return_udp = cast(Mapping[str, Any], return_outer).get("transport")
+                if (
+                    isinstance(ingress_index, int)
+                    and isinstance(return_index, int)
+                    and ingress_index < return_index
+                    and isinstance(ingress_udp, Mapping)
+                    and isinstance(return_udp, Mapping)
+                    and cast(Mapping[str, Any], ingress_inner).get("packet_sha256")
+                    == cast(Mapping[str, Any], return_inner).get("packet_sha256")
+                    and cast(Mapping[str, Any], ingress_geneve).get("options_sha256")
+                    == cast(Mapping[str, Any], return_geneve).get("options_sha256")
+                    and cast(Mapping[str, Any], ingress_geneve).get("ordered_options")
+                    == cast(Mapping[str, Any], return_geneve).get("ordered_options")
+                    and cast(Mapping[str, Any], ingress_geneve).get("flow_cookie_sha256")
+                    == cast(Mapping[str, Any], return_geneve).get("flow_cookie_sha256")
+                    and cast(Mapping[str, Any], ingress_geneve).get("vni") == 0
+                    and cast(Mapping[str, Any], return_geneve).get("vni") == 0
+                    and cast(Mapping[str, Any], ingress_outer).get("source_ip")
+                    == cast(Mapping[str, Any], return_outer).get("destination_ip")
+                    and cast(Mapping[str, Any], ingress_outer).get("destination_ip")
+                    == cast(Mapping[str, Any], return_outer).get("source_ip")
+                    and ingress_udp.get("source_port") == return_udp.get("source_port")
+                    and ingress_udp.get("destination_port") == 6081
+                    and return_udp.get("destination_port") == 6081
+                ):
+                    selected = ingress, returned
+                    break
+            if selected is not None:
+                break
+        if selected is None:
+            continue
+        ingress, returned = selected
+        geneve_value = cast(Mapping[str, Any], ingress["geneve"])
+        inner_value = cast(Mapping[str, Any], _captured_inner(ingress))
+        pairs.append(
+            {
+                "direction": direction,
+                "ingress_frame_sha256": ingress["frame_sha256"],
+                "return_frame_sha256": returned["frame_sha256"],
+                "inner_packet_sha256": inner_value["packet_sha256"],
+                "ordered_options_sha256": geneve_value["options_sha256"],
+                "flow_cookie_sha256": geneve_value["flow_cookie_sha256"],
+                "vni": 0,
+                "outer_tuple_swapped": True,
+                "return_source_port_preserved": True,
+            }
+        )
+    if not pairs:
+        raise WireAssertionError(
+            f"target {target_id} capture has no correlated ingress/return GENEVE pair"
+        )
+    return {
+        "observed": True,
+        "target_id": target_id,
+        "capture_sha256": capture["file_sha256"],
+        "capture_frame_count": capture["frame_count"],
+        "raw_pcap_deleted": True,
+        "pairs": pairs,
+    }
 
 
 def summarize_source_workload_capture(
@@ -2654,6 +2868,7 @@ _CREDENTIAL_KEYS = {
     "session_token",
     "token",
     "api_token",
+    "access_token",
     "auth_token",
     "auth_key",
     "authorization",
@@ -2662,6 +2877,9 @@ _CREDENTIAL_KEYS = {
     "secret",
     "client_secret",
     "oauth_client_secret",
+    "oauth_token",
+    "refresh_token",
+    "id_token",
     "tailscale_auth_key",
     "credential",
     "credentials",
@@ -2731,17 +2949,20 @@ def scan_evidence(document: Any) -> list[str]:
 
 @dataclasses.dataclass(frozen=True)
 class SymmetricFleetMember:
-    """A run-owned target or ingress router from the protected v2 output."""
+    """A run-owned target or transport router from the protected v2 output."""
 
     site: Site
-    role: Literal["target", "ingress-router"]
+    role: Literal["target", "transport-router"]
     region: str
     az_key: str
     instance_id: str
     target_group_arn: str | None = None
+    network_interface_id: str | None = None
+    gwlbe_route_table_id: str | None = None
+    advertised_prefix: str | None = None
 
     def __post_init__(self) -> None:
-        if self.site not in SITES or self.role not in {"target", "ingress-router"}:
+        if self.site not in SITES or self.role not in {"target", "transport-router"}:
             raise DeploymentError("symmetric fleet member site or role is invalid")
         if not _REGION_RE.fullmatch(self.region) or not re.fullmatch(r"[a-z][a-z0-9-]{0,15}", self.az_key):
             raise DeploymentError("symmetric fleet member region or AZ key is invalid")
@@ -2750,13 +2971,46 @@ class SymmetricFleetMember:
         if self.role == "target":
             if not isinstance(self.target_group_arn, str) or _TARGET_GROUP_ARN_RE.fullmatch(self.target_group_arn) is None:
                 raise DeploymentError("symmetric target has no valid regional target group")
-        elif self.target_group_arn is not None:
-            raise DeploymentError("ingress routers must not be GWLB targets")
+            if (
+                self.network_interface_id is not None
+                or self.gwlbe_route_table_id is not None
+                or self.advertised_prefix is not None
+            ):
+                raise DeploymentError("symmetric targets must not carry transport-router route identities")
+        else:
+            if self.target_group_arn is not None:
+                raise DeploymentError("transport routers must not be GWLB targets")
+            if (
+                not isinstance(self.network_interface_id, str)
+                or _ENI_ID_RE.fullmatch(self.network_interface_id) is None
+                or not isinstance(self.gwlbe_route_table_id, str)
+                or _ROUTE_TABLE_ID_RE.fullmatch(self.gwlbe_route_table_id) is None
+            ):
+                raise DeploymentError("transport routers require exact ENI and GWLBE route-table identities")
+            try:
+                advertised = ipaddress.ip_network(
+                    cast(str, self.advertised_prefix), strict=True
+                )
+            except (TypeError, ValueError) as error:
+                raise DeploymentError(
+                    "transport routers require one canonical advertised prefix"
+                ) from error
+            if advertised.version != 4:
+                raise DeploymentError(
+                    "transport routers require one canonical advertised IPv4 prefix"
+                )
+            object.__setattr__(self, "advertised_prefix", str(advertised))
 
     def as_dict(self) -> dict[str, str]:
         value = {"region": self.region, "az_key": self.az_key, "instance_id": self.instance_id}
         if self.target_group_arn is not None:
             value["target_group_arn"] = self.target_group_arn
+        if self.network_interface_id is not None:
+            assert self.gwlbe_route_table_id is not None
+            value["network_interface_id"] = self.network_interface_id
+            value["gwlbe_route_table_id"] = self.gwlbe_route_table_id
+            assert self.advertised_prefix is not None
+            value["advertised_prefix"] = self.advertised_prefix
         return value
 
 
@@ -2767,7 +3021,7 @@ class SymmetricSiteTopology:
     local_site_cidrs: tuple[str, ...]
     remote_site_cidrs: tuple[str, ...]
     target_fleet: tuple[SymmetricFleetMember, ...]
-    ingress_router_fleet: tuple[SymmetricFleetMember, ...]
+    transport_router_fleet: tuple[SymmetricFleetMember, ...]
 
     def __post_init__(self) -> None:
         if self.site not in SITES or not _REGION_RE.fullmatch(self.region):
@@ -2786,13 +3040,173 @@ class SymmetricSiteTopology:
         remote = [ipaddress.ip_network(value) for value in self.remote_site_cidrs]
         if any(left.overlaps(right) for left in local for right in remote):
             raise DeploymentError(f"{self.site} local and remote site CIDRs overlap")
-        if len(self.target_fleet) < 2 or len(self.ingress_router_fleet) < 2:
-            raise DeploymentError(f"{self.site} requires at least two targets and two ingress routers")
-        for fleet, role in ((self.target_fleet, "target"), (self.ingress_router_fleet, "ingress-router")):
+        if len(self.target_fleet) < 2 or len(self.transport_router_fleet) < 2:
+            raise DeploymentError(f"{self.site} requires at least two targets and two transport routers")
+        for fleet, role in (
+            (self.target_fleet, "target"),
+            (self.transport_router_fleet, "transport-router"),
+        ):
             if any(member.site != self.site or member.region != self.region or member.role != role for member in fleet):
                 raise DeploymentError(f"{self.site} {role} fleet contains a foreign member")
             if len({member.instance_id for member in fleet}) != len(fleet) or len({member.az_key for member in fleet}) < 2:
                 raise DeploymentError(f"{self.site} {role} fleet must have distinct members across two AZs")
+        router_enis = {member.network_interface_id for member in self.transport_router_fleet}
+        router_tables = {member.gwlbe_route_table_id for member in self.transport_router_fleet}
+        if len(router_enis) != len(self.transport_router_fleet) or len(router_tables) != len(
+            self.transport_router_fleet
+        ):
+            raise DeploymentError(
+                f"{self.site} transport routers must have distinct ENI and route-table identities"
+            )
+        advertised_prefixes = [
+            member.advertised_prefix for member in self.transport_router_fleet
+        ]
+        if (
+            any(prefix is None for prefix in advertised_prefixes)
+            or len(set(advertised_prefixes)) != len(advertised_prefixes)
+            or set(advertised_prefixes) != set(self.local_site_cidrs)
+        ):
+            raise DeploymentError(
+                f"{self.site} transport-router advertisements must exactly partition local-site CIDRs"
+            )
+
+    def transport_router_for_prefix(self, prefix: str) -> SymmetricFleetMember:
+        matches = [
+            member
+            for member in self.transport_router_fleet
+            if member.advertised_prefix == prefix
+        ]
+        if len(matches) != 1:
+            raise DeploymentError(
+                f"{self.site} has no unique configured transport owner for {prefix}"
+            )
+        return matches[0]
+
+
+@dataclasses.dataclass(frozen=True)
+class SymmetricRouteFailover:
+    mutation_timeout_seconds: int
+    restoration_timeout_seconds: int
+    recovery_timeout_seconds: int
+    initial_transport_router_az_by_gwlbe_az: Mapping[Site, Mapping[str, str]]
+
+    def __post_init__(self) -> None:
+        for name in (
+            "mutation_timeout_seconds",
+            "restoration_timeout_seconds",
+            "recovery_timeout_seconds",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 7200:
+                raise DeploymentError(f"symmetric route_failover.{name} must be between 1 and 7200")
+        if self.restoration_timeout_seconds < 2:
+            raise DeploymentError(
+                "symmetric route_failover restoration timeout must leave time for a quiet window"
+            )
+        if self.recovery_timeout_seconds <= self.quiet_window_seconds:
+            raise DeploymentError(
+                "symmetric route_failover recovery timeout must exceed the derived quiet window"
+            )
+        selections = self.initial_transport_router_az_by_gwlbe_az
+        if not isinstance(selections, Mapping) or set(selections) != set(SITES):
+            raise DeploymentError("symmetric route_failover initial selections must cover both sites")
+        normalized: dict[Site, dict[str, str]] = {}
+        for site in SITES:
+            value = selections[site]
+            if (
+                not isinstance(value, Mapping)
+                or not value
+                or not all(
+                    isinstance(az_key, str)
+                    and isinstance(router_az_key, str)
+                    and re.fullmatch(r"[a-z][a-z0-9-]{0,15}", az_key)
+                    and re.fullmatch(r"[a-z][a-z0-9-]{0,15}", router_az_key)
+                    for az_key, router_az_key in value.items()
+                )
+            ):
+                raise DeploymentError(
+                    f"symmetric route_failover {site} initial selection map is invalid"
+                )
+            normalized[site] = {str(key): str(selected) for key, selected in value.items()}
+        object.__setattr__(self, "initial_transport_router_az_by_gwlbe_az", normalized)
+
+    def initial_router_az(self, site: Site, gwlbe_az_key: str) -> str:
+        try:
+            return self.initial_transport_router_az_by_gwlbe_az[site][gwlbe_az_key]
+        except KeyError as error:
+            raise DeploymentError(
+                f"symmetric route_failover has no {site} selection for GWLBE AZ {gwlbe_az_key}"
+            ) from error
+
+    @property
+    def settlement_timeout_seconds(self) -> int:
+        return self.recovery_timeout_seconds
+
+    @property
+    def quiet_window_seconds(self) -> int:
+        return min(10, max(1, self.restoration_timeout_seconds // 10))
+
+    @property
+    def owner_lease_seconds(self) -> int:
+        return (
+            max(
+                self.mutation_timeout_seconds,
+                self.restoration_timeout_seconds,
+                self.recovery_timeout_seconds,
+                TRANSPORT_ROUTER_READINESS_RESERVATION_SECONDS,
+                TRANSPORT_CONTROL_RESERVATION_SECONDS,
+            )
+            + self.quiet_window_seconds
+            + ROUTE_OWNER_LEASE_MARGIN_SECONDS
+        )
+
+    def restoration_reservation_seconds(self, prefix_count: int) -> int:
+        if isinstance(prefix_count, bool) or not isinstance(prefix_count, int) or prefix_count < 1:
+            raise DeploymentError("route restoration requires at least one exact prefix")
+        return (
+            2 * TRANSPORT_CONTROL_RESERVATION_SECONDS
+            + 2 * TRANSPORT_CONTROL_RESERVATION_SECONDS
+            + self.restoration_timeout_seconds
+            + 2 * TRANSPORT_ROUTER_READINESS_RESERVATION_SECONDS
+            + prefix_count * self.restoration_timeout_seconds
+            + self.restoration_timeout_seconds
+        )
+
+    def transaction_reservation_seconds(self, prefix_count: int) -> int:
+        return (
+            2 * TRANSPORT_ROUTER_READINESS_RESERVATION_SECONDS
+            + 2 * TRANSPORT_CONTROL_RESERVATION_SECONDS
+            + self.recovery_timeout_seconds
+            + 20
+            + self.mutation_timeout_seconds
+            + self.recovery_timeout_seconds
+            + self.restoration_reservation_seconds(prefix_count)
+        )
+
+    def approved_bounds(self) -> dict[str, int]:
+        return {
+            "mutation_timeout_seconds": self.mutation_timeout_seconds,
+            "restoration_timeout_seconds": self.restoration_timeout_seconds,
+            "recovery_timeout_seconds": self.recovery_timeout_seconds,
+        }
+
+    def derived_bounds(self) -> dict[str, int]:
+        return {
+            "settlement_timeout_seconds": self.settlement_timeout_seconds,
+            "quiet_window_seconds": self.quiet_window_seconds,
+            "owner_lease_seconds": self.owner_lease_seconds,
+        }
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "mutation_timeout_seconds": self.mutation_timeout_seconds,
+            "restoration_timeout_seconds": self.restoration_timeout_seconds,
+            "recovery_timeout_seconds": self.recovery_timeout_seconds,
+            "initial_transport_router_az_by_gwlbe_az": {
+                site: dict(self.initial_transport_router_az_by_gwlbe_az[site])
+                for site in SITES
+            },
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2800,15 +3214,40 @@ class SymmetricTopologyV2:
     run_id: str
     west: SymmetricSiteTopology
     east: SymmetricSiteTopology
+    route_failover: SymmetricRouteFailover
 
     def __post_init__(self) -> None:
         if not _RUN_ID_RE.fullmatch(self.run_id):
             raise DeploymentError("symmetric topology run ID is invalid")
         if set(self.west.remote_site_cidrs) != set(self.east.local_site_cidrs) or set(self.east.remote_site_cidrs) != set(self.west.local_site_cidrs):
             raise DeploymentError("symmetric remote site CIDRs must exactly equal the peer local site CIDRs")
-        identities = [member.instance_id for site in (self.west, self.east) for member in (*site.target_fleet, *site.ingress_router_fleet)]
+        identities = [
+            member.instance_id
+            for site in (self.west, self.east)
+            for member in (*site.target_fleet, *site.transport_router_fleet)
+        ]
         if len(identities) != len(set(identities)):
-            raise DeploymentError("symmetric target and ingress-router identities must be globally unique")
+            raise DeploymentError("symmetric target and transport-router identities must be globally unique")
+        router_enis = [
+            member.network_interface_id
+            for site in (self.west, self.east)
+            for member in site.transport_router_fleet
+        ]
+        router_tables = [
+            member.gwlbe_route_table_id
+            for site in (self.west, self.east)
+            for member in site.transport_router_fleet
+        ]
+        if len(router_enis) != len(set(router_enis)) or len(router_tables) != len(set(router_tables)):
+            raise DeploymentError("symmetric transport ENI and GWLBE route-table identities must be globally unique")
+        for site_name in SITES:
+            site = self.site(site_name)
+            az_keys = {member.az_key for member in site.transport_router_fleet}
+            selections = self.route_failover.initial_transport_router_az_by_gwlbe_az[site_name]
+            if selections != {az_key: az_key for az_key in az_keys}:
+                raise DeploymentError(
+                    f"symmetric route_failover {site_name} must select the same transport-router AZ for every GWLBE AZ"
+                )
 
     def site(self, name: Site) -> SymmetricSiteTopology:
         return self.west if name == "west" else self.east
@@ -2817,13 +3256,16 @@ class SymmetricTopologyV2:
         return {
             "config_version": 2,
             "run_id": self.run_id,
+            "route_failover": self.route_failover.as_dict(),
             "sites": {
                 site: {
                     "region": value.region,
                     "local_site_cidrs": list(value.local_site_cidrs),
                     "remote_site_cidrs": list(value.remote_site_cidrs),
                     "target_fleet": [member.as_dict() for member in value.target_fleet],
-                    "ingress_router_fleet": [member.as_dict() for member in value.ingress_router_fleet],
+                    "transport_router_fleet": [
+                        member.as_dict() for member in value.transport_router_fleet
+                    ],
                 }
                 for site, value in (("west", self.west), ("east", self.east))
             },
@@ -2834,7 +3276,11 @@ def parse_symmetric_topology_v2(value: Any) -> SymmetricTopologyV2:
     """Parse only the v2 fleet contract; directional outputs are intentionally rejected."""
 
     document = _mapping(value, "symmetric topology")
-    _exact_keys(document, {"config_version", "run_id", "sites"}, "symmetric topology")
+    _exact_keys(
+        document,
+        {"config_version", "run_id", "route_failover", "sites"},
+        "symmetric topology",
+    )
     if document["config_version"] != 2:
         raise DeploymentError("symmetric topology config_version must be 2")
     sites = _mapping(document["sites"], "symmetric topology.sites")
@@ -2842,56 +3288,1358 @@ def parse_symmetric_topology_v2(value: Any) -> SymmetricTopologyV2:
 
     def parse_site(site: Site) -> SymmetricSiteTopology:
         item = _mapping(sites[site], f"symmetric topology.sites.{site}")
-        _exact_keys(item, {"region", "local_site_cidrs", "remote_site_cidrs", "target_fleet", "ingress_router_fleet"}, f"symmetric topology.sites.{site}")
+        _exact_keys(
+            item,
+            {
+                "region",
+                "local_site_cidrs",
+                "remote_site_cidrs",
+                "target_fleet",
+                "transport_router_fleet",
+            },
+            f"symmetric topology.sites.{site}",
+        )
 
-        def fleet(name: str, role: Literal["target", "ingress-router"]) -> tuple[SymmetricFleetMember, ...]:
+        def fleet(
+            name: str, role: Literal["target", "transport-router"]
+        ) -> tuple[SymmetricFleetMember, ...]:
             members = item[name]
             if not isinstance(members, list):
                 raise DeploymentError(f"symmetric topology.sites.{site}.{name} must be a list")
-            expected = {"region", "az_key", "instance_id", "target_group_arn"} if role == "target" else {"region", "az_key", "instance_id"}
+            expected = (
+                {"region", "az_key", "instance_id", "target_group_arn"}
+                if role == "target"
+                else {
+                    "region",
+                    "az_key",
+                    "instance_id",
+                    "network_interface_id",
+                    "gwlbe_route_table_id",
+                    "advertised_prefix",
+                }
+            )
             parsed: list[SymmetricFleetMember] = []
             for index, member in enumerate(members):
                 member_value = _mapping(member, f"symmetric topology.sites.{site}.{name}[{index}]")
                 _exact_keys(member_value, expected, f"symmetric topology.sites.{site}.{name}[{index}]")
-                parsed.append(SymmetricFleetMember(site, role, str(member_value["region"]), str(member_value["az_key"]), str(member_value["instance_id"]), str(member_value["target_group_arn"]) if role == "target" else None))
+                parsed.append(
+                    SymmetricFleetMember(
+                        site,
+                        role,
+                        str(member_value["region"]),
+                        str(member_value["az_key"]),
+                        str(member_value["instance_id"]),
+                        str(member_value["target_group_arn"]) if role == "target" else None,
+                        str(member_value["network_interface_id"])
+                        if role == "transport-router"
+                        else None,
+                        str(member_value["gwlbe_route_table_id"])
+                        if role == "transport-router"
+                        else None,
+                        str(member_value["advertised_prefix"])
+                        if role == "transport-router"
+                        else None,
+                    )
+                )
             return tuple(parsed)
 
         local, remote = item["local_site_cidrs"], item["remote_site_cidrs"]
         if not all(isinstance(candidate, list) and all(isinstance(cidr, str) for cidr in candidate) for candidate in (local, remote)):
             raise DeploymentError(f"symmetric topology.sites.{site} CIDRs must be string lists")
-        return SymmetricSiteTopology(site, str(item["region"]), tuple(local), tuple(remote), fleet("target_fleet", "target"), fleet("ingress_router_fleet", "ingress-router"))
+        return SymmetricSiteTopology(
+            site,
+            str(item["region"]),
+            tuple(local),
+            tuple(remote),
+            fleet("target_fleet", "target"),
+            fleet("transport_router_fleet", "transport-router"),
+        )
 
-    return SymmetricTopologyV2(str(document["run_id"]), parse_site("west"), parse_site("east"))
+    raw_failover = _mapping(document["route_failover"], "symmetric topology.route_failover")
+    failover_fields = {
+        "mutation_timeout_seconds",
+        "restoration_timeout_seconds",
+        "recovery_timeout_seconds",
+        "initial_transport_router_az_by_gwlbe_az",
+    }
+    _exact_keys(raw_failover, failover_fields, "symmetric topology.route_failover")
+    raw_selections = _mapping(
+        raw_failover["initial_transport_router_az_by_gwlbe_az"],
+        "symmetric topology.route_failover.initial_transport_router_az_by_gwlbe_az",
+    )
+    _exact_keys(
+        raw_selections,
+        set(SITES),
+        "symmetric topology.route_failover.initial_transport_router_az_by_gwlbe_az",
+    )
+    selections: dict[Site, dict[str, str]] = {}
+    for site in SITES:
+        value = _mapping(
+            raw_selections[site],
+            f"symmetric topology.route_failover.initial_transport_router_az_by_gwlbe_az.{site}",
+        )
+        selections[site] = {str(key): str(selected) for key, selected in value.items()}
+    failover = SymmetricRouteFailover(
+        mutation_timeout_seconds=raw_failover["mutation_timeout_seconds"],
+        restoration_timeout_seconds=raw_failover["restoration_timeout_seconds"],
+        recovery_timeout_seconds=raw_failover["recovery_timeout_seconds"],
+        initial_transport_router_az_by_gwlbe_az=selections,
+    )
+    return SymmetricTopologyV2(
+        str(document["run_id"]), parse_site("west"), parse_site("east"), failover
+    )
 
 
-def validate_symmetric_preflight(topology: SymmetricTopologyV2, readiness: Any) -> dict[str, Any]:
+def _parse_route_failover_output(
+    value: Any, topology: SymmetricTopologyV2
+) -> dict[str, Any]:
+    document = _mapping(value, "route_failover")
+    expected: dict[str, Any] = {
+        "config_version": 2,
+        **topology.route_failover.approved_bounds(),
+        "same_az_preferred": {
+            site: all(
+                gwlbe_az == router_az
+                for gwlbe_az, router_az in topology.route_failover.initial_transport_router_az_by_gwlbe_az[
+                    site
+                ].items()
+            )
+            for site in SITES
+        },
+        "sites": {},
+    }
+    for site in SITES:
+        topology_site = topology.site(site)
+        routers = {member.az_key: member for member in topology_site.transport_router_fleet}
+        site_routes: dict[str, Any] = {}
+        for gwlbe_az, router_az in topology.route_failover.initial_transport_router_az_by_gwlbe_az[
+            site
+        ].items():
+            table_owner = routers[gwlbe_az]
+            selected = routers[router_az]
+            site_routes[gwlbe_az] = {
+                "route_table_id": table_owner.gwlbe_route_table_id,
+                "source_workload_prefix": table_owner.advertised_prefix,
+                "remote_site_cidrs": sorted(topology_site.remote_site_cidrs),
+                "initial_transport_router_az_key": router_az,
+                "initial_network_interface_id": selected.network_interface_id,
+            }
+        cast(dict[str, Any], expected["sites"])[site] = site_routes
+    if (
+        type(document.get("config_version")) is not int
+        or any(
+            type(document.get(field)) is not int
+            for field in topology.route_failover.approved_bounds()
+        )
+        or any(
+            type(value) is not bool
+            for value in _mapping(
+                document.get("same_az_preferred"), "route_failover.same_az_preferred"
+            ).values()
+        )
+        or document != expected
+    ):
+        raise DeploymentError(
+            "route_failover output differs from the exact topology bounds, selections, route tables, or ENIs"
+        )
+    return copy.deepcopy(expected)
+
+
+def _transport_router_contract(
+    topology: SymmetricTopologyV2,
+    site: Site,
+    load_profile: ApprovedLoadProfile,
+) -> dict[str, Any]:
+    topology_site = topology.site(site)
+    return build_readiness_contract(
+        topology_site.local_site_cidrs,
+        topology_site.remote_site_cidrs,
+        TRANSPORT_UNDERLAY_INTERFACE,
+        TRANSPORT_TAILSCALE_INTERFACE,
+        load_profile.maximum_tcp_mss,
+    )
+
+
+def _contract_sha256(value: Mapping[str, Any]) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _parse_transport_router_readiness_expectations(
+    value: Any,
+    topology: SymmetricTopologyV2,
+    load_profile: ApprovedLoadProfile,
+) -> dict[Site, dict[str, Any]]:
+    document = _mapping(value, "transport_router_readiness_expectations")
+    _exact_keys(
+        document,
+        {"config_version", "sites"},
+        "transport_router_readiness_expectations",
+    )
+    if type(document.get("config_version")) is not int or document["config_version"] != 2:
+        raise DeploymentError("transport-router readiness expectations config_version must be 2")
+    sites = _mapping(document["sites"], "transport_router_readiness_expectations.sites")
+    _exact_keys(sites, set(SITES), "transport_router_readiness_expectations.sites")
+    result: dict[Site, dict[str, Any]] = {}
+    for site in SITES:
+        expected = _transport_router_contract(topology, site, load_profile)
+        expected_sha256 = _contract_sha256(expected)
+        actual = _mapping(
+            sites[site], f"transport_router_readiness_expectations.sites.{site}"
+        )
+        if (
+            set(actual) != set(expected) | {"contract_sha256"}
+            or actual.get("contract_sha256") != expected_sha256
+            or {key: actual[key] for key in expected} != expected
+        ):
+            raise DeploymentError(
+                f"transport_router_readiness_expectations.sites.{site} differs from its topology, load, or SHA contract"
+            )
+        result[site] = copy.deepcopy(dict(actual))
+    return result
+
+
+def _validate_transport_router_runtime_state(
+    contract: Mapping[str, Any], value: Any
+) -> dict[str, Any]:
+    state = _mapping(value, "transport-router runtime state")
+    expected_keys = {
+        "ready",
+        "contract_sha256",
+        "local_site_cidrs",
+        "remote_site_cidrs",
+        "local_policy_rules",
+        "ipv4_policy_rules",
+        "policy_rule_priority_base",
+        "local_route_table",
+        "remote_route_table",
+        "recovery_marker",
+        "forward_rules",
+        "mss_rules",
+        "filter_forward_policy",
+        "mangle_forward_policy",
+        "filter_forward_rules",
+        "mangle_forward_rules",
+        "mss_terminal_rules",
+        "underlay_mtu",
+        "tailscale_mtu",
+        "path_mtu",
+        "live_mtu_allowance",
+        "approved_maximum_tcp_mss",
+        "tcp_mss",
+        "ipv4_forwarding",
+        "ipv6_forwarding",
+        "ipv6_filter_forward_policy",
+        "ipv6_mangle_forward_policy",
+        "ipv6_filter_forward_rules",
+        "ipv6_forward_rules",
+        "ipv6_mangle_forward_rules",
+        "nat_rules",
+        "no_nat",
+    }
+    try:
+        _exact_keys(state, expected_keys, "transport-router runtime state")
+    except DeploymentError as error:
+        raise ReadinessError(str(error)) from None
+    underlay_mtu = state.get("underlay_mtu")
+    tailscale_mtu = state.get("tailscale_mtu")
+    path_mtu = state.get("path_mtu")
+    allowance = state.get("live_mtu_allowance")
+    tcp_mss = state.get("tcp_mss")
+    numeric = (underlay_mtu, tailscale_mtu, path_mtu, allowance, tcp_mss)
+    expected_copies = {
+        "local_site_cidrs": contract["local_site_cidrs"],
+        "remote_site_cidrs": contract["remote_site_cidrs"],
+        "local_policy_rules": contract["local_policy_rules"],
+        "ipv4_policy_rules": contract["ipv4_policy_rules"],
+        "policy_rule_priority_base": contract["policy_rule_priority_base"],
+        "local_route_table": contract["local_route_table"],
+        "remote_route_table": contract["remote_route_table"],
+        "recovery_marker": contract["recovery_marker"],
+        "forward_rules": contract["forward_rules"],
+        "filter_forward_policy": contract["filter_forward_policy"],
+        "mangle_forward_policy": contract["mangle_forward_policy"],
+        "filter_forward_rules": contract["filter_forward_rules"],
+        "mangle_forward_rules": contract["mangle_forward_rules"],
+        "mss_terminal_rules": contract["mss_terminal_rules"],
+        "approved_maximum_tcp_mss": contract["approved_maximum_tcp_mss"],
+        "ipv4_forwarding": contract["ipv4_forwarding"],
+        "ipv6_forwarding": contract["ipv6_forwarding"],
+        "ipv6_filter_forward_policy": contract["ipv6_filter_forward_policy"],
+        "ipv6_mangle_forward_policy": contract["ipv6_mangle_forward_policy"],
+        "ipv6_filter_forward_rules": contract["ipv6_filter_forward_rules"],
+        "ipv6_forward_rules": contract["ipv6_forward_rules"],
+        "ipv6_mangle_forward_rules": contract["ipv6_mangle_forward_rules"],
+        "nat_rules": contract["nat_rules"],
+    }
+    if (
+        state.get("ready") is not True
+        or state.get("no_nat") is not True
+        or state.get("contract_sha256") != contract.get("contract_sha256")
+        or any(state.get(key) != expected for key, expected in expected_copies.items())
+        or any(type(item) is not int for item in numeric)
+        or not 576 <= cast(int, underlay_mtu) <= 65535
+        or not 576 <= cast(int, tailscale_mtu) <= 65535
+        or path_mtu != min(cast(int, underlay_mtu), cast(int, tailscale_mtu))
+        or allowance != cast(int, path_mtu) - 40
+        or tcp_mss
+        != min(cast(int, allowance), cast(int, contract["approved_maximum_tcp_mss"]))
+        or not 536 <= cast(int, tcp_mss) <= cast(int, contract["approved_maximum_tcp_mss"])
+        or state.get("mss_rules")
+        != [
+            {**rule, "mss": tcp_mss}
+            for rule in cast(list[dict[str, Any]], contract["mss_rules"])
+        ]
+    ):
+        raise ReadinessError(
+            "transport-router runtime state differs from the reviewed readiness contract"
+        )
+    return copy.deepcopy(dict(state))
+
+
+def _iptables_save_table(value: Any, table: str) -> tuple[dict[str, str], list[list[str]]]:
+    if not isinstance(value, str) or len(value.encode("utf-8")) > 256 * 1024:
+        raise ReadinessError(f"effective {table} firewall snapshot is invalid")
+    lines = [
+        line.strip()
+        for line in value.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not lines or lines[0] != f"*{table}" or lines[-1] != "COMMIT":
+        raise ReadinessError(f"effective {table} firewall snapshot has the wrong table envelope")
+    policies: dict[str, str] = {}
+    rules: list[list[str]] = []
+    for line in lines[1:-1]:
+        if line.startswith(":"):
+            fields = line[1:].split()
+            if len(fields) < 2 or fields[0] in policies:
+                raise ReadinessError(f"effective {table} firewall chain declaration is invalid")
+            policies[fields[0]] = fields[1]
+        elif line.startswith("-A "):
+            try:
+                rules.append(shlex.split(line))
+            except ValueError as error:
+                raise ReadinessError(f"effective {table} firewall rule is invalid") from error
+        else:
+            raise ReadinessError(f"effective {table} firewall snapshot contains unsupported state")
+    return policies, rules
+
+
+def _iptables_rule(tokens: Sequence[str]) -> dict[str, Any]:
+    if len(tokens) < 3 or tokens[0] != "-A":
+        raise ReadinessError("effective firewall append rule is invalid")
+    result: dict[str, Any] = {"chain": tokens[1]}
+    index = 2
+    single = {
+        "-i": "input",
+        "-o": "output",
+        "-s": "source",
+        "-d": "destination",
+        "-p": "protocol",
+        "-j": "target",
+        "--set-mss": "mss",
+    }
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-m":
+            if index + 1 >= len(tokens):
+                raise ReadinessError("effective firewall rule uses an unsupported matcher")
+            matcher = tokens[index + 1]
+            if matcher == "comment":
+                if index + 3 >= len(tokens) or tokens[index + 2] != "--comment":
+                    raise ReadinessError("effective firewall comment matcher is incomplete")
+                index += 4
+                continue
+            if matcher != "tcp":
+                raise ReadinessError("effective firewall rule uses an unsupported matcher")
+            if "matcher" in result:
+                raise ReadinessError("effective firewall rule duplicates its TCP matcher")
+            result["matcher"] = "tcp"
+            index += 2
+            continue
+        if token == "--tcp-flags":
+            if index + 1 >= len(tokens):
+                raise ReadinessError("effective firewall TCP flags are incomplete")
+            raw_flags = tokens[index + 1]
+            if "/" in raw_flags:
+                values = raw_flags.split("/", 1)
+                index += 2
+            elif index + 2 < len(tokens):
+                values = list(tokens[index + 1 : index + 3])
+                index += 3
+            else:
+                raise ReadinessError("effective firewall TCP flags are incomplete")
+            mask, compare = values
+            numeric = None
+            try:
+                numeric = (int(mask, 0), int(compare, 0))
+            except ValueError:
+                pass
+            if (mask, compare) != ("SYN,RST", "SYN") and numeric != (0x06, 0x02):
+                raise ReadinessError("effective firewall TCP flags differ from SYN,RST SYN")
+            result["tcp_flags"] = "SYN,RST SYN"
+            continue
+        field = single.get(token)
+        if field is None or index + 1 >= len(tokens) or field in result:
+            raise ReadinessError("effective firewall rule contains an unsupported option")
+        raw = tokens[index + 1]
+        if field == "mss":
+            try:
+                result[field] = int(raw)
+            except ValueError as error:
+                raise ReadinessError("effective firewall MSS is invalid") from error
+        else:
+            result[field] = raw
+        index += 2
+    if result.get("target") == "TCPMSS":
+        if result.pop("matcher", None) != "tcp" or result.get("protocol") != "tcp":
+            raise ReadinessError("effective firewall TCPMSS rule omits its exact TCP matcher")
+    elif "matcher" in result or "mss" in result:
+        raise ReadinessError("effective firewall matcher is not bound to TCPMSS")
+    return result
+
+
+def _effective_transport_firewall(
+    snapshot: Mapping[str, Any], contract: Mapping[str, Any]
+) -> dict[str, Any]:
+    required = {
+        "iptables_filter",
+        "iptables_mangle",
+        "iptables_nat",
+        "ip6tables_filter",
+        "ip6tables_mangle",
+        "ip6tables_nat",
+        "nftables",
+    }
+    if not required.issubset(snapshot):
+        raise ReadinessError("effective firewall collection is incomplete")
+    ipv4_filter_policy, raw_ipv4_filter = _iptables_save_table(
+        snapshot["iptables_filter"], "filter"
+    )
+    ipv4_mangle_policy, raw_ipv4_mangle = _iptables_save_table(
+        snapshot["iptables_mangle"], "mangle"
+    )
+    _ipv4_nat_policy, raw_ipv4_nat = _iptables_save_table(snapshot["iptables_nat"], "nat")
+    ipv6_filter_policy, raw_ipv6_filter = _iptables_save_table(
+        snapshot["ip6tables_filter"], "filter"
+    )
+    ipv6_mangle_policy, raw_ipv6_mangle = _iptables_save_table(
+        snapshot["ip6tables_mangle"], "mangle"
+    )
+    _ipv6_nat_policy, raw_ipv6_nat = _iptables_save_table(snapshot["ip6tables_nat"], "nat")
+    nftables = snapshot.get("nftables")
+    if (
+        not isinstance(nftables, Mapping)
+        or set(nftables) != {"nftables"}
+        or not isinstance(nftables["nftables"], list)
+        or len(nftables["nftables"]) != 1
+        or not isinstance(nftables["nftables"][0], Mapping)
+        or set(nftables["nftables"][0]) != {"metainfo"}
+    ):
+        raise ReadinessError("native nftables state is not empty")
+
+    ipv4_filter = [_iptables_rule(rule) for rule in raw_ipv4_filter]
+    expected_filter_hook = [dict(value) for value in contract["filter_forward_rules"]]
+    expected_forward = [dict(value) for value in contract["forward_rules"]]
+    observed_filter_hook: list[dict[str, Any]] = []
+    observed_forward: list[dict[str, Any]] = []
+    for rule in ipv4_filter:
+        if rule == {
+            "chain": "FORWARD",
+            "target": "ENVELOPE-TRANSPORT-FORWARD",
+        }:
+            observed_filter_hook.append(expected_filter_hook[0])
+        elif rule.get("chain") == "ENVELOPE-TRANSPORT-FORWARD" and rule.get("target") == "ACCEPT":
+            observed_forward.append(
+                {
+                    "chain": "ENVELOPE-TRANSPORT-FORWARD",
+                    "input": rule.get("input"),
+                    "output": rule.get("output"),
+                    "source": rule.get("source"),
+                    "destination": rule.get("destination"),
+                    "action": "ACCEPT",
+                }
+            )
+        else:
+            raise ReadinessError("effective IPv4 filter contains an unapproved append rule")
+    if (
+        ipv4_filter_policy.get("FORWARD") != contract["filter_forward_policy"]
+        or observed_filter_hook != expected_filter_hook
+        or len(observed_forward) != len(expected_forward)
+        or {json.dumps(value, sort_keys=True) for value in observed_forward}
+        != {json.dumps(value, sort_keys=True) for value in expected_forward}
+    ):
+        raise ReadinessError("effective IPv4 filter differs from the reviewed contract")
+
+    ipv4_mangle = [_iptables_rule(rule) for rule in raw_ipv4_mangle]
+    expected_mangle_hook = [dict(value) for value in contract["mangle_forward_rules"]]
+    expected_mss = [dict(value) for value in contract["mss_rules"]]
+    observed_mangle_hook: list[dict[str, Any]] = []
+    observed_mss: list[dict[str, Any]] = []
+    terminal: list[dict[str, str]] = []
+    for rule in ipv4_mangle:
+        if rule == {"chain": "FORWARD", "target": "ENVELOPE-TRANSPORT-MSS"}:
+            observed_mangle_hook.append(expected_mangle_hook[0])
+        elif rule.get("chain") == "ENVELOPE-TRANSPORT-MSS" and rule.get("target") == "TCPMSS":
+            observed_mss.append(
+                {
+                    "chain": "ENVELOPE-TRANSPORT-MSS",
+                    "input": rule.get("input"),
+                    "output": rule.get("output"),
+                    "source": rule.get("source"),
+                    "destination": rule.get("destination"),
+                    "protocol": rule.get("protocol"),
+                    "tcp_flags": rule.get("tcp_flags"),
+                    "action": "TCPMSS",
+                    "mss": rule.get("mss"),
+                }
+            )
+        elif rule == {"chain": "ENVELOPE-TRANSPORT-MSS", "target": "RETURN"}:
+            terminal.append({"chain": "ENVELOPE-TRANSPORT-MSS", "action": "RETURN"})
+        else:
+            raise ReadinessError("effective IPv4 mangle contains an unapproved append rule")
+    expected_mss_without_value = {
+        json.dumps(value, sort_keys=True) for value in expected_mss
+    }
+    observed_mss_without_value = {
+        json.dumps({key: value for key, value in rule.items() if key != "mss"}, sort_keys=True)
+        for rule in observed_mss
+    }
+    if (
+        ipv4_mangle_policy.get("FORWARD") != contract["mangle_forward_policy"]
+        or observed_mangle_hook != expected_mangle_hook
+        or terminal != [dict(value) for value in contract["mss_terminal_rules"]]
+        or len(observed_mss) != len(expected_mss)
+        or observed_mss_without_value != expected_mss_without_value
+        or any(
+            isinstance(rule.get("mss"), bool) or not isinstance(rule.get("mss"), int)
+            for rule in observed_mss
+        )
+        or raw_ipv4_nat
+    ):
+        raise ReadinessError("effective IPv4 MSS or NAT state differs from the reviewed contract")
+
+    ipv6_filter = [_iptables_rule(rule) for rule in raw_ipv6_filter]
+    expected_ipv6_hook = [dict(value) for value in contract["ipv6_filter_forward_rules"]]
+    if (
+        ipv6_filter_policy.get("FORWARD") != contract["ipv6_filter_forward_policy"]
+        or ipv6_mangle_policy.get("FORWARD")
+        != contract["ipv6_mangle_forward_policy"]
+        or ipv6_filter
+        != [{"chain": "FORWARD", "target": "ENVELOPE-TRANSPORT-FORWARD"}]
+        or raw_ipv6_mangle
+        or raw_ipv6_nat
+    ):
+        raise ReadinessError("effective IPv6 firewall is not fail closed")
+    return {
+        "filter_forward_policy": contract["filter_forward_policy"],
+        "mangle_forward_policy": contract["mangle_forward_policy"],
+        "filter_forward_rules": expected_filter_hook,
+        "forward_rules": expected_forward,
+        "mangle_forward_rules": expected_mangle_hook,
+        "mss_rules": observed_mss,
+        "mss_terminal_rules": terminal,
+        "nat_rules": [],
+        "native_nft_rules": [],
+        "ipv6_filter_forward_policy": contract["ipv6_filter_forward_policy"],
+        "ipv6_mangle_forward_policy": contract["ipv6_mangle_forward_policy"],
+        "ipv6_filter_forward_rules": expected_ipv6_hook,
+        "ipv6_forward_rules": [],
+        "ipv6_mangle_forward_rules": [],
+    }
+
+
+def _effective_local_policy_rules(
+    value: Any, contract: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not all(isinstance(rule, Mapping) for rule in value):
+        raise ReadinessError("complete IPv4 policy-rule collection is invalid")
+    expected = [dict(rule) for rule in contract["ipv4_policy_rules"]]
+    allowed = {
+        "priority",
+        "src",
+        "srclen",
+        "dst",
+        "dstlen",
+        "fwmark",
+        "fwmask",
+        "iif",
+        "table",
+        "action",
+        "protocol",
+    }
+    normalized_rules: list[dict[str, Any]] = []
+
+    def prefix(raw: Mapping[str, Any], field: str, length_field: str) -> str:
+        address = raw.get(field, "all")
+        if address in (None, "all", "default"):
+            return "all"
+        rendered = str(address)
+        if "/" not in rendered:
+            rendered += f"/{raw.get(length_field, 32)}"
+        try:
+            return str(ipaddress.ip_network(rendered, strict=False))
+        except ValueError as error:
+            raise ReadinessError("IPv4 policy rule contains an invalid prefix") from error
+
+    def number(raw: Mapping[str, Any], field: str) -> int:
+        item = raw.get(field, 0)
+        if isinstance(item, bool):
+            raise ReadinessError("IPv4 policy rule contains an invalid mark")
+        try:
+            return int(str(item), 0)
+        except ValueError as error:
+            raise ReadinessError("IPv4 policy rule contains an invalid mark") from error
+
+    for raw in value:
+        if set(raw) - allowed:
+            raise ReadinessError("IPv4 policy rule contains an unsupported selector")
+        priority = raw.get("priority")
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise ReadinessError("complete IPv4 policy rules contain an invalid priority")
+        table = str(raw.get("table", "none"))
+        table = {
+            "255": "local",
+            "254": "main",
+            "253": "default",
+            "tailscale": "52",
+        }.get(table, table)
+        action = raw.get("action", "lookup")
+        normalized_rules.append(
+            {
+                "priority": priority,
+                "input": raw.get("iif", "all"),
+                "source": prefix(raw, "src", "srclen"),
+                "destination": prefix(raw, "dst", "dstlen"),
+                "fwmark": number(raw, "fwmark"),
+                "fwmask": number(raw, "fwmask"),
+                "table": table,
+                "action": "lookup" if action in (None, "to_tbl", "lookup") else action,
+            }
+        )
+    if normalized_rules != expected:
+        raise ReadinessError(
+            "complete effective IPv4 policy rules differ from the reviewed contract"
+        )
+    local_priorities = {rule["priority"] for rule in contract["local_policy_rules"]}
+    return [
+        {key: item for key, item in rule.items() if key != "fwmask"}
+        for rule in normalized_rules
+        if rule["priority"] in local_priorities
+    ]
+
+
+@dataclasses.dataclass(frozen=True)
+class SymmetricProtectedDeployment:
+    workloads: Deployment
+    topology: SymmetricTopologyV2
+    endpoint_ids: Mapping[Site, Mapping[str, str]]
+    flow_logs: Mapping[Site, ManagedFlowLog]
+    load_profile: ApprovedLoadProfile
+    vpc_ids: Mapping[Site, str]
+    runtime: Mapping[Site, Mapping[str, Any]]
+    route_failover_output: Mapping[str, Any]
+    transport_router_readiness_expectations: Mapping[Site, Mapping[str, Any]]
+    cost_profile: Mapping[str, Any]
+    output_sha256: str
+    estimated_fixed_hourly_usd: float
+    approved_max_hourly_usd: float
+
+    def __post_init__(self) -> None:
+        if self.topology.run_id == "":
+            raise DeploymentError("symmetric protected deployment has no run identity")
+        workload_ids = {target.instance_id for target in self.workloads.targets}
+        fleet_ids = {
+            member.instance_id
+            for site in (self.topology.west, self.topology.east)
+            for member in (*site.target_fleet, *site.transport_router_fleet)
+        }
+        if workload_ids.intersection(fleet_ids):
+            raise DeploymentError("symmetric fleet and workload instance identities overlap")
+        for site in SITES:
+            topology_site = self.topology.site(site)
+            if {member.az_key for member in topology_site.target_fleet} != set(self.endpoint_ids[site]):
+                raise DeploymentError(f"{site} target fleet and GWLBE AZ coverage differ")
+            if {member.az_key for member in topology_site.transport_router_fleet} != set(
+                self.endpoint_ids[site]
+            ):
+                raise DeploymentError(f"{site} transport-router fleet and GWLBE AZ coverage differ")
+            workload_cidrs = {
+                cast(str, self.workloads.target(site, role).cidr) for role in WORKLOAD_ROLES
+            }
+            if workload_cidrs != set(topology_site.local_site_cidrs):
+                raise DeploymentError(f"{site} workloads do not exactly cover the symmetric local-site CIDRs")
+            workload_prefix_by_az = {
+                cast(str, target.az_key): cast(str, target.cidr)
+                for target in self.workloads.targets
+                if target.site == site
+            }
+            routers_by_az = {
+                member.az_key: member
+                for member in topology_site.transport_router_fleet
+            }
+            for gwlbe_az, router_az in self.topology.route_failover.initial_transport_router_az_by_gwlbe_az[
+                site
+            ].items():
+                selected = routers_by_az[router_az]
+                route = self.route_failover_output["sites"][site][gwlbe_az]
+                if (
+                    selected.advertised_prefix
+                    != workload_prefix_by_az.get(gwlbe_az)
+                    or route.get("source_workload_prefix")
+                    != workload_prefix_by_az.get(gwlbe_az)
+                    or route.get("initial_network_interface_id")
+                    != selected.network_interface_id
+                ):
+                    raise DeploymentError(
+                        f"{site} GWLBE {gwlbe_az} route and source-prefix ownership disagree"
+                    )
+            runtime = self.runtime.get(site)
+            if not isinstance(runtime, Mapping):
+                raise DeploymentError(f"{site} symmetric packet-return runtime is absent")
+        for value, name in (
+            (self.estimated_fixed_hourly_usd, "estimated fixed hourly cost"),
+            (self.approved_max_hourly_usd, "approved maximum hourly cost"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise DeploymentError(f"symmetric protected deployment {name} is invalid")
+        if self.estimated_fixed_hourly_usd > self.approved_max_hourly_usd:
+            raise DeploymentError("symmetric protected deployment exceeds its approved hourly cost")
+
+    def appliance(self, site: Site) -> ApplianceTarget:
+        topology_site = self.topology.site(site)
+        member = topology_site.target_fleet[0]
+        assert member.target_group_arn is not None
+        return ApplianceTarget(site, member.region, member.instance_id, member.target_group_arn, self.vpc_ids[site])
+
+    def cost_evidence(self) -> dict[str, Any]:
+        return {
+            **copy.deepcopy(dict(self.cost_profile)),
+            "within_approved_ceiling": True,
+        }
+
+
+def parse_symmetric_protected_deployment_output(
+    document: Mapping[str, Any] | str,
+    *,
+    site_regions: Mapping[str, str] | None = None,
+) -> SymmetricProtectedDeployment:
+    if isinstance(document, str):
+        try:
+            decoded = json.loads(document)
+        except json.JSONDecodeError as error:
+            raise DeploymentError("symmetric protected deployment output is not valid JSON") from error
+        raw = _mapping(decoded, "symmetric protected deployment output")
+    else:
+        raw = _mapping(document, "symmetric protected deployment output")
+    if "instance_ids" in raw:
+        raise DeploymentError("symmetric protected deployment rejects the legacy single-appliance projection")
+    _exact_keys(
+        raw,
+        {
+            "artifact_identity",
+            "cost_profile",
+            "e2e_load_profile",
+            "envelope_runtime_config",
+            "flow_log_evidence",
+            "gwlb_endpoint_ids",
+            "gwlb_target_group_arns",
+            "route_failover",
+            "symmetric_topology",
+            "transport_router_readiness_expectations",
+            "vpc_ids",
+            "workload_instances",
+        },
+        "symmetric protected deployment output",
+    )
+    canonical = json.dumps(raw, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    workloads = parse_deployment_output(raw, output_name="workload_instances", site_regions=site_regions)
+    topology = parse_symmetric_topology_v2(_required_output(raw, "symmetric_topology"))
+    load_profile = _parse_load_profile(_required_output(raw, "e2e_load_profile"))
+    route_failover_output = _parse_route_failover_output(
+        _required_output(raw, "route_failover"), topology
+    )
+    readiness_expectations = _parse_transport_router_readiness_expectations(
+        _required_output(raw, "transport_router_readiness_expectations"),
+        topology,
+        load_profile,
+    )
+    regions = {site: topology.site(site).region for site in SITES}
+    if site_regions is not None and any(site_regions.get(site) != regions[site] for site in SITES):
+        raise DeploymentError("symmetric topology regions differ from the protected run configuration")
+    target_groups = _site_string_map(
+        _required_output(raw, "gwlb_target_group_arns"),
+        "gwlb_target_group_arns",
+        _TARGET_GROUP_ARN_RE,
+    )
+    for site in SITES:
+        topology_target_groups = {
+            member.target_group_arn for member in topology.site(site).target_fleet
+        }
+        if topology_target_groups != {target_groups[site]}:
+            raise DeploymentError(
+                f"gwlb_target_group_arns.{site} differs from the symmetric target fleet"
+            )
+    vpc_ids = _site_string_map(_required_output(raw, "vpc_ids"), "vpc_ids", _VPC_ID_RE)
+    raw_endpoints = _mapping(_required_output(raw, "gwlb_endpoint_ids"), "gwlb_endpoint_ids")
+    _exact_keys(raw_endpoints, set(SITES), "gwlb_endpoint_ids")
+    endpoints: dict[Site, dict[str, str]] = {}
+    for site in SITES:
+        site_endpoints = _mapping(raw_endpoints[site], f"gwlb_endpoint_ids.{site}")
+        endpoints[site] = {}
+        for az_key, endpoint_id in site_endpoints.items():
+            if (
+                not re.fullmatch(r"[a-z][a-z0-9-]{0,15}", az_key)
+                or not isinstance(endpoint_id, str)
+                or not _VPCE_ID_RE.fullmatch(endpoint_id)
+            ):
+                raise DeploymentError(f"gwlb_endpoint_ids.{site} contains an invalid identity")
+            endpoints[site][az_key] = endpoint_id
+    raw_flow_logs = _mapping(_required_output(raw, "flow_log_evidence"), "flow_log_evidence")
+    _exact_keys(raw_flow_logs, set(SITES), "flow_log_evidence")
+    flow_logs: dict[Site, ManagedFlowLog] = {}
+    for site in SITES:
+        value = _mapping(raw_flow_logs[site], f"flow_log_evidence.{site}")
+        _exact_keys(value, {"flow_log_id", "log_group_arn", "region"}, f"flow_log_evidence.{site}")
+        if value.get("region") != regions[site]:
+            raise DeploymentError(f"flow_log_evidence.{site}.region differs from the symmetric topology")
+        flow_logs[site] = ManagedFlowLog(
+            site,
+            regions[site],
+            str(value.get("flow_log_id", "")),
+            str(value.get("log_group_arn", "")),
+        )
+    raw_runtime = _mapping(_required_output(raw, "envelope_runtime_config"), "envelope_runtime_config")
+    _exact_keys(raw_runtime, set(SITES), "envelope_runtime_config")
+    runtime_fields = {
+        "config_version",
+        "mode",
+        "udp_bind",
+        "max_inner_packet_size",
+        "artifact_sha256",
+        "artifact_revision",
+    }
+    runtime: dict[Site, dict[str, Any]] = {}
+    for site in SITES:
+        value = _mapping(raw_runtime[site], f"envelope_runtime_config.{site}")
+        _exact_keys(value, runtime_fields, f"envelope_runtime_config.{site}")
+        if (
+            value.get("config_version") != 2
+            or value.get("mode") != "packet-return"
+            or value.get("udp_bind") != "0.0.0.0:6081"
+            or value.get("max_inner_packet_size") != 1280
+        ):
+            raise DeploymentError(
+                f"envelope_runtime_config.{site} is not the reviewed version-2 packet-return runtime"
+            )
+        if (
+            not isinstance(value.get("artifact_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", cast(str, value["artifact_sha256"])) is None
+            or not isinstance(value.get("artifact_revision"), str)
+            or re.fullmatch(r"[0-9a-f]{40}", cast(str, value["artifact_revision"])) is None
+        ):
+            raise DeploymentError(f"envelope_runtime_config.{site} has an invalid artifact identity")
+        runtime[site] = dict(value)
+    if runtime["west"].get("artifact_sha256") != runtime["east"].get("artifact_sha256") or runtime[
+        "west"
+    ].get("artifact_revision") != runtime["east"].get("artifact_revision"):
+        raise DeploymentError("symmetric targets do not use one reviewed artifact identity")
+    artifact = _mapping(_required_output(raw, "artifact_identity"), "artifact_identity")
+    _exact_keys(
+        artifact,
+        {
+            "bucket",
+            "key",
+            "sha256",
+            "architecture",
+            "ec2_arch",
+            "revision",
+            "version",
+        },
+        "artifact_identity",
+    )
+    architecture = artifact.get("architecture")
+    revision = runtime["west"]["artifact_revision"]
+    if (
+        architecture not in {"amd64", "arm64"}
+        or artifact.get("ec2_arch")
+        != {"amd64": "x86_64", "arm64": "arm64"}.get(cast(str, architecture))
+        or artifact.get("sha256") != runtime["west"]["artifact_sha256"]
+        or artifact.get("revision") != revision
+        or artifact.get("key")
+        != f"artifacts/{revision}/envelope-linux-{architecture}"
+        or not isinstance(artifact.get("bucket"), str)
+        or re.fullmatch(
+            rf"{re.escape(topology.run_id)}-[0-9]{{12}}-{re.escape(regions['west'])}-artifact",
+            cast(str, artifact.get("bucket")),
+        )
+        is None
+        or not isinstance(artifact.get("version"), str)
+        or re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}", cast(str, artifact.get("version"))
+        )
+        is None
+    ):
+        raise DeploymentError(
+            "artifact_identity differs from the reviewed target runtime and Terraform naming contract"
+        )
+    cost = _mapping(_required_output(raw, "cost_profile"), "cost_profile")
+    counts = _mapping(cost.get("resource_counts"), "cost_profile.resource_counts")
+    estimated = cost.get("estimated_fixed_hourly_usd")
+    approved = cost.get("approved_max_hourly_usd")
+    if (
+        isinstance(estimated, bool)
+        or not isinstance(estimated, (int, float))
+        or not math.isfinite(float(estimated))
+        or float(estimated) <= 0
+    ):
+        raise DeploymentError("symmetric cost profile omits its estimated fixed hourly cost")
+    if (
+        isinstance(approved, bool)
+        or not isinstance(approved, (int, float))
+        or not math.isfinite(float(approved))
+        or float(approved) <= 0
+    ):
+        raise DeploymentError("symmetric cost profile omits its approved maximum hourly cost")
+    expected_counts = {
+        "gwlbe_endpoints": sum(len(endpoints[site]) for site in SITES),
+        "target_instances": {
+            site: len(topology.site(site).target_fleet) for site in SITES
+        },
+        "transport_routers": {
+            site: len(topology.site(site).transport_router_fleet) for site in SITES
+        },
+        "workload_instances": len(workloads.targets),
+        "nat_gateways": len(SITES),
+        "elastic_ips": len(SITES),
+        "gateway_load_balancers": len(SITES),
+        "vpc_flow_logs": len(SITES),
+        "cloudwatch_log_groups": len(SITES),
+        "flow_log_iam_roles": 1,
+        "iam_roles": {
+            "target": len(SITES),
+            "workload": len(SITES),
+            "transport": len(SITES),
+            "flow_log": 1,
+        },
+        "iam_instance_profiles": {
+            "target": len(SITES),
+            "workload": len(SITES),
+            "transport": len(SITES),
+        },
+    }
+    expected_cost = {
+        "profile": "symmetric-gwlb-ha-v2",
+        "estimated_fixed_hourly_usd": estimated,
+        "approved_max_hourly_usd": approved,
+        "resource_counts": expected_counts,
+        "route_failover_bounds": topology.route_failover.approved_bounds(),
+        "nat_topology_limit": {
+            "gateways_per_site": 1,
+            "expanded_for_ha": False,
+            "placement": "one shared NAT gateway in each site's single management subnet",
+            "limitation": (
+                "private egress is not multi-AZ within a site and remains outside the protected data path"
+            ),
+        },
+    }
+    if counts != expected_counts or cost != expected_cost:
+        raise DeploymentError(
+            "protected output does not declare the exact expanded symmetric HA cost profile"
+        )
+    return SymmetricProtectedDeployment(
+        workloads=workloads,
+        topology=topology,
+        endpoint_ids=endpoints,
+        flow_logs=flow_logs,
+        load_profile=load_profile,
+        vpc_ids=vpc_ids,
+        runtime=runtime,
+        route_failover_output=route_failover_output,
+        transport_router_readiness_expectations=readiness_expectations,
+        cost_profile=copy.deepcopy(expected_cost),
+        output_sha256=hashlib.sha256(canonical.encode()).hexdigest(),
+        estimated_fixed_hourly_usd=float(estimated),
+        approved_max_hourly_usd=float(approved),
+    )
+
+
+def validate_symmetric_preflight(
+    topology: SymmetricTopologyV2,
+    readiness: Any,
+    transport_router_readiness_expectations: Mapping[Site, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Fail closed unless every route domain, target, and route advertiser is ready."""
 
     document = _mapping(readiness, "symmetric readiness")
-    _exact_keys(document, {"sites", "tailnet_policy_valid"}, "symmetric readiness")
+    expected_keys = {
+        "sites",
+        "tailnet_policy_valid",
+        "transport_router_contract_sha256",
+    }
+    if "config_version" in document:
+        expected_keys.add("config_version")
+    _exact_keys(document, expected_keys, "symmetric readiness")
+    if document.get("config_version", 2) != 2:
+        raise ReadinessError("symmetric readiness config_version must be 2")
     if document["tailnet_policy_valid"] is not True:
         raise ReadinessError("symmetric Tailnet policy validation did not pass")
+    contract_hashes = _mapping(
+        document["transport_router_contract_sha256"],
+        "symmetric readiness.transport_router_contract_sha256",
+    )
+    _exact_keys(
+        contract_hashes,
+        set(SITES),
+        "symmetric readiness.transport_router_contract_sha256",
+    )
+    if any(
+        not isinstance(contract_hashes[site], str)
+        or re.fullmatch(r"[0-9a-f]{64}", cast(str, contract_hashes[site])) is None
+        for site in SITES
+    ):
+        raise ReadinessError("symmetric readiness has an invalid transport-router contract SHA")
+    if transport_router_readiness_expectations is not None:
+        if (
+            not isinstance(transport_router_readiness_expectations, Mapping)
+            or set(transport_router_readiness_expectations) != set(SITES)
+            or any(
+                not isinstance(transport_router_readiness_expectations[site], Mapping)
+                for site in SITES
+            )
+        ):
+            raise ReadinessError("Terraform transport-router readiness contracts are incomplete")
+        expected_hashes = {
+            site: transport_router_readiness_expectations[site].get("contract_sha256")
+            for site in SITES
+        }
+        if contract_hashes != expected_hashes:
+            raise ReadinessError(
+                "live transport-router readiness differs from the Terraform contract SHA"
+            )
     sites = _mapping(document["sites"], "symmetric readiness.sites")
     _exact_keys(sites, set(SITES), "symmetric readiness.sites")
-    result: dict[str, Any] = {"config_version": 2, "tailnet_policy_valid": True, "sites": {}}
+    result: dict[str, Any] = {
+        "config_version": 2,
+        "tailnet_policy_valid": True,
+        "transport_router_contract_sha256": dict(contract_hashes),
+        "sites": {},
+    }
     for name in SITES:
         expected = topology.site(name)
         site = _mapping(sites[name], f"symmetric readiness.sites.{name}")
-        _exact_keys(site, {"route_domains", "targets", "ingress_routers"}, f"symmetric readiness.sites.{name}")
+        _exact_keys(
+            site,
+            {"route_domains", "targets", "transport_routers"},
+            f"symmetric readiness.sites.{name}",
+        )
         domains = _mapping(site["route_domains"], f"symmetric readiness.sites.{name}.route_domains")
-        _exact_keys(domains, {"workload", "ingress_router", "target"}, f"symmetric readiness.sites.{name}.route_domains")
+        _exact_keys(
+            domains,
+            {"workload", "transport", "target"},
+            f"symmetric readiness.sites.{name}.route_domains",
+        )
         if any(domains[domain] is not True for domain in domains):
             raise ReadinessError(f"{name} route-domain validation is incomplete")
         targets = _mapping(site["targets"], f"symmetric readiness.sites.{name}.targets")
-        routers = _mapping(site["ingress_routers"], f"symmetric readiness.sites.{name}.ingress_routers")
-        if set(targets) != {member.instance_id for member in expected.target_fleet} or set(routers) != {member.instance_id for member in expected.ingress_router_fleet}:
+        routers = _mapping(
+            site["transport_routers"],
+            f"symmetric readiness.sites.{name}.transport_routers",
+        )
+        if set(targets) != {member.instance_id for member in expected.target_fleet} or set(
+            routers
+        ) != {member.instance_id for member in expected.transport_router_fleet}:
             raise ReadinessError(f"{name} readiness fleet identities differ from the protected topology")
-        if any(targets[member.instance_id] is not True for member in expected.target_fleet):
-            raise ReadinessError(f"{name} has an unhealthy Envelope target")
-        if any(routers[member.instance_id] is not True for member in expected.ingress_router_fleet):
-            raise ReadinessError(f"{name} has an unready ingress router")
-        result["sites"][name] = {"route_domains": dict(domains), "targets": dict(targets), "ingress_routers": dict(routers)}
+        validated_routers: dict[str, dict[str, Any]] = {}
+        for member in expected.target_fleet:
+            identity = targets[member.instance_id]
+            if (
+                not isinstance(identity, Mapping)
+                or set(identity)
+                != {
+                    "ready",
+                    "target_group_arn",
+                    "registration_port",
+                    "process_generation_sha256",
+                }
+                or identity.get("ready") is not True
+                or identity.get("target_group_arn") != member.target_group_arn
+                or identity.get("registration_port") != 6081
+                or re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(identity.get("process_generation_sha256", "")),
+                )
+                is None
+            ):
+                raise ReadinessError(
+                    f"{name} target readiness is not bound to its service generation and registration"
+                )
+        for member in expected.transport_router_fleet:
+            identity = routers[member.instance_id]
+            if (
+                not isinstance(identity, Mapping)
+                or set(identity)
+                != {
+                    "ready",
+                    "network_interface_id",
+                    "advertised_prefix",
+                    "node_identity_ready",
+                    "tailnet_node_id_sha256",
+                    "contract_sha256",
+                    "primary_route_ownership",
+                }
+                or identity.get("ready") is not True
+                or identity.get("node_identity_ready") is not True
+                or identity.get("network_interface_id") != member.network_interface_id
+                or identity.get("advertised_prefix") != member.advertised_prefix
+                or identity.get("contract_sha256") != contract_hashes[name]
+                or re.fullmatch(
+                    r"[0-9a-f]{64}", str(identity.get("tailnet_node_id_sha256", ""))
+                )
+                is None
+            ):
+                raise ReadinessError(
+                    f"{name} transport readiness is not bound to its EC2 ENI and Tailnet node"
+                )
+            normalized_identity = dict(identity)
+            normalized_identity["primary_route_ownership"] = (
+                _validated_preflight_primary_route_ownership(
+                    topology,
+                    member,
+                    identity.get("primary_route_ownership"),
+                )
+            )
+            validated_routers[member.instance_id] = normalized_identity
+        result["sites"][name] = {
+            "route_domains": dict(domains),
+            "targets": dict(targets),
+            "transport_routers": validated_routers,
+        }
     return result
+
+
+def _validated_primary_route_ownership(
+    value: Any,
+    *,
+    local_prefixes: Sequence[str],
+    remote_prefixes: Sequence[str],
+    peer_bindings: Mapping[str, Mapping[str, str]],
+    selected_local_prefixes: set[str],
+    expected_remote_owner_instance_ids: Mapping[str, str],
+    expected_local_owner_instance_ids: Mapping[str, str],
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {"ObservedAt", "Remote", "Local"}:
+        raise ReadinessError("primary-route ownership has the wrong shape")
+    try:
+        observed_at_value = validate_canonical_utc_timestamp(
+            value.get("ObservedAt"), "primary-route ownership ObservedAt"
+        )
+    except LifecycleError as error:
+        raise ReadinessError(str(error)) from None
+    observed_at = dt.datetime.fromisoformat(observed_at_value.removesuffix("Z") + "+00:00")
+    expected_prefixes = {
+        "Remote": set(remote_prefixes),
+        "Local": set(local_prefixes),
+    }
+    expected_scopes = {"Remote": "remote", "Local": "local"}
+    expected_owners = {
+        "Remote": dict(expected_remote_owner_instance_ids),
+        "Local": dict(expected_local_owner_instance_ids),
+    }
+    if (
+        set(expected_owners["Remote"]) != expected_prefixes["Remote"]
+        or expected_owners["Local"]
+        or selected_local_prefixes
+    ):
+        raise ReadinessError(
+            "configured primary-route ownership must cover exact remote prefixes and no local prefixes"
+        )
+    claims: dict[str, dict[str, list[dict[str, Any]]]] = {
+        scope: {prefix: [] for prefix in prefixes}
+        for scope, prefixes in expected_prefixes.items()
+    }
+    for scope in ("Remote", "Local"):
+        entries = value.get(scope)
+        if not isinstance(entries, list):
+            raise ReadinessError("primary-route ownership claims must be lists")
+        if scope == "Local" and entries:
+            raise ReadinessError("local primary-route ownership must be empty")
+        for entry in entries:
+            if not isinstance(entry, Mapping) or set(entry) != {
+                "Prefix",
+                "PeerID",
+                "Hostname",
+                "Online",
+                "Expired",
+                "KeyExpiry",
+                "KeyExpiryDisabled",
+                "Ping",
+            }:
+                raise ReadinessError("primary-route ownership claim has the wrong shape")
+            prefix = entry.get("Prefix")
+            peer_id = entry.get("PeerID")
+            hostname = entry.get("Hostname")
+            if prefix not in expected_prefixes[scope]:
+                raise ReadinessError("primary-route ownership contains an unapproved prefix")
+            binding = peer_bindings.get(str(peer_id)) if isinstance(peer_id, str) else None
+            if (
+                not isinstance(binding, Mapping)
+                or set(binding) != {"hostname", "instance_id", "scope"}
+                or binding.get("scope") != expected_scopes[scope]
+                or binding.get("hostname") != hostname
+                or binding.get("instance_id")
+                != expected_owners[scope].get(str(prefix))
+                or entry.get("Online") is not True
+                or entry.get("Expired") is not False
+            ):
+                raise ReadinessError("primary-route owner is not the expected online protected peer")
+            try:
+                key_expiry_value = validate_canonical_utc_timestamp(
+                    entry.get("KeyExpiry"), "primary-route owner KeyExpiry"
+                )
+            except LifecycleError as error:
+                raise ReadinessError(str(error)) from None
+            key_expiry = dt.datetime.fromisoformat(
+                key_expiry_value.removesuffix("Z") + "+00:00"
+            )
+            key_expiry_disabled = entry.get("KeyExpiryDisabled")
+            ping = entry.get("Ping")
+            if not isinstance(ping, Mapping) or set(ping) != {
+                "PeerID",
+                "Succeeded",
+                "ObservedAt",
+                "LatencyMilliseconds",
+            }:
+                raise ReadinessError("primary-route owner ping has the wrong shape")
+            try:
+                ping_at_value = validate_canonical_utc_timestamp(
+                    ping.get("ObservedAt"), "primary-route owner ping ObservedAt"
+                )
+            except LifecycleError as error:
+                raise ReadinessError(str(error)) from None
+            ping_at = dt.datetime.fromisoformat(
+                ping_at_value.removesuffix("Z") + "+00:00"
+            )
+            latency = ping.get("LatencyMilliseconds")
+            if (
+                not isinstance(key_expiry_disabled, bool)
+                or (not key_expiry_disabled and key_expiry <= observed_at)
+                or ping.get("PeerID") != peer_id
+                or ping.get("Succeeded") is not True
+                or isinstance(latency, bool)
+                or not isinstance(latency, (int, float))
+                or not 0 <= latency <= MAX_PING_LATENCY_MILLISECONDS
+                or ping_at > observed_at
+                or (observed_at - ping_at).total_seconds() > MAX_PING_AGE_SECONDS
+            ):
+                raise ReadinessError("primary-route owner is expired or lacks a fresh bounded ping")
+            claims[scope][str(prefix)].append(
+                {
+                    "prefix": str(prefix),
+                    "owner_instance_id": binding["instance_id"],
+                    "online": True,
+                }
+            )
+
+    if any(len(owners) != 1 for owners in claims["Remote"].values()):
+        raise ReadinessError("every remote prefix must have one protected primary-route owner")
+    if any(
+        len(claims["Local"][prefix]) != 1
+        for prefix in expected_owners["Local"]
+    ) or any(
+        claims["Local"][prefix]
+        for prefix in expected_prefixes["Local"] - set(expected_owners["Local"])
+    ):
+        raise ReadinessError(
+            "local primary-route ownership must be empty"
+        )
+    observed_local = {
+        prefix for prefix, owners in claims["Local"].items() if owners
+    }
+    if observed_local or selected_local_prefixes:
+        raise ReadinessError(
+            "local primary-route ownership and table-52 selection must be empty"
+        )
+    return {
+        "observed_at": observed_at_value,
+        "remote": [
+            claims["Remote"][prefix][0] for prefix in sorted(claims["Remote"])
+        ],
+        "local": [],
+    }
+
+
+def _validated_preflight_primary_route_ownership(
+    topology: SymmetricTopologyV2,
+    observer: SymmetricFleetMember,
+    value: Any,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "observed_at",
+        "remote",
+        "local",
+    }:
+        raise ReadinessError("preflight primary-route ownership has the wrong shape")
+    try:
+        observed_at = validate_canonical_utc_timestamp(
+            value.get("observed_at"), "preflight primary-route ownership observed_at"
+        )
+    except LifecycleError as error:
+        raise ReadinessError(str(error)) from None
+    local_site = topology.site(observer.site)
+    remote_site = topology.site(_opposite(observer.site))
+    expected_prefixes = {
+        "remote": set(remote_site.local_site_cidrs),
+        "local": set(local_site.local_site_cidrs),
+    }
+    expected_owners = {
+        "remote": {
+            cast(str, member.advertised_prefix): member.instance_id
+            for member in remote_site.transport_router_fleet
+        },
+        "local": {},
+    }
+    normalized: dict[str, list[dict[str, Any]]] = {}
+    for scope in ("remote", "local"):
+        entries = value.get(scope)
+        if not isinstance(entries, list):
+            raise ReadinessError("preflight primary-route ownership claims must be lists")
+        if scope == "local" and entries:
+            raise ReadinessError("preflight local primary-route ownership must be empty")
+        seen: set[str] = set()
+        normalized[scope] = []
+        for entry in entries:
+            if not isinstance(entry, Mapping) or set(entry) != {
+                "prefix",
+                "owner_instance_id",
+                "online",
+            }:
+                raise ReadinessError(
+                    "preflight primary-route ownership claim has the wrong shape"
+                )
+            prefix = entry.get("prefix")
+            owner = entry.get("owner_instance_id")
+            if (
+                prefix not in expected_prefixes[scope]
+                or prefix in seen
+                or owner != expected_owners[scope].get(cast(str, prefix))
+                or entry.get("online") is not True
+            ):
+                raise ReadinessError(
+                    "preflight primary-route ownership is not bound to the protected fleet"
+                )
+            seen.add(cast(str, prefix))
+            normalized[scope].append(dict(entry))
+        if seen != set(expected_owners[scope]):
+            raise ReadinessError(
+                f"preflight {scope} prefixes lack exact configured primary-route ownership"
+            )
+        normalized[scope].sort(key=lambda entry: cast(str, entry["prefix"]))
+    return {
+        "observed_at": observed_at,
+        "remote": normalized["remote"],
+        "local": [],
+    }
 
 
 _EVIDENCE_KEYS = {
@@ -3220,14 +4968,781 @@ _SYMMETRIC_EVIDENCE_KEYS = {
     "kind",
     "run_id",
     "generated_at",
+    "status",
     "topology",
+    "endpoint_ids",
     "preflight",
+    "cold_initiation",
     "traversals",
     "recoveries",
     "transport",
+    "transport_router",
     "health_transitions",
+    "cost",
+    "lifecycle",
     "residual_audit",
+    "diagnostics",
+    "failure",
 }
+
+
+def _validate_route_snapshot_evidence(
+    value: Any,
+    *,
+    run_id: str,
+    member: SymmetricFleetMember,
+    route_table_id: str,
+    prefixes: tuple[str, ...],
+    target_eni: str,
+) -> None:
+    if not isinstance(value, Mapping) or set(value) != {
+        "route_table_id",
+        "vpc_id",
+        "ownership",
+        "routes",
+    }:
+        raise EvidenceError("GWLBE route snapshot has the wrong shape")
+    ownership = value.get("ownership")
+    if (
+        value.get("route_table_id") != route_table_id
+        or not isinstance(value.get("vpc_id"), str)
+        or _VPC_ID_RE.fullmatch(cast(str, value["vpc_id"])) is None
+        or ownership
+        != {
+            "EnvelopeRun": run_id,
+            "ManagedBy": "terraform",
+            "Profile": "symmetric-gwlb-ha-v2",
+            "Role": "gwlbe",
+            "ZoneKey": member.az_key,
+        }
+    ):
+        raise EvidenceError("GWLBE route snapshot ownership is invalid")
+    routes = value.get("routes")
+    if not isinstance(routes, list) or len(routes) != len(prefixes):
+        raise EvidenceError("GWLBE route snapshot does not cover every exact prefix")
+    by_prefix: dict[str, Mapping[str, Any]] = {}
+    for route in routes:
+        if not isinstance(route, Mapping) or set(route) != {
+            "destination_cidr_block",
+            "network_interface_id",
+            "origin",
+            "route_state",
+        }:
+            raise EvidenceError("GWLBE route snapshot route has the wrong shape")
+        prefix = route.get("destination_cidr_block")
+        if not isinstance(prefix, str) or prefix in by_prefix:
+            raise EvidenceError("GWLBE route snapshot prefix is invalid or duplicated")
+        by_prefix[prefix] = route
+    if set(by_prefix) != set(prefixes) or any(
+        route.get("network_interface_id") != target_eni
+        or route.get("origin") != "CreateRoute"
+        or route.get("route_state") != "active"
+        for route in by_prefix.values()
+    ):
+        raise EvidenceError("GWLBE route snapshot does not prove one exact active ENI target")
+
+
+def _validate_transport_router_evidence(
+    value: Any,
+    *,
+    topology: SymmetricTopologyV2,
+    recovery: Mapping[str, Any],
+    node_hashes_by_instance: Mapping[str, str],
+) -> None:
+    if not isinstance(value, Mapping) or set(value) != {"graceful", "abrupt"}:
+        raise EvidenceError("transport-router evidence must separate graceful and abrupt transactions")
+    graceful = value.get("graceful")
+    abrupt = value.get("abrupt")
+    exercise_keys = {
+        "control_plane",
+        "failed_id",
+        "alternate_id",
+        "probe",
+        "new_flows",
+        "new_flow_succeeded",
+        "recovery_duration_ms",
+        "route_replacement",
+        "restored",
+    }
+    if (
+        not isinstance(graceful, Mapping)
+        or set(graceful) != exercise_keys
+        or not isinstance(abrupt, Mapping)
+        or set(abrupt) != exercise_keys
+    ):
+        raise EvidenceError("coordinated transport-router evidence has the wrong shape")
+    all_routers = {
+        member.instance_id: member
+        for site in (topology.west, topology.east)
+        for member in site.transport_router_fleet
+    }
+    if (
+        set(node_hashes_by_instance) != set(all_routers)
+        or len(set(node_hashes_by_instance.values())) != len(all_routers)
+        or any(
+            re.fullmatch(r"[0-9a-f]{64}", str(value)) is None
+            for value in node_hashes_by_instance.values()
+        )
+    ):
+        raise EvidenceError(
+            "passing evidence does not bind distinct stable-node hashes to every router"
+        )
+    for label, exercise in (("graceful", graceful), ("abrupt", abrupt)):
+        failed = all_routers.get(cast(str, exercise.get("failed_id")))
+        alternate = all_routers.get(cast(str, exercise.get("alternate_id")))
+        duration = exercise.get("recovery_duration_ms")
+        probe = exercise.get("probe")
+        if (
+            exercise.get("control_plane") != "tailnet-and-gwlbe-route"
+            or failed is None
+            or alternate is None
+            or failed == alternate
+            or failed.site != alternate.site
+            or exercise.get("new_flow_succeeded") is not True
+            or exercise.get("restored") is not True
+            or isinstance(duration, bool)
+            or not isinstance(duration, int)
+            or not 1 <= duration <= 7_200_000
+            or not isinstance(probe, Mapping)
+            or probe.get("succeeded") is not True
+            or exercise.get("new_flows") != probe.get("new_flows")
+        ):
+            raise EvidenceError("transport-router exercise identity, bound, probe, or restoration is invalid")
+        if label == "graceful" and probe.get(
+            "destination_transport_router_id"
+        ) != alternate.instance_id:
+            raise EvidenceError("graceful transport evidence does not prove alternate Tailnet selection")
+        if label == "abrupt" and (
+            probe.get("source_transport_router_id") != alternate.instance_id
+            or probe.get("source_transport_eni_id") != alternate.network_interface_id
+        ):
+            raise EvidenceError("abrupt transport evidence does not prove alternate GWLBE ENI selection")
+        _validate_new_flow_matrix(exercise.get("new_flows"))
+        for item in cast(Mapping[str, Any], exercise["new_flows"]).values():
+            path = cast(Mapping[str, Any], item)["path"]
+            if (
+                label == "graceful"
+                and path.get("destination_transport_router_id") != alternate.instance_id
+            ) or (
+                label == "abrupt"
+                and (
+                    path.get("source_transport_router_id") != alternate.instance_id
+                    or path.get("source_transport_eni_id")
+                    != alternate.network_interface_id
+                )
+            ):
+                raise EvidenceError(
+                    "TCP/UDP new-flow paths do not bind the selected alternate router"
+                )
+
+    route_keys = {
+        "route_table_id",
+        "gwlbe_az_key",
+        "source_prefix",
+        "prefixes",
+        "current",
+        "alternate",
+        "bounds",
+        "before",
+        "advertisements",
+        "ownership",
+        "after",
+        "probe",
+        "restoration",
+        "restored",
+    }
+    member_keys = {
+        "instance_id",
+        "network_interface_id",
+        "baseline_advertisements",
+        "state_before",
+        "node_id_sha256",
+    }
+
+    def validate_advertisement_record(
+        value: Any, expected: Mapping[str, Any], *, field: str
+    ) -> None:
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != {"advertisements", "command"}
+            or value.get("advertisements") != expected
+            or value.get("command") is not None
+            and not isinstance(value.get("command"), Mapping)
+        ):
+            raise EvidenceError(f"{field} advertisement transition is invalid")
+
+    def validate_ownership_observation(
+        observation: Any,
+        *,
+        site: SymmetricSiteTopology,
+        expected_owners: Mapping[str, str],
+    ) -> None:
+        observers = observation.get("observers") if isinstance(observation, Mapping) else None
+        expected_observers = topology.site(_opposite(site.site)).transport_router_fleet
+        if (
+            not isinstance(observation, Mapping)
+            or set(observation) != {"quiet_window_seconds", "observers"}
+            or observation.get("quiet_window_seconds")
+            != topology.route_failover.quiet_window_seconds
+            or not isinstance(observers, list)
+            or len(observers) != len(expected_observers)
+        ):
+            raise EvidenceError("Tailnet ownership observation has the wrong bounded shape")
+        by_observer = {
+            item.get("observer_instance_id"): item
+            for item in observers
+            if isinstance(item, Mapping)
+        }
+        if set(by_observer) != {
+            member.instance_id for member in expected_observers
+        }:
+            raise EvidenceError("Tailnet ownership observation omits a protected observer")
+        for item in by_observer.values():
+            owners = item.get("owners")
+            if (
+                set(item) != {"observer_instance_id", "owners", "command"}
+                or not isinstance(owners, list)
+                or len(owners) != len(expected_owners)
+                or any(
+                    not isinstance(owner, Mapping)
+                    or set(owner)
+                    != {
+                        "prefix",
+                        "owner_instance_id",
+                        "owner_node_id_sha256",
+                    }
+                    or owner.get("owner_instance_id")
+                    != expected_owners.get(cast(str, owner.get("prefix")))
+                    or owner.get("owner_node_id_sha256")
+                    != node_hashes_by_instance.get(
+                        cast(str, owner.get("owner_instance_id"))
+                    )
+                    for owner in owners
+                )
+                or {cast(str, owner["prefix"]) for owner in owners}
+                != set(expected_owners)
+            ):
+                raise EvidenceError("Tailnet ownership observation selected a wrong stable owner")
+
+    for label, exercise in (("graceful", graceful), ("abrupt", abrupt)):
+        route = exercise.get("route_replacement")
+        if not isinstance(route, Mapping) or set(route) != route_keys:
+            raise EvidenceError("coordinated transport failover evidence has the wrong shape")
+        current_value = route.get("current")
+        alternate_value = route.get("alternate")
+        current = (
+            all_routers.get(cast(str, current_value.get("instance_id")))
+            if isinstance(current_value, Mapping)
+            else None
+        )
+        alternate = (
+            all_routers.get(cast(str, alternate_value.get("instance_id")))
+            if isinstance(alternate_value, Mapping)
+            else None
+        )
+        table_owners = [
+            member
+            for member in all_routers.values()
+            if member.gwlbe_route_table_id == route.get("route_table_id")
+            and member.az_key == route.get("gwlbe_az_key")
+        ]
+        table_owner = table_owners[0] if len(table_owners) == 1 else None
+        if (
+            not isinstance(current_value, Mapping)
+            or set(current_value) != member_keys
+            or not isinstance(alternate_value, Mapping)
+            or set(alternate_value) != member_keys
+            or current is None
+            or alternate is None
+            or table_owner is None
+            or current.site != alternate.site
+            or table_owner.site != current.site
+            or topology.route_failover.initial_router_az(
+                current.site, cast(str, route.get("gwlbe_az_key"))
+            )
+            != current.az_key
+            or route.get("source_prefix") != current.advertised_prefix
+            or table_owner.advertised_prefix != current.advertised_prefix
+            or current_value.get("baseline_advertisements")
+            != [current.advertised_prefix]
+            or alternate_value.get("baseline_advertisements")
+            != [alternate.advertised_prefix]
+            or current.network_interface_id
+            != current_value.get("network_interface_id")
+            or alternate.network_interface_id
+            != alternate_value.get("network_interface_id")
+            or any(
+                re.fullmatch(r"[0-9a-f]{64}", str(member.get("node_id_sha256", "")))
+                is None
+                for member in (current_value, alternate_value)
+            )
+            or current_value.get("node_id_sha256")
+            != node_hashes_by_instance.get(current.instance_id)
+            or alternate_value.get("node_id_sha256")
+            != node_hashes_by_instance.get(alternate.instance_id)
+            or current_value.get("node_id_sha256")
+            == alternate_value.get("node_id_sha256")
+            or route.get("restored") is not True
+            or exercise.get("failed_id") != current.instance_id
+            or exercise.get("alternate_id") != alternate.instance_id
+            or (label == "abrupt" and recovery.get("failed_id") != current.instance_id)
+        ):
+            raise EvidenceError("coordinated failover identities or source-prefix owner are invalid")
+        prefixes_value = route.get("prefixes")
+        prefixes = tuple(prefixes_value) if isinstance(prefixes_value, list) else ()
+        if prefixes != tuple(topology.site(current.site).remote_site_cidrs):
+            raise EvidenceError("GWLBE route prefixes differ from the exact remote-site allowlist")
+        expected_bounds = {
+            "approved_inputs": topology.route_failover.approved_bounds(),
+            "effective": {
+                "mutation_timeout_seconds": topology.route_failover.mutation_timeout_seconds,
+                "restoration_timeout_seconds": topology.route_failover.restoration_timeout_seconds,
+                **topology.route_failover.derived_bounds(),
+            },
+            "derivation": {
+                "settlement_timeout_seconds": "recovery_timeout_seconds",
+                "quiet_window_seconds": "min(10,max(1,restoration_timeout_seconds//10))",
+                "owner_lease_seconds": (
+                    "max(mutation_timeout_seconds,restoration_timeout_seconds,"
+                    "recovery_timeout_seconds,165,45)+quiet_window_seconds+15"
+                ),
+            },
+        }
+        if route.get("bounds") != expected_bounds:
+            raise EvidenceError("coordinated failover bounds are invalid")
+        assert table_owner.gwlbe_route_table_id is not None
+        assert current.network_interface_id is not None
+        assert alternate.network_interface_id is not None
+        _validate_route_snapshot_evidence(
+            route.get("before"),
+            run_id=topology.run_id,
+            member=table_owner,
+            route_table_id=table_owner.gwlbe_route_table_id,
+            prefixes=prefixes,
+            target_eni=current.network_interface_id,
+        )
+        _validate_route_snapshot_evidence(
+            route.get("after"),
+            run_id=topology.run_id,
+            member=table_owner,
+            route_table_id=table_owner.gwlbe_route_table_id,
+            prefixes=prefixes,
+            target_eni=alternate.network_interface_id,
+        )
+        advertisements = route.get("advertisements")
+        forward_generation = (
+            advertisements.get("forward_generation")
+            if isinstance(advertisements, Mapping)
+            else None
+        )
+        restore_generation = (
+            advertisements.get("restore_generation")
+            if isinstance(advertisements, Mapping)
+            else None
+        )
+        if (
+            not isinstance(advertisements, Mapping)
+            or set(advertisements)
+            != {
+                "forward_generation",
+                "restore_generation",
+                "failure_mode",
+                "alternate_expansion",
+                "current_withdrawal",
+            }
+            or advertisements.get("failure_mode") != label
+            or any(
+                re.fullmatch(
+                    r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                    str(advertisements.get(field, "")),
+                )
+                is None
+                for field in ("forward_generation", "restore_generation")
+            )
+            or forward_generation == restore_generation
+            or not isinstance(advertisements.get("alternate_expansion"), Mapping)
+            or not isinstance(advertisements.get("current_withdrawal"), Mapping)
+        ):
+            raise EvidenceError("fenced advertisement mutation evidence is invalid")
+        current_before = current_value.get("state_before")
+        alternate_before = alternate_value.get("state_before")
+        current_before_state = (
+            current_before.get("advertisements")
+            if isinstance(current_before, Mapping)
+            else None
+        )
+        alternate_before_state = (
+            alternate_before.get("advertisements")
+            if isinstance(alternate_before, Mapping)
+            else None
+        )
+        if (
+            not isinstance(current_before_state, Mapping)
+            or not isinstance(alternate_before_state, Mapping)
+            or not isinstance(current_before_state.get("generation"), str)
+            or not current_before_state.get("generation")
+            or not isinstance(alternate_before_state.get("generation"), str)
+            or not alternate_before_state.get("generation")
+            or current_before_state.get("generation")
+            == alternate_before_state.get("generation")
+            or current_before_state.get("generation")
+            in {forward_generation, restore_generation}
+            or alternate_before_state.get("generation")
+            in {forward_generation, restore_generation}
+        ):
+            raise EvidenceError("advertisement predecessor generations are not distinct")
+        validate_advertisement_record(
+            current_before,
+            {
+                "generation": current_before_state["generation"],
+                "routes": [current.advertised_prefix],
+                "service": "running",
+                "mode": "normal",
+            },
+            field="current baseline",
+        )
+        validate_advertisement_record(
+            alternate_before,
+            {
+                "generation": alternate_before_state["generation"],
+                "routes": [alternate.advertised_prefix],
+                "service": "running",
+                "mode": "normal",
+            },
+            field="alternate baseline",
+        )
+        validate_advertisement_record(
+            advertisements["alternate_expansion"],
+            {
+                "generation": forward_generation,
+                "routes": sorted(
+                    {
+                        cast(str, current.advertised_prefix),
+                        cast(str, alternate.advertised_prefix),
+                    }
+                ),
+                "service": "running",
+                "mode": "normal",
+            },
+            field="alternate expansion",
+        )
+        validate_advertisement_record(
+            advertisements["current_withdrawal"],
+            {
+                "generation": forward_generation,
+                "routes": [],
+                "service": "stopped",
+                "mode": label,
+            },
+            field="current withdrawal",
+        )
+        baseline_owners = {
+            cast(str, member.advertised_prefix): member.instance_id
+            for member in topology.site(current.site).transport_router_fleet
+        }
+        transferred_owners = dict(baseline_owners)
+        transferred_owners[cast(str, current.advertised_prefix)] = alternate.instance_id
+        ownership = route.get("ownership")
+        if not isinstance(ownership, Mapping) or set(ownership) != {
+            "before",
+            "transferred",
+        }:
+            raise EvidenceError("coordinated Tailnet ownership evidence is invalid")
+        validate_ownership_observation(
+            ownership.get("before"),
+            site=topology.site(current.site),
+            expected_owners=baseline_owners,
+        )
+        validate_ownership_observation(
+            ownership.get("transferred"),
+            site=topology.site(current.site),
+            expected_owners=transferred_owners,
+        )
+        restoration = route.get("restoration")
+        if (
+            not isinstance(restoration, Mapping)
+            or set(restoration)
+            != {"status", "advertisements", "ownership", "routes"}
+            or restoration.get("status") != "verified"
+            or any(
+                not isinstance(restoration.get(component), Mapping)
+                or restoration[component].get("status") != "verified"
+                for component in ("advertisements", "ownership", "routes")
+            )
+        ):
+            raise EvidenceError("coordinated failover restoration is incomplete")
+        restored_advertisements = cast(
+            Mapping[str, Any], restoration["advertisements"]
+        )
+        verification = restored_advertisements.get("verification")
+        expected_restored_states = {
+            "current": {
+                "generation": restore_generation,
+                "routes": [current.advertised_prefix],
+                "service": "running",
+                "mode": "normal",
+            },
+            "alternate": {
+                "generation": restore_generation,
+                "routes": [alternate.advertised_prefix],
+                "service": "running",
+                "mode": "normal",
+            },
+        }
+        if (
+            set(restored_advertisements)
+            != {"status", "current", "alternate", "verification", "failures"}
+            or restored_advertisements.get("failures") != []
+            or not isinstance(verification, Mapping)
+            or set(verification) != {"current", "alternate"}
+        ):
+            raise EvidenceError("advertisement restoration is incomplete or ambiguous")
+        for member_label, expected_state in expected_restored_states.items():
+            validate_advertisement_record(
+                restored_advertisements.get(member_label),
+                expected_state,
+                field=f"restored {member_label}",
+            )
+            validate_advertisement_record(
+                verification.get(member_label),
+                expected_state,
+                field=f"verified {member_label}",
+            )
+        restored_ownership = cast(Mapping[str, Any], restoration["ownership"])
+        if set(restored_ownership) != {"status", "observation"}:
+            raise EvidenceError("Tailnet ownership restoration is incomplete")
+        restored_routes = cast(Mapping[str, Any], restoration["routes"])
+        if (
+            set(restored_routes)
+            != {
+                "status",
+                "attempted_prefixes",
+                "api_failures",
+                "settled_prefixes",
+                "quiet_window_seconds",
+                "snapshot",
+            }
+            or
+            restored_routes.get("attempted_prefixes") != list(prefixes)
+            or restored_routes.get("settled_prefixes") != list(prefixes)
+            or restored_routes.get("api_failures") != []
+            or restored_routes.get("quiet_window_seconds")
+            != topology.route_failover.quiet_window_seconds
+        ):
+            raise EvidenceError("GWLBE route restoration is incomplete")
+        _validate_route_snapshot_evidence(
+            restored_routes.get("snapshot"),
+            run_id=topology.run_id,
+            member=table_owner,
+            route_table_id=table_owner.gwlbe_route_table_id,
+            prefixes=prefixes,
+            target_eni=current.network_interface_id,
+        )
+        validate_ownership_observation(
+            restored_ownership.get("observation"),
+            site=topology.site(current.site),
+            expected_owners=baseline_owners,
+        )
+        route_probe = route.get("probe")
+        if (
+            not isinstance(route_probe, Mapping)
+            or route_probe.get("succeeded") is not True
+            or (
+                label == "graceful"
+                and route_probe.get("destination_transport_router_id")
+                != alternate.instance_id
+            )
+            or (
+                label == "abrupt"
+                and (
+                    route_probe.get("source_transport_router_id")
+                    != alternate.instance_id
+                    or route_probe.get("source_transport_eni_id")
+                    != alternate.network_interface_id
+                )
+            )
+        ):
+            raise EvidenceError("coordinated failover probe does not prove the alternate owner")
+
+
+def _validate_geneve_fidelity_evidence(value: Any, *, target_id: str) -> None:
+    expected_keys = {
+        "observed",
+        "target_id",
+        "capture_sha256",
+        "capture_frame_count",
+        "raw_pcap_deleted",
+        "pairs",
+    }
+    pairs = value.get("pairs") if isinstance(value, Mapping) else None
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != expected_keys
+        or value.get("observed") is not True
+        or value.get("target_id") != target_id
+        or re.fullmatch(r"[0-9a-f]{64}", str(value.get("capture_sha256", ""))) is None
+        or isinstance(value.get("capture_frame_count"), bool)
+        or not isinstance(value.get("capture_frame_count"), int)
+        or not 2 <= value.get("capture_frame_count", 0) <= 512
+        or value.get("raw_pcap_deleted") is not True
+        or not isinstance(pairs, list)
+        or not 1 <= len(pairs) <= 2
+    ):
+        raise EvidenceError("GENEVE fidelity is not backed by a bounded deleted AF_PACKET capture")
+    pair_keys = {
+        "direction",
+        "ingress_frame_sha256",
+        "return_frame_sha256",
+        "inner_packet_sha256",
+        "ordered_options_sha256",
+        "flow_cookie_sha256",
+        "vni",
+        "outer_tuple_swapped",
+        "return_source_port_preserved",
+    }
+    directions: set[str] = set()
+    for pair in pairs:
+        hashes = (
+            pair.get("ingress_frame_sha256"),
+            pair.get("return_frame_sha256"),
+            pair.get("inner_packet_sha256"),
+            pair.get("ordered_options_sha256"),
+            pair.get("flow_cookie_sha256"),
+        ) if isinstance(pair, Mapping) else ()
+        if (
+            not isinstance(pair, Mapping)
+            or set(pair) != pair_keys
+            or pair.get("direction") not in {"request", "reply"}
+            or pair.get("direction") in directions
+            or any(re.fullmatch(r"[0-9a-f]{64}", str(value)) is None for value in hashes)
+            or pair.get("vni") != 0
+            or pair.get("outer_tuple_swapped") is not True
+            or pair.get("return_source_port_preserved") is not True
+        ):
+            raise EvidenceError("GENEVE capture pair does not prove exact ingress/return fidelity")
+        directions.add(cast(str, pair["direction"]))
+
+
+def _validate_new_flow_matrix(value: Any) -> None:
+    if not isinstance(value, Mapping) or set(value) != set(TRANSPORT_PROTOCOLS):
+        raise EvidenceError("failure evidence does not contain exact TCP and UDP new flows")
+    for protocol in TRANSPORT_PROTOCOLS:
+        item = value.get(protocol)
+        path = item.get("path") if isinstance(item, Mapping) else None
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != {"succeeded", "path"}
+            or item.get("succeeded") is not True
+            or not isinstance(path, Mapping)
+            or path.get("protocol") != protocol
+        ):
+            raise EvidenceError(f"{protocol} new-flow recovery path is not explicit")
+
+
+def _validate_failure_transport_measurement(
+    value: Any, *, allowed_failed_ids: set[str]
+) -> dict[str, str]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "failed_ids",
+        "tcp",
+        "udp",
+        "receivers",
+    }:
+        raise EvidenceError("failure transport measurement has the wrong shape")
+    failed_ids = value.get("failed_ids")
+    if (
+        not isinstance(failed_ids, Mapping)
+        or set(failed_ids) != {"tcp", "udp"}
+        or any(identifier not in allowed_failed_ids for identifier in failed_ids.values())
+    ):
+        raise EvidenceError("failure transport measurement is not bound to its failed members")
+    stream_keys = {
+        "protocol",
+        "flow_id",
+        "outcome",
+        "one_socket",
+        "analysis_available",
+        "sent_markers",
+        "received_markers",
+        "lost_markers",
+        "loss_percent",
+        "maximum_interruption_ms",
+        "threshold_ms",
+        "within_threshold",
+    }
+    for protocol in TRANSPORT_PROTOCOLS:
+        stream = value.get(protocol)
+        if (
+            not isinstance(stream, Mapping)
+            or set(stream) != stream_keys
+            or stream.get("protocol") != protocol
+            or not isinstance(stream.get("flow_id"), str)
+            or _LABEL_RE.fullmatch(cast(str, stream.get("flow_id"))) is None
+            or stream.get("one_socket") is not True
+            or isinstance(stream.get("threshold_ms"), bool)
+            or not isinstance(stream.get("threshold_ms"), int)
+            or not 1 <= stream.get("threshold_ms", 0) <= 7_200_000
+            or stream.get("within_threshold") is not True
+        ):
+            raise EvidenceError(f"{protocol} failure stream identity or threshold is invalid")
+        if stream.get("outcome") == "interrupted":
+            if (
+                protocol != "tcp"
+                or stream.get("analysis_available") is not False
+                or any(
+                    stream.get(field) is not None
+                    for field in (
+                        "sent_markers",
+                        "received_markers",
+                        "lost_markers",
+                        "loss_percent",
+                        "maximum_interruption_ms",
+                    )
+                )
+            ):
+                raise EvidenceError("interrupted TCP measurement retained invalid analysis claims")
+            continue
+        sent = stream.get("sent_markers")
+        received = stream.get("received_markers")
+        lost = stream.get("lost_markers")
+        loss = stream.get("loss_percent")
+        interruption = stream.get("maximum_interruption_ms")
+        if (
+            stream.get("outcome") != "resumed"
+            or stream.get("analysis_available") is not True
+            or any(isinstance(item, bool) or not isinstance(item, int) for item in (sent, received, lost))
+            or not 2 <= cast(int, received) <= cast(int, sent)
+            or cast(int, lost) != cast(int, sent) - cast(int, received)
+            or isinstance(loss, bool)
+            or not isinstance(loss, (int, float))
+            or not math.isclose(
+                float(loss), cast(int, lost) * 100.0 / cast(int, sent), abs_tol=1e-9
+            )
+            or isinstance(interruption, bool)
+            or not isinstance(interruption, int)
+            or not 0 <= interruption <= cast(int, stream["threshold_ms"])
+        ):
+            raise EvidenceError(f"{protocol} failure stream loss or interruption is invalid")
+    receivers = value.get("receivers")
+    if (
+        not isinstance(receivers, Mapping)
+        or set(receivers)
+        != {
+            "tcp_sessions",
+            "tcp_duplicates",
+            "udp_sessions",
+            "udp_duplicates",
+        }
+        or receivers
+        != {
+            "tcp_sessions": 1,
+            "tcp_duplicates": 0,
+            "udp_sessions": 1,
+            "udp_duplicates": 0,
+        }
+    ):
+        raise EvidenceError("failure stream receiver identity or duplicate count is invalid")
+    return {"tcp": cast(str, failed_ids["tcp"]), "udp": cast(str, failed_ids["udp"])}
 
 
 def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
@@ -3241,16 +5756,81 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
     if document.get("schema") != SYMMETRIC_EVIDENCE_SCHEMA or document.get("kind") != SYMMETRIC_EVIDENCE_KIND:
         raise EvidenceError("symmetric evidence schema or kind is invalid")
     _validate_generated_at(document.get("generated_at"))
+    status = document.get("status")
+    failure = document.get("failure")
+    diagnostics = document.get("diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        raise EvidenceError("symmetric evidence diagnostics must be an object")
+    if status == "failed":
+        if (
+            not isinstance(failure, Mapping)
+            or set(failure) != {"phase", "category", "message"}
+            or not all(isinstance(failure.get(field), str) for field in failure)
+            or not isinstance(document.get("lifecycle"), Mapping)
+            or not isinstance(document.get("residual_audit"), Mapping)
+            or not all(
+                isinstance(document.get(field), list)
+                for field in ("cold_initiation", "traversals", "recoveries", "health_transitions")
+            )
+            or not all(
+                isinstance(document.get(field), Mapping)
+                for field in (
+                    "topology",
+                    "endpoint_ids",
+                    "preflight",
+                    "transport",
+                    "transport_router",
+                    "cost",
+                )
+            )
+        ):
+            raise EvidenceError("failed symmetric evidence has an invalid failure bundle")
+        return _normalize_safe_evidence(document)
+    if status != "passed" or failure is not None:
+        raise EvidenceError("symmetric evidence is not a valid passing or failed acceptance bundle")
     try:
         topology = parse_symmetric_topology_v2(document.get("topology"))
     except DeploymentError as error:
         raise EvidenceError(f"symmetric evidence topology is invalid: {error}") from None
     if document.get("run_id") != topology.run_id:
         raise EvidenceError("symmetric evidence run ID does not match its topology")
+    raw_endpoints = document.get("endpoint_ids")
+    if not isinstance(raw_endpoints, Mapping) or set(raw_endpoints) != set(SITES):
+        raise EvidenceError("symmetric evidence endpoint identities are incomplete")
+    endpoint_ids: dict[Site, dict[str, str]] = {}
+    for site in SITES:
+        values = raw_endpoints[site]
+        expected_az_keys = {member.az_key for member in topology.site(site).target_fleet}
+        if (
+            not isinstance(values, Mapping)
+            or set(values) != expected_az_keys
+            or any(not isinstance(value, str) or _VPCE_ID_RE.fullmatch(value) is None for value in values.values())
+        ):
+            raise EvidenceError(f"symmetric evidence {site} GWLBE identities differ from its fleet AZs")
+        endpoint_ids[site] = {str(key): str(value) for key, value in values.items()}
+    flattened_endpoints = [value for values in endpoint_ids.values() for value in values.values()]
+    if len(flattened_endpoints) != len(set(flattened_endpoints)):
+        raise EvidenceError("symmetric evidence GWLBE identities are not globally distinct")
     try:
-        validate_symmetric_preflight(topology, document.get("preflight"))
+        validated_preflight = validate_symmetric_preflight(
+            topology, document.get("preflight")
+        )
     except (DeploymentError, ReadinessError) as error:
         raise EvidenceError(f"symmetric evidence preflight is invalid: {error}") from None
+    node_hashes_by_instance = {
+        member.instance_id: cast(
+            str,
+            validated_preflight["sites"][site]["transport_routers"][
+                member.instance_id
+            ]["tailnet_node_id_sha256"],
+        )
+        for site in SITES
+        for member in topology.site(site).transport_router_fleet
+    }
+    if len(set(node_hashes_by_instance.values())) != len(node_hashes_by_instance):
+        raise EvidenceError(
+            "passing preflight reuses a stable Tailnet node hash across routers"
+        )
 
     traversals = document.get("traversals")
     if not isinstance(traversals, list) or len(traversals) != 2:
@@ -3258,70 +5838,505 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
     expected_directions = {("west", "east"), ("east", "west")}
     observed_directions: set[tuple[str, str]] = set()
     for item in traversals:
-        if not isinstance(item, Mapping) or set(item) != {"source_site", "destination_site", "gwlbe_id", "target_id", "ingress_router_id", "protocols", "source_preserved"}:
+        if not isinstance(item, Mapping) or set(item) != {
+            "source_site",
+            "destination_site",
+            "probes",
+        }:
             raise EvidenceError("symmetric traversal has the wrong shape")
         source, destination = item.get("source_site"), item.get("destination_site")
         if (source, destination) not in expected_directions or (source, destination) in observed_directions:
             raise EvidenceError("symmetric traversal direction is invalid or duplicated")
         source_site = topology.site(cast(Site, source))
         destination_site = topology.site(cast(Site, destination))
-        target_ids = {member.instance_id for member in source_site.target_fleet}
-        router_ids = {member.instance_id for member in destination_site.ingress_router_fleet}
-        if (
-            not isinstance(item.get("gwlbe_id"), str)
-            or not _VPCE_ID_RE.fullmatch(cast(str, item["gwlbe_id"]))
-            or item.get("target_id") not in target_ids
-            or item.get("ingress_router_id") not in router_ids
-            or item.get("protocols") != list(PROTOCOLS)
-            or item.get("source_preserved") is not True
-        ):
-            raise EvidenceError("symmetric traversal lacks exact GWLB target, ingress router, or protocol proof")
+        source_target_ids = {member.instance_id for member in source_site.target_fleet}
+        destination_target_ids = {member.instance_id for member in destination_site.target_fleet}
+        source_router_ids = {
+            member.instance_id for member in source_site.transport_router_fleet
+        }
+        router_ids = {
+            member.instance_id for member in destination_site.transport_router_fleet
+        }
+        probes = item.get("probes")
+        if not isinstance(probes, list) or len(probes) != len(PROTOCOLS) * len(WORKLOAD_ROLES):
+            raise EvidenceError("symmetric traversal lacks exact protocol proof")
+        observed_flows: list[tuple[str, str, str]] = []
+        for probe in probes:
+            if not isinstance(probe, Mapping) or set(probe) != {
+                "protocol",
+                "source_role",
+                "destination_role",
+                "source_az_key",
+                "destination_az_key",
+                "source_gwlbe_id",
+                "destination_gwlbe_id",
+                "source_target_id",
+                "destination_target_id",
+                "source_transport_router_id",
+                "source_transport_eni_id",
+                "destination_transport_router_id",
+                "geneve_return_proof",
+                "source_preserved",
+            }:
+                raise EvidenceError("symmetric traversal probe has the wrong shape")
+            if (
+                probe.get("protocol") not in PROTOCOLS
+                or probe.get("source_role") not in WORKLOAD_ROLES
+                or probe.get("destination_role") != _opposite_workload_role(cast(WorkloadRole, probe.get("source_role")))
+                or probe.get("source_az_key") not in endpoint_ids[cast(Site, source)]
+                or probe.get("destination_az_key")
+                not in endpoint_ids[cast(Site, destination)]
+                or probe.get("source_gwlbe_id")
+                != endpoint_ids[cast(Site, source)].get(str(probe.get("source_az_key")))
+                or probe.get("source_target_id") not in source_target_ids
+                or probe.get("destination_target_id") not in destination_target_ids
+                or probe.get("source_transport_router_id") not in source_router_ids
+                or probe.get("destination_transport_router_id") not in router_ids
+                or probe.get("source_preserved") is not True
+            ):
+                raise EvidenceError("symmetric traversal probe lacks exact target, router, or source proof")
+            source_router = next(
+                member
+                for member in source_site.transport_router_fleet
+                if member.instance_id == probe.get("source_transport_router_id")
+            )
+            if (
+                source_router.az_key
+                != topology.route_failover.initial_router_az(
+                    cast(Site, source), cast(str, probe.get("source_az_key"))
+                )
+                or probe.get("source_transport_eni_id") != source_router.network_interface_id
+                or source_router.advertised_prefix
+                != next(
+                    member.advertised_prefix
+                    for member in source_site.transport_router_fleet
+                    if member.az_key == probe.get("source_az_key")
+                )
+            ):
+                raise EvidenceError(
+                    "symmetric traversal probe lacks its source GWLBE's same-AZ transport ENI"
+                )
+            destination_transport_router = next(
+                member
+                for member in destination_site.transport_router_fleet
+                if member.instance_id == probe.get("destination_transport_router_id")
+            )
+            if probe.get("destination_gwlbe_id") != endpoint_ids[cast(Site, destination)][
+                cast(str, probe.get("destination_az_key"))
+            ] or destination_transport_router.az_key != probe.get("destination_az_key"):
+                raise EvidenceError(
+                    "symmetric traversal probe lacks its configured destination prefix owner's same-AZ GWLBE"
+                )
+            return_proof = probe.get("geneve_return_proof")
+            if not isinstance(return_proof, Mapping) or set(return_proof) != {
+                "source",
+                "destination",
+            }:
+                raise EvidenceError("symmetric traversal probe omits GENEVE return proof")
+            for side, target_id in (
+                ("source", probe.get("source_target_id")),
+                ("destination", probe.get("destination_target_id")),
+            ):
+                proof = return_proof.get(side)
+                metrics = proof.get("metrics") if isinstance(proof, Mapping) else None
+                fidelity = proof.get("fidelity") if isinstance(proof, Mapping) else None
+                if (
+                    not isinstance(proof, Mapping)
+                    or set(proof) != {
+                        "target_id",
+                        "metrics",
+                        "fidelity",
+                    }
+                    or proof.get("target_id") != target_id
+                    or not isinstance(metrics, Mapping)
+                    or set(metrics)
+                    != {
+                        "geneve_rx_packets_delta",
+                        "geneve_tx_packets_delta",
+                        "geneve_options_validation_errors_delta",
+                        "gwlb_profile_rejections_total_delta",
+                        "gwlb_receive_drops_total_delta",
+                        "gwlb_inner_validation_failures_total_delta",
+                        "gwlb_return_build_failures_total_delta",
+                        "gwlb_send_failures_total_delta",
+                        "drops_delta",
+                        "gwlb_target_ready",
+                        "components_ready",
+                    }
+                    or any(
+                        isinstance(metrics.get(name), bool)
+                        or not isinstance(metrics.get(name), (int, float))
+                        or not math.isfinite(cast(float, metrics.get(name)))
+                        or cast(float, metrics.get(name)) <= 0
+                        for name in ("geneve_rx_packets_delta", "geneve_tx_packets_delta")
+                    )
+                    or metrics.get("geneve_rx_packets_delta")
+                    != metrics.get("geneve_tx_packets_delta")
+                    or any(
+                        metrics.get(name) != 0
+                        for name in (
+                            "geneve_options_validation_errors_delta",
+                            "gwlb_profile_rejections_total_delta",
+                            "gwlb_receive_drops_total_delta",
+                            "gwlb_inner_validation_failures_total_delta",
+                            "gwlb_return_build_failures_total_delta",
+                            "gwlb_send_failures_total_delta",
+                            "drops_delta",
+                        )
+                    )
+                    or metrics.get("gwlb_target_ready") != 1
+                    or metrics.get("components_ready")
+                    != {"receiver": 1, "validation": 1, "sender": 1}
+                ):
+                    raise EvidenceError(
+                        "symmetric traversal probe does not prove packet-scoped target turnaround fidelity"
+                    )
+                _validate_geneve_fidelity_evidence(
+                    fidelity, target_id=cast(str, target_id)
+                )
+            observed_flows.append(
+                (
+                    cast(str, probe["source_role"]),
+                    cast(str, probe["destination_role"]),
+                    cast(str, probe["protocol"]),
+                )
+            )
+        expected_flows = [
+            (source_role, _opposite_workload_role(source_role), protocol)
+            for source_role in WORKLOAD_ROLES
+            for protocol in PROTOCOLS
+        ]
+        if observed_flows != expected_flows:
+            raise EvidenceError("symmetric traversal roles or protocols are incomplete or out of order")
         observed_directions.add((cast(str, source), cast(str, destination)))
     if observed_directions != expected_directions:
         raise EvidenceError("symmetric evidence is not bidirectional")
+    cold = document.get("cold_initiation")
+    if not isinstance(cold, list) or len(cold) != len(SITES) * len(PROTOCOLS):
+        raise EvidenceError("symmetric evidence requires six simultaneous bidirectional cold initiations")
+    cold_intervals: list[tuple[int, int]] = []
+    cold_directions: set[tuple[str, str]] = set()
+    observed_cold_flows: set[tuple[str, str, str, str, str]] = set()
+    for item in cold:
+        if not isinstance(item, Mapping) or set(item) != {
+            "source_site",
+            "destination_site",
+            "source_role",
+            "destination_role",
+            "protocol",
+            "source_az_key",
+            "source_gwlbe_id",
+            "dispatch_monotonic_ns",
+            "succeeded",
+        }:
+            raise EvidenceError("symmetric cold initiation has the wrong shape")
+        source, destination = item.get("source_site"), item.get("destination_site")
+        dispatched = item.get("dispatch_monotonic_ns")
+        identity = (
+            str(source),
+            str(destination),
+            str(item.get("source_role")),
+            str(item.get("destination_role")),
+            str(item.get("protocol")),
+        )
+        if (
+            (source, destination) not in expected_directions
+            or identity in observed_cold_flows
+            or item.get("source_role") not in WORKLOAD_ROLES
+            or item.get("destination_role")
+            != _opposite_workload_role(cast(WorkloadRole, item.get("source_role")))
+            or item.get("protocol") not in PROTOCOLS
+            or item.get("source_az_key") not in endpoint_ids.get(cast(Site, source), {})
+            or item.get("source_gwlbe_id")
+            != endpoint_ids.get(cast(Site, source), {}).get(str(item.get("source_az_key")))
+            or item.get("succeeded") is not True
+            or isinstance(dispatched, bool)
+            or not isinstance(dispatched, int)
+            or dispatched <= 0
+        ):
+            raise EvidenceError("symmetric cold initiation identity or timing is invalid")
+        cold_directions.add((cast(str, source), cast(str, destination)))
+        observed_cold_flows.add(cast(tuple[str, str, str, str, str], identity))
+        cold_intervals.append((cast(int, dispatched), cast(int, dispatched)))
+    expected_cold_flows = {
+        ("west", "east", "initiator", "responder", protocol)
+        for protocol in PROTOCOLS
+    } | {
+        ("east", "west", "responder", "initiator", protocol)
+        for protocol in PROTOCOLS
+    }
+    if (
+        cold_directions != expected_directions
+        or observed_cold_flows != expected_cold_flows
+        or max(start for start, _finish in cold_intervals)
+        - min(start for start, _finish in cold_intervals)
+        > 1_000_000_000
+    ):
+        raise EvidenceError("symmetric cold initiation did not dispatch all flows concurrently")
 
     recoveries = document.get("recoveries")
-    if not isinstance(recoveries, list) or len(recoveries) != 2:
-        raise EvidenceError("symmetric evidence requires target and ingress-router recovery records")
-    expected_recovery_kinds = {"target", "ingress-router"}
+    if not isinstance(recoveries, list) or len(recoveries) != 3:
+        raise EvidenceError("symmetric evidence requires process, instance, and transport-router recovery records")
+    expected_recovery_kinds = {"target-process", "target-instance", "transport-router"}
     seen_kinds: set[str] = set()
+    recovery_records: dict[str, Mapping[str, Any]] = {}
     for item in recoveries:
-        if not isinstance(item, Mapping) or set(item) != {"kind", "site", "failed_id", "alternate_id", "new_flow_succeeded", "recovery_duration_ms"}:
+        kind = item.get("kind") if isinstance(item, Mapping) else None
+        expected_keys = {
+            "kind",
+            "site",
+            "failed_id",
+            "alternate_id",
+            "new_flow_succeeded",
+            "new_flows",
+            "recovery_duration_ms",
+        }
+        if kind == "target-instance":
+            expected_keys.update(
+                {
+                    "replacement_id",
+                    "replacement_ready",
+                    "drain_state",
+                    "drain_duration_ms",
+                    "old_process_generation_sha256",
+                    "replacement_process_generation_sha256",
+                    "target_group_arn",
+                    "registration_port",
+                }
+            )
+        if not isinstance(item, Mapping) or set(item) != expected_keys:
             raise EvidenceError("symmetric recovery has the wrong shape")
-        kind, site = item.get("kind"), item.get("site")
+        site = item.get("site")
         if kind not in expected_recovery_kinds or kind in seen_kinds or site not in SITES:
             raise EvidenceError("symmetric recovery kind or site is invalid")
-        fleet = topology.site(cast(Site, site)).target_fleet if kind == "target" else topology.site(cast(Site, site)).ingress_router_fleet
+        fleet = (
+            topology.site(cast(Site, site)).transport_router_fleet
+            if kind == "transport-router"
+            else topology.site(cast(Site, site)).target_fleet
+        )
         identifiers = {member.instance_id for member in fleet}
         duration = item.get("recovery_duration_ms")
         if item.get("failed_id") not in identifiers or item.get("alternate_id") not in identifiers or item["failed_id"] == item["alternate_id"] or item.get("new_flow_succeeded") is not True or isinstance(duration, bool) or not isinstance(duration, int) or not 1 <= duration <= 7_200_000:
             raise EvidenceError("symmetric recovery does not prove bounded alternate-path new-flow recovery")
+        _validate_new_flow_matrix(item.get("new_flows"))
+        if kind == "target-instance":
+            replacement_id = item.get("replacement_id")
+            drain_duration = item.get("drain_duration_ms")
+            if (
+                not isinstance(replacement_id, str)
+                or _INSTANCE_ID_RE.fullmatch(replacement_id) is None
+                or replacement_id in identifiers
+                or item.get("replacement_ready") is not True
+                or item.get("drain_state") not in {"draining", "unused", "deregistered"}
+                or isinstance(drain_duration, bool)
+                or not isinstance(drain_duration, int)
+                or drain_duration < 1
+                or re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(item.get("old_process_generation_sha256", "")),
+                )
+                is None
+                or re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(item.get("replacement_process_generation_sha256", "")),
+                )
+                is None
+                or item.get("old_process_generation_sha256")
+                == item.get("replacement_process_generation_sha256")
+                or _TARGET_GROUP_ARN_RE.fullmatch(str(item.get("target_group_arn", "")))
+                is None
+                or item.get("registration_port") != 6081
+            ):
+                raise EvidenceError("symmetric target replacement lacks exact drain or replacement readiness proof")
         seen_kinds.add(cast(str, kind))
+        recovery_records[cast(str, kind)] = item
     if seen_kinds != expected_recovery_kinds:
         raise EvidenceError("symmetric evidence omits a recovery class")
+    _validate_transport_router_evidence(
+        document.get("transport_router"),
+        topology=topology,
+        recovery=recovery_records["transport-router"],
+        node_hashes_by_instance=node_hashes_by_instance,
+    )
 
     transport = document.get("transport")
-    if not isinstance(transport, Mapping) or set(transport) != {"established_tcp_outcome", "udp_sent", "udp_received", "udp_loss_percent"}:
-        raise EvidenceError("symmetric evidence transport has the wrong shape")
-    sent, received, loss = transport.get("udp_sent"), transport.get("udp_received"), transport.get("udp_loss_percent")
-    if transport.get("established_tcp_outcome") not in {"resumed", "interrupted", "failed"} or isinstance(sent, bool) or not isinstance(sent, int) or sent < 1 or isinstance(received, bool) or not isinstance(received, int) or not 0 <= received <= sent or isinstance(loss, bool) or not isinstance(loss, (int, float)) or not math.isfinite(loss) or not math.isclose(float(loss), (sent - received) * 100.0 / sent, abs_tol=1e-9):
-        raise EvidenceError("symmetric evidence transport outcome or UDP loss is invalid")
+    if not isinstance(transport, Mapping) or set(transport) != {
+        "target_process",
+        "target_instance",
+        "transport_router",
+    }:
+        raise EvidenceError("symmetric evidence transport matrix has the wrong shape")
+    process_site = cast(Site, recovery_records["target-process"]["site"])
+    target_ids = {member.instance_id for member in topology.site(process_site).target_fleet}
+    process_failed_ids = _validate_failure_transport_measurement(
+        transport["target_process"], allowed_failed_ids=target_ids
+    )
+    instance_site = cast(Site, recovery_records["target-instance"]["site"])
+    instance_ids = {
+        member.instance_id for member in topology.site(instance_site).target_fleet
+    }
+    instance_failed_ids = _validate_failure_transport_measurement(
+        transport["target_instance"], allowed_failed_ids=instance_ids
+    )
+    if set(instance_failed_ids.values()) != {
+        recovery_records["target-instance"]["failed_id"]
+    }:
+        raise EvidenceError("target-instance streams are not bound to the replaced target")
+    router_transport = transport.get("transport_router")
+    if not isinstance(router_transport, Mapping) or set(router_transport) != {
+        "graceful",
+        "abrupt",
+    }:
+        raise EvidenceError("transport-router failure matrix has the wrong shape")
+    all_router_ids = {
+        member.instance_id
+        for site in (topology.west, topology.east)
+        for member in site.transport_router_fleet
+    }
+    graceful_failed_ids = _validate_failure_transport_measurement(
+        router_transport["graceful"], allowed_failed_ids=all_router_ids
+    )
+    abrupt_failed_ids = _validate_failure_transport_measurement(
+        router_transport["abrupt"], allowed_failed_ids=all_router_ids
+    )
+    transport_router_value = cast(Mapping[str, Any], document["transport_router"])
+    if (
+        set(graceful_failed_ids.values())
+        != {transport_router_value["graceful"]["failed_id"]}
+        or set(abrupt_failed_ids.values())
+        != {transport_router_value["abrupt"]["failed_id"]}
+    ):
+        raise EvidenceError("transport streams are not bound to their exact failed routers")
     transitions = document.get("health_transitions")
-    if not isinstance(transitions, list) or len(transitions) < 2:
-        raise EvidenceError("symmetric evidence requires target and ingress-router health transitions")
+    expected_process_members = set(process_failed_ids.values())
+    if not isinstance(transitions, list) or len(transitions) != 2 + len(expected_process_members):
+        raise EvidenceError("symmetric evidence requires every process, instance, and transport-router health transition")
     kinds = set()
+    process_members: set[str] = set()
     for item in transitions:
         kind = item.get("kind") if isinstance(item, Mapping) else None
         identifiers = {
             member.instance_id
             for site in (topology.west, topology.east)
-            for member in (site.target_fleet if kind == "target" else site.ingress_router_fleet)
+            for member in (
+                site.transport_router_fleet if kind == "transport-router" else site.target_fleet
+            )
         }
-        if not isinstance(item, Mapping) or set(item) != {"kind", "member_id", "states"} or kind not in expected_recovery_kinds or item.get("member_id") not in identifiers or item.get("states") != ["healthy", "unavailable", "healthy"]:
+        expected_states = {
+            "target-process": ["healthy", "unavailable", "healthy"],
+            "transport-router": ["healthy", "unavailable", "healthy"],
+        }.get(cast(str, kind))
+        states = item.get("states") if isinstance(item, Mapping) else None
+        valid_states = (
+            isinstance(states, list)
+            and len(states) == 3
+            and states[0] == "healthy"
+            and states[1] in {"draining", "unused", "deregistered"}
+            and states[2] == "replaced"
+            if kind == "target-instance"
+            else states == expected_states
+        )
+        recovery = recovery_records.get(cast(str, kind))
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != {"kind", "member_id", "states"}
+            or kind not in expected_recovery_kinds
+            or item.get("member_id") not in identifiers
+            or not isinstance(recovery, Mapping)
+            or (
+                kind != "target-process"
+                and item.get("member_id") != recovery.get("failed_id")
+            )
+            or (
+                kind == "target-process"
+                and item.get("member_id") not in expected_process_members
+            )
+            or not valid_states
+            or (kind == "target-instance" and states[1] != recovery.get("drain_state"))
+        ):
             raise EvidenceError("symmetric health transition is invalid")
         kinds.add(cast(str, item["kind"]))
-    if kinds != expected_recovery_kinds:
+        if kind == "target-process":
+            process_members.add(cast(str, item["member_id"]))
+    if kinds != expected_recovery_kinds or process_members != expected_process_members:
         raise EvidenceError("symmetric evidence omits a health transition class")
+    cost = document.get("cost")
+    if not isinstance(cost, Mapping) or set(cost) != {
+        "profile",
+        "estimated_fixed_hourly_usd",
+        "approved_max_hourly_usd",
+        "resource_counts",
+        "route_failover_bounds",
+        "nat_topology_limit",
+        "within_approved_ceiling",
+    }:
+        raise EvidenceError("symmetric evidence cost has the wrong shape")
+    estimated, approved = cost.get("estimated_fixed_hourly_usd"), cost.get("approved_max_hourly_usd")
+    expected_counts = {
+        "gwlbe_endpoints": sum(
+            len(topology.site(site).transport_router_fleet) for site in SITES
+        ),
+        "target_instances": {
+            site: len(topology.site(site).target_fleet) for site in SITES
+        },
+        "transport_routers": {
+            site: len(topology.site(site).transport_router_fleet) for site in SITES
+        },
+        "workload_instances": sum(
+            len(topology.site(site).local_site_cidrs) for site in SITES
+        ),
+        "nat_gateways": len(SITES),
+        "elastic_ips": len(SITES),
+        "gateway_load_balancers": len(SITES),
+        "vpc_flow_logs": len(SITES),
+        "cloudwatch_log_groups": len(SITES),
+        "flow_log_iam_roles": 1,
+        "iam_roles": {
+            "target": len(SITES),
+            "workload": len(SITES),
+            "transport": len(SITES),
+            "flow_log": 1,
+        },
+        "iam_instance_profiles": {
+            "target": len(SITES),
+            "workload": len(SITES),
+            "transport": len(SITES),
+        },
+    }
+    if (
+        cost.get("profile") != "symmetric-gwlb-ha-v2"
+        or cost.get("resource_counts") != expected_counts
+        or cost.get("route_failover_bounds") != topology.route_failover.approved_bounds()
+        or cost.get("nat_topology_limit")
+        != {
+            "gateways_per_site": 1,
+            "expanded_for_ha": False,
+            "placement": "one shared NAT gateway in each site's single management subnet",
+            "limitation": (
+                "private egress is not multi-AZ within a site and remains outside the protected data path"
+            ),
+        }
+        or isinstance(estimated, bool)
+        or not isinstance(estimated, (int, float))
+        or not math.isfinite(estimated)
+        or estimated <= 0
+        or isinstance(approved, bool)
+        or not isinstance(approved, (int, float))
+        or not math.isfinite(approved)
+        or approved <= 0
+        or estimated > approved
+        or cost.get("within_approved_ceiling") is not True
+    ):
+        raise EvidenceError("symmetric evidence cost exceeds or omits its approved ceiling")
+    lifecycle = document.get("lifecycle")
+    if not isinstance(lifecycle, Mapping) or lifecycle != {
+        "claimed": True,
+        "drift_precheck": "clean",
+        "drift_postcheck": "clean",
+        "finish": "passed",
+        "cleanup": "complete",
+    }:
+        raise EvidenceError("symmetric evidence lifecycle proof is incomplete")
     audit = document.get("residual_audit")
     if not isinstance(audit, Mapping) or set(audit) != {"passed", "owned_resources_remaining"} or audit.get("passed") is not True or audit.get("owned_resources_remaining") != 0:
         raise EvidenceError("symmetric evidence residual audit did not pass")
@@ -3329,7 +6344,7 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
 
 
 def validate_evidence(document: Any) -> dict[str, Any]:
-    """Validate and return a detached schema-1 core or schema-2 live document."""
+    """Validate and return a detached core, legacy live, or symmetric HA document."""
 
     if not isinstance(document, Mapping) or not all(isinstance(key, str) for key in document):
         raise EvidenceError("evidence must be a JSON object")
@@ -3459,8 +6474,16 @@ class SymmetricLifecycle:
         self.dry_run = dry_run
         self.monotonic = monotonic
 
-    def _authorize(self, member: SymmetricFleetMember, role: Literal["target", "ingress-router"]) -> None:
-        fleet = self.topology.site(member.site).target_fleet if role == "target" else self.topology.site(member.site).ingress_router_fleet
+    def _authorize(
+        self,
+        member: SymmetricFleetMember,
+        role: Literal["target", "transport-router"],
+    ) -> None:
+        fleet = (
+            self.topology.site(member.site).target_fleet
+            if role == "target"
+            else self.topology.site(member.site).transport_router_fleet
+        )
         if member.role != role or member not in fleet:
             raise ResilienceError("lifecycle operation is not authorized for a protected fleet member")
         if not self.dry_run and not self.adapter.owned(member, self.topology.run_id):
@@ -3498,9 +6521,9 @@ class SymmetricLifecycle:
             raise ResilienceError("target drain timeout must be within one bounded acceptance run")
         started = self.monotonic()
         deadline = started + timeout_seconds
-        while self.monotonic() <= deadline:
+        while self.monotonic() < deadline:
             health = self.adapter.target_health(member)
-            if health in {"draining", "unused", "unhealthy"}:
+            if health in {"draining", "unused", "deregistered"}:
                 return {"health": health, "drain_duration_ms": max(1, int((self.monotonic() - started) * 1000))}
             remaining = deadline - self.monotonic()
             if remaining > 0:
@@ -3538,20 +6561,35 @@ class SymmetricLifecycle:
             if replacement.instance_id == member.instance_id or self.adapter.target_health(replacement) != "healthy":
                 raise ResilienceError("target replacement did not produce a distinct healthy target")
             return {"operation": "target-instance-replacement", "member_id": member.instance_id, "replacement_id": replacement.instance_id, "dry_run": False, "mutated": True, "health": "healthy"}
+        except PROTECTED_CONTROL_FLOW:
+            raise
         except BaseException:
             if quiesced:
                 try:
                     self.adapter.command(member, "systemctl start envelope.service")
+                except PROTECTED_CONTROL_FLOW:
+                    raise
                 except Exception:
                     pass
             raise
 
-    def fail_ingress_router(self, member: SymmetricFleetMember, *, graceful: bool) -> dict[str, Any]:
-        self._authorize(member, "ingress-router")
-        operation = "ingress-router-graceful-failure" if graceful else "ingress-router-abrupt-failure"
+    def fail_transport_router(
+        self, member: SymmetricFleetMember, *, graceful: bool
+    ) -> dict[str, Any]:
+        self._authorize(member, "transport-router")
+        operation = (
+            "transport-router-graceful-failure"
+            if graceful
+            else "transport-router-abrupt-failure"
+        )
         if self.dry_run:
             return self._planned(operation, member)
-        command = "tailscale set --advertise-routes= && systemctl stop tailscaled.service" if graceful else "systemctl kill --kill-who=main tailscaled.service"
+        command = (
+            "tailscale set --advertise-routes= && systemctl stop tailscaled.service"
+            if graceful
+            else "systemctl kill --kill-who=main --signal=SIGKILL tailscaled.service && "
+            "systemctl stop tailscaled.service"
+        )
         self.adapter.command(member, command)
         return {"operation": operation, "member_id": member.instance_id, "dry_run": False, "mutated": True, "health": "unavailable"}
 
@@ -3559,16 +6597,24 @@ class SymmetricLifecycle:
         self,
         source_site: Site,
         target_id: str,
-        ingress_router_id: str,
+        destination_transport_router_id: str,
     ) -> dict[str, str]:
-        """Bind a probe to a source target and the peer's selected ingress router."""
+        """Bind a probe to a source target and the peer's selected transport router."""
 
         destination_site = _opposite(source_site)
         targets = {member.instance_id for member in self.topology.site(source_site).target_fleet}
-        routers = {member.instance_id for member in self.topology.site(destination_site).ingress_router_fleet}
-        if target_id not in targets or ingress_router_id not in routers:
+        routers = {
+            member.instance_id
+            for member in self.topology.site(destination_site).transport_router_fleet
+        }
+        if target_id not in targets or destination_transport_router_id not in routers:
             raise ProbeError("probe identities are not members of the selected symmetric paths")
-        return {"source_site": source_site, "destination_site": destination_site, "target_id": target_id, "ingress_router_id": ingress_router_id}
+        return {
+            "source_site": source_site,
+            "destination_site": destination_site,
+            "target_id": target_id,
+            "destination_transport_router_id": destination_transport_router_id,
+        }
 
     def observe_new_flow_recovery(
         self,
@@ -3583,7 +6629,7 @@ class SymmetricLifecycle:
             raise ResilienceError("recovery timeout must be within one bounded acceptance run")
         started = self.monotonic()
         deadline = started + timeout_seconds
-        while self.monotonic() <= deadline:
+        while self.monotonic() < deadline:
             if probe():
                 return max(1, int((self.monotonic() - started) * 1000))
             remaining = deadline - self.monotonic()
@@ -3592,10 +6638,1790 @@ class SymmetricLifecycle:
         raise ResilienceError("new-flow recovery did not complete within its bounded timeout")
 
 
+class TransportControlExecutor(Protocol):
+    def __call__(
+        self,
+        member: SymmetricFleetMember,
+        command: str,
+        *,
+        timeout_seconds: int,
+        comment: str,
+    ) -> Mapping[str, Any]: ...
+
+
+class TailnetAdvertisementControl:
+    """Fenced transport advertisement changes and stable-node ownership waits."""
+
+    def __init__(
+        self,
+        topology: SymmetricTopologyV2,
+        execute: TransportControlExecutor,
+        node_ids_by_instance: Mapping[str, str],
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        expected_instances = {
+            member.instance_id
+            for site in SITES
+            for member in topology.site(site).transport_router_fleet
+        }
+        if (
+            set(node_ids_by_instance) != expected_instances
+            or len(set(node_ids_by_instance.values())) != len(expected_instances)
+            or any(
+                not isinstance(node_id, str)
+                or not node_id
+                or node_id.startswith(("nodekey:", "key:"))
+                for node_id in node_ids_by_instance.values()
+            )
+        ):
+            raise ResilienceError(
+                "transport advertisement control requires every stable Tailnet node identity"
+            )
+        self.topology = topology
+        self.execute = execute
+        self.node_ids_by_instance = dict(node_ids_by_instance)
+        self.monotonic = monotonic
+        self.sleep = sleep
+
+    def _run(
+        self,
+        member: SymmetricFleetMember,
+        command: str,
+        *,
+        timeout_seconds: int,
+        comment: str,
+    ) -> tuple[dict[str, Any], Mapping[str, Any] | None]:
+        raw = self.execute(
+            member,
+            command,
+            timeout_seconds=timeout_seconds,
+            comment=comment,
+        )
+        response = raw.get("response") if isinstance(raw.get("response"), Mapping) else raw
+        command_evidence = raw.get("command") if isinstance(raw.get("command"), Mapping) else None
+        if (
+            not isinstance(response, Mapping)
+            or response.get("success") is not True
+            or not isinstance(response.get("payload"), Mapping)
+        ):
+            raise ResilienceError(
+                "transport advertisement controller returned an invalid response"
+            )
+        return dict(cast(Mapping[str, Any], response["payload"])), command_evidence
+
+    def _validated_state(
+        self, member: SymmetricFleetMember, value: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        if set(value) != {"generation", "routes", "service", "mode"}:
+            raise ResilienceError("transport advertisement state has the wrong shape")
+        generation = value.get("generation")
+        routes = value.get("routes")
+        service = value.get("service")
+        mode = value.get("mode")
+        if (
+            not isinstance(generation, str)
+            or not generation
+            or not isinstance(routes, list)
+            or len(routes) != len(set(routes))
+            or not all(
+                isinstance(prefix, str)
+                and prefix in self.topology.site(member.site).local_site_cidrs
+                for prefix in routes
+            )
+            or service not in {"running", "stopped"}
+            or mode not in {"normal", "graceful", "abrupt"}
+            or (service == "running" and (not routes or mode != "normal"))
+            or (service == "stopped" and (routes or mode == "normal"))
+        ):
+            raise ResilienceError("transport advertisement state is outside its allowlist")
+        return {
+            "generation": generation,
+            "routes": sorted(cast(list[str], routes)),
+            "service": service,
+            "mode": mode,
+        }
+
+    def inspect(self, member: SymmetricFleetMember) -> dict[str, Any]:
+        state, command = self._run(
+            member,
+            "/usr/local/sbin/envelope-transport-advertisements inspect",
+            timeout_seconds=TRANSPORT_CONTROL_COMMAND_TIMEOUT_SECONDS,
+            comment="Envelope inspect transport advertisements",
+        )
+        return {
+            "advertisements": self._validated_state(member, state),
+            "command": dict(command) if command is not None else None,
+        }
+
+    def apply(
+        self,
+        member: SymmetricFleetMember,
+        routes: Sequence[str],
+        *,
+        service: Literal["running", "stopped"],
+        mode: Literal["normal", "graceful", "abrupt"],
+        generation: str,
+        predecessors: Sequence[str],
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        command = " ".join(
+            (
+                "/usr/local/sbin/envelope-transport-advertisements apply",
+                shlex.quote(generation),
+                shlex.quote(json.dumps(list(predecessors), separators=(",", ":"))),
+                shlex.quote(json.dumps(sorted(routes), separators=(",", ":"))),
+                service,
+                mode,
+            )
+        )
+        state, command_evidence = self._run(
+            member,
+            command,
+            timeout_seconds=timeout_seconds,
+            comment="Envelope mutate transport advertisements",
+        )
+        normalized = self._validated_state(member, state)
+        expected = {
+            "generation": generation,
+            "routes": sorted(routes),
+            "service": service,
+            "mode": mode,
+        }
+        if normalized != expected:
+            raise ResilienceError(
+                "transport advertisement controller did not reach the requested fenced state"
+            )
+        return {
+            "advertisements": normalized,
+            "command": dict(command_evidence)
+            if command_evidence is not None
+            else None,
+        }
+
+    def _observe_ownership_once(
+        self,
+        site: Site,
+        expected_owner_instance_ids: Mapping[str, str],
+        *,
+        timeout_seconds: float,
+    ) -> list[dict[str, Any]]:
+        expected_node_ids = {
+            prefix: self.node_ids_by_instance[instance_id]
+            for prefix, instance_id in expected_owner_instance_ids.items()
+        }
+        script = r'''import json,subprocess,sys
+expected=json.loads(sys.argv[1]); status=json.loads(subprocess.check_output(["/usr/bin/tailscale","status","--json"],text=True,timeout=20)); self_status=status.get("Self"); peers=status.get("Peer",{}); peers=list(peers.values()) if isinstance(peers,dict) else peers if isinstance(peers,list) else []
+if status.get("BackendState")!="Running" or not isinstance(self_status,dict) or self_status.get("Online") is not True or self_status.get("Expired") is not False: raise SystemExit(2)
+by_id={}
+for peer in peers:
+    if not isinstance(peer,dict) or not isinstance(peer.get("ID"),str) or peer.get("ID") in by_id or not isinstance(peer.get("PrimaryRoutes",[]),list): raise SystemExit(2)
+    by_id[peer["ID"]]=peer
+claims={prefix:[] for prefix in expected}
+for peer in by_id.values():
+    for prefix in peer.get("PrimaryRoutes",[]):
+        if prefix in claims: claims[prefix].append(peer.get("ID"))
+if any(owners!=[expected[prefix]] for prefix,owners in claims.items()): raise SystemExit(3)
+if any(expected_id not in by_id or by_id[expected_id].get("Online") is not True or by_id[expected_id].get("Expired") is not False for expected_id in expected.values()): raise SystemExit(4)
+print(json.dumps({"success":True,"payload":{"owners":{prefix:owners[0] for prefix,owners in claims.items()}}},sort_keys=True,separators=(",",":")))'''
+        command = (
+            "python3 -c "
+            + shlex.quote(script)
+            + " "
+            + shlex.quote(
+                json.dumps(expected_node_ids, sort_keys=True, separators=(",", ":"))
+            )
+        )
+        observations: list[dict[str, Any]] = []
+        observers = self.topology.site(_opposite(site)).transport_router_fleet
+        deadline = self.monotonic() + timeout_seconds
+        for index, observer in enumerate(observers):
+            remaining = deadline - self.monotonic()
+            remaining_observers = len(observers) - index
+            if remaining <= 0 or remaining < remaining_observers:
+                raise TimeoutError("Tailnet ownership observers exhausted their shared deadline")
+            payload, command_evidence = self._run(
+                observer,
+                command,
+                timeout_seconds=max(
+                    1,
+                    min(
+                        TRANSPORT_CONTROL_COMMAND_TIMEOUT_SECONDS,
+                        int(remaining // remaining_observers),
+                    ),
+                ),
+                comment="Envelope observe Tailnet prefix owners",
+            )
+            owners = payload.get("owners")
+            if not isinstance(owners, Mapping) or dict(owners) != expected_node_ids:
+                raise ResilienceError(
+                    "Tailnet observer did not select the configured stable prefix owners"
+                )
+            observations.append(
+                {
+                    "observer_instance_id": observer.instance_id,
+                    "owners": [
+                        {
+                            "prefix": prefix,
+                            "owner_instance_id": expected_owner_instance_ids[prefix],
+                            "owner_node_id_sha256": hashlib.sha256(
+                                expected_node_ids[prefix].encode("utf-8")
+                            ).hexdigest(),
+                        }
+                        for prefix in sorted(expected_node_ids)
+                    ],
+                    "command": dict(command_evidence)
+                    if command_evidence is not None
+                    else None,
+                }
+            )
+        return observations
+
+    def wait_ownership(
+        self,
+        site: Site,
+        expected_owner_instance_ids: Mapping[str, str],
+        *,
+        timeout_seconds: float,
+        quiet_window_seconds: float,
+    ) -> dict[str, Any]:
+        expected_prefixes = set(self.topology.site(site).local_site_cidrs)
+        if (
+            set(expected_owner_instance_ids) != expected_prefixes
+            or any(
+                instance_id
+                not in {
+                    member.instance_id
+                    for member in self.topology.site(site).transport_router_fleet
+                }
+                for instance_id in expected_owner_instance_ids.values()
+            )
+        ):
+            raise ResilienceError(
+                "Tailnet ownership wait does not contain the site's exact configured prefixes"
+            )
+        deadline = self.monotonic() + timeout_seconds
+        stable_since: float | None = None
+        latest: list[dict[str, Any]] | None = None
+        last_error: BaseException | None = None
+        while self.monotonic() <= deadline:
+            remaining = deadline - self.monotonic()
+            try:
+                latest = self._observe_ownership_once(
+                    site,
+                    expected_owner_instance_ids,
+                    timeout_seconds=max(1.0, remaining),
+                )
+            except PROTECTED_CONTROL_FLOW:
+                raise
+            except BaseException as error:
+                stable_since = None
+                last_error = error
+            else:
+                now = self.monotonic()
+                if stable_since is None:
+                    stable_since = now
+                if now - stable_since >= quiet_window_seconds:
+                    return {
+                        "quiet_window_seconds": quiet_window_seconds,
+                        "observers": latest,
+                    }
+            remaining = deadline - self.monotonic()
+            if remaining > 1e-6:
+                self.sleep(min(1.0, remaining))
+            else:
+                break
+        detail = (
+            f": {_sanitize_string(str(last_error))}" if last_error is not None else ""
+        )
+        raise TimeoutError(
+            "Tailnet stable prefix ownership did not converge within its bounded deadline"
+            + detail
+        )
+
+
+ROUTE_MUTATION_ACTIONS = ("ec2:CreateRoute", "ec2:DeleteRoute", "ec2:ReplaceRoute")
+ROUTE_JOURNAL_SCHEMA = 4
+ROUTE_JOURNAL_KIND = "transport-prefix-and-gwlbe-route-failover"
+_RECOVERABLE_ROUTE_JOURNAL_STATUSES = {
+    "authorized",
+    "alternate-advertising",
+    "ownership-converging",
+    "ownership-transferred",
+    "failed-before-restoration",
+    "ambiguous-forward-call",
+    "alternate-active",
+    "probe-passed",
+    "recovery-claimed",
+    "restoring",
+    "restoration-failed",
+    "restored",
+    "restored-after-failure",
+    "reconciled-after-crash",
+}
+
+
+class RouteRestorationError(ResilienceError):
+    """A GWLBE route transaction could not verify its original targets."""
+
+
+class AmbiguousRouteMutationError(ResilienceError):
+    """A forward route API call had an unknown settlement outcome."""
+
+
+class RouteTransactionDurability(Protocol):
+    def load_route_transaction(self) -> tuple[dict[str, Any], str] | None: ...
+
+    def create_route_transaction(self, value: Mapping[str, Any]) -> str: ...
+
+    def update_route_transaction(
+        self, value: Mapping[str, Any], *, expected_revision: str
+    ) -> str: ...
+
+    def finalize_route_transaction(
+        self,
+        transaction_id: str,
+        summary: Mapping[str, Any],
+        *,
+        expected_revision: str,
+    ) -> str: ...
+
+
+class GWLBERouteFailover:
+    """Protected-runner-only replacement of one GWLBE table's remote routes."""
+
+    def __init__(
+        self,
+        topology: SymmetricTopologyV2,
+        vpc_ids: Mapping[Site, str],
+        aws: AWSJSON | AwsCLI,
+        *,
+        authorize: Callable[
+            [
+                SymmetricFleetMember,
+                SymmetricFleetMember,
+                tuple[str, ...],
+                SymmetricFleetMember,
+            ],
+            Mapping[str, Any],
+        ],
+        durability: RouteTransactionDurability,
+        verify_ready: Callable[[SymmetricFleetMember], None],
+        advertisement_control: TailnetAdvertisementControl,
+        evidence_path: pathlib.Path,
+        environment: Mapping[str, str] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+        wall_clock: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
+        api_timeout_seconds: float = 10.0,
+    ) -> None:
+        if set(vpc_ids) != set(SITES) or any(
+            not isinstance(vpc_ids[site], str) or _VPC_ID_RE.fullmatch(vpc_ids[site]) is None
+            for site in SITES
+        ):
+            raise ResilienceError("GWLBE route authority requires both exact protected VPC identities")
+        if (
+            isinstance(api_timeout_seconds, bool)
+            or not isinstance(api_timeout_seconds, (int, float))
+            or not math.isfinite(api_timeout_seconds)
+            or not 0 < api_timeout_seconds <= 60
+        ):
+            raise ResilienceError("GWLBE route API timeout must be between 0 and 60 seconds")
+        self.topology = topology
+        self.vpc_ids = dict(vpc_ids)
+        self.aws = aws
+        self.authorize = authorize
+        self.durability = durability
+        self.verify_ready = verify_ready
+        self.advertisement_control = advertisement_control
+        self.evidence_path = evidence_path.expanduser().resolve()
+        self.environment = environment
+        self.monotonic = monotonic
+        self.sleep = sleep
+        self.wall_clock = wall_clock
+        self.api_timeout_seconds = float(api_timeout_seconds)
+        self._durable_revision: str | None = None
+
+    @staticmethod
+    def _bounded_timeout(value: float, name: str) -> float:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not 0 < value <= 7200
+        ):
+            raise ResilienceError(f"{name} must be between 0 and 7200 seconds")
+        return float(value)
+
+    def _aws_json(
+        self,
+        args: list[str],
+        *,
+        region: str,
+        deadline: float,
+        operation: str,
+    ) -> dict[str, Any]:
+        remaining = deadline - self.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"{operation} exhausted its bounded deadline")
+        timeout = min(self.api_timeout_seconds, remaining)
+        try:
+            return self.aws.json(
+                args,
+                region=region,
+                timeout_seconds=timeout,
+            )
+        except PROTECTED_CONTROL_FLOW:
+            raise
+        except TimeoutError as error:
+            raise TimeoutError(f"{operation} exceeded its native timeout: {error}") from None
+
+    @staticmethod
+    def _route_evidence(route: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "destination_cidr_block": route.get("DestinationCidrBlock"),
+            "network_interface_id": route.get("NetworkInterfaceId"),
+            "origin": route.get("Origin"),
+            "route_state": route.get("State"),
+        }
+
+    def _table_snapshot(
+        self,
+        table_owner: SymmetricFleetMember,
+        prefixes: tuple[str, ...],
+        expected_target: str | set[str],
+        *,
+        deadline: float,
+        operation: str,
+    ) -> dict[str, Any]:
+        assert table_owner.gwlbe_route_table_id is not None
+        response = self._aws_json(
+            ["ec2", "describe-route-tables", "--route-table-ids", table_owner.gwlbe_route_table_id],
+            region=table_owner.region,
+            deadline=deadline,
+            operation=operation,
+        )
+        tables = response.get("RouteTables")
+        if not isinstance(tables, list) or len(tables) != 1 or not isinstance(tables[0], Mapping):
+            raise ResilienceError("GWLBE route-table ownership lookup was not exact")
+        table = tables[0]
+        tags = AwsLiveOperations._tags(table)
+        expected_tags = {
+            "EnvelopeRun": self.topology.run_id,
+            "ManagedBy": "terraform",
+            "Profile": "symmetric-gwlb-ha-v2",
+            "Role": "gwlbe",
+            "ZoneKey": table_owner.az_key,
+        }
+        associations = table.get("Associations")
+        active_associations = [
+            association
+            for association in associations or []
+            if isinstance(association, Mapping)
+            and association.get("Main") is False
+            and association.get("AssociationState", {}).get("State") == "associated"
+            and _SUBNET_ID_RE.fullmatch(str(association.get("SubnetId", ""))) is not None
+        ]
+        if (
+            table.get("RouteTableId") != table_owner.gwlbe_route_table_id
+            or table.get("VpcId") != self.vpc_ids[table_owner.site]
+            or any(tags.get(name) != value for name, value in expected_tags.items())
+            or len(active_associations) != 1
+        ):
+            raise ResilienceError("GWLBE route table is not the exact run-owned endpoint route table")
+        routes = table.get("Routes")
+        if not isinstance(routes, list):
+            raise ResilienceError("GWLBE route table omitted its route set")
+        exact_target = isinstance(expected_target, str)
+        expected_targets = {expected_target} if exact_target else expected_target
+        if not expected_targets:
+            raise ResilienceError("GWLBE route snapshot has no authorized ENI target")
+        selected: list[dict[str, Any]] = []
+        for prefix in prefixes:
+            matches = [
+                route
+                for route in routes
+                if isinstance(route, Mapping) and route.get("DestinationCidrBlock") == prefix
+            ]
+            if (
+                len(matches) != 1
+                or matches[0].get("State") != "active"
+                or matches[0].get("Origin") != "CreateRoute"
+                or not any(
+                    AwsLiveOperations._route_selects_only_target(
+                        matches[0], "NetworkInterfaceId", target
+                    )
+                    for target in expected_targets
+                )
+            ):
+                raise ResilienceError(
+                    f"GWLBE route {prefix} does not select "
+                    + (
+                        "the exact authorized current ENI"
+                        if exact_target
+                        else "one exact authorized ENI"
+                    )
+                )
+            selected.append(self._route_evidence(matches[0]))
+        return {
+            "route_table_id": table_owner.gwlbe_route_table_id,
+            "vpc_id": self.vpc_ids[table_owner.site],
+            "ownership": expected_tags,
+            "routes": selected,
+        }
+
+    def _wait_snapshot(
+        self,
+        table_owner: SymmetricFleetMember,
+        prefixes: tuple[str, ...],
+        expected_target: str,
+        *,
+        deadline: float,
+        operation: str,
+    ) -> dict[str, Any]:
+        last_error: Exception | None = None
+        while self.monotonic() <= deadline:
+            try:
+                return self._table_snapshot(
+                    table_owner,
+                    prefixes,
+                    expected_target,
+                    deadline=deadline,
+                    operation=operation,
+                )
+            except PROTECTED_CONTROL_FLOW:
+                raise
+            except Exception as error:
+                last_error = error
+                remaining = deadline - self.monotonic()
+                if remaining > 1e-6:
+                    self.sleep(min(1.0, remaining))
+                else:
+                    break
+        detail = f": {_sanitize_string(str(last_error))}" if last_error is not None else ""
+        raise TimeoutError(f"{operation} did not converge within its bounded deadline{detail}")
+
+    def _wait_snapshot_quiet(
+        self,
+        table_owner: SymmetricFleetMember,
+        prefixes: tuple[str, ...],
+        expected_target: str,
+        *,
+        deadline: float,
+        quiet_window_seconds: float,
+        operation: str,
+    ) -> dict[str, Any]:
+        stable_since: float | None = None
+        latest: dict[str, Any] | None = None
+        last_error: Exception | None = None
+        while self.monotonic() <= deadline:
+            try:
+                latest = self._table_snapshot(
+                    table_owner,
+                    prefixes,
+                    expected_target,
+                    deadline=deadline,
+                    operation=operation,
+                )
+            except PROTECTED_CONTROL_FLOW:
+                raise
+            except Exception as error:
+                stable_since = None
+                last_error = error
+            else:
+                now = self.monotonic()
+                if stable_since is None:
+                    stable_since = now
+                if now - stable_since >= quiet_window_seconds:
+                    return latest
+            remaining = deadline - self.monotonic()
+            if remaining > 1e-6:
+                self.sleep(min(1.0, remaining))
+            else:
+                break
+        detail = f": {_sanitize_string(str(last_error))}" if last_error is not None else ""
+        raise TimeoutError(f"{operation} was not stable for its required quiet window{detail}")
+
+    def _settle_route_target(
+        self,
+        table_owner: SymmetricFleetMember,
+        prefix: str,
+        allowed_targets: set[str],
+        *,
+        deadline: float,
+        operation: str,
+    ) -> tuple[str, dict[str, Any]]:
+        stable_target: str | None = None
+        stable_since: float | None = None
+        latest: dict[str, Any] | None = None
+        last_error: Exception | None = None
+        while self.monotonic() < deadline:
+            try:
+                latest = self._table_snapshot(
+                    table_owner,
+                    (prefix,),
+                    allowed_targets,
+                    deadline=deadline,
+                    operation=operation,
+                )
+                routes = latest.get("routes")
+                target = (
+                    routes[0].get("network_interface_id")
+                    if isinstance(routes, list)
+                    and len(routes) == 1
+                    and isinstance(routes[0], Mapping)
+                    else None
+                )
+                if not isinstance(target, str) or target not in allowed_targets:
+                    raise ResilienceError("settlement observed a route target outside the allowlist")
+            except PROTECTED_CONTROL_FLOW:
+                raise
+            except Exception as error:
+                stable_target = None
+                stable_since = None
+                last_error = error
+            else:
+                now = self.monotonic()
+                if target != stable_target:
+                    stable_target = target
+                    stable_since = now
+                if (
+                    stable_since is not None
+                    and now - stable_since >= self.topology.route_failover.quiet_window_seconds
+                ):
+                    return target, latest
+            remaining = deadline - self.monotonic()
+            if remaining > 1e-6:
+                self.sleep(min(1.0, remaining))
+            else:
+                break
+        detail = f": {_sanitize_string(str(last_error))}" if last_error is not None else ""
+        raise TimeoutError(f"{operation} did not settle within its bounded deadline{detail}")
+
+    def _network_interface_evidence(
+        self,
+        current: SymmetricFleetMember,
+        alternate: SymmetricFleetMember,
+        *,
+        deadline: float,
+    ) -> list[dict[str, str]]:
+        assert current.network_interface_id is not None
+        assert alternate.network_interface_id is not None
+        response = self._aws_json(
+            [
+                "ec2",
+                "describe-network-interfaces",
+                "--network-interface-ids",
+                current.network_interface_id,
+                alternate.network_interface_id,
+            ],
+            region=current.region,
+            deadline=deadline,
+            operation="GWLBE failover ENI ownership lookup",
+        )
+        interfaces = response.get("NetworkInterfaces")
+        if not isinstance(interfaces, list) or not all(isinstance(value, Mapping) for value in interfaces):
+            raise ResilienceError("GWLBE failover ENI ownership response is invalid")
+        by_id = {
+            str(value.get("NetworkInterfaceId")): value
+            for value in interfaces
+            if isinstance(value.get("NetworkInterfaceId"), str)
+        }
+        expected = {
+            cast(str, current.network_interface_id): current,
+            cast(str, alternate.network_interface_id): alternate,
+        }
+        if set(by_id) != set(expected):
+            raise ResilienceError("GWLBE failover did not resolve both exact eligible ENIs")
+        evidence: list[dict[str, str]] = []
+        for interface_id, member in expected.items():
+            value = by_id[interface_id]
+            attachment = value.get("Attachment")
+            if (
+                value.get("VpcId") != self.vpc_ids[current.site]
+                or value.get("Status") != "in-use"
+                or not isinstance(attachment, Mapping)
+                or attachment.get("InstanceId") != member.instance_id
+                or attachment.get("DeviceIndex") != 0
+                or attachment.get("Status") != "attached"
+            ):
+                raise ResilienceError("GWLBE failover ENI is not the protected router's attached primary ENI")
+            evidence.append(
+                {
+                    "instance_id": member.instance_id,
+                    "network_interface_id": interface_id,
+                }
+            )
+        return evidence
+
+    def _lease_expires_at(self) -> str:
+        now = self.wall_clock()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise AmbiguousOwnershipError("route transaction wall clock is not timezone-aware")
+        return (
+            now.astimezone(dt.timezone.utc)
+            + dt.timedelta(seconds=self.topology.route_failover.owner_lease_seconds)
+        ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    def _persist(self, journal: Mapping[str, Any]) -> None:
+        if not isinstance(journal, dict):
+            raise EvidenceError("GWLBE route transaction must be mutable while active")
+        self._journal_owned_by_current_runner(journal)
+        journal["lease_expires_at"] = self._lease_expires_at()
+        safe = sanitize_evidence_value(journal)
+        if not isinstance(safe, Mapping):
+            raise EvidenceError("GWLBE route journal did not normalize to an object")
+        if self._durable_revision is None:
+            self._durable_revision = self.durability.create_route_transaction(safe)
+        else:
+            self._durable_revision = self.durability.update_route_transaction(
+                safe, expected_revision=self._durable_revision
+            )
+        _write_private_json(self.evidence_path, cast(Mapping[str, Any], safe))
+        directory_fd = os.open(
+            self.evidence_path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    @staticmethod
+    def _failure(error: BaseException) -> dict[str, str]:
+        return {
+            "category": type(error).__name__,
+            "message": _sanitize_string(str(error)),
+        }
+
+    def _load_journal(self) -> dict[str, Any] | None:
+        durable = self.durability.load_route_transaction()
+        if durable is None:
+            return None
+        value, revision = durable
+        if not isinstance(revision, str) or not revision:
+            raise AmbiguousOwnershipError("durable GWLBE route transaction has no CAS revision")
+        self._durable_revision = revision
+        findings = scan_evidence(value)
+        if findings:
+            raise AmbiguousOwnershipError("durable GWLBE route journal contains unsafe values")
+        required = {
+            "schema",
+            "kind",
+            "run_id",
+            "claim_id",
+            "transaction_id",
+            "owner",
+            "lease_expires_at",
+            "site",
+            "gwlbe_az_key",
+            "started_at",
+            "status",
+            "route_table_id",
+            "source_prefix",
+            "prefixes",
+            "current",
+            "alternate",
+            "interfaces",
+            "before",
+            "advertisements",
+            "ownership",
+            "mutation",
+            "after",
+            "probe",
+            "restoration",
+            "failure",
+        }
+        allowed = required | {"failure_transition", "finished_at", "reconciled_at"}
+        if (
+            not isinstance(value, dict)
+            or not required.issubset(value)
+            or set(value) - allowed
+            or value.get("schema") != ROUTE_JOURNAL_SCHEMA
+            or value.get("kind") != ROUTE_JOURNAL_KIND
+            or value.get("run_id") != self.topology.run_id
+            or not isinstance(value.get("transaction_id"), str)
+            or re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                cast(str, value.get("transaction_id")),
+            )
+            is None
+        ):
+            raise AmbiguousOwnershipError("durable GWLBE route journal identity is ambiguous")
+        owner = value.get("owner")
+        if (
+            not isinstance(owner, Mapping)
+            or set(owner) != {"pid", "host_sha256", "boot_id"}
+            or isinstance(owner.get("pid"), bool)
+            or not isinstance(owner.get("pid"), int)
+            or owner["pid"] <= 0
+            or not isinstance(owner.get("host_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", cast(str, owner["host_sha256"])) is None
+            or not isinstance(owner.get("boot_id"), str)
+            or not isinstance(value.get("lease_expires_at"), str)
+        ):
+            raise AmbiguousOwnershipError("durable GWLBE route journal owner is invalid")
+        try:
+            validate_canonical_utc_timestamp(
+                value["lease_expires_at"], "route_transaction.lease_expires_at"
+            )
+        except LifecycleError as error:
+            raise AmbiguousOwnershipError(str(error)) from None
+        _write_private_json(self.evidence_path, value)
+        return value
+
+    def _finalize_durable(self, journal: Mapping[str, Any]) -> None:
+        revision = self._durable_revision
+        transaction_id = journal.get("transaction_id")
+        if not isinstance(revision, str) or not isinstance(transaction_id, str):
+            raise AmbiguousOwnershipError("route transaction cannot finalize without CAS identity")
+        summary = {
+            "transaction_id": transaction_id,
+            "status": journal.get("status"),
+            "finished_at": journal.get("finished_at"),
+            "restored": (
+                isinstance(journal.get("restoration"), Mapping)
+                and journal["restoration"].get("status") == "verified"
+                and all(
+                    isinstance(journal["restoration"].get(component), Mapping)
+                    and journal["restoration"][component].get("status")
+                    == "verified"
+                    for component in ("advertisements", "ownership", "routes")
+                )
+            ),
+        }
+        self._durable_revision = self.durability.finalize_route_transaction(
+            transaction_id,
+            summary,
+            expected_revision=revision,
+        )
+
+    @staticmethod
+    def _journal_owned_by_current_runner(
+        journal: Mapping[str, Any], *, identity: Mapping[str, Any] | None = None
+    ) -> None:
+        owner = cast(Mapping[str, Any], journal["owner"])
+        current = dict(identity or _route_runner_identity())
+        if owner != current:
+            raise AmbiguousOwnershipError(
+                "durable GWLBE route transaction was not leased to this runner"
+            )
+
+    def _restore_original_routes(
+        self,
+        journal: dict[str, Any],
+        current: SymmetricFleetMember,
+        alternate: SymmetricFleetMember,
+        table_owner: SymmetricFleetMember,
+        prefixes: tuple[str, ...],
+        *,
+        restoration_timeout: float,
+        primary_error: BaseException | None,
+        recovered: bool,
+    ) -> dict[str, Any]:
+        assert table_owner.gwlbe_route_table_id is not None
+        assert current.network_interface_id is not None
+        journal.pop("finished_at", None)
+        journal.pop("reconciled_at", None)
+        journal["status"] = "restoring"
+        journal["restoration"] = {
+            "status": "running",
+            "advertisements": {
+                "status": "running",
+                "current": None,
+                "alternate": None,
+                "verification": None,
+                "failures": [],
+            },
+            "ownership": {"status": "not-started", "observation": None},
+            "routes": {
+                "status": "not-started",
+                "attempted_prefixes": [],
+                "api_failures": [],
+                "settled_prefixes": [],
+                "quiet_window_seconds": self.topology.route_failover.quiet_window_seconds,
+                "snapshot": None,
+            },
+        }
+        # This checkpoint is the restoration fence. No remote mutation is safe
+        # if the durable CAS claim cannot be renewed first.
+        self._persist(journal)
+        restoration_error: BaseException | None = None
+        restoration = cast(dict[str, Any], journal["restoration"])
+        advertisement_restoration = cast(
+            dict[str, Any], restoration["advertisements"]
+        )
+        current_value = cast(Mapping[str, Any], journal["current"])
+        alternate_value = cast(Mapping[str, Any], journal["alternate"])
+        generations = cast(Mapping[str, Any], journal["advertisements"])
+        restore_generation = cast(str, generations["restore_generation"])
+        forward_generation = cast(str, generations["forward_generation"])
+        current_baseline_observed = False
+        for label, member, value in (
+            ("current", current, current_value),
+            ("alternate", alternate, alternate_value),
+        ):
+            before = cast(Mapping[str, Any], value["state_before"])
+            before_state = cast(Mapping[str, Any], before["advertisements"])
+            baseline = cast(list[str], value["baseline_advertisements"])
+            if label == "alternate" and not current_baseline_observed:
+                error = ResilienceError(
+                    "original prefix owner was not observed before alternate withdrawal"
+                )
+                advertisement_restoration["failures"].append(
+                    {"member": label, **self._failure(error)}
+                )
+                restoration_error = restoration_error or error
+                break
+            self._persist(journal)
+            try:
+                advertisement_restoration[label] = self.advertisement_control.apply(
+                    member,
+                    baseline,
+                    service="running",
+                    mode="normal",
+                    generation=restore_generation,
+                    predecessors=(
+                        cast(str, before_state["generation"]),
+                        forward_generation,
+                    ),
+                    timeout_seconds=max(
+                        1,
+                        min(
+                            TRANSPORT_CONTROL_COMMAND_TIMEOUT_SECONDS,
+                            int(math.ceil(restoration_timeout)),
+                        ),
+                    ),
+                )
+            except BaseException as error:
+                _rethrow_protected_control_flow(error)
+                advertisement_restoration["failures"].append(
+                    {"member": label, **self._failure(error)}
+                )
+                restoration_error = restoration_error or error
+            self._persist(journal)
+            if label == "current":
+                try:
+                    observed_current = self.advertisement_control.inspect(current)
+                    current_baseline_observed = observed_current.get(
+                        "advertisements"
+                    ) == {
+                        "generation": restore_generation,
+                        "routes": baseline,
+                        "service": "running",
+                        "mode": "normal",
+                    }
+                except BaseException as error:
+                    _rethrow_protected_control_flow(error)
+                    advertisement_restoration["failures"].append(
+                        {"member": label, **self._failure(error)}
+                    )
+                    restoration_error = restoration_error or error
+                if not current_baseline_observed:
+                    error = ResilienceError(
+                        "original prefix owner baseline was not freshly observed"
+                    )
+                    advertisement_restoration["failures"].append(
+                        {"member": label, **self._failure(error)}
+                    )
+                    restoration_error = restoration_error or error
+                self._persist(journal)
+
+        advertisement_verification: dict[str, Any] = {}
+        for label, member in (("current", current), ("alternate", alternate)):
+            self._persist(journal)
+            try:
+                advertisement_verification[label] = self.advertisement_control.inspect(
+                    member
+                )
+            except BaseException as error:
+                _rethrow_protected_control_flow(error)
+                advertisement_restoration["failures"].append(
+                    {"member": label, **self._failure(error)}
+                )
+                restoration_error = restoration_error or error
+            self._persist(journal)
+        advertisement_restoration["verification"] = advertisement_verification
+        expected_advertisements = {
+            "current": {
+                "generation": restore_generation,
+                "routes": list(current_value["baseline_advertisements"]),
+                "service": "running",
+                "mode": "normal",
+            },
+            "alternate": {
+                "generation": restore_generation,
+                "routes": list(alternate_value["baseline_advertisements"]),
+                "service": "running",
+                "mode": "normal",
+            },
+        }
+        advertisements_match = all(
+            isinstance(advertisement_verification.get(label), Mapping)
+            and advertisement_verification[label].get("advertisements") == expected
+            for label, expected in expected_advertisements.items()
+        )
+        if not advertisements_match:
+            error = ResilienceError(
+                "transport advertisements did not restore to their fenced baseline"
+            )
+            advertisement_restoration["failures"].append(self._failure(error))
+            restoration_error = restoration_error or error
+        advertisement_restoration["status"] = (
+            "verified"
+            if advertisements_match and not advertisement_restoration["failures"]
+            else "failed"
+        )
+        self._persist(journal)
+
+        ownership_restoration = cast(dict[str, Any], restoration["ownership"])
+        ownership_restoration["status"] = "running"
+        self._persist(journal)
+        try:
+            ownership_restoration[
+                "observation"
+            ] = self.advertisement_control.wait_ownership(
+                current.site,
+                {
+                    cast(str, member.advertised_prefix): member.instance_id
+                    for member in self.topology.site(
+                        current.site
+                    ).transport_router_fleet
+                },
+                timeout_seconds=restoration_timeout,
+                quiet_window_seconds=self.topology.route_failover.quiet_window_seconds,
+            )
+            self._persist(journal)
+        except BaseException as error:
+            _rethrow_protected_control_flow(error)
+            ownership_restoration["failure"] = self._failure(error)
+            restoration_error = restoration_error or error
+            self._persist(journal)
+        for member in (current, alternate):
+            self._persist(journal)
+            try:
+                self.verify_ready(member)
+            except BaseException as error:
+                _rethrow_protected_control_flow(error)
+                ownership_restoration.setdefault("failure", self._failure(error))
+                restoration_error = restoration_error or error
+            self._persist(journal)
+        ownership_restoration["status"] = (
+            "verified"
+            if ownership_restoration.get("observation") is not None
+            and "failure" not in ownership_restoration
+            else "failed"
+        )
+        self._persist(journal)
+
+        route_restoration = cast(dict[str, Any], restoration["routes"])
+        if not advertisements_match or ownership_restoration["status"] != "verified":
+            error = ResilienceError(
+                "original GWLBE routes cannot be restored before advertisement ownership"
+            )
+            route_restoration["status"] = "failed"
+            route_restoration["failure"] = self._failure(error)
+            restoration["status"] = "failed"
+            journal["status"] = "restoration-failed"
+            self._persist(journal)
+            failure = RouteRestorationError(
+                "transport failover restoration could not verify advertisements and ownership before routes"
+            )
+            setattr(failure, "evidence_path", str(self.evidence_path))
+            raise failure from primary_error or restoration_error or error
+        route_restoration["status"] = "running"
+        for prefix in prefixes:
+            route_restoration["attempted_prefixes"].append(prefix)
+            self._persist(journal)
+            prefix_deadline = self.monotonic() + restoration_timeout
+            try:
+                self._aws_json(
+                    [
+                        "ec2",
+                        "replace-route",
+                        "--route-table-id",
+                        table_owner.gwlbe_route_table_id,
+                        "--destination-cidr-block",
+                        prefix,
+                        "--network-interface-id",
+                        current.network_interface_id,
+                    ],
+                    region=table_owner.region,
+                    deadline=prefix_deadline,
+                    operation=f"GWLBE route restoration for {prefix}",
+                )
+            except BaseException as error:
+                _rethrow_protected_control_flow(error)
+                route_restoration["api_failures"].append(
+                    {"prefix": prefix, **self._failure(error)}
+                )
+                restoration_error = restoration_error or error
+                self._persist(journal)
+            try:
+                self._wait_snapshot(
+                    table_owner,
+                    (prefix,),
+                    current.network_interface_id,
+                    deadline=prefix_deadline,
+                    operation=f"GWLBE route restoration settlement for {prefix}",
+                )
+                route_restoration["settled_prefixes"].append(prefix)
+            except BaseException as error:
+                _rethrow_protected_control_flow(error)
+                restoration_error = restoration_error or error
+            self._persist(journal)
+        self._persist(journal)
+        try:
+            quiet_deadline = self.monotonic() + restoration_timeout
+            restored = self._wait_snapshot_quiet(
+                table_owner,
+                prefixes,
+                current.network_interface_id,
+                deadline=quiet_deadline,
+                quiet_window_seconds=self.topology.route_failover.quiet_window_seconds,
+                operation="GWLBE original route restoration",
+            )
+            route_restoration["snapshot"] = restored
+        except BaseException as error:
+            _rethrow_protected_control_flow(error)
+            restoration_error = restoration_error or error
+            route_restoration["status"] = "failed"
+            route_restoration["failure"] = self._failure(error)
+        else:
+            routes_verified = (
+                route_restoration["api_failures"] == []
+                and route_restoration["attempted_prefixes"] == list(prefixes)
+                and route_restoration["settled_prefixes"] == list(prefixes)
+            )
+            route_restoration["status"] = "verified" if routes_verified else "failed"
+        restoration_verified = all(
+            cast(Mapping[str, Any], restoration[component]).get("status")
+            == "verified"
+            for component in ("advertisements", "ownership", "routes")
+        )
+        restoration["status"] = "verified" if restoration_verified else "failed"
+        if restoration_verified:
+            journal["status"] = (
+                "reconciled-after-crash"
+                if recovered
+                else "restored"
+                if primary_error is None
+                else "restored-after-failure"
+            )
+            journal["finished_at"] = _utc_now()
+            if recovered:
+                journal["reconciled_at"] = journal["finished_at"]
+        else:
+            journal["status"] = "restoration-failed"
+        self._persist(journal)
+        if not restoration_verified and restoration_error is None:
+            restoration_error = RouteRestorationError(
+                "transport advertisement or ownership restoration was not verified"
+            )
+        if restoration_verified and restoration_error is None:
+            try:
+                self._finalize_durable(journal)
+            except BaseException as error:
+                _rethrow_protected_control_flow(error)
+                if isinstance(
+                    error,
+                    (
+                        ConcurrentLifecycleError,
+                        ConcurrentRunError,
+                        ClaimPersistenceError,
+                        AmbiguousOwnershipError,
+                    ),
+                ):
+                    raise
+                restoration_error = error
+        if restoration_error is not None:
+            message = "transport failover restoration could not verify advertisements, ownership, and routes"
+            if primary_error is not None:
+                message += f" after {type(primary_error).__name__}"
+            failure = RouteRestorationError(message)
+            setattr(failure, "evidence_path", str(self.evidence_path))
+            raise failure from primary_error or restoration_error
+        return restoration
+
+    def reconcile(self, *, restoration_timeout_seconds: float) -> Mapping[str, Any]:
+        """Restore an abandoned route transaction before a restarted run proceeds."""
+
+        restoration_timeout = self._bounded_timeout(
+            restoration_timeout_seconds, "GWLBE route reconciliation timeout"
+        )
+        validate_protected_execution(
+            self.topology.run_id,
+            self.environment if self.environment is not None else os.environ,
+        )
+        journal = self._load_journal()
+        if journal is None:
+            return {"required": False, "restored": True}
+        if journal.get("status") not in _RECOVERABLE_ROUTE_JOURNAL_STATUSES:
+            return {"required": False, "restored": journal.get("status") in {"restored", "restored-after-failure", "reconciled-after-crash"}}
+        self._journal_owned_by_current_runner(journal)
+        self._persist(journal)
+        site_value = journal.get("site")
+        if site_value not in SITES:
+            raise AmbiguousOwnershipError("durable GWLBE route journal site is invalid")
+        site = self.topology.site(cast(Site, site_value))
+        current_value = journal.get("current")
+        alternate_value = journal.get("alternate")
+        prefixes_value = journal.get("prefixes")
+        if (
+            not isinstance(current_value, Mapping)
+            or set(current_value)
+            != {
+                "instance_id",
+                "network_interface_id",
+                "baseline_advertisements",
+                "state_before",
+                "node_id_sha256",
+            }
+            or not isinstance(alternate_value, Mapping)
+            or set(alternate_value)
+            != {
+                "instance_id",
+                "network_interface_id",
+                "baseline_advertisements",
+                "state_before",
+                "node_id_sha256",
+            }
+            or not isinstance(prefixes_value, list)
+            or not all(isinstance(value, str) for value in prefixes_value)
+        ):
+            raise AmbiguousOwnershipError("durable GWLBE route journal allowlist is invalid")
+        current_matches = [
+            member
+            for member in site.transport_router_fleet
+            if member.instance_id == current_value.get("instance_id")
+            and member.network_interface_id == current_value.get("network_interface_id")
+        ]
+        table_owner_matches = [
+            member
+            for member in site.transport_router_fleet
+            if member.gwlbe_route_table_id == journal.get("route_table_id")
+            and member.az_key == journal.get("gwlbe_az_key")
+        ]
+        alternate_matches = [
+            member
+            for member in site.transport_router_fleet
+            if member.instance_id == alternate_value.get("instance_id")
+            and member.network_interface_id == alternate_value.get("network_interface_id")
+        ]
+        prefixes = tuple(cast(list[str], prefixes_value))
+        if (
+            len(current_matches) != 1
+            or len(table_owner_matches) != 1
+            or len(alternate_matches) != 1
+            or alternate_matches[0] == current_matches[0]
+            or prefixes != tuple(site.remote_site_cidrs)
+            or journal.get("source_prefix")
+            != current_matches[0].advertised_prefix
+            or current_value.get("baseline_advertisements")
+            != [current_matches[0].advertised_prefix]
+            or alternate_value.get("baseline_advertisements")
+            != [alternate_matches[0].advertised_prefix]
+            or current_value.get("node_id_sha256")
+            != hashlib.sha256(
+                self.advertisement_control.node_ids_by_instance[
+                    current_matches[0].instance_id
+                ].encode("utf-8")
+            ).hexdigest()
+            or alternate_value.get("node_id_sha256")
+            != hashlib.sha256(
+                self.advertisement_control.node_ids_by_instance[
+                    alternate_matches[0].instance_id
+                ].encode("utf-8")
+            ).hexdigest()
+            or self.topology.route_failover.initial_router_az(
+                cast(Site, site_value), cast(str, journal.get("gwlbe_az_key"))
+            )
+            != current_matches[0].az_key
+        ):
+            raise AmbiguousOwnershipError("durable GWLBE route journal differs from topology")
+        current, alternate = current_matches[0], alternate_matches[0]
+        table_owner = table_owner_matches[0]
+        authority = self.authorize(current, alternate, prefixes, table_owner)
+        claim_id = authority.get("claim_id") if isinstance(authority, Mapping) else None
+        if (
+            not isinstance(authority, Mapping)
+            or authority.get("authorized") is not True
+            or authority.get("cleanup_authorized") is not True
+            or authority.get("claim_id") != journal.get("claim_id")
+        ):
+            raise AmbiguousOwnershipError("durable GWLBE route cleanup authority is ambiguous")
+        self._persist(journal)
+        deadline = self.monotonic() + restoration_timeout
+        self._network_interface_evidence(current, alternate, deadline=deadline)
+        self._persist(journal)
+        self._table_snapshot(
+            table_owner,
+            prefixes,
+            {cast(str, current.network_interface_id), cast(str, alternate.network_interface_id)},
+            deadline=deadline,
+            operation="GWLBE abandoned route ownership lookup",
+        )
+        self._persist(journal)
+        restoration = self._restore_original_routes(
+            journal,
+            current,
+            alternate,
+            table_owner,
+            prefixes,
+            restoration_timeout=restoration_timeout,
+            primary_error=InterruptedError("prior protected runner exited during route mutation"),
+            recovered=True,
+        )
+        return {
+            "required": True,
+            "restored": True,
+            "route_table_id": table_owner.gwlbe_route_table_id,
+            "prefixes": list(prefixes),
+            "restoration": restoration,
+        }
+
+    def replace(
+        self,
+        current: SymmetricFleetMember,
+        alternate: SymmetricFleetMember,
+        *,
+        route_table_owner: SymmetricFleetMember | None = None,
+        probe: Callable[[float], Mapping[str, Any]],
+        timeout_seconds: float,
+        restoration_timeout_seconds: float,
+        failure_mode: Literal["graceful", "abrupt"] = "abrupt",
+        before_replace: Callable[[], Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Replace every exact remote prefix, then always restore the prior ENI."""
+
+        timeout = self._bounded_timeout(timeout_seconds, "GWLBE route replacement timeout")
+        restoration_timeout = self._bounded_timeout(
+            restoration_timeout_seconds, "GWLBE route restoration timeout"
+        )
+        validate_protected_execution(
+            self.topology.run_id,
+            self.environment if self.environment is not None else os.environ,
+        )
+        if current.site not in SITES:
+            raise ResilienceError("GWLBE route replacement current router has an invalid site")
+        site = self.topology.site(current.site)
+        table_owner = route_table_owner or current
+        table_owners = [
+            member
+            for member in site.transport_router_fleet
+            if member.gwlbe_route_table_id == table_owner.gwlbe_route_table_id
+        ]
+        if (
+            table_owner.site != current.site
+            or table_owner.region != current.region
+            or len(table_owners) != 1
+            or table_owners[0] != table_owner
+            or self.topology.route_failover.initial_router_az(
+                current.site, table_owner.az_key
+            )
+            != current.az_key
+        ):
+            raise ResilienceError("GWLBE route replacement current router/table is outside the allowlist")
+        source_prefix = current.advertised_prefix
+        if (
+            not isinstance(source_prefix, str)
+            or table_owner.advertised_prefix != source_prefix
+            or site.transport_router_for_prefix(source_prefix) != current
+        ):
+            raise ResilienceError(
+                "GWLBE route replacement source prefix is not owned by the selected current router"
+            )
+        if alternate not in site.transport_router_fleet or alternate == current:
+            raise ResilienceError("GWLBE route replacement alternate is not a distinct same-site router")
+        if failure_mode not in {"graceful", "abrupt"}:
+            raise ResilienceError("transport failover requires an explicit failure mode")
+        if current.region != alternate.region or current.network_interface_id is None or alternate.network_interface_id is None:
+            raise ResilienceError("GWLBE route replacement routers do not expose exact same-region ENIs")
+        prefixes = tuple(site.remote_site_cidrs)
+        authority = self.authorize(current, alternate, prefixes, table_owner)
+        claim_id = authority.get("claim_id") if isinstance(authority, Mapping) else None
+        if (
+            not isinstance(authority, Mapping)
+            or authority.get("authorized") is not True
+            or authority.get("ownership_verified") is not True
+            or authority.get("cleanup_authorized") is not True
+            or authority.get("route_table_id") != table_owner.gwlbe_route_table_id
+            or authority.get("prefixes") != list(prefixes)
+            or authority.get("source_prefix") != source_prefix
+            or authority.get("current_network_interface_id") != current.network_interface_id
+            or authority.get("alternate_network_interface_id") != alternate.network_interface_id
+            or not isinstance(claim_id, str)
+            or re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                claim_id,
+            )
+            is None
+        ):
+            raise ResilienceError("durable GWLBE route replacement authority was not exact")
+
+        self.verify_ready(current)
+        self.verify_ready(alternate)
+        current_state = self.advertisement_control.inspect(current)
+        alternate_state = self.advertisement_control.inspect(alternate)
+        if (
+            current_state.get("advertisements")
+            != {
+                "generation": current_state.get("advertisements", {}).get("generation"),
+                "routes": [source_prefix],
+                "service": "running",
+                "mode": "normal",
+            }
+            or alternate_state.get("advertisements")
+            != {
+                "generation": alternate_state.get("advertisements", {}).get("generation"),
+                "routes": [alternate.advertised_prefix],
+                "service": "running",
+                "mode": "normal",
+            }
+        ):
+            raise ResilienceError(
+                "transport failover advertisements are not at their deterministic baseline"
+            )
+        baseline_owner_instance_ids = {
+            cast(str, member.advertised_prefix): member.instance_id
+            for member in site.transport_router_fleet
+        }
+        ownership_before = self.advertisement_control.wait_ownership(
+            current.site,
+            baseline_owner_instance_ids,
+            timeout_seconds=self.topology.route_failover.recovery_timeout_seconds,
+            quiet_window_seconds=self.topology.route_failover.quiet_window_seconds,
+        )
+        preflight_deadline = self.monotonic() + timeout
+        interfaces = self._network_interface_evidence(
+            current, alternate, deadline=preflight_deadline
+        )
+        before = self._table_snapshot(
+            table_owner,
+            prefixes,
+            current.network_interface_id,
+            deadline=preflight_deadline,
+            operation="GWLBE route replacement before-state lookup",
+        )
+        journal: dict[str, Any] = {
+            "schema": ROUTE_JOURNAL_SCHEMA,
+            "kind": ROUTE_JOURNAL_KIND,
+            "run_id": self.topology.run_id,
+            "claim_id": claim_id,
+            "transaction_id": str(uuid.uuid4()),
+            "owner": _route_runner_identity(),
+            "lease_expires_at": self._lease_expires_at(),
+            "site": current.site,
+            "gwlbe_az_key": table_owner.az_key,
+            "started_at": _utc_now(),
+            "status": "authorized",
+            "route_table_id": table_owner.gwlbe_route_table_id,
+            "source_prefix": source_prefix,
+            "prefixes": list(prefixes),
+            "current": {
+                "instance_id": current.instance_id,
+                "network_interface_id": current.network_interface_id,
+                "baseline_advertisements": [source_prefix],
+                "state_before": current_state,
+                "node_id_sha256": hashlib.sha256(
+                    self.advertisement_control.node_ids_by_instance[
+                        current.instance_id
+                    ].encode("utf-8")
+                ).hexdigest(),
+            },
+            "alternate": {
+                "instance_id": alternate.instance_id,
+                "network_interface_id": alternate.network_interface_id,
+                "baseline_advertisements": [alternate.advertised_prefix],
+                "state_before": alternate_state,
+                "node_id_sha256": hashlib.sha256(
+                    self.advertisement_control.node_ids_by_instance[
+                        alternate.instance_id
+                    ].encode("utf-8")
+                ).hexdigest(),
+            },
+            "interfaces": interfaces,
+            "before": before,
+            "advertisements": {
+                "forward_generation": str(uuid.uuid4()),
+                "restore_generation": str(uuid.uuid4()),
+                "failure_mode": failure_mode,
+                "alternate_expansion": None,
+                "current_withdrawal": None,
+            },
+            "ownership": {"before": ownership_before, "transferred": None},
+            "mutation": {
+                "attempted_prefixes": [],
+                "completed_prefixes": [],
+                "ambiguous_calls": [],
+            },
+            "after": None,
+            "probe": None,
+            "restoration": {
+                "status": "not-started",
+                "advertisements": {"status": "not-started"},
+                "ownership": {"status": "not-started"},
+                "routes": {"status": "not-started"},
+            },
+            "failure": None,
+        }
+        self._persist(journal)
+        deadline = self.monotonic() + timeout
+
+        primary_error: BaseException | None = None
+        control_flow_error: BaseException | None = None
+        result: dict[str, Any] | None = None
+        try:
+            advertisement_mutation = cast(
+                dict[str, Any], journal["advertisements"]
+            )
+            forward_generation = cast(
+                str, advertisement_mutation["forward_generation"]
+            )
+            alternate_baseline = cast(
+                list[str], cast(Mapping[str, Any], journal["alternate"])["baseline_advertisements"]
+            )
+            self._persist(journal)
+            remaining = deadline - self.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "alternate advertisement has no route-mutation time remaining"
+                )
+            advertisement_mutation[
+                "alternate_expansion"
+            ] = self.advertisement_control.apply(
+                alternate,
+                sorted({*alternate_baseline, source_prefix}),
+                service="running",
+                mode="normal",
+                generation=forward_generation,
+                predecessors=(
+                    cast(
+                        str,
+                        cast(Mapping[str, Any], alternate_state["advertisements"])[
+                            "generation"
+                        ],
+                    ),
+                ),
+                timeout_seconds=max(1, int(math.ceil(remaining))),
+            )
+            journal["status"] = "alternate-advertising"
+            self._persist(journal)
+            if before_replace is not None:
+                self._persist(journal)
+                remaining = deadline - self.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("transport-router failure transition has no time remaining")
+                failure_transition = dict(before_replace())
+                if self.monotonic() >= deadline:
+                    raise TimeoutError("transport-router failure transition exceeded its bounded deadline")
+                journal["failure_transition"] = sanitize_evidence_value(failure_transition)
+                self._persist(journal)
+            self._persist(journal)
+            remaining = deadline - self.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "current advertisement withdrawal has no route-mutation time remaining"
+                )
+            advertisement_mutation[
+                "current_withdrawal"
+            ] = self.advertisement_control.apply(
+                current,
+                (),
+                service="stopped",
+                mode=failure_mode,
+                generation=forward_generation,
+                predecessors=(
+                    cast(
+                        str,
+                        cast(Mapping[str, Any], current_state["advertisements"])[
+                            "generation"
+                        ],
+                    ),
+                ),
+                timeout_seconds=max(1, int(math.ceil(remaining))),
+            )
+            journal["status"] = "ownership-converging"
+            self._persist(journal)
+            transferred_owner_instance_ids = dict(baseline_owner_instance_ids)
+            transferred_owner_instance_ids[source_prefix] = alternate.instance_id
+            self._persist(journal)
+            remaining = deadline - self.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "transferred ownership observation has no mutation time remaining"
+                )
+            cast(dict[str, Any], journal["ownership"])[
+                "transferred"
+            ] = self.advertisement_control.wait_ownership(
+                current.site,
+                transferred_owner_instance_ids,
+                timeout_seconds=remaining,
+                quiet_window_seconds=self.topology.route_failover.quiet_window_seconds,
+            )
+            journal["status"] = "ownership-transferred"
+            self._persist(journal)
+            for prefix in prefixes:
+                cast(dict[str, Any], journal["mutation"])["attempted_prefixes"].append(prefix)
+                self._persist(journal)
+                try:
+                    self._aws_json(
+                        [
+                            "ec2",
+                            "replace-route",
+                            "--route-table-id",
+                            cast(str, table_owner.gwlbe_route_table_id),
+                            "--destination-cidr-block",
+                            prefix,
+                            "--network-interface-id",
+                            alternate.network_interface_id,
+                        ],
+                        region=table_owner.region,
+                        deadline=deadline,
+                        operation=f"GWLBE route replacement for {prefix}",
+                    )
+                except BaseException as error:
+                    _rethrow_protected_control_flow(error)
+                    settlement = {
+                        "prefix": prefix,
+                        **self._failure(error),
+                        "settled_target": None,
+                    }
+                    cast(list[dict[str, Any]], cast(dict[str, Any], journal["mutation"])["ambiguous_calls"]).append(settlement)
+                    journal["status"] = "ambiguous-forward-call"
+                    self._persist(journal)
+                    settlement_deadline = (
+                        self.monotonic()
+                        + self.topology.route_failover.settlement_timeout_seconds
+                    )
+                    try:
+                        settled_target, observed = self._settle_route_target(
+                            table_owner,
+                            prefix,
+                            {
+                                cast(str, current.network_interface_id),
+                                cast(str, alternate.network_interface_id),
+                            },
+                            deadline=settlement_deadline,
+                            operation=f"ambiguous GWLBE route settlement for {prefix}",
+                        )
+                        settlement["settled_target"] = settled_target
+                        settlement["observation"] = observed
+                    except BaseException as settlement_error:
+                        _rethrow_protected_control_flow(settlement_error)
+                        settlement["settlement_failure"] = self._failure(settlement_error)
+                    self._persist(journal)
+                    raise AmbiguousRouteMutationError(
+                        f"GWLBE route replacement for {prefix} had an ambiguous API outcome"
+                    ) from error
+                cast(dict[str, Any], journal["mutation"])["completed_prefixes"].append(prefix)
+                self._persist(journal)
+            after = self._wait_snapshot(
+                table_owner,
+                prefixes,
+                alternate.network_interface_id,
+                deadline=deadline,
+                operation="GWLBE alternate route convergence",
+            )
+            journal["after"] = after
+            journal["status"] = "alternate-active"
+            self._persist(journal)
+            remaining = deadline - self.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("GWLBE alternate probe has no time remaining")
+            raw_probe = dict(probe(remaining))
+            if self.monotonic() > deadline:
+                raise TimeoutError("GWLBE alternate new-flow probe exceeded its deadline")
+            probe_value = sanitize_evidence_value(raw_probe)
+            if not isinstance(probe_value, Mapping):
+                raise EvidenceError("GWLBE alternate probe did not sanitize to an object")
+            probe_value = dict(probe_value)
+            journal["probe"] = probe_value
+            journal["status"] = "probe-passed"
+            self._persist(journal)
+            result = {"after": after, "probe": probe_value}
+        except PROTECTED_CONTROL_FLOW as error:
+            control_flow_error = error
+            raise
+        except BaseException as error:
+            primary_error = error
+            journal["failure"] = self._failure(error)
+            journal["status"] = "failed-before-restoration"
+            try:
+                self._persist(journal)
+            except PROTECTED_CONTROL_FLOW as persistence_control_flow:
+                control_flow_error = persistence_control_flow
+                raise
+            except BaseException:
+                pass
+        finally:
+            if control_flow_error is None:
+                self._restore_original_routes(
+                    journal,
+                    current,
+                    alternate,
+                    table_owner,
+                    prefixes,
+                    restoration_timeout=restoration_timeout,
+                    primary_error=primary_error,
+                    recovered=False,
+                )
+
+        if primary_error is not None:
+            raise primary_error
+        if result is None or journal["restoration"].get("status") != "verified":
+            raise RouteRestorationError("GWLBE route replacement ended without verified restoration")
+        result.update(
+            {
+                "route_table_id": table_owner.gwlbe_route_table_id,
+                "gwlbe_az_key": table_owner.az_key,
+                "prefixes": list(prefixes),
+                "source_prefix": source_prefix,
+                "current": dict(journal["current"]),
+                "alternate": dict(journal["alternate"]),
+                "bounds": {
+                    "approved_inputs": self.topology.route_failover.approved_bounds(),
+                    "effective": {
+                        "mutation_timeout_seconds": (
+                            int(timeout) if timeout.is_integer() else timeout
+                        ),
+                        "restoration_timeout_seconds": (
+                            int(restoration_timeout)
+                            if restoration_timeout.is_integer()
+                            else restoration_timeout
+                        ),
+                        **self.topology.route_failover.derived_bounds(),
+                    },
+                    "derivation": {
+                        "settlement_timeout_seconds": "recovery_timeout_seconds",
+                        "quiet_window_seconds": (
+                            "min(10,max(1,restoration_timeout_seconds//10))"
+                        ),
+                        "owner_lease_seconds": (
+                            "max(mutation_timeout_seconds,restoration_timeout_seconds,"
+                            "recovery_timeout_seconds,165,45)+quiet_window_seconds+15"
+                        ),
+                    },
+                },
+                "before": before,
+                "advertisements": journal["advertisements"],
+                "ownership": journal["ownership"],
+                "restoration": journal["restoration"],
+                "restored": True,
+            }
+        )
+        return result
+
+
 def verify_live_evidence(document: Any) -> dict[str, Any]:
-    """Strictly verify that a schema-2 bundle proves a complete passing run."""
+    """Strictly verify that a live schema-2 or symmetric schema-3 bundle passed."""
 
     normalized = validate_evidence(document)
+    if normalized.get("kind") == SYMMETRIC_EVIDENCE_KIND:
+        if normalized.get("status") != "passed":
+            raise EvidenceVerificationError("symmetric evidence run status is not passed")
+        return normalized
     if normalized.get("kind") != LIVE_EVIDENCE_KIND:
         raise EvidenceVerificationError("evidence is not an AWS two-region live bundle")
     failures: list[str] = []
@@ -4423,19 +9249,50 @@ def sanitize_evidence_value(value: Any, *, depth: int = 0) -> Any:
                 continue
             normalized = _normalized_key(key)
             if normalized in _RAW_MATERIAL_KEYS:
-                result[f"{normalized}_omitted"] = True
+                output_key = f"{normalized}_omitted"
+                output_value: Any = True
             elif normalized in _CREDENTIAL_KEYS:
-                result[key] = "[REDACTED]"
+                output_key = key
+                output_value = "[REDACTED]"
             else:
-                result[key] = sanitize_evidence_value(child, depth=depth + 1)
+                output_key = key
+                output_value = sanitize_evidence_value(child, depth=depth + 1)
+            safe_key = _sanitize_string(output_key)
+            if not safe_key or safe_key != output_key:
+                safe_key = "[REDACTED_KEY]"
+            suffix = 1
+            candidate = safe_key
+            while candidate in result:
+                suffix += 1
+                candidate = f"{safe_key}_{suffix}"
+            result[candidate] = output_value
         return result
     if isinstance(value, (list, tuple)):
         return [sanitize_evidence_value(child, depth=depth + 1) for child in value[:10_000]]
     if isinstance(value, str):
         return _sanitize_string(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        return "[NON_FINITE_NUMBER]"
     if value is None or isinstance(value, (bool, int, float)):
         return value
     return _sanitize_string(str(value))
+
+
+_COLD_FAILURE_OUTPUT_LIMIT = 4096
+
+
+def _bounded_exception_output(error: BaseException, stream: Literal["stdout", "stderr"]) -> str:
+    values: list[str] = []
+    visited: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        for attribute in (stream, f"raw_{stream}"):
+            value = getattr(current, attribute, "")
+            if isinstance(value, str) and value and value not in values:
+                values.append(value)
+        current = current.__cause__ or current.__context__
+    return _sanitize_string("\n".join(values))[:_COLD_FAILURE_OUTPUT_LIMIT]
 
 
 def new_live_evidence(run_id: str, budgets: TimeoutBudgets) -> dict[str, Any]:
@@ -4469,9 +9326,30 @@ def new_live_evidence(run_id: str, budgets: TimeoutBudgets) -> dict[str, Any]:
 
 
 class ProtectedLifecycleAPI(Protocol):
-    def claim(self, raw_deployment: Mapping[str, Any], deployment: ProtectedDeployment) -> Mapping[str, Any]: ...
+    def claim(
+        self,
+        raw_deployment: Mapping[str, Any],
+        deployment: ProtectedDeployment | SymmetricProtectedDeployment,
+    ) -> Mapping[str, Any]: ...
 
     def verify_no_drift(self, stage: Literal["before", "after"]) -> Mapping[str, Any]: ...
+
+    def authorize_gwlbe_route_replacement(
+        self,
+        current: SymmetricFleetMember,
+        alternate: SymmetricFleetMember,
+        prefixes: tuple[str, ...],
+        route_table_owner: SymmetricFleetMember,
+    ) -> Mapping[str, Any]: ...
+
+    def reconcile_gwlbe_route_replacement(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        *,
+        timeout_seconds: int,
+    ) -> Mapping[str, Any]: ...
+
+    def replace_target_instance(self, member: SymmetricFleetMember) -> Mapping[str, Any]: ...
 
     def finish(self, passed: bool) -> Mapping[str, Any]: ...
 
@@ -4552,6 +9430,663 @@ class LiveRunResult:
     @property
     def passed(self) -> bool:
         return self.exit_code == EXIT_OK
+
+
+class SymmetricLiveOperations(Protocol):
+    def verify_readiness(
+        self, deployment: SymmetricProtectedDeployment, *, timeout_seconds: int
+    ) -> Mapping[str, Any]: ...
+
+    def run_cold_probe(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        flow: FlowRecord,
+        *,
+        start_barrier: threading.Barrier,
+        timeout_seconds: int,
+    ) -> Mapping[str, Any]: ...
+
+    def run_traversal(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        source_site: Site,
+        flows: Sequence[FlowRecord],
+        *,
+        timeout_seconds: int,
+    ) -> Mapping[str, Any]: ...
+
+    def run_target_process_recovery(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        failed: SymmetricFleetMember,
+        new_flow: FlowRecord,
+        new_tcp_flow: FlowRecord,
+        tcp_flow: FlowRecord,
+        udp_flow: FlowRecord,
+        *,
+        timeout_seconds: int,
+    ) -> Mapping[str, Any]: ...
+
+    def run_target_instance_recovery(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        failed: SymmetricFleetMember,
+        new_flow: FlowRecord,
+        new_tcp_flow: FlowRecord,
+        tcp_flow: FlowRecord,
+        udp_flow: FlowRecord,
+        *,
+        timeout_seconds: int,
+    ) -> tuple[SymmetricProtectedDeployment, Mapping[str, Any]]: ...
+
+    def run_transport_router_recovery(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        graceful_failed: SymmetricFleetMember,
+        abrupt_failed: SymmetricFleetMember,
+        graceful_flow: FlowRecord,
+        abrupt_flow: FlowRecord,
+        graceful_new_tcp_flow: FlowRecord,
+        abrupt_new_tcp_flow: FlowRecord,
+        graceful_tcp_flow: FlowRecord,
+        graceful_udp_flow: FlowRecord,
+        abrupt_tcp_flow: FlowRecord,
+        abrupt_udp_flow: FlowRecord,
+        *,
+        timeout_seconds: int,
+    ) -> Mapping[str, Any]: ...
+
+    def collect_diagnostics(self, deployment: SymmetricProtectedDeployment | None) -> Mapping[str, Any]: ...
+
+
+class SymmetricTwoRegionE2ERunner:
+    """One ownership-safe v2 HA transaction producing only final schema-3 evidence."""
+
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        raw_deployment: Mapping[str, Any],
+        site_regions: Mapping[str, str],
+        lifecycle: ProtectedLifecycleAPI,
+        operations: SymmetricLiveOperations,
+        evidence_path: pathlib.Path,
+        budgets: TimeoutBudgets = DEFAULT_TIMEOUTS,
+    ) -> None:
+        if not _RUN_ID_RE.fullmatch(run_id):
+            raise E2EError("symmetric live run_id must be a lowercase deployment slug")
+        self.run_id = run_id
+        self.raw_deployment = dict(raw_deployment)
+        self.site_regions = dict(site_regions)
+        self.lifecycle = lifecycle
+        self.operations = operations
+        self.evidence_path = evidence_path.expanduser().resolve()
+        self.budgets = budgets
+        self.ledger = FlowLedger(run_id)
+
+    def _allocate(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        protocol: ProtocolName,
+        source: Site,
+        purpose: str,
+        *,
+        source_role: WorkloadRole = "initiator",
+        destination_role: WorkloadRole = "responder",
+    ) -> FlowRecord:
+        return self.ledger.allocate(
+            protocol,
+            deployment.workloads.target(source, source_role),
+            deployment.workloads.target(_opposite(source), destination_role),
+            destination_port=None if protocol == "icmp" else 5201,
+            purpose=purpose,
+            generation=self.ledger.begin_generation(purpose),
+        )
+
+    def _failure_evidence(
+        self,
+        error: BaseException,
+        *,
+        failure_phase: str,
+        deployment: SymmetricProtectedDeployment | None,
+        diagnostics: Mapping[str, Any],
+        cold_initiation: Sequence[Mapping[str, Any]],
+        claimed: bool,
+        finished: bool,
+        ownership_resolution: str | None,
+        cleanup_status: Literal["passed", "failed", "skipped"],
+        residual_audit: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        lifecycle: dict[str, Any] = {
+            "claimed": claimed,
+            "finish": "persisted" if finished else "failed" if claimed else "not-claimed",
+            "cleanup": cleanup_status,
+        }
+        if ownership_resolution is not None:
+            lifecycle["ownership_resolution"] = ownership_resolution
+        safe_diagnostics = cast(dict[str, Any], sanitize_evidence_value(diagnostics))
+        document = {
+            "schema": SYMMETRIC_EVIDENCE_SCHEMA,
+            "kind": SYMMETRIC_EVIDENCE_KIND,
+            "run_id": self.run_id,
+            "generated_at": _utc_now(),
+            "status": "failed",
+            "topology": deployment.topology.as_dict() if deployment is not None else {},
+            "endpoint_ids": (
+                {site: dict(values) for site, values in deployment.endpoint_ids.items()}
+                if deployment is not None
+                else {}
+            ),
+            "preflight": {},
+            "cold_initiation": [dict(value) for value in cold_initiation],
+            "traversals": [],
+            "recoveries": [],
+            "transport": {},
+            "transport_router": {},
+            "health_transitions": [],
+            "cost": deployment.cost_evidence() if deployment is not None else {},
+            "lifecycle": lifecycle,
+            "residual_audit": dict(residual_audit),
+            "diagnostics": safe_diagnostics,
+            "failure": {
+                "phase": failure_phase,
+                "category": type(error).__name__,
+                "message": _sanitize_string(str(error)),
+            },
+        }
+        document = validate_symmetric_evidence(document)
+        _write_private_json(self.evidence_path.parent / "diagnostics.json", safe_diagnostics)
+        write_evidence(self.evidence_path, document)
+        return document
+
+    @staticmethod
+    def _residual_audit(cleanup: Mapping[str, Any]) -> dict[str, Any]:
+        residual_count = cleanup.get("final_residual_count", cleanup.get("residual_count"))
+        if residual_count != 0:
+            raise EvidenceError("protected cleanup did not prove a zero-resource final residual audit")
+        return {"passed": True, "owned_resources_remaining": 0}
+
+    def run(self) -> LiveRunResult:
+        deployment: SymmetricProtectedDeployment | None = None
+        cold_initiation: list[dict[str, Any]] = []
+        claimed = False
+        finished = False
+        cleanup_status: Literal["passed", "failed", "skipped"] = "skipped"
+        cleanup_attempted = False
+        acceptance_completed = False
+        cleanup_result: Mapping[str, Any] = {}
+        deferred_finish: Mapping[str, Any] | None = None
+        current_phase = Phase.CONSUME_DEPLOYMENT.value
+        try:
+            deployment = parse_symmetric_protected_deployment_output(
+                self.raw_deployment,
+                site_regions=self.site_regions,
+            )
+            if deployment.topology.run_id != self.run_id:
+                raise DeploymentError("symmetric topology run ID differs from the approved live run")
+            route_failover = deployment.topology.route_failover
+            transaction_reservations: list[int] = []
+            restoration_reservations: list[int] = []
+            for site in SITES:
+                site_topology = deployment.topology.site(site)
+                observer_count = len(
+                    deployment.topology.site(_opposite(site)).transport_router_fleet
+                )
+                minimum_ownership_window = (
+                    2 * observer_count + route_failover.quiet_window_seconds
+                )
+                if min(
+                    route_failover.mutation_timeout_seconds,
+                    route_failover.restoration_timeout_seconds,
+                    route_failover.recovery_timeout_seconds,
+                ) < minimum_ownership_window:
+                    raise DeploymentError(
+                        "route failover timeouts cannot cover every sequential ownership observer and quiet window"
+                    )
+                prefix_count = len(site_topology.remote_site_cidrs)
+                transaction_reservations.append(
+                    route_failover.transaction_reservation_seconds(prefix_count)
+                    + STREAM_MUTATION_OVERHEAD_SECONDS
+                )
+                restoration_reservations.append(
+                    route_failover.restoration_reservation_seconds(prefix_count)
+                )
+            if max(restoration_reservations) > self.budgets.cleanup:
+                raise DeploymentError(
+                    "route restoration cannot fit the protected cleanup reservation"
+                )
+            if (
+                max(transaction_reservations)
+                > MAX_STREAM_MUTATION_RESERVATION_SECONDS
+                or sum(transaction_reservations) > self.budgets.hard_timeout
+            ):
+                raise DeploymentError(
+                    "graceful and abrupt route failover cannot fit the stream and active-run reservations"
+                )
+            claim = self.lifecycle.claim(self.raw_deployment, deployment)
+            claimed = True
+            if claim.get("load_profile_approved_before_apply") is not True:
+                raise LoadProfileError("symmetric lifecycle claim did not prove pre-apply load approval")
+            reconcile = getattr(self.lifecycle, "reconcile_gwlbe_route_replacement", None)
+            reconciliation = (
+                reconcile(
+                    deployment,
+                    timeout_seconds=deployment.topology.route_failover.recovery_timeout_seconds,
+                )
+                if callable(reconcile)
+                else {"required": False, "restored": True}
+            )
+            if claim.get("route_recovery_required") is True:
+                if reconciliation.get("required") is not True or reconciliation.get("restored") is not True:
+                    raise RouteRestorationError(
+                        "abandoned GWLBE route claim did not complete verified startup restoration"
+                    )
+                raise ResilienceError(
+                    "abandoned GWLBE routes were restored; the interrupted acceptance will not be replayed"
+                )
+            current_phase = Phase.DRIFT_PRECHECK.value
+            if self.lifecycle.verify_no_drift("before").get("clean") is not True:
+                raise DriftError("symmetric protected Terraform precheck is not clean")
+            current_phase = Phase.READINESS_TOPOLOGY.value
+            preflight = validate_symmetric_preflight(
+                deployment.topology,
+                self.operations.verify_readiness(deployment, timeout_seconds=self.budgets.readiness_topology),
+                deployment.transport_router_readiness_expectations,
+            )
+            traversal_flows = {
+                source: [
+                    self._allocate(
+                        deployment,
+                        protocol,
+                        source,
+                        f"symmetric-{source}-{source_role}-{protocol}",
+                        source_role=source_role,
+                        destination_role=_opposite_workload_role(source_role),
+                    )
+                    for source_role in WORKLOAD_ROLES
+                    for protocol in PROTOCOLS
+                ]
+                for source in SITES
+            }
+            cold_flows = [
+                self._allocate(
+                    deployment,
+                    protocol,
+                    source,
+                    f"simultaneous-cold-{source}-{protocol}",
+                    source_role="initiator" if source == "west" else "responder",
+                    destination_role="responder" if source == "west" else "initiator",
+                )
+                for source in SITES
+                for protocol in PROTOCOLS
+            ]
+            barrier = threading.Barrier(len(cold_flows))
+            current_phase = "simultaneous-cold-initiation"
+
+            def run_cold(flow: FlowRecord) -> dict[str, Any]:
+                return dict(
+                    self.operations.run_cold_probe(
+                        deployment,
+                        flow,
+                        start_barrier=barrier,
+                        timeout_seconds=self.budgets.cold_direction,
+                    )
+                )
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(cold_flows)) as pool:
+                futures = [(flow, pool.submit(run_cold, flow)) for flow in cold_flows]
+                cold_errors: list[BaseException] = []
+                for flow, future in futures:
+                    try:
+                        cold_initiation.append(future.result())
+                    except BaseException as cold_error:
+                        cold_errors.append(cold_error)
+                        source_az = flow.source.az_key
+                        dispatch = getattr(cold_error, "dispatch_monotonic_ns", 0)
+                        if isinstance(dispatch, bool) or not isinstance(dispatch, int):
+                            dispatch = 0
+                        cold_initiation.append(
+                            {
+                                "source_site": flow.source.site,
+                                "destination_site": flow.destination.site,
+                                "source_role": flow.source.role,
+                                "destination_role": flow.destination.role,
+                                "protocol": flow.protocol,
+                                "source_az_key": source_az,
+                                "source_gwlbe_id": (
+                                    deployment.endpoint_ids[flow.source.site].get(source_az)
+                                    if source_az is not None
+                                    else None
+                                ),
+                                "dispatch_monotonic_ns": max(0, dispatch),
+                                "succeeded": False,
+                                "failure": {
+                                    "category": type(cold_error).__name__,
+                                    "message": _sanitize_string(str(cold_error)),
+                                },
+                                "stdout": _bounded_exception_output(cold_error, "stdout"),
+                                "stderr": _bounded_exception_output(cold_error, "stderr"),
+                            }
+                        )
+                if cold_errors:
+                    selected = next(
+                        (
+                            error
+                            for error in cold_errors
+                            if isinstance(error, (TimeoutError, InterruptedError, KeyboardInterrupt))
+                        ),
+                        cold_errors[0],
+                    )
+                    if hasattr(selected, "add_note"):
+                        selected.add_note(
+                            f"retained all {len(cold_initiation)} cold outcomes; "
+                            f"{len(cold_errors)} failed"
+                        )
+                    raise selected
+            current_phase = "bidirectional-traversal"
+            traversals = [
+                dict(
+                    self.operations.run_traversal(
+                        deployment,
+                        source,
+                        traversal_flows[source],
+                        timeout_seconds=self.budgets.cold_direction,
+                    )
+                )
+                for source in SITES
+            ]
+
+            west_traversal = next(value for value in traversals if value.get("source_site") == "west")
+            west_probe = cast(list[dict[str, Any]], west_traversal["probes"])[0]
+            selected_target = next(
+                member
+                for member in deployment.topology.west.target_fleet
+                if member.instance_id == west_probe.get("source_target_id")
+            )
+            current_phase = "target-process-recovery"
+            process = dict(
+                self.operations.run_target_process_recovery(
+                    deployment,
+                    selected_target,
+                    self._allocate(deployment, "udp", "west", "target-process-new-flow"),
+                    self._allocate(deployment, "tcp", "west", "target-process-new-tcp-flow"),
+                    self._allocate(deployment, "tcp", "west", "target-process-established-tcp"),
+                    self._allocate(deployment, "udp", "west", "target-process-established-udp"),
+                    timeout_seconds=self.budgets.service_stop,
+                )
+            )
+            current_phase = "target-instance-recovery"
+            deployment, instance_value = self.operations.run_target_instance_recovery(
+                deployment,
+                selected_target,
+                self._allocate(deployment, "udp", "west", "target-instance-new-flow"),
+                self._allocate(deployment, "tcp", "west", "target-instance-new-tcp-flow"),
+                self._allocate(deployment, "tcp", "west", "target-instance-established-tcp"),
+                self._allocate(deployment, "udp", "west", "target-instance-established-udp"),
+                timeout_seconds=self.budgets.ec2_reboot,
+            )
+            instance = dict(instance_value)
+            graceful_router = next(
+                member
+                for member in deployment.topology.east.transport_router_fleet
+                if member.instance_id
+                == west_probe.get("destination_transport_router_id")
+            )
+            source_az_key = west_probe.get("source_az_key")
+            if not isinstance(source_az_key, str):
+                raise ProbeError("west traversal did not bind its source GWLBE AZ")
+            expected_router_az = deployment.topology.route_failover.initial_router_az(
+                "west", source_az_key
+            )
+            abrupt_router = next(
+                member
+                for member in deployment.topology.west.transport_router_fleet
+                if member.az_key == expected_router_az
+            )
+            if abrupt_router.instance_id != west_probe.get("source_transport_router_id"):
+                raise ProbeError(
+                    "observed source transport router differs from the intended GWLBE route selection"
+                )
+            current_phase = "transport-router-recovery"
+            transport_recovery = getattr(self.operations, "run_transport_router_recovery", None)
+            if not callable(transport_recovery):
+                raise ResilienceError(
+                    "symmetric operations must implement the transport-router recovery contract"
+                )
+            router = dict(
+                transport_recovery(
+                    deployment,
+                    graceful_router,
+                    abrupt_router,
+                    self._allocate(
+                        deployment, "udp", "west", "transport-router-graceful-new-flow"
+                    ),
+                    self._allocate(
+                        deployment, "udp", "west", "transport-router-route-new-flow"
+                    ),
+                    self._allocate(
+                        deployment, "tcp", "west", "transport-router-graceful-new-tcp-flow"
+                    ),
+                    self._allocate(
+                        deployment, "tcp", "west", "transport-router-route-new-tcp-flow"
+                    ),
+                    self._allocate(
+                        deployment, "tcp", "west", "transport-router-graceful-established-tcp"
+                    ),
+                    self._allocate(
+                        deployment, "udp", "west", "transport-router-graceful-established-udp"
+                    ),
+                    self._allocate(
+                        deployment, "tcp", "west", "transport-router-abrupt-established-tcp"
+                    ),
+                    self._allocate(
+                        deployment, "udp", "west", "transport-router-abrupt-established-udp"
+                    ),
+                    timeout_seconds=self.budgets.route_mutation,
+                )
+            )
+            current_phase = Phase.DRIFT_POSTCHECK.value
+            if self.lifecycle.verify_no_drift("after").get("clean") is not True:
+                raise DriftError("symmetric protected Terraform postcheck is not clean")
+            current_phase = "lifecycle-finish"
+            finish = self.lifecycle.finish(True)
+            if (
+                finish.get("acceptance") != "passed"
+                or finish.get("finish") == "deferred-route-recovery"
+            ):
+                raise ClaimPersistenceError("symmetric lifecycle did not persist its passing result")
+            finished = True
+            acceptance_completed = True
+            current_phase = Phase.CLEANUP.value
+            cleanup_attempted = True
+            cleanup_result = self.lifecycle.cleanup()
+            cleanup_status = "passed"
+            residual_audit = self._residual_audit(cleanup_result)
+            current_phase = Phase.EVIDENCE.value
+            evidence = {
+                "schema": SYMMETRIC_EVIDENCE_SCHEMA,
+                "kind": SYMMETRIC_EVIDENCE_KIND,
+                "run_id": self.run_id,
+                "generated_at": _utc_now(),
+                "status": "passed",
+                "topology": parse_symmetric_protected_deployment_output(
+                    self.raw_deployment,
+                    site_regions=self.site_regions,
+                ).topology.as_dict(),
+                "endpoint_ids": {
+                    site: dict(values) for site, values in deployment.endpoint_ids.items()
+                },
+                "preflight": preflight,
+                "cold_initiation": cold_initiation,
+                "traversals": traversals,
+                "recoveries": [process["recovery"], instance["recovery"], router["recovery"]],
+                "transport": {
+                    "target_process": process["transport"],
+                    "target_instance": instance["transport"],
+                    "transport_router": router["transport"],
+                },
+                "transport_router": {
+                    "graceful": router["graceful"],
+                    "abrupt": router["abrupt"],
+                },
+                "health_transitions": [
+                    *process["health_transitions"],
+                    instance["health_transition"],
+                    router["health_transition"],
+                ],
+                "cost": deployment.cost_evidence(),
+                "lifecycle": {
+                    "claimed": True,
+                    "drift_precheck": "clean",
+                    "drift_postcheck": "clean",
+                    "finish": "passed",
+                    "cleanup": "complete",
+                },
+                "residual_audit": residual_audit,
+                "diagnostics": {},
+                "failure": None,
+            }
+            normalized = validate_symmetric_evidence(evidence)
+            write_evidence(self.evidence_path, normalized)
+            return LiveRunResult(EXIT_OK, self.evidence_path, normalized)
+        except PROTECTED_CONTROL_FLOW:
+            raise
+        except BaseException as error:
+            acceptance_failure_phase = current_phase
+            active_limit_exhausted = isinstance(error, (TimeoutError, InterruptedError, KeyboardInterrupt))
+            cleanup_error: BaseException | None = None
+            acceptance_error: BaseException | None = error
+            if cleanup_attempted and current_phase == Phase.CLEANUP.value:
+                cleanup_error = error
+                acceptance_error = None if acceptance_completed else error
+                cleanup_status = "failed"
+
+            ownership_resolution = _ownership_resolution(acceptance_error or cleanup_error)
+            cleanup_blocked = ownership_resolution in {"competing-claim", "ambiguous-ownership"}
+            diagnostics: Mapping[str, Any] = {}
+            finish_error: BaseException | None = None
+            if (
+                acceptance_error is not None
+                and claimed
+                and not cleanup_attempted
+                and not active_limit_exhausted
+                and not cleanup_blocked
+                and deployment is not None
+            ):
+                try:
+                    diagnostics = self.operations.collect_diagnostics(deployment)
+                except PROTECTED_CONTROL_FLOW:
+                    raise
+                except BaseException as diagnostic_error:
+                    active_limit_exhausted = active_limit_exhausted or isinstance(
+                        diagnostic_error, (TimeoutError, InterruptedError, KeyboardInterrupt)
+                    )
+                    diagnostics = (
+                        {
+                            "collection": "skipped",
+                            "reason": "active run limit exhausted during diagnostics; protected cleanup took priority",
+                        }
+                        if active_limit_exhausted
+                        else {
+                            "collection": "failed",
+                            "error": _sanitize_string(str(diagnostic_error)),
+                        }
+                    )
+
+            if (
+                acceptance_error is not None
+                and claimed
+                and not active_limit_exhausted
+                and not cleanup_blocked
+                and not finished
+                and not isinstance(acceptance_error, ClaimPersistenceError)
+            ):
+                try:
+                    finish_result = self.lifecycle.finish(False)
+                    if finish_result.get("acceptance") != "failed":
+                        raise ClaimPersistenceError("symmetric lifecycle did not persist its failing result")
+                    if finish_result.get("finish") == "deferred-route-recovery":
+                        deferred_finish = dict(finish_result)
+                    else:
+                        finished = True
+                except PROTECTED_CONTROL_FLOW:
+                    raise
+                except BaseException as candidate:
+                    finish_error = candidate
+                    active_limit_exhausted = active_limit_exhausted or isinstance(
+                        candidate, (TimeoutError, InterruptedError, KeyboardInterrupt)
+                    )
+                    finish_resolution = _ownership_resolution(candidate)
+                    if finish_resolution is not None:
+                        ownership_resolution = finish_resolution
+                    cleanup_blocked = finish_resolution in {"competing-claim", "ambiguous-ownership"}
+
+            cleanup_authorized = not cleanup_blocked
+            if cleanup_authorized and not cleanup_attempted:
+                cleanup_attempted = True
+                try:
+                    cleanup_result = self.lifecycle.cleanup()
+                    cleanup_status = "passed"
+                except BaseException as candidate:
+                    cleanup_status = "failed"
+                    cleanup_error = candidate
+                    cleanup_resolution = _ownership_resolution(candidate)
+                    if cleanup_resolution is not None:
+                        ownership_resolution = cleanup_resolution
+
+            try:
+                residual_audit = (
+                    self._residual_audit(cleanup_result)
+                    if cleanup_status == "passed"
+                    else {"passed": False, "owned_resources_remaining": None}
+                )
+            except PROTECTED_CONTROL_FLOW:
+                raise
+            except BaseException as audit_error:
+                cleanup_status = "failed"
+                cleanup_error = cleanup_error or audit_error
+                residual_audit = {"passed": False, "owned_resources_remaining": None}
+
+            diagnostic_values = dict(diagnostics)
+            if active_limit_exhausted:
+                diagnostic_values["collection"] = "skipped"
+                diagnostic_values["reason"] = "active run limit exhausted; protected cleanup took priority"
+            if finish_error is not None:
+                diagnostic_values["lifecycle_finish_failure"] = {
+                    "category": type(finish_error).__name__,
+                    "message": _sanitize_string(str(finish_error)),
+                }
+            if deferred_finish is not None:
+                diagnostic_values["lifecycle_finish_deferred"] = sanitize_evidence_value(
+                    deferred_finish
+                )
+            if cleanup_error is not None and acceptance_error is not None and cleanup_error is not acceptance_error:
+                diagnostic_values["acceptance_failure_before_cleanup"] = {
+                    "phase": acceptance_failure_phase,
+                    "category": type(acceptance_error).__name__,
+                    "message": _sanitize_string(str(acceptance_error)),
+                }
+
+            selected_error = cleanup_error or acceptance_error or finish_error or error
+            failure_phase = Phase.CLEANUP.value if cleanup_error is not None else acceptance_failure_phase
+            failure = self._failure_evidence(
+                selected_error,
+                failure_phase=failure_phase,
+                deployment=deployment,
+                diagnostics=diagnostic_values,
+                cold_initiation=cold_initiation,
+                claimed=claimed,
+                finished=finished,
+                ownership_resolution=ownership_resolution,
+                cleanup_status=cleanup_status,
+                residual_audit=residual_audit,
+            )
+            return LiveRunResult(
+                EXIT_CLEANUP_FAILED if cleanup_error is not None else EXIT_ACCEPTANCE_FAILED,
+                self.evidence_path,
+                failure,
+                _sanitize_string(str(selected_error)),
+            )
 
 
 def _opposite(site: Site) -> Site:
@@ -5742,6 +11277,8 @@ class TwoRegionE2ERunner:
 
             self._phase(Phase.EVIDENCE, evidence_phase)
             acceptance_passed = True
+        except PROTECTED_CONTROL_FLOW:
+            raise
         except BaseException as error:
             primary_error = error
             resolution = _ownership_resolution(error)
@@ -5962,6 +11499,7 @@ class ProtectedLifecycleAdapter:
 
     @staticmethod
     def _propagate_after_owned_recovery(error: BaseException) -> None:
+        _rethrow_protected_control_flow(error)
         message = "durable persistence was interrupted after its write committed; cleanup remains authorized"
         if isinstance(error, KeyboardInterrupt):
             raise KeyboardInterrupt(message) from None
@@ -5970,7 +11508,7 @@ class ProtectedLifecycleAdapter:
         if isinstance(error, TimeoutError):
             raise TimeoutError(message) from None
         if not isinstance(error, Exception):
-            raise error
+            raise
 
     def _clear_claim_original(self) -> None:
         self._claim_original_manifest = None
@@ -5986,6 +11524,19 @@ class ProtectedLifecycleAdapter:
         self._claim_original_etag = original_etag
         self._claim_etag = original_etag
         self._ownership_state = "claim-pending"
+        self.manifest = copy.deepcopy(dict(candidate))
+        self._last_persistence_resolution = "conditional-write"
+
+    def _install_pending_replacement(
+        self,
+        original: Mapping[str, Any],
+        original_etag: str,
+        candidate: Mapping[str, Any],
+    ) -> None:
+        self._claim_original_manifest = copy.deepcopy(dict(original))
+        self._claim_original_etag = original_etag
+        self._claim_etag = original_etag
+        self._ownership_state = "replacement-pending"
         self.manifest = copy.deepcopy(dict(candidate))
         self._last_persistence_resolution = "conditional-write"
 
@@ -6009,20 +11560,352 @@ class ProtectedLifecycleAdapter:
             "durable E2E ownership is ambiguous after bounded recovery; cleanup is prohibited"
         )
 
-    def _authoritative_recover(self) -> tuple[dict[str, Any], str]:
-        def recover() -> dict[str, Any]:
-            manifest = self.store.recover()
-            return {"manifest": manifest, "etag": self.store.remote_etag}
+    def _validate_extended_manifest(self, manifest: Mapping[str, Any]) -> dict[str, Any]:
+        value = copy.deepcopy(dict(manifest))
+        base = copy.deepcopy(value)
+        e2e_value = base.get("e2e")
+        if isinstance(e2e_value, dict):
+            e2e_value.pop("route_transaction", None)
+        validate_manifest(base, self.config)
+        return value
 
+    def _recover_manifest(self) -> dict[str, Any]:
+        if not isinstance(self.store, ManifestStore):
+            return self.store.recover()
+        response = self.aws.json(
+            [
+                "s3api",
+                "get-object",
+                "--bucket",
+                self.config.backend["bucket"],
+                "--key",
+                self.config.manifest_key,
+                str(self.store.path),
+            ],
+            region=self.config.backend["region"],
+            timeout_seconds=10,
+        )
+        etag = response.get("ETag")
+        self.store.remote_etag = str(etag) if isinstance(etag, str) and etag else None
         try:
-            recovered = _bounded_call(recover, 10.0, "durable E2E ownership recovery")
-        except BaseException:
+            value = json.loads(self.store.path.read_text(encoding="utf-8"))
+        except PROTECTED_CONTROL_FLOW:
+            raise
+        except (OSError, json.JSONDecodeError) as error:
+            raise LifecycleError(f"cannot decode durable extended manifest: {error}") from error
+        if not isinstance(value, dict):
+            raise LifecycleError("durable extended manifest is not an object")
+        os.chmod(self.store.path, 0o600)
+        return self._validate_extended_manifest(value)
+
+    def _write_manifest(self, manifest: Mapping[str, Any], *, if_match: str) -> None:
+        if not isinstance(self.store, ManifestStore):
+            self.store.write(dict(manifest), if_match=if_match)
+            return
+        value = self._validate_extended_manifest(manifest)
+        _write_private_json(self.store.path, value)
+        tagging = urllib.parse.urlencode(
+            {"EnvelopeRun": self.config.run_id, "ExpiresAt": self.config.expires_at}
+        )
+        response = self.aws.json(
+            [
+                "s3api",
+                "put-object",
+                "--bucket",
+                self.config.backend["bucket"],
+                "--key",
+                self.config.manifest_key,
+                "--body",
+                str(self.store.path),
+                "--server-side-encryption",
+                "aws:kms",
+                "--ssekms-key-id",
+                self.config.backend["kms_key_arn"],
+                "--tagging",
+                tagging,
+                "--if-match",
+                if_match,
+            ],
+            region=self.config.backend["region"],
+            timeout_seconds=10,
+        )
+        etag = response.get("ETag")
+        self.store.remote_etag = str(etag) if isinstance(etag, str) and etag else None
+        if self.store.remote_etag is None:
+            raise LifecycleError("conditional durable extended manifest write returned no ETag")
+
+    def _authoritative_recover(self) -> tuple[dict[str, Any], str]:
+        try:
+            manifest = self._recover_manifest()
+        except BaseException as error:
+            _rethrow_protected_control_flow(error)
             self._raise_ambiguous()
-        manifest = recovered.get("manifest")
-        etag = recovered.get("etag")
+        etag = self.store.remote_etag
         if not isinstance(manifest, dict) or not isinstance(etag, str) or not etag:
             self._raise_ambiguous()
         return manifest, etag
+
+    def _write_route_transaction_manifest(
+        self,
+        original: Mapping[str, Any],
+        candidate: Mapping[str, Any],
+        *,
+        expected_revision: str,
+    ) -> str:
+        if (
+            getattr(self, "_ownership_state", "unclaimed") != "running-owned"
+            or self.manifest != original
+            or getattr(self, "_claim_etag", None) != expected_revision
+        ):
+            raise ClaimPersistenceError(
+                "route transaction CAS requires this runner's exact durable E2E claim"
+            )
+        try:
+            self._write_manifest(candidate, if_match=expected_revision)
+        except BaseException as error:
+            _rethrow_protected_control_flow(error)
+            durable, etag = self._authoritative_recover()
+            if durable == candidate:
+                self._set_owned(durable, etag, terminal=False)
+                return etag
+            if durable == original and etag == expected_revision:
+                self._set_owned(durable, etag, terminal=False)
+                raise ClaimPersistenceError("route transaction manifest write was not committed") from None
+            if (
+                durable.get("phase") == "e2e_running"
+                and self._manifest_claim_id(durable) != self._manifest_claim_id(original)
+            ):
+                self._raise_competing()
+            durable_transaction = (
+                durable.get("e2e", {}).get("route_transaction")
+                if isinstance(durable.get("e2e"), Mapping)
+                else None
+            )
+            candidate_transaction = (
+                candidate.get("e2e", {}).get("route_transaction")
+                if isinstance(candidate.get("e2e"), Mapping)
+                else None
+            )
+            if durable_transaction != candidate_transaction:
+                self._raise_competing()
+            self._raise_ambiguous()
+        committed_etag = self.store.remote_etag
+        if not isinstance(committed_etag, str) or not committed_etag:
+            durable, etag = self._authoritative_recover()
+            if durable != candidate:
+                self._raise_ambiguous()
+            committed_etag = etag
+        self._set_owned(candidate, committed_etag, terminal=False)
+        return committed_etag
+
+    def load_route_transaction(self) -> tuple[dict[str, Any], str] | None:
+        original = self.manifest
+        if (
+            getattr(self, "_ownership_state", "unclaimed") != "running-owned"
+            or not isinstance(original, dict)
+            or original.get("phase") != "e2e_running"
+        ):
+            raise ClaimPersistenceError(
+                "route transaction recovery requires this runner's durable E2E claim"
+            )
+        durable, etag = self._authoritative_recover()
+        if durable != original or etag != getattr(self, "_claim_etag", None):
+            if self._manifest_claim_id(durable) != self._manifest_claim_id(original):
+                self._raise_competing()
+            self._raise_ambiguous()
+        e2e_value = durable.get("e2e")
+        transaction = (
+            e2e_value.get("route_transaction") if isinstance(e2e_value, Mapping) else None
+        )
+        if transaction is None:
+            return None
+        if not isinstance(transaction, dict):
+            self._raise_ambiguous()
+        return copy.deepcopy(transaction), etag
+
+    def create_route_transaction(self, value: Mapping[str, Any]) -> str:
+        original = self.manifest
+        if (
+            not isinstance(original, dict)
+            or original.get("phase") != "e2e_running"
+            or not isinstance(original.get("e2e"), Mapping)
+            or original["e2e"].get("route_transaction") is not None
+            or value.get("claim_id") != self._manifest_claim_id(original)
+            or value.get("run_id") != self.config.run_id
+            or scan_evidence(value)
+        ):
+            raise ClaimPersistenceError("route transaction creation is not durably authorized")
+        revision = getattr(self, "_claim_etag", None)
+        if not isinstance(revision, str) or not revision:
+            self._raise_ambiguous()
+        candidate = copy.deepcopy(original)
+        candidate["e2e"]["route_transaction"] = copy.deepcopy(dict(value))
+        return self._write_route_transaction_manifest(
+            original, candidate, expected_revision=revision
+        )
+
+    def update_route_transaction(
+        self, value: Mapping[str, Any], *, expected_revision: str
+    ) -> str:
+        original = self.manifest
+        e2e_value = original.get("e2e") if isinstance(original, Mapping) else None
+        existing = (
+            e2e_value.get("route_transaction") if isinstance(e2e_value, Mapping) else None
+        )
+        if (
+            not isinstance(original, dict)
+            or not isinstance(existing, Mapping)
+            or existing.get("transaction_id") != value.get("transaction_id")
+            or value.get("claim_id") != self._manifest_claim_id(original)
+            or value.get("run_id") != self.config.run_id
+            or scan_evidence(value)
+        ):
+            raise ClaimPersistenceError("route transaction update differs from durable authority")
+        candidate = copy.deepcopy(original)
+        candidate["e2e"]["route_transaction"] = copy.deepcopy(dict(value))
+        return self._write_route_transaction_manifest(
+            original, candidate, expected_revision=expected_revision
+        )
+
+    def finalize_route_transaction(
+        self,
+        transaction_id: str,
+        summary: Mapping[str, Any],
+        *,
+        expected_revision: str,
+    ) -> str:
+        original = self.manifest
+        e2e_value = original.get("e2e") if isinstance(original, Mapping) else None
+        existing = (
+            e2e_value.get("route_transaction") if isinstance(e2e_value, Mapping) else None
+        )
+        restoration = existing.get("restoration") if isinstance(existing, Mapping) else None
+        advertisement_restoration = (
+            restoration.get("advertisements")
+            if isinstance(restoration, Mapping)
+            else None
+        )
+        route_restoration = (
+            restoration.get("routes") if isinstance(restoration, Mapping) else None
+        )
+        if (
+            not isinstance(original, dict)
+            or not isinstance(existing, Mapping)
+            or existing.get("transaction_id") != transaction_id
+            or not isinstance(restoration, Mapping)
+            or restoration.get("status") != "verified"
+            or any(
+                not isinstance(restoration.get(component), Mapping)
+                or restoration[component].get("status") != "verified"
+                for component in ("advertisements", "ownership", "routes")
+            )
+            or not isinstance(advertisement_restoration, Mapping)
+            or advertisement_restoration.get("failures") != []
+            or not isinstance(route_restoration, Mapping)
+            or route_restoration.get("api_failures") != []
+            or route_restoration.get("attempted_prefixes")
+            != existing.get("prefixes")
+            or route_restoration.get("settled_prefixes")
+            != existing.get("prefixes")
+            or summary.get("transaction_id") != transaction_id
+            or summary.get("restored") is not True
+            or scan_evidence(summary)
+        ):
+            raise ClaimPersistenceError("route transaction cannot finalize before durable restoration")
+        candidate = copy.deepcopy(original)
+        del candidate["e2e"]["route_transaction"]
+        return self._write_route_transaction_manifest(
+            original, candidate, expected_revision=expected_revision
+        )
+
+    @classmethod
+    def _replacement_identity(cls, manifest: Mapping[str, Any] | None) -> tuple[str, str, str] | None:
+        e2e = manifest.get("e2e") if isinstance(manifest, Mapping) else None
+        replacement = e2e.get("replacement") if isinstance(e2e, Mapping) else None
+        if not isinstance(replacement, Mapping):
+            return None
+        values = tuple(replacement.get(field) for field in ("address", "old_instance_id", "started_at"))
+        if not all(isinstance(value, str) and value for value in values):
+            return None
+        return cast(tuple[str, str, str], values)
+
+    @classmethod
+    def _same_replacement_claim(
+        cls, left: Mapping[str, Any] | None, right: Mapping[str, Any] | None
+    ) -> bool:
+        claim_id = cls._manifest_claim_id(left)
+        return (
+            claim_id is not None
+            and claim_id == cls._manifest_claim_id(right)
+            and cls._replacement_identity(left) is not None
+            and cls._replacement_identity(left) == cls._replacement_identity(right)
+        )
+
+    def _reconcile_replacement_write(
+        self,
+        original: Mapping[str, Any],
+        original_etag: str,
+        candidate: Mapping[str, Any],
+        expected_phase: str,
+        error: BaseException,
+    ) -> str:
+        durable, etag = self._authoritative_recover()
+        if durable == candidate and durable.get("phase") == expected_phase:
+            self._set_owned(durable, etag, terminal=False)
+            self._last_persistence_resolution = "recovered-owned-replacement"
+            self._propagate_after_owned_recovery(error)
+            return self._last_persistence_resolution
+        if durable == original and etag == original_etag:
+            self._set_owned(original, etag, terminal=False)
+            self._last_persistence_resolution = "replacement-not-committed"
+            raise ClaimPersistenceError(
+                "durable replacement transition was not committed; the existing E2E claim remains owned"
+            )
+        durable_claim_id = self._manifest_claim_id(durable)
+        if durable_claim_id is not None and durable_claim_id != self._manifest_claim_id(candidate):
+            self._raise_competing()
+        self._raise_ambiguous()
+
+    def _persist_replacement_transition(
+        self,
+        original: Mapping[str, Any],
+        original_etag: str,
+        candidate: Mapping[str, Any],
+        expected_phase: str,
+    ) -> str:
+        self._install_pending_replacement(original, original_etag, candidate)
+        try:
+            self._write_manifest(candidate, if_match=original_etag)
+        except BaseException as error:
+            _rethrow_protected_control_flow(error)
+            return self._reconcile_replacement_write(
+                original, original_etag, candidate, expected_phase, error
+            )
+        committed_etag = self.store.remote_etag
+        if not isinstance(committed_etag, str) or not committed_etag:
+            return self._reconcile_replacement_write(
+                original,
+                original_etag,
+                candidate,
+                expected_phase,
+                LifecycleError("conditional replacement write returned no ETag"),
+            )
+        self._set_owned(candidate, committed_etag, terminal=False)
+        return "conditional-write"
+
+    @staticmethod
+    def _replacement_handoff_safe(manifest: Mapping[str, Any]) -> bool:
+        return manifest.get("phase") in {
+            "e2e_replacement_ready",
+            "replacement_planned",
+            "apply_failed",
+            "applied",
+            "readiness_failed",
+            "e2e_replacement_complete",
+        } and not any(
+            field in manifest
+            for field in ("apply_claimed_at", "readiness_started_at")
+        )
 
     def _reconcile_claim_write(
         self,
@@ -6048,16 +11931,18 @@ class ProtectedLifecycleAdapter:
                 "durable E2E claim was not committed; deployment cleanup remains authorized"
             )
         durable_claim_id = self._manifest_claim_id(durable)
-        if durable.get("phase") == "e2e_running" and durable_claim_id is not None and durable_claim_id != claim_id:
+        if durable_claim_id is not None and durable_claim_id != claim_id:
             self._raise_competing()
         self._raise_ambiguous()
 
     def _claim_summary(
         self,
         candidate: Mapping[str, Any],
-        deployment: ProtectedDeployment,
+        deployment: ProtectedDeployment | SymmetricProtectedDeployment,
         device_ids: Mapping[str, Any],
         persistence: str,
+        *,
+        route_recovery_required: bool = False,
     ) -> Mapping[str, Any]:
         claim_id = self._manifest_claim_id(candidate)
         assert claim_id is not None
@@ -6071,20 +11956,109 @@ class ProtectedLifecycleAdapter:
             "load_profile_sha256": deployment.load_profile.sha256,
             "load_profile_approved_before_apply": True,
             "tailnet_device_count": len(device_ids),
+            "transport_router_nodes": len(device_ids),
+            "route_recovery_required": route_recovery_required,
             "bootstrap_generation": key_generation,
             "bootstrap_identity_sha256": hashlib.sha256(auth_key_id.encode()).hexdigest() if auth_key_id else "absent",
         }
 
-    def claim(self, raw_deployment: Mapping[str, Any], deployment: ProtectedDeployment) -> Mapping[str, Any]:
-        manifest = self.store.recover()
+    def claim(
+        self,
+        raw_deployment: Mapping[str, Any],
+        deployment: ProtectedDeployment | SymmetricProtectedDeployment,
+    ) -> Mapping[str, Any]:
+        manifest = self._recover_manifest()
         if self.store.remote_etag is None:
-            self._raise_ambiguous()
-        if manifest.get("phase") != "ready":
-            if manifest.get("phase") == "e2e_running" and self._manifest_claim_id(manifest) is not None:
-                self._raise_competing()
             self._raise_ambiguous()
         if manifest.get("deployment") != raw_deployment:
             raise DeploymentError("deployment output differs from the durable applied output")
+        route_recovery_required = False
+        if manifest.get("phase") == "e2e_running" and self._manifest_claim_id(manifest) is not None:
+            e2e_value = manifest.get("e2e")
+            journal = (
+                e2e_value.get("route_transaction")
+                if isinstance(e2e_value, Mapping)
+                else None
+            )
+            owner = journal.get("owner") if isinstance(journal, Mapping) else None
+            try:
+                lease_value = validate_canonical_utc_timestamp(
+                    journal.get("lease_expires_at") if isinstance(journal, Mapping) else None,
+                    "e2e.route_transaction.lease_expires_at",
+                )
+            except LifecycleError:
+                self._raise_ambiguous()
+            if (
+                not isinstance(journal, Mapping)
+                or journal.get("schema") != ROUTE_JOURNAL_SCHEMA
+                or journal.get("kind") != ROUTE_JOURNAL_KIND
+                or journal.get("run_id") != self.config.run_id
+                or journal.get("claim_id") != self._manifest_claim_id(manifest)
+                or journal.get("status") not in _RECOVERABLE_ROUTE_JOURNAL_STATUSES
+                or not isinstance(journal.get("transaction_id"), str)
+                or re.fullmatch(
+                    r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                    cast(str, journal.get("transaction_id")),
+                )
+                is None
+                or scan_evidence(journal)
+                or not isinstance(owner, Mapping)
+                or set(owner) != {"pid", "host_sha256", "boot_id"}
+                or isinstance(owner.get("pid"), bool)
+                or not isinstance(owner.get("pid"), int)
+                or cast(int, owner.get("pid")) <= 0
+                or not isinstance(owner.get("host_sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", cast(str, owner.get("host_sha256"))) is None
+                or not isinstance(owner.get("boot_id"), str)
+            ):
+                self._raise_ambiguous()
+            identity = _route_runner_identity()
+            now = dt.datetime.now(dt.timezone.utc)
+            lease_expires = dt.datetime.fromisoformat(lease_value.removesuffix("Z") + "+00:00")
+            if lease_expires > now:
+                self._raise_competing()
+            same_host = owner.get("host_sha256") == identity["host_sha256"]
+            same_boot = (
+                owner.get("boot_id") == identity["boot_id"]
+                or owner.get("boot_id") == "unavailable"
+                or identity["boot_id"] == "unavailable"
+            )
+            if same_host and same_boot and _route_process_alive(cast(int, owner["pid"])):
+                self._raise_competing()
+            route_failover = getattr(getattr(deployment, "topology", None), "route_failover", None)
+            lease_seconds = getattr(route_failover, "owner_lease_seconds", None)
+            if not isinstance(lease_seconds, int) or isinstance(lease_seconds, bool):
+                self._raise_ambiguous()
+            candidate = copy.deepcopy(manifest)
+            candidate_transaction = candidate["e2e"]["route_transaction"]
+            candidate_transaction["owner"] = identity
+            candidate_transaction["lease_expires_at"] = (
+                now + dt.timedelta(seconds=lease_seconds)
+            ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            candidate_transaction["status"] = "recovery-claimed"
+            original_etag = cast(str, self.store.remote_etag)
+            try:
+                self._write_manifest(candidate, if_match=original_etag)
+            except BaseException as error:
+                _rethrow_protected_control_flow(error)
+                durable, etag = self._authoritative_recover()
+                if durable != candidate:
+                    if durable.get("phase") == "e2e_running":
+                        self._raise_competing()
+                    self._raise_ambiguous()
+                self._set_owned(durable, etag, terminal=False)
+                manifest = durable
+            else:
+                committed_etag = self.store.remote_etag
+                if not isinstance(committed_etag, str) or not committed_etag:
+                    durable, committed_etag = self._authoritative_recover()
+                    if durable != candidate:
+                        self._raise_ambiguous()
+                self._set_owned(candidate, committed_etag, terminal=False)
+                manifest = candidate
+            route_recovery_required = True
+        elif manifest.get("phase") != "ready":
+            self._raise_ambiguous()
         if "apply_claimed_at" in manifest:
             raise DeploymentError("ready durable manifest retains a stale active apply claim")
         saved_plan = manifest.get("saved_plan")
@@ -6100,11 +12074,36 @@ class ProtectedLifecycleAdapter:
         approved_at = dt.datetime.fromisoformat(deployment.load_profile.approved_at.removesuffix("Z") + "+00:00")
         if approved_at >= applied_after:
             raise LoadProfileError("load thresholds were not approved before the protected apply")
-        device_ids = manifest.get("tailnet", {}).get("device_ids")
-        if not isinstance(device_ids, Mapping) or set(device_ids) != set(SITES) or len(set(device_ids.values())) != 2:
-            raise DeploymentError("durable manifest does not identify exactly two ready Tailnet appliances")
+        tailnet = manifest.get("tailnet")
+        device_ids = tailnet.get("device_ids") if isinstance(tailnet, Mapping) else None
+        device_roles = tailnet.get("device_roles") if isinstance(tailnet, Mapping) else None
+        durable_hostnames = tailnet.get("expected_hostnames") if isinstance(tailnet, Mapping) else None
+        expected_hostnames = set(expected_tailnet_hostnames(self.config))
+        if (
+            len(expected_hostnames) != 4
+            or not isinstance(device_ids, Mapping)
+            or set(device_ids) != expected_hostnames
+            or len(set(device_ids.values())) != len(expected_hostnames)
+            or not isinstance(device_roles, Mapping)
+            or device_roles != {hostname: "transport-router" for hostname in expected_hostnames}
+            or not isinstance(durable_hostnames, list)
+            or len(durable_hostnames) != len(expected_hostnames)
+            or set(durable_hostnames) != expected_hostnames
+            or any("-target-" in hostname or "-transport-" not in hostname for hostname in expected_hostnames)
+        ):
+            raise DeploymentError(
+                "durable manifest must identify exactly four role-separated transport-router Tailnet nodes"
+            )
         if any(self.config.sites[site]["region"] != deployment.appliance(site).region for site in SITES):
             raise DeploymentError("deployment regions differ from protected run configuration")
+        if route_recovery_required:
+            return self._claim_summary(
+                manifest,
+                deployment,
+                cast(Mapping[str, Any], device_ids),
+                "recovered-abandoned-route-claim",
+                route_recovery_required=True,
+            )
         candidate = copy.deepcopy(manifest)
         claim_id = str(uuid.uuid4())
         candidate["phase"] = "e2e_running"
@@ -6116,8 +12115,9 @@ class ProtectedLifecycleAdapter:
         original_etag = cast(str, self.store.remote_etag)
         self._install_pending_claim(manifest, original_etag, candidate)
         try:
-            self.store.write(candidate, if_match=original_etag)
+            self._write_manifest(candidate, if_match=original_etag)
         except BaseException as error:
+            _rethrow_protected_control_flow(error)
             persistence = self._reconcile_claim_write(manifest, original_etag, candidate, error)
         else:
             committed_etag = self.store.remote_etag
@@ -6146,6 +12146,248 @@ class ProtectedLifecycleAdapter:
             raise DriftError(f"{stage} protected Terraform no-drift gate failed: {error}") from None
         return {"clean": True, "stage": stage, "source": "protected-lifecycle"}
 
+    def reconcile_gwlbe_route_replacement(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        *,
+        timeout_seconds: int,
+    ) -> Mapping[str, Any]:
+        if getattr(self, "_ownership_state", "unclaimed") != "running-owned":
+            raise ClaimPersistenceError(
+                "GWLBE route reconciliation requires an exact recovered durable claim"
+            )
+        recovery_operations = AwsSymmetricLiveOperations(
+            self.config, self.aws, self.run_dir, self
+        )
+        transaction = GWLBERouteFailover(
+            deployment.topology,
+            deployment.vpc_ids,
+            self.aws,
+            authorize=self.authorize_gwlbe_route_replacement,
+            durability=self,
+            verify_ready=lambda _member: None,
+            advertisement_control=recovery_operations._advertisement_control(
+                deployment
+            ),
+            evidence_path=self.run_dir / "gwlbe-route-replacement.json",
+        )
+        return transaction.reconcile(restoration_timeout_seconds=timeout_seconds)
+
+    def authorize_gwlbe_route_replacement(
+        self,
+        current: SymmetricFleetMember,
+        alternate: SymmetricFleetMember,
+        prefixes: tuple[str, ...],
+        route_table_owner: SymmetricFleetMember,
+    ) -> Mapping[str, Any]:
+        original = self.manifest
+        if (
+            getattr(self, "_ownership_state", "unclaimed") != "running-owned"
+            or not isinstance(original, dict)
+            or original.get("phase") != "e2e_running"
+            or self._manifest_claim_id(original) is None
+        ):
+            raise ClaimPersistenceError(
+                "GWLBE route replacement requires this runner's active durable E2E claim"
+            )
+        durable, etag = self._authoritative_recover()
+        if durable != original or etag != getattr(self, "_claim_etag", None):
+            durable_claim = self._manifest_claim_id(durable)
+            if durable.get("phase") == "e2e_running" and durable_claim != self._manifest_claim_id(original):
+                self._raise_competing()
+            self._raise_ambiguous()
+        raw_deployment = original.get("deployment")
+        if not isinstance(raw_deployment, Mapping):
+            raise ResilienceError("durable GWLBE route authority has no symmetric deployment")
+        deployment = parse_symmetric_protected_deployment_output(
+            raw_deployment,
+            site_regions={site: self.config.sites[site]["region"] for site in SITES},
+        )
+        e2e_claim = original.get("e2e")
+        replacement = e2e_claim.get("replacement") if isinstance(e2e_claim, Mapping) else None
+        expected_output_sha256 = (
+            replacement.get("new_output_sha256")
+            if isinstance(replacement, Mapping) and "finished_at" in replacement
+            else e2e_claim.get("output_sha256")
+            if isinstance(e2e_claim, Mapping)
+            else None
+        )
+        if (
+            deployment.topology.run_id != self.config.run_id
+            or expected_output_sha256 != deployment.output_sha256
+            or current.site not in SITES
+        ):
+            raise ResilienceError("durable GWLBE route authority differs from the active run")
+        site = deployment.topology.site(current.site)
+        owners = [
+            member
+            for member in site.transport_router_fleet
+            if member.gwlbe_route_table_id == route_table_owner.gwlbe_route_table_id
+        ]
+        if (
+            route_table_owner.site != current.site
+            or len(owners) != 1
+            or owners[0] != route_table_owner
+            or deployment.topology.route_failover.initial_router_az(
+                current.site, route_table_owner.az_key
+            )
+            != current.az_key
+        ):
+            raise ResilienceError("GWLBE route table/current ENI is outside the durable allowlist")
+        if alternate not in site.transport_router_fleet or alternate == current:
+            raise ResilienceError("GWLBE route alternate ENI is outside the durable same-site allowlist")
+        if len(prefixes) != len(site.remote_site_cidrs) or set(prefixes) != set(
+            site.remote_site_cidrs
+        ):
+            raise ResilienceError("GWLBE route prefixes differ from the durable exact remote-site allowlist")
+        if (
+            current.advertised_prefix is None
+            or route_table_owner.advertised_prefix != current.advertised_prefix
+            or site.transport_router_for_prefix(current.advertised_prefix) != current
+        ):
+            raise ResilienceError(
+                "GWLBE route source prefix differs from the durable deterministic owner"
+            )
+        assert route_table_owner.gwlbe_route_table_id is not None
+        assert current.network_interface_id is not None
+        assert alternate.network_interface_id is not None
+        claim_id = self._manifest_claim_id(original)
+        assert claim_id is not None
+        return {
+            "authorized": True,
+            "ownership_verified": True,
+            "cleanup_authorized": True,
+            "claim_id": claim_id,
+            "route_table_id": route_table_owner.gwlbe_route_table_id,
+            "prefixes": list(prefixes),
+            "source_prefix": current.advertised_prefix,
+            "current_network_interface_id": current.network_interface_id,
+            "alternate_network_interface_id": alternate.network_interface_id,
+        }
+
+    def replace_target_instance(self, member: SymmetricFleetMember) -> Mapping[str, Any]:
+        original = self.manifest
+        if (
+            getattr(self, "_ownership_state", "unclaimed") != "running-owned"
+            or not isinstance(original, dict)
+            or original.get("phase") != "e2e_running"
+            or self._manifest_claim_id(original) is None
+        ):
+            raise ClaimPersistenceError("target replacement requires this runner's active E2E claim")
+        durable, etag = self._authoritative_recover()
+        if durable != original or etag != getattr(self, "_claim_etag", None):
+            durable_claim = self._manifest_claim_id(durable)
+            if durable.get("phase") == "e2e_running" and durable_claim != self._manifest_claim_id(original):
+                self._raise_competing()
+            self._raise_ambiguous()
+        if member.role != "target" or member.site not in SITES:
+            raise ResilienceError("replacement authority accepts only a protected symmetric target")
+        raw_deployment = original.get("deployment")
+        if not isinstance(raw_deployment, Mapping):
+            raise ResilienceError("replacement authority has no durable symmetric deployment")
+        deployment = parse_symmetric_protected_deployment_output(
+            raw_deployment,
+            site_regions={site: self.config.sites[site]["region"] for site in SITES},
+        )
+        current = [
+            candidate
+            for candidate in deployment.topology.site(member.site).target_fleet
+            if candidate.az_key == member.az_key
+        ]
+        if len(current) != 1 or current[0] != member:
+            raise ResilienceError("replacement target is not the exact current durable same-AZ member")
+        address = f'aws_instance.envelope_target_{member.site}["{member.az_key}"]'
+        transition = copy.deepcopy(original)
+        transition["phase"] = "e2e_replacement_ready"
+        transition["e2e"]["replacement"] = {
+            "address": address,
+            "old_instance_id": member.instance_id,
+            "started_at": _utc_now(),
+        }
+        self._persist_replacement_transition(original, etag, transition, "e2e_replacement_ready")
+        tailscale = build_tailscale(self.config)
+        try:
+            plan = terraform_plan(
+                self.config,
+                self.aws,
+                self.runner,
+                self.run_dir,
+                self.terraform_dir,
+                replace_address=address,
+            )
+            raw = terraform_apply(
+                self.config,
+                self.aws,
+                self.runner,
+                self.run_dir,
+                self.terraform_dir,
+                plan,
+                tailscale_factory=lambda: build_tailscale(self.config),
+            )
+            wait_and_record(
+                self.config,
+                self.aws,
+                tailscale,
+                self.run_dir,
+                raw,
+                timeout_seconds=900,
+                final_phase="e2e_replacement_complete",
+            )
+            completed = self._recover_manifest()
+            completed_etag = self.store.remote_etag
+            if (
+                completed.get("phase") != "e2e_replacement_complete"
+                or self._manifest_claim_id(completed) != self._manifest_claim_id(original)
+                or not isinstance(completed_etag, str)
+                or not completed_etag
+            ):
+                self._raise_ambiguous()
+            if completed.get("tailnet") != original.get("tailnet"):
+                raise ResilienceError(
+                    "target replacement changed durable Tailnet devices or bootstrap identity"
+                )
+            resumed = copy.deepcopy(completed)
+            resumed["phase"] = "e2e_running"
+            resumed["e2e"]["replacement"].update(
+                {"finished_at": _utc_now(), "new_output_sha256": hashlib.sha256(
+                    json.dumps(raw, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+                ).hexdigest()}
+            )
+            self._persist_replacement_transition(completed, completed_etag, resumed, "e2e_running")
+            return raw
+        except BaseException as error:
+            _rethrow_protected_control_flow(error)
+            if isinstance(error, ConcurrentLifecycleError):
+                self._raise_competing()
+            if isinstance(error, (ConcurrentRunError, AmbiguousOwnershipError)):
+                raise
+            try:
+                failed = self._recover_manifest()
+                failed_etag = self.store.remote_etag
+                replacement = failed.get("e2e", {}).get("replacement")
+                if (
+                    self._manifest_claim_id(failed) == self._manifest_claim_id(original)
+                    and isinstance(replacement, dict)
+                    and set(replacement) == {"address", "old_instance_id", "started_at"}
+                    and not any(
+                        timestamp in failed
+                        for timestamp in ("apply_claimed_at", "readiness_started_at")
+                    )
+                    and isinstance(failed_etag, str)
+                    and failed_etag
+                ):
+                    resumed = copy.deepcopy(failed)
+                    resumed["phase"] = "e2e_running"
+                    resumed["e2e"]["replacement"]["failed_at"] = _utc_now()
+                    self._persist_replacement_transition(failed, failed_etag, resumed, "e2e_running")
+            except ConcurrentLifecycleError:
+                self._raise_competing()
+            except (ConcurrentRunError, AmbiguousOwnershipError):
+                raise
+            except BaseException as recovery_error:
+                _rethrow_protected_control_flow(recovery_error)
+            raise
+
     def finish(self, passed: bool) -> Mapping[str, Any]:
         if getattr(self, "_ownership_state", "unclaimed") == "competing":
             self._raise_competing()
@@ -6154,6 +12396,17 @@ class ProtectedLifecycleAdapter:
         original = self.manifest
         if not isinstance(original, dict) or original.get("phase") != "e2e_running":
             raise ClaimPersistenceError("cannot persist an E2E result without this runner's running claim")
+        e2e_value = original.get("e2e")
+        if isinstance(e2e_value, Mapping) and "route_transaction" in e2e_value:
+            if passed:
+                raise ClaimPersistenceError(
+                    "cannot persist passing acceptance while a route transaction remains active"
+                )
+            return {
+                "finish": "deferred-route-recovery",
+                "acceptance": "failed",
+                "result_persistence": "active-route-transaction",
+            }
         original_etag = getattr(self, "_claim_etag", None) or self.store.remote_etag
         if not isinstance(original_etag, str) or not original_etag:
             self._raise_ambiguous()
@@ -6165,8 +12418,9 @@ class ProtectedLifecycleAdapter:
         self._ownership_state = "terminal-pending"
         self._last_persistence_resolution = "conditional-write"
         try:
-            self.store.write(candidate, if_match=original_etag)
+            self._write_manifest(candidate, if_match=original_etag)
         except BaseException as error:
+            _rethrow_protected_control_flow(error)
             persistence = self._reconcile_finish_write(original, original_etag, candidate, error)
         else:
             committed_etag = self.store.remote_etag
@@ -6207,7 +12461,7 @@ class ProtectedLifecycleAdapter:
                 "durable E2E result was not committed; owned-claim cleanup handoff remains authorized"
             )
         durable_claim_id = self._manifest_claim_id(durable)
-        if durable.get("phase") == "e2e_running" and durable_claim_id is not None and durable_claim_id != claim_id:
+        if durable_claim_id is not None and durable_claim_id != claim_id:
             self._raise_competing()
         self._raise_ambiguous()
 
@@ -6267,6 +12521,31 @@ class ProtectedLifecycleAdapter:
                 ):
                     self._raise_competing()
                 self._raise_ambiguous()
+        if state == "replacement-pending":
+            original = getattr(self, "_claim_original_manifest", None)
+            original_etag = getattr(self, "_claim_original_etag", None)
+            if (
+                not isinstance(original, dict)
+                or not isinstance(in_memory, dict)
+                or not isinstance(original_etag, str)
+                or not original_etag
+                or getattr(self, "_claim_etag", None) not in {original_etag, etag}
+                or self._manifest_claim_id(original) != self._manifest_claim_id(in_memory)
+            ):
+                self._raise_ambiguous()
+            if durable == in_memory:
+                self._set_owned(durable, etag, terminal=False)
+            elif durable == original and etag == original_etag:
+                self._set_owned(original, etag, terminal=False)
+            elif self._same_replacement_claim(in_memory, durable):
+                self._set_owned(durable, etag, terminal=False)
+            else:
+                durable_claim_id = self._manifest_claim_id(durable)
+                if durable_claim_id is not None and durable_claim_id != self._manifest_claim_id(in_memory):
+                    self._raise_competing()
+                self._raise_ambiguous()
+            in_memory = self.manifest
+            state = self._ownership_state
         if not isinstance(in_memory, dict):
             if state == "unclaimed":
                 self._claim_etag = None
@@ -6279,6 +12558,50 @@ class ProtectedLifecycleAdapter:
         claim_id = self._manifest_claim_id(in_memory)
         if claim_id is None:
             self._raise_ambiguous()
+        if self._replacement_identity(in_memory) is not None:
+            if durable != in_memory:
+                if self._same_replacement_claim(in_memory, durable):
+                    self._set_owned(durable, etag, terminal=False)
+                    in_memory = cast(dict[str, Any], self.manifest)
+                else:
+                    durable_claim_id = self._manifest_claim_id(durable)
+                    if durable_claim_id is not None and durable_claim_id != claim_id:
+                        self._raise_competing()
+                    self._raise_ambiguous()
+            if in_memory.get("phase") not in {"e2e_running", "e2e_passed", "e2e_failed"}:
+                if not self._replacement_handoff_safe(in_memory):
+                    return None
+                candidate = copy.deepcopy(in_memory)
+                replacement = candidate["e2e"]["replacement"]
+                if set(replacement) == {"address", "old_instance_id", "started_at"}:
+                    replacement["failed_at"] = _utc_now()
+                candidate["phase"] = "e2e_failed"
+                candidate["e2e"]["finished_at"] = _utc_now()
+                candidate["e2e"]["passed"] = False
+                self.manifest = candidate
+                self._ownership_state = "terminal-pending"
+                try:
+                    self._write_manifest(candidate, if_match=etag)
+                except BaseException as error:
+                    _rethrow_protected_control_flow(error)
+                    persistence = self._reconcile_finish_write(in_memory, etag, candidate, error)
+                else:
+                    committed_etag = self.store.remote_etag
+                    if not isinstance(committed_etag, str) or not committed_etag:
+                        persistence = self._reconcile_finish_write(
+                            in_memory,
+                            etag,
+                            candidate,
+                            LifecycleError("conditional replacement cleanup handoff returned no ETag"),
+                        )
+                    else:
+                        self._set_owned(candidate, committed_etag, terminal=True)
+                        persistence = "conditional-write"
+                return {
+                    "claim_identity_preserved": True,
+                    "manifest_phase": "e2e_failed",
+                    "persistence": persistence,
+                }
         if in_memory.get("phase") in {"e2e_passed", "e2e_failed"}:
             if durable == in_memory:
                 if state == "terminal-owned" and getattr(self, "_claim_etag", None) != etag:
@@ -6323,8 +12646,9 @@ class ProtectedLifecycleAdapter:
         self.manifest = candidate
         self._ownership_state = "terminal-pending"
         try:
-            self.store.write(candidate, if_match=etag)
+            self._write_manifest(candidate, if_match=etag)
         except BaseException as error:
+            _rethrow_protected_control_flow(error)
             persistence = self._reconcile_finish_write(in_memory, etag, candidate, error)
         else:
             committed_etag = self.store.remote_etag
@@ -6345,6 +12669,28 @@ class ProtectedLifecycleAdapter:
         }
 
     def cleanup(self) -> Mapping[str, Any]:
+        route_recovery: Mapping[str, Any] | None = None
+        manifest = self.manifest
+        e2e_value = manifest.get("e2e") if isinstance(manifest, Mapping) else None
+        if isinstance(e2e_value, Mapping) and "route_transaction" in e2e_value:
+            raw_deployment = manifest.get("deployment")
+            if not isinstance(raw_deployment, Mapping):
+                raise ClaimPersistenceError(
+                    "active route cleanup has no durable symmetric deployment"
+                )
+            deployment = parse_symmetric_protected_deployment_output(
+                raw_deployment,
+                site_regions={site: self.config.sites[site]["region"] for site in SITES},
+            )
+            route_recovery = self.reconcile_gwlbe_route_replacement(
+                deployment,
+                timeout_seconds=deployment.topology.route_failover.restoration_timeout_seconds,
+            )
+            if route_recovery.get("restored") is not True:
+                raise RouteRestorationError(
+                    "protected cleanup cannot proceed before durable route restoration"
+                )
+            self.finish(False)
         handoff = self._handoff_active_claim_for_cleanup()
         tailscale = build_tailscale(self.config)
         result = protected_cleanup(
@@ -6358,9 +12704,12 @@ class ProtectedLifecycleAdapter:
             dry_run=False,
             skip_destroy=False,
         )
-        if handoff is None:
-            return result
-        return {**result, "e2e_claim_handoff": dict(handoff)}
+        enriched = dict(result)
+        if handoff is not None:
+            enriched["e2e_claim_handoff"] = dict(handoff)
+        if route_recovery is not None:
+            enriched["route_recovery_before_cleanup"] = dict(route_recovery)
+        return enriched
 
 
 def validate_protected_execution(run_id: str, environment: Mapping[str, str]) -> None:
@@ -6390,10 +12739,10 @@ def hard_timeout(seconds: int, *, operation: str = "live E2E") -> Iterable[None]
     previous_alarm_seconds = signal.alarm(0)
 
     def expired(_signum: int, _frame: Any) -> None:
-        raise TimeoutError(f"{operation} exceeded its {seconds}-second hard timeout")
+        raise ProtectedHardTimeout(f"{operation} exceeded its {seconds}-second hard timeout")
 
     def interrupted(_signum: int, _frame: Any) -> None:
-        raise InterruptedError(f"{operation} received SIGTERM and entered protected cleanup")
+        raise ProtectedTermination(f"{operation} received SIGTERM and entered protected cleanup")
 
     signal.signal(signal.SIGALRM, expired)
     signal.signal(signal.SIGTERM, interrupted)
@@ -6598,20 +12947,32 @@ def probe(args):
           "protocol": args.protocol, "source_ip": str(local[0]), "source_port": int(local[1]), "success": True})
 
 def stream_server(args):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    tcp = args.protocol == "tcp"
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM if tcp else socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((args.bind, args.port))
+    if tcp:
+        sock.listen(1)
     deadline = time.monotonic() + args.duration
     seen = set()
     duplicates = 0
     sources = set()
+    connection = None
     try:
+        if tcp:
+            sock.settimeout(max(0.01, deadline - time.monotonic()))
+            connection, peer = sock.accept()
         while time.monotonic() < deadline:
-            sock.settimeout(min(1.0, max(0.01, deadline - time.monotonic())))
             try:
-                data, peer = sock.recvfrom(MAX_FRAME + 1)
+                if tcp:
+                    data = tcp_frame(connection, deadline)
+                else:
+                    sock.settimeout(min(1.0, max(0.01, deadline - time.monotonic())))
+                    data, peer = sock.recvfrom(MAX_FRAME + 1)
             except socket.timeout:
                 continue
+            except RuntimeError:
+                break
             request = decode(data)
             if set(request) != {"connection_id", "flow_id", "kind", "sequence"} or request["kind"] != "marker" or request["flow_id"] != args.flow_id:
                 raise RuntimeError("stream marker mismatch")
@@ -6623,15 +12984,23 @@ def stream_server(args):
             seen.add(sequence)
             sources.add((str(peer[0]), int(peer[1]), str(request["connection_id"])))
             ack = {"connection_id": request["connection_id"], "flow_id": args.flow_id, "kind": "ack", "sequence": sequence}
-            sock.sendto(encode(ack), peer)
+            if tcp:
+                connection.sendall(encode(ack, True))
+            else:
+                sock.sendto(encode(ack), peer)
     finally:
+        if connection is not None:
+            connection.close()
         sock.close()
     emit({"duplicates": duplicates, "flow_id": args.flow_id, "receives": len(seen), "sessions": len(sources), "success": duplicates == 0 and len(sources) == 1})
 
 def stream_client(args):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    tcp = args.protocol == "tcp"
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM if tcp else socket.SOCK_DGRAM)
     connection_id = args.flow_id + ":c0001"
     markers = []
+    interrupted = False
+    buffer = b""
     try:
         try:
             os.unlink(args.ready_path)
@@ -6646,13 +13015,23 @@ def stream_client(args):
                 time.sleep(target - time.monotonic())
             sent = time.monotonic_ns()
             request = {"connection_id": connection_id, "flow_id": args.flow_id, "kind": "marker", "sequence": sequence}
-            sock.send(encode(request))
+            try:
+                sock.sendall(encode(request, True)) if tcp else sock.send(encode(request))
+            except OSError:
+                interrupted = True
+                break
             ack_deadline = time.monotonic() + args.ack_timeout
             while time.monotonic() < ack_deadline:
                 sock.settimeout(max(0.01, ack_deadline - time.monotonic()))
                 try:
-                    response = decode(sock.recv(MAX_FRAME + 1))
-                except socket.timeout:
+                    if tcp:
+                        while b"\n" not in buffer:
+                            buffer += sock.recv(MAX_FRAME + 1 - len(buffer))
+                        raw, buffer = buffer.split(b"\n", 1)
+                        response = decode(raw)
+                    else:
+                        response = decode(sock.recv(MAX_FRAME + 1))
+                except (socket.timeout, OSError, RuntimeError):
                     break
                 if response == {"connection_id": connection_id, "flow_id": args.flow_id, "kind": "ack", "sequence": sequence}:
                     markers.append({"connection_id": connection_id, "flow_id": args.flow_id,
@@ -6670,7 +13049,7 @@ def stream_client(args):
     finally:
         sock.close()
     emit({"connection_id": connection_id, "flow_id": args.flow_id, "markers": markers,
-          "socket_count": 1, "source_port": args.source_port, "success": True})
+          "interrupted": interrupted, "socket_count": 1, "source_port": args.source_port, "success": True})
 
 def sized_udp_server(args):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -6811,9 +13190,11 @@ def main():
     client.add_argument("--source-port", type=int, required=True); client.add_argument("--flow-id", required=True)
     client.add_argument("--payload", required=True); client.add_argument("--timeout", type=float, default=30)
     server = sub.add_parser("stream-server")
+    server.add_argument("--protocol", choices=("tcp", "udp"), required=True)
     server.add_argument("--bind", required=True); server.add_argument("--port", type=int, required=True)
     server.add_argument("--flow-id", required=True); server.add_argument("--duration", type=float, required=True)
     stream = sub.add_parser("stream-client")
+    stream.add_argument("--protocol", choices=("tcp", "udp"), required=True)
     stream.add_argument("--host", required=True); stream.add_argument("--port", type=int, required=True)
     stream.add_argument("--source-ip", required=True); stream.add_argument("--source-port", type=int, required=True)
     stream.add_argument("--flow-id", required=True); stream.add_argument("--count", type=int, required=True)
@@ -6996,16 +13377,26 @@ class AwsLiveOperations:
         *,
         timeout_seconds: int,
         comment: str,
+        client_token: str | None = None,
     ) -> SSMResult:
         bounded = max(1, min(int(timeout_seconds), 3600))
         result = self.ssm.execute(
-            SSMCommand(target, (command,), timeout_seconds=bounded, comment=comment),
+            SSMCommand(
+                target,
+                (command,),
+                timeout_seconds=bounded,
+                comment=comment,
+                client_token=client_token,
+            ),
             wait_timeout_seconds=bounded + 15,
         )
         if not result.succeeded:
             detail = result.stderr.strip() or result.stdout.strip() or result.status
-            raise SSMError(
-                f"{target.site} {target.role} command failed ({result.response_code}): {_sanitize_string(detail)}"
+            raise _attach_ssm_output(
+                SSMError(
+                    f"{target.site} {target.role} command failed ({result.response_code}): {_sanitize_string(detail)}"
+                ),
+                result,
             )
         return result
 
@@ -7020,15 +13411,27 @@ class AwsLiveOperations:
         result = self._execute(target, command, timeout_seconds=timeout_seconds, comment=comment)
         lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         if not lines:
-            raise SSMError(f"{target.site} {target.role} command returned no JSON")
+            raise _attach_ssm_output(
+                SSMError(f"{target.site} {target.role} command returned no JSON"), result
+            )
         try:
             value = json.loads(lines[-1])
         except json.JSONDecodeError as error:
-            raise SSMError(f"{target.site} {target.role} command returned invalid JSON") from error
+            failure = SSMError(f"{target.site} {target.role} command returned invalid JSON")
+            _attach_ssm_output(failure, result)
+            raise failure from error
         if not isinstance(value, dict):
-            raise SSMError(f"{target.site} {target.role} command returned non-object JSON")
+            raise _attach_ssm_output(
+                SSMError(f"{target.site} {target.role} command returned non-object JSON"), result
+            )
         if value.get("success") is False:
-            raise SSMError(f"{target.site} {target.role} agent failed: {_sanitize_string(str(value.get('error', 'unknown')))}")
+            raise _attach_ssm_output(
+                SSMError(
+                    f"{target.site} {target.role} agent failed: "
+                    f"{_sanitize_string(str(value.get('error', 'unknown')))}"
+                ),
+                result,
+            )
         return value
 
     def _wait_until(
@@ -7048,6 +13451,8 @@ class AwsLiveOperations:
                 last = operation()
                 if predicate(last):
                     return last
+            except PROTECTED_CONTROL_FLOW:
+                raise
             except Exception as error:
                 last_error = error
             remaining = deadline - self.monotonic()
@@ -7609,14 +14014,18 @@ printf '{{"cloud_init_complete":true,"host_network_preflight":true,"links_ready"
     def _json_from_result(result: SSMResult) -> dict[str, Any]:
         lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         if not lines:
-            raise SSMError("remote agent returned no JSON")
+            raise _attach_ssm_output(SSMError("remote agent returned no JSON"), result)
         try:
             value = json.loads(lines[-1])
         except json.JSONDecodeError as error:
-            raise SSMError("remote agent returned invalid JSON") from error
+            failure = SSMError("remote agent returned invalid JSON")
+            _attach_ssm_output(failure, result)
+            raise failure from error
         if not isinstance(value, dict) or value.get("success") is not True:
             detail = value.get("error") if isinstance(value, dict) else "non-object result"
-            raise SSMError(f"remote agent failed: {_sanitize_string(str(detail))}")
+            raise _attach_ssm_output(
+                SSMError(f"remote agent failed: {_sanitize_string(str(detail))}"), result
+            )
         return value
 
     def _pid(self, target: ApplianceTarget) -> int:
@@ -8040,9 +14449,18 @@ exit 1"""
             parts.append("--expect-timeout")
         return " ".join(parts)
 
-    def _run_icmp_probe(self, flow: FlowRecord, *, payload_bytes: int, timeout_seconds: int) -> dict[str, Any]:
+    def _run_icmp_probe(
+        self,
+        flow: FlowRecord,
+        *,
+        payload_bytes: int,
+        timeout_seconds: int,
+        before_client: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
         payload = bytes([0xA5]) * payload_bytes
         digest = hashlib.sha256(payload).hexdigest()
+        if before_client is not None:
+            before_client()
         value = self._execute_json(
             flow.source,
             self._icmp_client_command(flow, payload_bytes=payload_bytes, timeout_seconds=timeout_seconds),
@@ -8076,7 +14494,13 @@ exit 1"""
             "success": True,
         }
 
-    def _run_probe(self, flow: FlowRecord, *, timeout_seconds: int) -> dict[str, Any]:
+    def _run_probe(
+        self,
+        flow: FlowRecord,
+        *,
+        timeout_seconds: int,
+        before_client: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
         payload = hashlib.sha512(f"{flow.flow_id}:receiver-observed-payload".encode()).hexdigest()
         payload_sha256 = hashlib.sha256(payload.encode("ascii")).hexdigest()
         server_command = " ".join(
@@ -8108,11 +14532,14 @@ exit 1"""
         )
         server_id: str | None = None
         pause_attempted = False
+        control_flow_interrupted = False
         try:
             pause_attempted = True
             self._pause_managed_responder(flow.destination, flow.protocol)
             server_id = self.ssm.send(server_spec, timeout_seconds=10)
             self._wait_listener(flow.destination, flow.protocol, timeout_seconds=min(20, timeout_seconds))
+            if before_client is not None:
+                before_client()
             client_command = " ".join(
                 [
                     "set -euo pipefail; exec",
@@ -8148,8 +14575,16 @@ exit 1"""
                 timeout_seconds=min(60, timeout_seconds),
             )
             if not server_result.succeeded:
-                raise ProbeError(f"receiver command for {flow.flow_id} failed with {server_result.status}")
+                raise _attach_ssm_output(
+                    ProbeError(
+                        f"receiver command for {flow.flow_id} failed with {server_result.status}"
+                    ),
+                    server_result,
+                )
             receiver = self._json_from_result(server_result)
+        except PROTECTED_CONTROL_FLOW:
+            control_flow_interrupted = True
+            raise
         except Exception:
             if server_id is not None:
                 try:
@@ -8158,7 +14593,7 @@ exit 1"""
                     pass
             raise
         finally:
-            if pause_attempted:
+            if pause_attempted and not control_flow_interrupted:
                 self._resume_managed_responder(flow.destination, flow.protocol)
         if (
             client.get("flow_id") != flow.flow_id
@@ -8983,9 +15418,13 @@ exit 1"""
         maximum_loss_ns: int,
         label: str,
         mutate_and_restore: Callable[[], Mapping[str, Any]],
-    ) -> tuple[StreamAnalysis, dict[str, Any], Mapping[str, Any]]:
-        duration = max(35, min(140, timeout_seconds - 30))
-        interval = 0.5
+        allow_interrupted: bool = False,
+        expose_interval: bool = False,
+    ) -> tuple[StreamAnalysis | None, dict[str, Any], Mapping[str, Any]]:
+        if flow.protocol not in TRANSPORT_PROTOCOLS:
+            raise StreamAnalysisError("continuity stream must use TCP or UDP")
+        duration = max(35, min(3500, timeout_seconds + 30))
+        interval = max(0.5, duration / 160.0)
         count = max(20, int((duration - 2) / interval))
         ready_path = f"/run/envelope-e2e-stream-{flow.flow_id}.ready"
         server_command = " ".join(
@@ -8993,6 +15432,8 @@ exit 1"""
                 "set -euo pipefail; exec",
                 shlex.quote(REMOTE_AGENT_PATH),
                 "stream-server",
+                "--protocol",
+                flow.protocol,
                 "--bind",
                 flow.destination.private_ip,
                 "--port",
@@ -9008,6 +15449,8 @@ exit 1"""
                 "set -euo pipefail; exec",
                 shlex.quote(REMOTE_AGENT_PATH),
                 "stream-client",
+                "--protocol",
+                flow.protocol,
                 "--host",
                 flow.destination.private_ip,
                 "--port",
@@ -9043,11 +15486,12 @@ exit 1"""
         server_id: str | None = None
         client_id: str | None = None
         pause_attempted = False
+        control_flow_interrupted = False
         try:
             pause_attempted = True
-            self._pause_managed_responder(flow.destination, "udp")
+            self._pause_managed_responder(flow.destination, flow.protocol)
             server_id = self.ssm.send(server_spec, timeout_seconds=10)
-            self._wait_listener(flow.destination, "udp", timeout_seconds=15)
+            self._wait_listener(flow.destination, flow.protocol, timeout_seconds=15)
             self._execute(
                 flow.source,
                 f"set -euo pipefail; rm -f {shlex.quote(ready_path)}; ! test -e {shlex.quote(ready_path)}",
@@ -9069,8 +15513,22 @@ exit 1"""
                 interval_seconds=1,
             )
             mutation_start = self._remote_monotonic_ns(flow.source)
-            mutation_summary = mutate_and_restore()
+            mutation_summary = dict(mutate_and_restore())
             mutation_end = self._remote_monotonic_ns(flow.source)
+            nested_interval = mutation_summary.pop("_stream_analysis_interval", None)
+            if nested_interval is not None:
+                if (
+                    not isinstance(nested_interval, Mapping)
+                    or isinstance(nested_interval.get("start_monotonic_ns"), bool)
+                    or not isinstance(nested_interval.get("start_monotonic_ns"), int)
+                    or isinstance(nested_interval.get("end_monotonic_ns"), bool)
+                    or not isinstance(nested_interval.get("end_monotonic_ns"), int)
+                    or nested_interval["end_monotonic_ns"]
+                    < nested_interval["start_monotonic_ns"]
+                ):
+                    raise StreamAnalysisError("nested stream mutation interval is invalid")
+                mutation_start = cast(int, nested_interval["start_monotonic_ns"])
+                mutation_end = cast(int, nested_interval["end_monotonic_ns"])
             client_result = self.ssm.wait(
                 flow.source,
                 client_id,
@@ -9091,6 +15549,9 @@ exit 1"""
                 timeout_seconds=15,
                 comment="Envelope E2E delete continuity readiness",
             )
+        except PROTECTED_CONTROL_FLOW:
+            control_flow_interrupted = True
+            raise
         except Exception:
             for target, command_id in ((flow.source, client_id), (flow.destination, server_id)):
                 if command_id is None:
@@ -9110,22 +15571,41 @@ exit 1"""
                 pass
             raise
         finally:
-            if pause_attempted:
-                self._resume_managed_responder(flow.destination, "udp")
+            if pause_attempted and not control_flow_interrupted:
+                self._resume_managed_responder(flow.destination, flow.protocol)
         markers_value = client.get("markers")
         if not isinstance(markers_value, list) or client.get("socket_count") != 1 or client.get(
             "source_port"
         ) != flow.source_port:
             raise StreamAnalysisError(f"{label} did not retain one exact source socket")
-        analysis = analyze_stream_markers(
-            cast(Sequence[Mapping[str, Any]], markers_value),
-            MutationInterval(mutation_start, mutation_end, label),
-            maximum_loss_ns=maximum_loss_ns,
-            expected_first_sequence=0,
-            expected_last_sequence=count - 1,
-        )
+        analysis: StreamAnalysis | None
+        try:
+            analysis = analyze_stream_markers(
+                cast(Sequence[Mapping[str, Any]], markers_value),
+                MutationInterval(mutation_start, mutation_end, label),
+                maximum_loss_ns=maximum_loss_ns,
+                expected_first_sequence=0,
+                expected_last_sequence=count - 1,
+            )
+        except StreamAnalysisError:
+            if not allow_interrupted or flow.protocol != "tcp":
+                raise
+            analysis = None
         if receiver.get("duplicates") != 0 or receiver.get("sessions") != 1:
             raise StreamAnalysisError(f"{label} receiver observed duplicate markers or multiple sockets")
+        if allow_interrupted:
+            mutation_summary = {
+                **dict(mutation_summary),
+                "stream_client_interrupted": client.get("interrupted") is True,
+            }
+        if expose_interval:
+            mutation_summary = {
+                **dict(mutation_summary),
+                "_stream_analysis_interval": {
+                    "start_monotonic_ns": mutation_start,
+                    "end_monotonic_ns": mutation_end,
+                },
+            }
         return analysis, receiver, mutation_summary
 
     def _return_rule_snapshot(self, deployment: ProtectedDeployment, site: Site) -> list[dict[str, Any]]:
@@ -10033,6 +16513,14 @@ class _LifecycleRemoteTarget:
     instance_id: str
 
 
+@dataclasses.dataclass(frozen=True)
+class _SymmetricGeneveCapture:
+    member: SymmetricFleetMember
+    path: str
+    command_id: str
+    duration_seconds: int
+
+
 class AwsSymmetricLifecycleAdapter:
     """AWS/SSM adapter for ``SymmetricLifecycle``; replacement remains explicitly supplied."""
 
@@ -10054,7 +16542,7 @@ class AwsSymmetricLifecycleAdapter:
         if value is None:
             return False
         tags = self.operations._tags(value)
-        expected_role = "target" if member.role == "target" else "tailnet-ingress"
+        expected_role = "target" if member.role == "target" else "transport-router"
         return (
             value.get("State", {}).get("Name") == "running"
             and tags.get("EnvelopeRun") == run_id
@@ -10095,23 +16583,3126 @@ class AwsSymmetricLifecycleAdapter:
             region=member.region,
         )
         descriptions = response.get("TargetHealthDescriptions")
+        if not isinstance(descriptions, list):
+            raise ResilienceError("target health response has an invalid schema")
         matches = [
             value
-            for value in descriptions or []
+            for value in descriptions
             if isinstance(value, Mapping)
             and isinstance(value.get("Target"), Mapping)
             and value["Target"].get("Id") == member.instance_id
             and isinstance(value.get("TargetHealth"), Mapping)
         ]
+        if not matches:
+            return "deregistered"
         if len(matches) != 1:
-            return "unavailable"
+            raise ResilienceError("target health response duplicated the protected target")
         state = matches[0]["TargetHealth"].get("State")
-        return state if isinstance(state, str) else "unavailable"
+        if not isinstance(state, str) or not state:
+            raise ResilienceError("target health response omitted the protected target state")
+        return state
 
     def replace(self, member: SymmetricFleetMember) -> SymmetricFleetMember:
         if self.replace_target is None:
             raise ResilienceError("target replacement has no explicit run-owned replacement authority")
         return self.replace_target(member)
+
+
+class AwsSymmetricLiveOperations:
+    """Concrete v2 fleet probes and failure exercises over the existing SSM boundary."""
+
+    def __init__(
+        self,
+        config: RunConfig,
+        aws: AwsCLI,
+        run_dir: pathlib.Path,
+        lifecycle: ProtectedLifecycleAPI,
+    ) -> None:
+        self.config = config
+        self.aws = aws
+        self.run_dir = run_dir.expanduser().resolve()
+        self.lifecycle = lifecycle
+        self.base = AwsLiveOperations(config, aws, self.run_dir)
+        self.current_deployment: SymmetricProtectedDeployment | None = None
+        self.adapter = AwsSymmetricLifecycleAdapter(self.base, replace_target=self._replace_target)
+        self._route_mutation_denied_profiles: set[str] = set()
+        self._geneve_capture_events: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _remote(member: SymmetricFleetMember) -> _LifecycleRemoteTarget:
+        return _LifecycleRemoteTarget(member.site, member.role, member.region, member.instance_id)
+
+    def _execute_transport_control(
+        self,
+        member: SymmetricFleetMember,
+        command: str,
+        *,
+        timeout_seconds: int,
+        comment: str,
+    ) -> Mapping[str, Any]:
+        mutating = command.startswith(
+            "/usr/local/sbin/envelope-transport-advertisements apply "
+        )
+        result = self.base._execute(
+            self._remote(member),
+            command,
+            timeout_seconds=timeout_seconds,
+            comment=comment,
+            client_token=(
+                "env-"
+                + hashlib.sha256(
+                    f"{member.instance_id}\0{command}".encode("utf-8")
+                ).hexdigest()[:60]
+                if mutating
+                else None
+            ),
+        )
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if not lines:
+            raise SSMError("transport advertisement command returned no JSON")
+        try:
+            response = json.loads(lines[-1])
+        except json.JSONDecodeError as error:
+            raise SSMError(
+                "transport advertisement command returned invalid JSON"
+            ) from error
+        if not isinstance(response, Mapping):
+            raise SSMError("transport advertisement command returned non-object JSON")
+        return {"response": dict(response), "command": result.summary()}
+
+    def _advertisement_control(
+        self, deployment: SymmetricProtectedDeployment
+    ) -> TailnetAdvertisementControl:
+        identities = self._tailnet_status_identities()
+        node_ids_by_instance: dict[str, str] = {}
+        for site in SITES:
+            for member in deployment.topology.site(site).transport_router_fleet:
+                hostname = (
+                    f"{self.config.run_id}-{site}-transport-{member.az_key}"
+                )
+                identity = identities.get(hostname)
+                node_id = identity.get("node_id") if isinstance(identity, Mapping) else None
+                if not isinstance(node_id, str) or not node_id:
+                    raise ReadinessError(
+                        "transport advertisement control cannot resolve a stable node identity"
+                    )
+                node_ids_by_instance[member.instance_id] = node_id
+        return TailnetAdvertisementControl(
+            deployment.topology,
+            self._execute_transport_control,
+            node_ids_by_instance,
+            monotonic=self.base.monotonic,
+            sleep=self.base.sleep,
+        )
+
+    def _tailnet_status_identities(self) -> dict[str, dict[str, Any]]:
+        cached = getattr(self, "_tailnet_status_identity_cache", None)
+        if isinstance(cached, dict):
+            return {hostname: dict(identity) for hostname, identity in cached.items()}
+        manifest = getattr(self.lifecycle, "manifest", None)
+        tailnet = manifest.get("tailnet") if isinstance(manifest, Mapping) else None
+        recorded = tailnet.get("device_ids") if isinstance(tailnet, Mapping) else None
+        expected_hostnames = set(expected_tailnet_hostnames(self.config))
+        if (
+            not isinstance(recorded, Mapping)
+            or set(recorded) != expected_hostnames
+            or len(set(recorded.values())) != len(expected_hostnames)
+        ):
+            raise ReadinessError(
+                "durable manifest does not bind every transport router to one Tailnet device"
+            )
+        required_tag = self.config.tailnet["tag"]
+        devices = build_tailscale(self.config).list_devices()
+        result: dict[str, dict[str, Any]] = {}
+        for hostname in sorted(expected_hostnames):
+            matches = [
+                device
+                for device in devices
+                if str(device.get("hostname") or device.get("name") or "").split(".")[0]
+                == hostname
+                and device.get("id") == recorded[hostname]
+                and required_tag in {str(tag) for tag in device.get("tags", [])}
+            ]
+            if len(matches) != 1:
+                raise ReadinessError(
+                    "Tailnet API identity does not match one durable transport router"
+                )
+            node_id = matches[0].get("nodeId")
+            if not isinstance(node_id, str) or not node_id:
+                raise ReadinessError("Tailnet API transport router omitted its stable node ID")
+            key_expiry_disabled = matches[0].get("keyExpiryDisabled")
+            authorized = matches[0].get("authorized")
+            try:
+                key_expiry = validate_canonical_utc_timestamp(
+                    matches[0].get("expires"), "Tailnet API transport router expires"
+                )
+            except LifecycleError as error:
+                raise ReadinessError(str(error)) from None
+            if not isinstance(key_expiry_disabled, bool):
+                raise ReadinessError(
+                    "Tailnet API transport router omitted its key-expiry mode"
+                )
+            if authorized is not True:
+                raise ReadinessError("Tailnet API transport router is not authorized")
+            result[hostname] = {
+                "node_id": node_id,
+                "key_expiry": key_expiry,
+                "key_expiry_disabled": key_expiry_disabled,
+                "authorized": True,
+            }
+        if len({identity["node_id"] for identity in result.values()}) != len(result):
+            raise ReadinessError("Tailnet transport routers do not have distinct stable node IDs")
+        self._tailnet_status_identity_cache = {
+            hostname: dict(identity) for hostname, identity in result.items()
+        }
+        return result
+
+    def _tailnet_status_node_ids(self) -> dict[str, str]:
+        return {
+            hostname: cast(str, identity["node_id"])
+            for hostname, identity in self._tailnet_status_identities().items()
+        }
+
+    @staticmethod
+    def _metric_value(snapshot: MetricSnapshot, name: str) -> float:
+        for candidate in (f"{name}_total", name):
+            selected = tuple(sample.value for sample in snapshot.samples if sample.name == candidate and not sample.labels)
+            if selected:
+                return sum(selected)
+        raise MetricAssertionError(f"symmetric target metric {name} is absent")
+
+    @staticmethod
+    def _metric_series_value(
+        snapshot: MetricSnapshot,
+        name: str,
+        labels: Mapping[str, str] | None = None,
+    ) -> float:
+        selected = snapshot.select(name, labels)
+        if len(selected) != 1 or not math.isfinite(selected[0].value):
+            raise MetricAssertionError(f"symmetric target metric {name} is not one finite series")
+        return selected[0].value
+
+    def _target_health(self, member: SymmetricFleetMember) -> str:
+        return self.adapter.target_health(member)
+
+    def _wait_target_health(
+        self,
+        member: SymmetricFleetMember,
+        states: set[str],
+        *,
+        timeout_seconds: float,
+    ) -> str:
+        value = self.base._wait_until(
+            lambda: self._target_health(member),
+            lambda candidate: candidate in states,
+            timeout_seconds=timeout_seconds,
+            description=f"{member.site} target {member.instance_id} health in {sorted(states)}",
+            interval_seconds=3,
+        )
+        return cast(str, value)
+
+    def _verify_target_group_registrations(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        site: Site,
+        *,
+        expected_state: str = "healthy",
+    ) -> dict[str, dict[str, Any]]:
+        members = deployment.topology.site(site).target_fleet
+        target_group_arns = {member.target_group_arn for member in members}
+        if len(target_group_arns) != 1 or None in target_group_arns:
+            raise ReadinessError("symmetric target fleet does not bind one target group")
+        target_group_arn = cast(str, next(iter(target_group_arns)))
+        response = self.aws.json(
+            ["elbv2", "describe-target-health", "--target-group-arn", target_group_arn],
+            region=deployment.topology.site(site).region,
+        )
+        descriptions = response.get("TargetHealthDescriptions")
+        if not isinstance(descriptions, list) or not all(
+            isinstance(value, Mapping) for value in descriptions
+        ):
+            raise ReadinessError("symmetric target-group registration response is invalid")
+        registrations: dict[str, dict[str, Any]] = {}
+        for value in descriptions:
+            target = value.get("Target")
+            health = value.get("TargetHealth")
+            if (
+                not isinstance(target, Mapping)
+                or not isinstance(health, Mapping)
+                or not isinstance(target.get("Id"), str)
+                or target.get("Id") in registrations
+                or target.get("Port") != 6081
+                or health.get("State") != expected_state
+            ):
+                raise ReadinessError(
+                    "symmetric target-group registration identity, port, or state is invalid"
+                )
+            registrations[cast(str, target["Id"])] = {
+                "target_group_arn": target_group_arn,
+                "port": 6081,
+                "state": expected_state,
+            }
+        expected_ids = {member.instance_id for member in members}
+        if set(registrations) != expected_ids:
+            raise ReadinessError(
+                "symmetric target group does not contain exactly the intended fleet instances"
+            )
+        return registrations
+
+    def _target_snapshots(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        *,
+        exclude: set[str] | None = None,
+    ) -> dict[str, MetricSnapshot]:
+        excluded = exclude or set()
+        result: dict[str, MetricSnapshot] = {}
+        for site in SITES:
+            for member in deployment.topology.site(site).target_fleet:
+                if member.instance_id in excluded or self._target_health(member) != "healthy":
+                    continue
+                result[member.instance_id] = self.base._metric_snapshot(
+                    cast(ApplianceTarget, self._remote(member))
+                )
+        return result
+
+    def _selected_target(
+        self,
+        before: Mapping[str, MetricSnapshot],
+        after: Mapping[str, MetricSnapshot],
+        site: Site,
+        deployment: SymmetricProtectedDeployment,
+    ) -> str:
+        candidates: list[str] = []
+        site_ids = {member.instance_id for member in deployment.topology.site(site).target_fleet}
+        for instance_id in sorted(set(before).intersection(after).intersection(site_ids)):
+            initial, final = before[instance_id], after[instance_id]
+            if initial.generation != final.generation:
+                continue
+            geneve_rx_delta = self._metric_value(final, "geneve_rx_packets") - self._metric_value(
+                initial, "geneve_rx_packets"
+            )
+            geneve_tx_delta = self._metric_value(final, "geneve_tx_packets") - self._metric_value(
+                initial, "geneve_tx_packets"
+            )
+            if geneve_rx_delta > 0 and geneve_tx_delta > 0:
+                candidates.append(instance_id)
+        if len(candidates) != 1:
+            raise MetricAssertionError(
+                f"{site} symmetric probe selected {len(candidates)} targets instead of exactly one"
+            )
+        return candidates[0]
+
+    def _geneve_return_proof(
+        self,
+        before: Mapping[str, MetricSnapshot],
+        after: Mapping[str, MetricSnapshot],
+        target_id: str,
+        fidelity: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if target_id not in before or target_id not in after:
+            raise MetricAssertionError("selected target is absent from its GENEVE metric snapshots")
+        initial, final = before[target_id], after[target_id]
+        if initial.generation != final.generation:
+            raise MetricAssertionError("GENEVE return proof crosses a target process generation")
+        rx_delta = self._metric_value(final, "geneve_rx_packets") - self._metric_value(
+            initial, "geneve_rx_packets"
+        )
+        tx_delta = self._metric_value(final, "geneve_tx_packets") - self._metric_value(
+            initial, "geneve_tx_packets"
+        )
+        failure_metrics = (
+            "geneve_options_validation_errors",
+            "gwlb_profile_rejections_total",
+            "gwlb_receive_drops_total",
+            "gwlb_inner_validation_failures_total",
+            "gwlb_return_build_failures_total",
+            "gwlb_send_failures_total",
+            "drops",
+        )
+        failure_deltas = {
+            f"{name}_delta": self._metric_value(final, name)
+            - self._metric_value(initial, name)
+            for name in failure_metrics
+        }
+        target_ready = self._metric_series_value(final, "gwlb_target_ready")
+        components = {
+            component: self._metric_series_value(
+                final,
+                "gwlb_target_component_ready",
+                {"component": component},
+            )
+            for component in ("receiver", "validation", "sender")
+        }
+        if (
+            not math.isfinite(rx_delta)
+            or not math.isfinite(tx_delta)
+            or rx_delta <= 0
+            or tx_delta <= 0
+            or any(delta != 0 for delta in failure_deltas.values())
+            or target_ready != 1
+            or any(value != 1 for value in components.values())
+            or fidelity.get("observed") is not True
+            or fidelity.get("target_id") != target_id
+        ):
+            raise MetricAssertionError("selected target lacks positive receive and GENEVE return deltas")
+        return {
+            "target_id": target_id,
+            "metrics": {
+                "geneve_rx_packets_delta": rx_delta,
+                "geneve_tx_packets_delta": tx_delta,
+                **failure_deltas,
+                "gwlb_target_ready": target_ready,
+                "components_ready": components,
+            },
+            "fidelity": dict(fidelity),
+        }
+
+    def _start_geneve_captures(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        flow: FlowRecord,
+        *,
+        timeout_seconds: int,
+    ) -> dict[str, _SymmetricGeneveCapture]:
+        duration = max(8, min(30, timeout_seconds + 5))
+        handles: dict[str, _SymmetricGeneveCapture] = {}
+        try:
+            for site in SITES:
+                for member in deployment.topology.site(site).target_fleet:
+                    path = (
+                        f"/run/envelope-e2e-capture/{flow.flow_id}-{member.instance_id}-geneve.pcap"
+                    )
+                    command = (
+                        "set -euo pipefail; install -d -m 0700 /run/envelope-e2e-capture; "
+                        f"rm -f {shlex.quote(path)}; set +e; "
+                        f"timeout --signal=INT --kill-after=2 {duration}s "
+                        f"tcpdump -U -n -i {TRANSPORT_UNDERLAY_INTERFACE} -s 0 -c 64 "
+                        f"-w {shlex.quote(path)} 'udp port 6081' >/dev/null 2>&1; status=$?; "
+                        "set -e; [[ $status -eq 0 || $status -eq 124 ]]"
+                    )
+                    target = cast(RemoteTarget, self._remote(member))
+                    command_id = self.base.ssm.send(
+                        SSMCommand(
+                            target,
+                            (command,),
+                            timeout_seconds=duration + 10,
+                            comment="Envelope symmetric AF_PACKET GENEVE capture",
+                        ),
+                        timeout_seconds=10,
+                    )
+                    handles[member.instance_id] = _SymmetricGeneveCapture(
+                        member, path, command_id, duration
+                    )
+            for handle in handles.values():
+                ready = self.base._execute_json(
+                    cast(RemoteTarget, self._remote(handle.member)),
+                    f"set -euo pipefail; for attempt in $(seq 1 40); do "
+                    f"if test -s {shlex.quote(handle.path)}; then "
+                    "printf '{\"ready\":true,\"success\":true}\\n'; exit 0; fi; "
+                    "sleep 0.25; done; exit 1",
+                    timeout_seconds=15,
+                    comment="Envelope symmetric GENEVE capture readiness",
+                )
+                if ready.get("ready") is not True:
+                    raise WireAssertionError("target GENEVE capture did not become ready")
+            return handles
+        except PROTECTED_CONTROL_FLOW:
+            raise
+        except BaseException:
+            self._finish_geneve_captures(handles, inspect=False)
+            raise
+
+    def _finish_geneve_captures(
+        self,
+        handles: Mapping[str, _SymmetricGeneveCapture],
+        *,
+        inspect: bool,
+    ) -> dict[str, dict[str, Any]]:
+        summaries: dict[str, dict[str, Any]] = {}
+        primary_error: BaseException | None = None
+        for target_id, handle in handles.items():
+            target = cast(RemoteTarget, self._remote(handle.member))
+            completed = False
+            deleted = False
+            control_flow_error: BaseException | None = None
+            try:
+                result = self.base.ssm.wait(
+                    target,
+                    handle.command_id,
+                    timeout_seconds=handle.duration_seconds + 15,
+                )
+                if not result.succeeded:
+                    raise WireAssertionError("bounded target GENEVE capture did not complete")
+                completed = True
+                if inspect:
+                    summaries[target_id] = self.base._inspect_capture_summary(
+                        target, handle.path
+                    )
+            except PROTECTED_CONTROL_FLOW as error:
+                control_flow_error = error
+            except BaseException as error:
+                primary_error = primary_error or error
+                try:
+                    self.base.ssm.cancel(target, handle.command_id, timeout_seconds=5)
+                except E2EError:
+                    pass
+            finally:
+                try:
+                    self.base._execute(
+                        target,
+                        f"set -u; rm -f {shlex.quote(handle.path)}; "
+                        f"! test -e {shlex.quote(handle.path)}",
+                        timeout_seconds=20,
+                        comment="Envelope symmetric delete raw GENEVE capture",
+                    )
+                    deleted = True
+                except PROTECTED_CONTROL_FLOW as error:
+                    control_flow_error = control_flow_error or error
+                except BaseException as error:
+                    primary_error = primary_error or error
+                finally:
+                    events = getattr(self, "_geneve_capture_events", [])
+                    events.append(
+                        {
+                            "target_id": target_id,
+                            "capture_method": "linux-af-packet",
+                            "bounded": True,
+                            "completed": completed,
+                            "inspected": inspect and target_id in summaries,
+                            "raw_pcap_deleted": deleted,
+                        }
+                    )
+                    self._geneve_capture_events = events
+            if control_flow_error is not None:
+                raise control_flow_error
+        if primary_error is not None:
+            raise WireAssertionError(
+                "target GENEVE capture completion or raw deletion failed"
+            ) from primary_error
+        return summaries
+
+    def _selected_destination_transport_router(
+        self,
+        source_router: SymmetricFleetMember,
+        destination: SymmetricSiteTopology,
+        destination_ip: str,
+    ) -> str:
+        try:
+            address = ipaddress.ip_address(destination_ip)
+            destination_prefixes = [
+                prefix
+                for prefix in destination.local_site_cidrs
+                if address in ipaddress.ip_network(prefix, strict=True)
+            ]
+        except ValueError:
+            destination_prefixes = []
+        if len(destination_prefixes) != 1:
+            raise ProbeError(
+                "symmetric probe destination does not identify one exact destination-site prefix"
+            )
+        status_node_ids = self._tailnet_status_node_ids()
+        expected_nodes = {
+            status_node_ids[
+                f"{self.config.run_id}-{destination.site}-transport-{member.az_key}"
+            ]: f"{self.config.run_id}-{destination.site}-transport-{member.az_key}"
+            for member in destination.transport_router_fleet
+        }
+        expected_owner = destination.transport_router_for_prefix(
+            destination_prefixes[0]
+        )
+        script = r'''import json,sys
+prefix=sys.argv[1]; expected=json.loads(sys.argv[2])
+status=json.load(sys.stdin)
+peers=status.get("Peer", {})
+values=list(peers.values()) if isinstance(peers, dict) else peers if isinstance(peers, list) else []
+matches=[]
+for peer in values:
+    if not isinstance(peer, dict):
+        raise SystemExit(2)
+    routes=peer.get("PrimaryRoutes", [])
+    if not isinstance(routes, list) or not all(isinstance(route, str) for route in routes):
+        raise SystemExit(2)
+    if prefix in routes:
+        matches.append({"hostname":str(peer.get("HostName") or peer.get("DNSName") or "").split(".")[0],"online":peer.get("Online"),"peer_id":peer.get("ID")})
+if len(matches)!=1:
+    raise SystemExit(2)
+match=matches[0]
+if match["online"] is not True or expected.get(match["peer_id"])!=match["hostname"]:
+    raise SystemExit(2)
+print(json.dumps({"peer_id":match["peer_id"],"success":True},sort_keys=True))'''
+        value = self.base._execute_json(
+            self._remote(source_router),
+            "set -euo pipefail; tailscale status --json | python3 -c "
+            + shlex.quote(script)
+            + " "
+            + shlex.quote(destination_prefixes[0])
+            + " "
+            + shlex.quote(json.dumps(expected_nodes, sort_keys=True, separators=(",", ":"))),
+            timeout_seconds=20,
+            comment="Envelope symmetric selected destination transport route",
+        )
+        peer_id = value.get("peer_id")
+        matches = [
+            member
+            for member in destination.transport_router_fleet
+            if peer_id
+            == status_node_ids[
+                f"{self.config.run_id}-{destination.site}-transport-{member.az_key}"
+            ]
+        ]
+        if len(matches) != 1 or matches[0] != expected_owner:
+            raise ProbeError(
+                "active Tailnet primary route does not identify the configured destination prefix owner"
+            )
+        return matches[0].instance_id
+
+    def _selected_established_target(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        flow: FlowRecord,
+        *,
+        timeout_seconds: int,
+    ) -> SymmetricFleetMember:
+        if flow.protocol not in TRANSPORT_PROTOCOLS:
+            raise ResilienceError("established target attribution requires TCP or UDP")
+        captures = self._start_geneve_captures(
+            deployment,
+            flow,
+            timeout_seconds=max(8, min(timeout_seconds, 30)),
+        )
+        summaries = self._finish_geneve_captures(captures, inspect=True)
+        candidates: list[SymmetricFleetMember] = []
+        for member in deployment.topology.site(flow.source.site).target_fleet:
+            try:
+                correlate_geneve_turnaround_capture(
+                    summaries.get(member.instance_id, {}),
+                    flow,
+                    target_id=member.instance_id,
+                    raw_deleted=True,
+                )
+            except WireAssertionError:
+                continue
+            candidates.append(member)
+        if len(candidates) != 1:
+            raise ResilienceError(
+                f"established {flow.protocol} flow resolved to {len(candidates)} packet-correlated source targets"
+            )
+        return candidates[0]
+
+    def _selected_gwlbe_transport_router(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        site: Site,
+        az_key: str,
+        destination_ip: str,
+    ) -> SymmetricFleetMember:
+        topology_site = deployment.topology.site(site)
+        table_owners = [
+            member
+            for member in topology_site.transport_router_fleet
+            if member.az_key == az_key
+        ]
+        if len(table_owners) != 1 or table_owners[0].gwlbe_route_table_id is None:
+            raise ProbeError("source GWLBE AZ does not identify one protected route table")
+        prefixes = [
+            prefix
+            for prefix in topology_site.remote_site_cidrs
+            if ipaddress.ip_address(destination_ip) in ipaddress.ip_network(prefix, strict=True)
+        ]
+        if len(prefixes) != 1:
+            raise ProbeError("symmetric probe destination does not identify one remote-site prefix")
+        owner = table_owners[0]
+        tables = self.aws.json(
+            ["ec2", "describe-route-tables", "--route-table-ids", owner.gwlbe_route_table_id],
+            region=owner.region,
+        ).get("RouteTables")
+        if not isinstance(tables, list) or len(tables) != 1 or not isinstance(tables[0], Mapping):
+            raise ProbeError("source GWLBE route-table lookup was not exact")
+        routes = tables[0].get("Routes")
+        if not isinstance(routes, list):
+            raise ProbeError("source GWLBE route-table lookup omitted routes")
+        matches = [
+            route
+            for route in routes
+            if isinstance(route, Mapping) and route.get("DestinationCidrBlock") == prefixes[0]
+        ]
+        if len(matches) != 1 or matches[0].get("State") != "active":
+            raise ProbeError("source GWLBE remote route is not uniquely active")
+        selected = [
+            member
+            for member in topology_site.transport_router_fleet
+            if member.network_interface_id is not None
+            and AwsLiveOperations._route_selects_only_target(
+                matches[0], "NetworkInterfaceId", member.network_interface_id
+            )
+        ]
+        if len(selected) != 1:
+            raise ProbeError("source GWLBE remote route does not select one eligible transport ENI")
+        return selected[0]
+
+    def _run_probe_with_path(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        flow: FlowRecord,
+        *,
+        timeout_seconds: int,
+        exclude_targets: set[str] | None = None,
+    ) -> dict[str, Any]:
+        captures = self._start_geneve_captures(
+            deployment, flow, timeout_seconds=timeout_seconds
+        )
+        capture_summaries: dict[str, dict[str, Any]] = {}
+        try:
+            before = self._target_snapshots(deployment, exclude=exclude_targets)
+            probe = (
+                self.base._run_icmp_probe(flow, payload_bytes=56, timeout_seconds=timeout_seconds)
+                if flow.protocol == "icmp"
+                else self.base._run_probe(flow, timeout_seconds=timeout_seconds)
+            )
+            _validate_probe_evidence(flow, probe, kind="symmetric")
+            after = self._target_snapshots(deployment, exclude=exclude_targets)
+        finally:
+            capture_summaries = self._finish_geneve_captures(captures, inspect=True)
+        source_id = self._selected_target(before, after, flow.source.site, deployment)
+        destination_id = self._selected_target(before, after, flow.destination.site, deployment)
+        source_fidelity = correlate_geneve_turnaround_capture(
+            capture_summaries.get(source_id, {}),
+            flow,
+            target_id=source_id,
+            raw_deleted=True,
+        )
+        destination_fidelity = correlate_geneve_turnaround_capture(
+            capture_summaries.get(destination_id, {}),
+            flow,
+            target_id=destination_id,
+            raw_deleted=True,
+        )
+        if flow.source.az_key is None or flow.destination.az_key is None:
+            raise ProbeError("symmetric probe omitted a protected workload AZ")
+        source_router = self._selected_gwlbe_transport_router(
+            deployment,
+            flow.source.site,
+            flow.source.az_key,
+            flow.destination.private_ip,
+        )
+        destination_transport_router_id = self._selected_destination_transport_router(
+            source_router,
+            deployment.topology.site(flow.destination.site),
+            flow.destination.private_ip,
+        )
+        destination_transport_router = next(
+            member
+            for member in deployment.topology.site(
+                flow.destination.site
+            ).transport_router_fleet
+            if member.instance_id == destination_transport_router_id
+        )
+        return {
+            "protocol": flow.protocol,
+            "source_role": flow.source.role,
+            "destination_role": flow.destination.role,
+            "source_az_key": flow.source.az_key,
+            "destination_az_key": flow.destination.az_key,
+            "source_gwlbe_id": deployment.endpoint_ids[flow.source.site][flow.source.az_key],
+            "destination_gwlbe_id": deployment.endpoint_ids[flow.destination.site][
+                destination_transport_router.az_key
+            ],
+            "source_target_id": source_id,
+            "destination_target_id": destination_id,
+            "source_transport_router_id": source_router.instance_id,
+            "source_transport_eni_id": source_router.network_interface_id,
+            "destination_transport_router_id": destination_transport_router_id,
+            "geneve_return_proof": {
+                "source": self._geneve_return_proof(
+                    before, after, source_id, source_fidelity
+                ),
+                "destination": self._geneve_return_proof(
+                    before, after, destination_id, destination_fidelity
+                ),
+            },
+            "source_preserved": True,
+        }
+
+    def _wait_probe_path(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        flow: FlowRecord,
+        *,
+        timeout_seconds: int,
+        exclude_targets: set[str] | None = None,
+    ) -> dict[str, Any]:
+        deadline = self.base.monotonic() + timeout_seconds
+        last_error: BaseException | None = None
+        while self.base.monotonic() < deadline:
+            try:
+                return self._run_probe_with_path(
+                    deployment,
+                    flow,
+                    timeout_seconds=max(10, min(20, int(deadline - self.base.monotonic()))),
+                    exclude_targets=exclude_targets,
+                )
+            except PROTECTED_CONTROL_FLOW:
+                raise
+            except (E2EError, OSError) as error:
+                last_error = error
+                if self.base.monotonic() < deadline:
+                    self.base.sleep(min(2.0, max(0.0, deadline - self.base.monotonic())))
+        raise ResilienceError(
+            "alternate-path new-flow recovery timed out"
+            + (f": {_sanitize_string(str(last_error))}" if last_error is not None else "")
+        )
+
+    def _describe_instance(
+        self, member: SymmetricFleetMember | SSMTarget
+    ) -> Mapping[str, Any]:
+        response = self.aws.json(
+            ["ec2", "describe-instances", "--instance-ids", member.instance_id],
+            region=member.region,
+        )
+        values = self.base._instances(response)
+        if set(values) != {member.instance_id}:
+            raise ReadinessError("symmetric fleet instance lookup was not exact")
+        return values[member.instance_id]
+
+    @staticmethod
+    def _primary_network_identity(
+        instance: Mapping[str, Any],
+        *,
+        expected_availability_zone: str,
+        expected_source_dest_check: bool,
+        expected_subnet_id: str | None = None,
+    ) -> dict[str, str]:
+        interfaces = instance.get("NetworkInterfaces")
+        primary = [
+            interface
+            for interface in interfaces or []
+            if isinstance(interface, Mapping)
+            and isinstance(interface.get("Attachment"), Mapping)
+            and interface["Attachment"].get("DeviceIndex") == 0
+        ]
+        subnet_id = instance.get("SubnetId")
+        eni_id = primary[0].get("NetworkInterfaceId") if len(primary) == 1 else None
+        attachment = primary[0].get("Attachment") if len(primary) == 1 else None
+        if (
+            instance.get("State", {}).get("Name") != "running"
+            or instance.get("SourceDestCheck") is not expected_source_dest_check
+            or instance.get("Placement", {}).get("AvailabilityZone")
+            != expected_availability_zone
+            or not isinstance(subnet_id, str)
+            or _SUBNET_ID_RE.fullmatch(subnet_id) is None
+            or expected_subnet_id is not None
+            and subnet_id != expected_subnet_id
+            or len(primary) != 1
+            or not isinstance(eni_id, str)
+            or _ENI_ID_RE.fullmatch(eni_id) is None
+            or primary[0].get("SubnetId") != subnet_id
+            or primary[0].get("Status") != "in-use"
+            or primary[0].get("SourceDestCheck") is not expected_source_dest_check
+            or not isinstance(attachment, Mapping)
+            or attachment.get("Status") != "attached"
+        ):
+            raise ReadinessError(
+                "EC2 AZ, subnet, primary ENI, running state, or source/destination checking is invalid"
+            )
+        return {
+            "availability_zone": expected_availability_zone,
+            "subnet_id": subnet_id,
+            "network_interface_id": eni_id,
+        }
+
+    def _verify_primary_network_binding(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        member: SymmetricFleetMember | SSMTarget,
+        network_identity: Mapping[str, str],
+        *,
+        expected_cidr: str,
+        expected_source_dest_check: bool,
+    ) -> None:
+        eni_id = network_identity["network_interface_id"]
+        subnet_id = network_identity["subnet_id"]
+        availability_zone = network_identity["availability_zone"]
+        interfaces = self.aws.json(
+            ["ec2", "describe-network-interfaces", "--network-interface-ids", eni_id],
+            region=member.region,
+        ).get("NetworkInterfaces")
+        if (
+            not isinstance(interfaces, list)
+            or len(interfaces) != 1
+            or not isinstance(interfaces[0], Mapping)
+        ):
+            raise ReadinessError("primary ENI lookup was not exact")
+        interface = interfaces[0]
+        attachment = interface.get("Attachment")
+        if (
+            interface.get("NetworkInterfaceId") != eni_id
+            or interface.get("SubnetId") != subnet_id
+            or interface.get("VpcId") != deployment.vpc_ids[member.site]
+            or interface.get("AvailabilityZone") != availability_zone
+            or interface.get("Status") != "in-use"
+            or interface.get("SourceDestCheck") is not expected_source_dest_check
+            or not isinstance(attachment, Mapping)
+            or attachment.get("InstanceId") != member.instance_id
+            or attachment.get("DeviceIndex") != 0
+            or attachment.get("Status") != "attached"
+        ):
+            raise ReadinessError(
+                "primary ENI is not attached to the exact instance, VPC, subnet, and AZ"
+            )
+        subnets = self.aws.json(
+            ["ec2", "describe-subnets", "--subnet-ids", subnet_id],
+            region=member.region,
+        ).get("Subnets")
+        if (
+            not isinstance(subnets, list)
+            or len(subnets) != 1
+            or not isinstance(subnets[0], Mapping)
+            or subnets[0].get("SubnetId") != subnet_id
+            or subnets[0].get("VpcId") != deployment.vpc_ids[member.site]
+            or subnets[0].get("AvailabilityZone") != availability_zone
+            or subnets[0].get("CidrBlock") != expected_cidr
+            or subnets[0].get("State") != "available"
+        ):
+            raise ReadinessError(
+                "primary ENI subnet does not match the exact protected VPC, AZ, and CIDR"
+            )
+
+    def _verify_no_route_mutation_authority(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        member: SymmetricFleetMember,
+        instance: Mapping[str, Any],
+    ) -> None:
+        profile_reference = instance.get("IamInstanceProfile")
+        expected_name = (
+            f"{self.config.run_id}-{member.site}-runtime"
+            if member.role == "target"
+            else f"{self.config.run_id}-{member.site}-transport"
+        )
+        if not isinstance(profile_reference, Mapping):
+            raise ReadinessError("symmetric target or transport router omitted its instance profile")
+        profile_arn = profile_reference.get("Arn")
+        if (
+            not isinstance(profile_arn, str)
+            or not profile_arn.endswith(f":instance-profile/{expected_name}")
+        ):
+            raise ReadinessError("symmetric target or transport router uses an unexpected instance profile")
+        denied_profiles = getattr(self, "_route_mutation_denied_profiles", set())
+        if profile_arn in denied_profiles:
+            return
+        profile_response = self.aws.json(
+            ["iam", "get-instance-profile", "--instance-profile-name", expected_name]
+        )
+        profile = profile_response.get("InstanceProfile")
+        roles = profile.get("Roles") if isinstance(profile, Mapping) else None
+        if (
+            not isinstance(profile, Mapping)
+            or profile.get("Arn") != profile_arn
+            or profile.get("InstanceProfileName") != expected_name
+            or not isinstance(roles, list)
+            or len(roles) != 1
+            or not isinstance(roles[0], Mapping)
+        ):
+            raise ReadinessError("symmetric instance profile did not resolve to one exact IAM role")
+        role = roles[0]
+        role_arn = role.get("Arn")
+        role_match = re.fullmatch(
+            r"arn:(aws(?:-[a-z0-9-]+)?):iam::([0-9]{12}):role/(?:[^/]+/)*([^/]+)",
+            str(role_arn),
+        )
+        if role_match is None or role_match.group(3) != expected_name or role.get("RoleName") != expected_name:
+            raise ReadinessError("symmetric instance profile role identity is invalid")
+        partition, account_id = role_match.group(1), role_match.group(2)
+        route_table_arns = sorted(
+            {
+                f"arn:{partition}:ec2:{router.region}:{account_id}:route-table/{router.gwlbe_route_table_id}"
+                for site in SITES
+                for router in deployment.topology.site(site).transport_router_fleet
+            }
+        )
+        simulation = self.aws.json(
+            [
+                "iam",
+                "simulate-principal-policy",
+                "--policy-source-arn",
+                cast(str, role_arn),
+                "--action-names",
+                *ROUTE_MUTATION_ACTIONS,
+                "--resource-arns",
+                *route_table_arns,
+            ]
+        )
+        results = simulation.get("EvaluationResults")
+        if simulation.get("IsTruncated") not in (None, False) or not isinstance(results, list):
+            raise ReadinessError("route-mutation IAM denial simulation was incomplete")
+        by_action: dict[str, Mapping[str, Any]] = {}
+        for result in results:
+            if not isinstance(result, Mapping) or not isinstance(result.get("EvalActionName"), str):
+                raise ReadinessError("route-mutation IAM denial simulation returned an invalid result")
+            action = cast(str, result["EvalActionName"])
+            if action in by_action:
+                raise ReadinessError("route-mutation IAM denial simulation duplicated an action")
+            by_action[action] = result
+        if set(by_action) != set(ROUTE_MUTATION_ACTIONS):
+            raise ReadinessError("route-mutation IAM denial simulation omitted an action")
+        valid_denials = {"implicitDeny", "explicitDeny"}
+        for action, result in by_action.items():
+            resource_results = result.get("ResourceSpecificResults")
+            if resource_results is not None and (
+                not isinstance(resource_results, list)
+                or not all(isinstance(value, Mapping) for value in resource_results)
+            ):
+                raise ReadinessError("route-mutation IAM denial simulation returned invalid resources")
+            if result.get("EvalDecision") not in valid_denials or any(
+                value.get("EvalResourceDecision") not in valid_denials
+                for value in resource_results or []
+            ):
+                raise ReadinessError(
+                    f"{member.role} instance role unexpectedly permits protected runner action {action}"
+                )
+        denied_profiles.add(profile_arn)
+        self._route_mutation_denied_profiles = denied_profiles
+
+    def _verify_gwlbe_endpoints(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        site: Site,
+        *,
+        deadline: float,
+    ) -> dict[str, str]:
+        expected = deployment.endpoint_ids[site]
+        response = self.aws.json(
+            ["ec2", "describe-vpc-endpoints", "--vpc-endpoint-ids", *expected.values()],
+            region=deployment.topology.site(site).region,
+        )
+        endpoints = response.get("VpcEndpoints")
+        if not isinstance(endpoints, list) or not all(isinstance(value, Mapping) for value in endpoints):
+            raise ReadinessError(f"{site} GWLB endpoint response is invalid")
+        by_id = {
+            str(value.get("VpcEndpointId")): value
+            for value in endpoints
+            if isinstance(value.get("VpcEndpointId"), str)
+        }
+        if set(by_id) != set(expected.values()) or any(
+            value.get("State") != "available"
+            or value.get("VpcId") != deployment.vpc_ids[site]
+            or value.get("VpcEndpointType") != "GatewayLoadBalancer"
+            for value in by_id.values()
+        ):
+            raise ReadinessError(f"{site} GWLB endpoints are not exactly available in the expected VPC")
+        self.base._wait_for_gwlbe_stability(site, list(by_id.values()), deadline=deadline)
+        endpoint_subnets: dict[str, str] = {}
+        for az_key, endpoint_id in expected.items():
+            subnets = by_id[endpoint_id].get("SubnetIds")
+            if (
+                not isinstance(subnets, list)
+                or len(subnets) != 1
+                or _SUBNET_ID_RE.fullmatch(str(subnets[0])) is None
+            ):
+                raise ReadinessError(f"{site} GWLB endpoint {az_key} does not have one exact subnet")
+            endpoint_subnets[az_key] = str(subnets[0])
+        subnet_response = self.aws.json(
+            ["ec2", "describe-subnets", "--subnet-ids", *endpoint_subnets.values()],
+            region=deployment.topology.site(site).region,
+        )
+        subnets = subnet_response.get("Subnets")
+        if not isinstance(subnets, list) or not all(isinstance(value, Mapping) for value in subnets):
+            raise ReadinessError(f"{site} GWLB endpoint subnet response is invalid")
+        by_subnet = {
+            str(value.get("SubnetId")): value
+            for value in subnets
+            if isinstance(value.get("SubnetId"), str)
+        }
+        if set(by_subnet) != set(endpoint_subnets.values()) or any(
+            by_subnet[subnet_id].get("VpcId") != deployment.vpc_ids[site]
+            or by_subnet[subnet_id].get("AvailabilityZone") != self.config.sites[site]["azs"].get(az_key)
+            or by_subnet[subnet_id].get("CidrBlock")
+            != self.config.sites[site]["gwlbe_subnet_cidrs"].get(az_key)
+            or by_subnet[subnet_id].get("State") != "available"
+            for az_key, subnet_id in endpoint_subnets.items()
+        ):
+            raise ReadinessError(f"{site} GWLB endpoint map does not preserve exact VPC/AZ identities")
+        return endpoint_subnets
+
+    def _verify_gwlbe_route_domain(
+        self,
+        routes: Sequence[Any],
+        prefixes: Sequence[str],
+        target_id: str,
+        description: str,
+        *,
+        target_field: str = "GatewayId",
+    ) -> None:
+        if target_field not in _ROUTE_TARGET_FIELDS:
+            raise ReadinessError(f"{description} uses an unsupported route target field")
+        parsed: list[tuple[Mapping[str, Any], ipaddress.IPv4Network | None]] = []
+        for route in routes:
+            if not isinstance(route, Mapping):
+                raise ReadinessError(f"{description} route table contains a non-object route")
+            destination = route.get("DestinationCidrBlock")
+            if not isinstance(destination, str):
+                parsed.append((route, None))
+                continue
+            try:
+                network = ipaddress.ip_network(destination, strict=False)
+            except ValueError as error:
+                raise ReadinessError(f"{description} route table contains an invalid destination") from error
+            parsed.append((route, network if isinstance(network, ipaddress.IPv4Network) else None))
+        for prefix_value in prefixes:
+            prefix = ipaddress.ip_network(prefix_value, strict=True)
+            exact = [route for route, network in parsed if network == prefix]
+            if (
+                len(exact) != 1
+                or exact[0].get("State") != "active"
+                or not self.base._route_selects_only_target(exact[0], target_field, target_id)
+            ):
+                raise ReadinessError(f"{description} does not select one active exact protected next hop")
+            bypasses = [
+                str(network)
+                for route, network in parsed
+                if network is not None
+                and network != prefix
+                and network.subnet_of(prefix)
+                and (
+                    route.get("State") != "active"
+                    or not self.base._route_selects_only_target(route, target_field, target_id)
+                )
+            ]
+            if bypasses:
+                raise ReadinessError(
+                    f"{description} has a more-specific route that bypasses its same-AZ GWLBE: "
+                    + ",".join(sorted(bypasses))
+                )
+
+    def _verify_gwlbe_post_inspection_routes(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        member: SymmetricFleetMember,
+        endpoint_subnet_id: str,
+    ) -> None:
+        if member.network_interface_id is None or member.gwlbe_route_table_id is None:
+            raise ReadinessError("transport router omitted its protected ENI or GWLBE route table")
+        source_prefix_by_az = {
+            target.az_key: target.cidr
+            for target in deployment.workloads.targets
+            if target.site == member.site
+        }
+        if (
+            member.advertised_prefix != source_prefix_by_az.get(member.az_key)
+            or deployment.topology.route_failover.initial_router_az(
+                member.site, member.az_key
+            )
+            != member.az_key
+        ):
+            raise ReadinessError(
+                "GWLBE post-inspection route table is not coupled to its source-prefix owner"
+            )
+        response = self.aws.json(
+            ["ec2", "describe-route-tables", "--route-table-ids", member.gwlbe_route_table_id],
+            region=member.region,
+        )
+        tables = response.get("RouteTables")
+        if not isinstance(tables, list) or len(tables) != 1 or not isinstance(tables[0], Mapping):
+            raise ReadinessError("GWLBE post-inspection route-table lookup was not exact")
+        table = tables[0]
+        associations = table.get("Associations")
+        matching_associations = [
+            association
+            for association in associations or []
+            if isinstance(association, Mapping)
+            and association.get("SubnetId") == endpoint_subnet_id
+            and association.get("Main") is False
+            and association.get("AssociationState", {}).get("State") == "associated"
+        ]
+        if (
+            table.get("RouteTableId") != member.gwlbe_route_table_id
+            or table.get("VpcId") != deployment.vpc_ids[member.site]
+            or len(matching_associations) != 1
+        ):
+            raise ReadinessError("GWLBE route table is not exactly associated with its protected endpoint subnet")
+        routes = table.get("Routes")
+        if not isinstance(routes, list):
+            raise ReadinessError("GWLBE post-inspection route table omitted routes")
+        topology_site = deployment.topology.site(member.site)
+        self._verify_gwlbe_route_domain(
+            routes,
+            topology_site.remote_site_cidrs,
+            member.network_interface_id,
+            "GWLBE post-inspection remote-site route domain",
+            target_field="NetworkInterfaceId",
+        )
+
+        route_networks: list[tuple[Mapping[str, Any], ipaddress.IPv4Network]] = []
+        for route in routes:
+            if not isinstance(route, Mapping) or not isinstance(route.get("DestinationCidrBlock"), str):
+                continue
+            try:
+                network = ipaddress.ip_network(cast(str, route["DestinationCidrBlock"]), strict=False)
+            except ValueError as error:
+                raise ReadinessError("GWLBE route table contains an invalid local destination") from error
+            if isinstance(network, ipaddress.IPv4Network):
+                route_networks.append((route, network))
+        for prefix_value in topology_site.local_site_cidrs:
+            prefix = ipaddress.ip_network(prefix_value, strict=True)
+            covering = [
+                (route, network)
+                for route, network in route_networks
+                if prefix.subnet_of(network)
+            ]
+            if not covering:
+                raise ReadinessError(f"GWLBE post-inspection local prefix {prefix} has no VPC-local route")
+            longest = max(network.prefixlen for _route, network in covering)
+            winners = [route for route, network in covering if network.prefixlen == longest]
+            if (
+                len(winners) != 1
+                or winners[0].get("State") != "active"
+                or not self.base._route_selects_only_target(winners[0], "GatewayId", "local")
+            ):
+                raise ReadinessError(f"GWLBE post-inspection local prefix {prefix} bypasses VPC local delivery")
+            bypasses = [
+                str(network)
+                for route, network in route_networks
+                if network != prefix
+                and network.subnet_of(prefix)
+                and (
+                    route.get("State") != "active"
+                    or not self.base._route_selects_only_target(route, "GatewayId", "local")
+                )
+            ]
+            if bypasses:
+                raise ReadinessError(
+                    f"GWLBE post-inspection local prefix {prefix} has a more-specific bypass"
+                )
+
+    def _wait_transport_routes_enabled(
+        self,
+        member: SymmetricFleetMember,
+        expected_routes: Sequence[str],
+        *,
+        timeout_seconds: int,
+    ) -> str:
+        tailscale = build_tailscale(self.config)
+        expected_hostname = f"{self.config.run_id}-{member.site}-transport-{member.az_key}"
+        expected = set(expected_routes)
+        manifest = getattr(self.lifecycle, "manifest", None)
+        tailnet = manifest.get("tailnet") if isinstance(manifest, Mapping) else None
+        device_ids = tailnet.get("device_ids") if isinstance(tailnet, Mapping) else None
+        expected_device_id = (
+            device_ids.get(expected_hostname) if isinstance(device_ids, Mapping) else None
+        )
+        if not isinstance(expected_device_id, str) or not expected_device_id:
+            raise ReadinessError(
+                "durable manifest does not bind the transport router to one Tailnet device ID"
+            )
+
+        def enabled() -> str | None:
+            matches = [
+                device
+                for device in tailscale.list_devices()
+                if str(device.get("hostname") or device.get("name") or "").split(".")[0]
+                == expected_hostname
+                and self.config.tailnet["tag"] in {str(tag) for tag in device.get("tags", [])}
+                and device.get("id") == expected_device_id
+            ]
+            if len(matches) != 1:
+                return None
+            advertised = matches[0].get("advertisedRoutes")
+            active = matches[0].get("enabledRoutes")
+            if (
+                isinstance(advertised, list)
+                and isinstance(active, list)
+                and {str(route) for route in advertised} == expected
+                and {str(route) for route in active} == expected
+            ):
+                return expected_device_id
+            return None
+
+        value = self.base._wait_until(
+            enabled,
+            lambda value: value == expected_device_id,
+            timeout_seconds=timeout_seconds,
+            description=f"{member.site} transport router {member.az_key} exact enabled routes",
+            interval_seconds=3,
+        )
+        return cast(str, value)
+
+    def _verify_transport_router(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        member: SymmetricFleetMember,
+    ) -> dict[str, Any]:
+        instance = self._describe_instance(member)
+        tags = self.base._tags(instance)
+        network_identity = self._primary_network_identity(
+            instance,
+            expected_availability_zone=self.config.sites[member.site]["azs"][
+                member.az_key
+            ],
+            expected_source_dest_check=False,
+        )
+        self._verify_primary_network_binding(
+            deployment,
+            member,
+            network_identity,
+            expected_cidr=self.config.sites[member.site]["transport_subnet_cidrs"][
+                member.az_key
+            ],
+            expected_source_dest_check=False,
+        )
+        if (
+            network_identity["network_interface_id"] != member.network_interface_id
+            or tags.get("EnvelopeRun") != self.config.run_id
+            or tags.get("Role") != "transport-router"
+            or tags.get("Site") != member.site
+            or tags.get("ZoneKey") != member.az_key
+        ):
+            raise ReadinessError("transport-router EC2 ownership or running state is invalid")
+        expected = deployment.topology.site(member.site)
+        contract = deployment.transport_router_readiness_expectations.get(member.site)
+        if not isinstance(contract, Mapping):
+            raise ReadinessError("transport router has no Terraform readiness contract")
+        self._wait_transport_routes_enabled(
+            member, [cast(str, member.advertised_prefix)], timeout_seconds=60
+        )
+        status_identities = self._tailnet_status_identities()
+        status_node_ids = {
+            hostname: cast(str, identity["node_id"])
+            for hostname, identity in status_identities.items()
+        }
+        expected_hostname = (
+            f"{self.config.run_id}-{member.site}-transport-{member.az_key}"
+        )
+        expected_status_node_id = status_node_ids[expected_hostname]
+        identity_bindings: dict[str, dict[str, Any]] = {}
+        peer_bindings: dict[str, dict[str, str]] = {}
+        for site in SITES:
+            for candidate in deployment.topology.site(site).transport_router_fleet:
+                hostname = (
+                    f"{self.config.run_id}-{site}-transport-{candidate.az_key}"
+                )
+                identity = status_identities[hostname]
+                node_id = cast(str, identity["node_id"])
+                binding = {
+                    "hostname": hostname,
+                    "instance_id": candidate.instance_id,
+                    "scope": "local" if site == member.site else "remote",
+                }
+                identity_bindings[node_id] = {
+                    **binding,
+                    "KeyExpiry": identity["key_expiry"],
+                    "KeyExpiryDisabled": identity["key_expiry_disabled"],
+                    "Authorized": identity["authorized"],
+                }
+                if candidate.instance_id != member.instance_id:
+                    peer_bindings[node_id] = binding
+        expected_router_count = sum(
+            len(deployment.topology.site(site).transport_router_fleet)
+            for site in SITES
+        )
+        if len(identity_bindings) != expected_router_count:
+            raise ReadinessError("Tailnet status identities are not distinct")
+        if len(peer_bindings) != sum(
+            len(deployment.topology.site(site).transport_router_fleet)
+            for site in SITES
+        ) - 1:
+            raise ReadinessError("Tailnet status peer identities are not distinct")
+        script = r'''import datetime,hashlib,json,os,subprocess,sys,time
+local=set(json.loads(sys.argv[1])); remote=set(json.loads(sys.argv[2])); underlay=sys.argv[3]; tailscale_iface=sys.argv[4]
+expected_hostname=sys.argv[5]; expected_node_id=sys.argv[6]; expected_sha=sys.argv[7]
+expected_contract=json.loads(sys.argv[8]); marker=sys.argv[9]; runtime_state=sys.argv[10]; identity_bindings=json.loads(sys.argv[11])
+def output(args):
+    return subprocess.check_output(args,text=True,timeout=20)
+def json_output(args):
+    return json.loads(output(args))
+def timestamp(value):
+    if not isinstance(value,str):
+        raise RuntimeError("missing timestamp")
+    parsed=datetime.datetime.fromisoformat(value.replace("Z","+00:00"))
+    if parsed.tzinfo is None:
+        raise RuntimeError("naive timestamp")
+    return parsed.astimezone(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
+def expired(key_expiry,key_expiry_disabled,authorized):
+    if not isinstance(authorized,bool):
+        raise RuntimeError("missing authorization state")
+    return not authorized or (not key_expiry_disabled and datetime.datetime.fromisoformat(key_expiry.replace("Z","+00:00"))<=datetime.datetime.now(datetime.timezone.utc))
+with open("/etc/envelope/transport-router-readiness-expectations.json",encoding="utf-8") as source:
+    installed_contract=json.load(source)
+encoded=json.dumps(installed_contract,sort_keys=True,separators=(",",":"),allow_nan=False).encode()
+if (underlay==tailscale_iface or "envelope0" in {underlay,tailscale_iface} or
+    installed_contract!=expected_contract or hashlib.sha256(encoded).hexdigest()!=expected_sha or
+    marker!=expected_contract.get("readiness_marker") or runtime_state!=expected_contract.get("runtime_state")):
+    raise SystemExit(2)
+for required_path in (marker,runtime_state,expected_contract.get("recovery_marker")):
+    if not isinstance(required_path,str) or not os.path.isfile(required_path):
+        raise SystemExit(3)
+with open(runtime_state,encoding="utf-8") as source:
+    state=json.load(source)
+raw_status=json_output(["tailscale","status","--json"]); prefs=json_output(["tailscale","debug","prefs"])
+self_value=raw_status.get("Self")
+self_binding=identity_bindings.get(expected_node_id)
+if (not isinstance(self_value,dict) or
+    not isinstance(self_binding,dict) or self_binding.get("hostname")!=expected_hostname or
+    str(self_value.get("HostName") or self_value.get("DNSName") or "").split(".")[0]!=expected_hostname or
+    self_value.get("ID")!=expected_node_id or prefs.get("RouteAll") is not True):
+    raise SystemExit(4)
+peers_value=raw_status.get("Peer",{})
+peers=list(peers_value.values()) if isinstance(peers_value,dict) else peers_value if isinstance(peers_value,list) else []
+accepted=set(); route_peers=[]; ownership={"Remote":[],"Local":[]}; ping_results={}
+for peer in peers:
+    if not isinstance(peer,dict):
+        raise SystemExit(5)
+    routes=peer.get("PrimaryRoutes",[])
+    if not isinstance(routes,list) or not all(isinstance(route,str) for route in routes):
+        raise SystemExit(6)
+    selected_remote=remote.intersection(routes); selected_local=local.intersection(routes)
+    if selected_local:
+        raise SystemExit(8)
+    if not selected_remote:
+        continue
+    peer_id=peer.get("ID"); addresses=peer.get("TailscaleIPs",[])
+    hostname=str(peer.get("HostName") or peer.get("DNSName") or "").split(".")[0]
+    if not isinstance(peer_id,str) or peer_id.startswith(("nodekey:","key:")):
+        raise SystemExit(7)
+    binding=identity_bindings.get(peer_id)
+    if not isinstance(binding,dict) or binding.get("hostname")!=hostname:
+        raise SystemExit(7)
+    key_expiry=timestamp(binding.get("KeyExpiry")); key_expiry_disabled=binding.get("KeyExpiryDisabled"); authorized=binding.get("Authorized")
+    if not isinstance(key_expiry_disabled,bool) or not isinstance(authorized,bool):
+        raise SystemExit(7)
+    if peer_id not in ping_results:
+        started=time.monotonic(); succeeded=False
+        if isinstance(addresses,list) and addresses and isinstance(addresses[0],str):
+            try:
+                result=subprocess.run(["tailscale","ping","--until-direct=false","--timeout=5s","--c=1",addresses[0]],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=6,check=False)
+                succeeded=result.returncode==0
+            except subprocess.TimeoutExpired:
+                pass
+        ping_results[peer_id]={"PeerID":peer_id,"Succeeded":succeeded,"ObservedAt":timestamp(datetime.datetime.now(datetime.timezone.utc).isoformat()),"LatencyMilliseconds":int((time.monotonic()-started)*1000)}
+    common={"PeerID":peer_id,"Hostname":hostname,"Online":peer.get("Online"),"Expired":expired(key_expiry,key_expiry_disabled,authorized),"KeyExpiry":key_expiry,"KeyExpiryDisabled":key_expiry_disabled,"Ping":ping_results[peer_id]}
+    for prefix in sorted(selected_remote):
+        accepted.add(prefix); claim={"Prefix":prefix,**common}; route_peers.append({key:value for key,value in claim.items() if key!="Hostname"}); ownership["Remote"].append(claim)
+checked_at=timestamp(datetime.datetime.now(datetime.timezone.utc).isoformat())
+self_expiry=timestamp(self_binding.get("KeyExpiry")); self_expiry_disabled=self_binding.get("KeyExpiryDisabled"); self_authorized=self_binding.get("Authorized")
+if not isinstance(self_expiry_disabled,bool) or not isinstance(self_authorized,bool):
+    raise SystemExit(4)
+status={"BackendState":raw_status.get("BackendState"),"TUN":raw_status.get("TUN"),"Health":raw_status.get("Health",[]),"CheckedAt":checked_at,"Self":{"Online":self_value.get("Online"),"Expired":expired(self_expiry,self_expiry_disabled,self_authorized),"KeyExpiry":self_expiry,"KeyExpiryDisabled":self_expiry_disabled,"AdvertisedRoutes":prefs.get("AdvertiseRoutes"),"AcceptedRoutes":sorted(accepted),"NoSNAT":prefs.get("NoSNAT"),"RoutePeers":route_peers}}
+sysctl_names=["net.ipv4.ip_forward","net.ipv6.conf.all.forwarding","net.ipv6.conf.default.forwarding","net.ipv4.conf.all.rp_filter","net.ipv4.conf.default.rp_filter",f"net.ipv4.conf.{underlay}.rp_filter",f"net.ipv4.conf.{tailscale_iface}.rp_filter"]
+firewall={"iptables_filter":output(["/usr/sbin/iptables-save","-t","filter"]),"iptables_mangle":output(["/usr/sbin/iptables-save","-t","mangle"]),"iptables_nat":output(["/usr/sbin/iptables-save","-t","nat"]),"ip6tables_filter":output(["/usr/sbin/ip6tables-save","-t","filter"]),"ip6tables_mangle":output(["/usr/sbin/ip6tables-save","-t","mangle"]),"ip6tables_nat":output(["/usr/sbin/ip6tables-save","-t","nat"]),"nftables":json_output(["/usr/sbin/nft","-j","list","ruleset"])}
+payload={"runtime_state":state,"status":status,"primary_route_ownership":{"ObservedAt":checked_at,**ownership},"firewall":firewall,"policy_rules":json_output(["/usr/sbin/ip","-j","-details","-4","rule","show"]),"table52_routes":json_output(["/usr/sbin/ip","-j","-details","-4","route","show","table","52"]),"main_routes":json_output(["/usr/sbin/ip","-j","-details","-4","route","show","table","main"]),"sysctls":{name:int(output(["/usr/sbin/sysctl","-n",name]).strip()) for name in sysctl_names},"underlay_mtu":int(open(f"/sys/class/net/{underlay}/mtu",encoding="utf-8").read()),"tailscale_mtu":int(open(f"/sys/class/net/{tailscale_iface}/mtu",encoding="utf-8").read()),"host_network_service":{"unit":"envelope-transport-router-network.service","enabled":True,"active":True,"readiness_marker":marker,"runtime_state":runtime_state,"recovery_marker":expected_contract["recovery_marker"]}}
+print(json.dumps({"payload":payload,"success":True},sort_keys=True,separators=(",",":")))'''
+        value = self.base._execute_json(
+            self._remote(member),
+            "set -euo pipefail; timeout 60 cloud-init status --wait >/dev/null; "
+            "systemctl is-enabled --quiet envelope-transport-router-network.service; "
+            "systemctl is-active --quiet envelope-transport-router-network.service tailscaled.service; "
+            "python3 -c "
+            + shlex.quote(script)
+            + " "
+            + shlex.quote(json.dumps(list(expected.local_site_cidrs), separators=(",", ":")))
+            + " "
+            + shlex.quote(json.dumps(list(expected.remote_site_cidrs), separators=(",", ":")))
+            + " "
+            + shlex.quote(cast(str, contract["underlay_interface"]))
+            + " "
+            + shlex.quote(cast(str, contract["tailscale_interface"]))
+            + " "
+            + shlex.quote(f"{self.config.run_id}-{member.site}-transport-{member.az_key}")
+            + " "
+            + shlex.quote(expected_status_node_id)
+            + " "
+            + shlex.quote(cast(str, contract["contract_sha256"]))
+            + " "
+            + shlex.quote(
+                json.dumps(
+                    {key: value for key, value in contract.items() if key != "contract_sha256"},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            )
+            + " "
+            + shlex.quote(cast(str, contract["readiness_marker"]))
+            + " "
+            + shlex.quote(cast(str, contract["runtime_state"]))
+            + " "
+            + shlex.quote(
+                json.dumps(identity_bindings, sort_keys=True, separators=(",", ":"))
+            ),
+            timeout_seconds=90,
+            comment="Envelope transport-router readiness",
+        )
+        if set(value) != {"payload", "success"} or value.get("success") is not True:
+            raise ReadinessError("transport-router readiness returned an invalid state wrapper")
+        payload = value.get("payload")
+        if not isinstance(payload, Mapping) or set(payload) != {
+            "runtime_state",
+            "status",
+            "primary_route_ownership",
+            "firewall",
+            "policy_rules",
+            "table52_routes",
+            "main_routes",
+            "sysctls",
+            "underlay_mtu",
+            "tailscale_mtu",
+            "host_network_service",
+        }:
+            raise ReadinessError("transport-router effective readiness collection is incomplete")
+        _validate_transport_router_runtime_state(contract, payload["runtime_state"])
+        sysctls = payload.get("sysctls")
+        expected_sysctls = {
+            "net.ipv4.ip_forward": 1,
+            "net.ipv6.conf.all.forwarding": 0,
+            "net.ipv6.conf.default.forwarding": 0,
+            "net.ipv4.conf.all.rp_filter": 0,
+            "net.ipv4.conf.default.rp_filter": 0,
+            f"net.ipv4.conf.{contract['underlay_interface']}.rp_filter": 0,
+            f"net.ipv4.conf.{contract['tailscale_interface']}.rp_filter": 0,
+        }
+        if not isinstance(sysctls, Mapping) or dict(sysctls) != expected_sysctls:
+            raise ReadinessError("effective transport-router forwarding sysctls differ from contract")
+        firewall = payload.get("firewall")
+        if not isinstance(firewall, Mapping):
+            raise ReadinessError("effective transport-router firewall collection is invalid")
+        status = payload.get("status")
+        if not isinstance(status, Mapping):
+            raise ReadinessError("effective transport-router status collection is invalid")
+        transport_state = {
+            "source_dest_check": False,
+            **network_identity,
+            "ipv4_forwarding": True,
+            "ipv6_forwarding": False,
+            "rp_filter": {
+                "all": 0,
+                "default": 0,
+                cast(str, contract["underlay_interface"]): 0,
+                cast(str, contract["tailscale_interface"]): 0,
+            },
+            "underlay_mtu": payload["underlay_mtu"],
+            "tailscale_mtu": payload["tailscale_mtu"],
+            **_effective_transport_firewall(firewall, contract),
+            "local_policy_rules": _effective_local_policy_rules(
+                payload["policy_rules"], contract
+            ),
+            "ipv4_policy_rules": [dict(rule) for rule in contract["ipv4_policy_rules"]],
+            "policy_rule_priority_base": contract["policy_rule_priority_base"],
+            "local_route_table": contract["local_route_table"],
+            "remote_route_table": contract["remote_route_table"],
+            "table52_routes": payload["table52_routes"],
+            "main_routes": payload["main_routes"],
+            "host_network_service": payload["host_network_service"],
+        }
+        subnet_id = network_identity["subnet_id"]
+        tables = self.aws.json(
+            [
+                "ec2",
+                "describe-route-tables",
+                "--filters",
+                f"Name=association.subnet-id,Values={subnet_id}",
+            ],
+            region=member.region,
+        ).get("RouteTables")
+        if not isinstance(tables, list) or len(tables) != 1 or not isinstance(tables[0], Mapping):
+            raise ReadinessError(
+                "transport-router subnet does not select one explicit route table"
+            )
+        table = tables[0]
+        associations = table.get("Associations")
+        matching = [
+            association
+            for association in associations or []
+            if isinstance(association, Mapping)
+            and association.get("SubnetId") == subnet_id
+            and association.get("Main") is False
+            and association.get("AssociationState", {}).get("State") == "associated"
+        ]
+        if (
+            table.get("VpcId") != deployment.vpc_ids[member.site]
+            or not isinstance(table.get("RouteTableId"), str)
+            or _ROUTE_TABLE_ID_RE.fullmatch(cast(str, table["RouteTableId"])) is None
+            or table.get("RouteTableId") == member.gwlbe_route_table_id
+            or len(matching) != 1
+        ):
+            raise ReadinessError("transport-router subnet route-table identity is not exact")
+        endpoint = deployment.endpoint_ids[member.site][member.az_key]
+        availability_zone = self.config.sites[member.site]["azs"][member.az_key]
+        table52_routes = transport_state["table52_routes"]
+        if not isinstance(table52_routes, list) or not all(
+            isinstance(route, Mapping) for route in table52_routes
+        ):
+            raise ReadinessError("transport-router table 52 must be a route-object list")
+        local_networks = tuple(
+            ipaddress.ip_network(prefix, strict=True)
+            for prefix in expected.local_site_cidrs
+        )
+        for route in table52_routes:
+            destination = route.get("dst", "default")
+            try:
+                network = ipaddress.ip_network(
+                    "0.0.0.0/0" if destination == "default" else cast(str, destination),
+                    strict=False,
+                )
+            except (TypeError, ValueError) as error:
+                raise ReadinessError(
+                    "transport-router table 52 contains an invalid destination"
+                ) from error
+            if any(
+                network.version == local.version and network.overlaps(local)
+                for local in local_networks
+            ):
+                raise ReadinessError(
+                    "transport-router table 52 contains a local-site route"
+                )
+
+        def validate_transport_state(state: Mapping[str, Any]) -> dict[str, Any]:
+            return validate_effective_transport_router_readiness(
+                status,
+                state,
+                table,
+                expected.local_site_cidrs,
+                expected.remote_site_cidrs,
+                cast(str, member.advertised_prefix),
+                endpoint,
+                member.network_interface_id,
+                subnet_id,
+                cast(str, table["RouteTableId"]),
+                availability_zone,
+                availability_zone,
+                cast(str, contract["underlay_interface"]),
+                cast(str, contract["tailscale_interface"]),
+                contract,
+                expected_remote_prefix_owners={
+                    cast(str, candidate.advertised_prefix): status_node_ids[
+                        f"{self.config.run_id}-{candidate.site}-transport-{candidate.az_key}"
+                    ]
+                    for candidate in deployment.topology.site(
+                        _opposite(member.site)
+                    ).transport_router_fleet
+                },
+            )
+
+        try:
+            try:
+                validate_transport_state(transport_state)
+            except StandaloneTransportReadinessError as error:
+                if str(error) != (
+                    "table-52 local selections must contain every sibling prefix "
+                    "and exclude the self-owned prefix"
+                ):
+                    raise
+                # Reuse the standalone checks after replacing its sibling-route
+                # model with the protected remote-only check above.
+                standalone_state = copy.deepcopy(transport_state)
+                standalone_state["table52_routes"] = [
+                    *table52_routes,
+                    *[
+                        {
+                            "dst": prefix,
+                            "dev": contract["tailscale_interface"],
+                            "type": "unicast",
+                        }
+                        for prefix in expected.local_site_cidrs
+                        if prefix != member.advertised_prefix
+                    ],
+                ]
+                validate_transport_state(standalone_state)
+        except StandaloneTransportReadinessError as error:
+            raise ReadinessError(
+                f"transport-router effective readiness failed: {error}"
+            ) from None
+        raw_ownership = payload.get("primary_route_ownership")
+        if (
+            not isinstance(status, Mapping)
+            or not isinstance(raw_ownership, Mapping)
+            or raw_ownership.get("ObservedAt") != status.get("CheckedAt")
+        ):
+            raise ReadinessError(
+                "primary-route ownership is not bound to the readiness observation"
+            )
+        ownership = _validated_primary_route_ownership(
+            raw_ownership,
+            local_prefixes=expected.local_site_cidrs,
+            remote_prefixes=expected.remote_site_cidrs,
+            peer_bindings=peer_bindings,
+            selected_local_prefixes=set(),
+            expected_remote_owner_instance_ids={
+                cast(str, candidate.advertised_prefix): candidate.instance_id
+                for candidate in deployment.topology.site(
+                    _opposite(member.site)
+                ).transport_router_fleet
+            },
+            expected_local_owner_instance_ids={},
+        )
+        return {
+            "ready": True,
+            "node_identity_ready": True,
+            "network_interface_id": member.network_interface_id,
+            "advertised_prefix": member.advertised_prefix,
+            "contract_sha256": contract["contract_sha256"],
+            "tailnet_node_id_sha256": hashlib.sha256(
+                expected_status_node_id.encode("utf-8")
+            ).hexdigest(),
+            "primary_route_ownership": ownership,
+        }
+
+    def _verify_workload(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        workload: SSMTarget,
+    ) -> None:
+        if (
+            workload.az_key is None
+            or workload.availability_zone is None
+            or workload.subnet_id is None
+            or workload.route_table_id is None
+        ):
+            raise ReadinessError("symmetric workload omitted its AZ, subnet, or route-table identity")
+        instance = self._describe_instance(workload)
+        network_identity = self._primary_network_identity(
+            instance,
+            expected_availability_zone=workload.availability_zone,
+            expected_source_dest_check=True,
+            expected_subnet_id=workload.subnet_id,
+        )
+        self._verify_primary_network_binding(
+            deployment,
+            workload,
+            network_identity,
+            expected_cidr=workload.cidr,
+            expected_source_dest_check=True,
+        )
+        tags = self.base._tags(instance)
+        if (
+            tags.get("EnvelopeRun") != self.config.run_id
+            or tags.get("Site") != workload.site
+            or tags.get("Role") != workload.role
+            or tags.get("ZoneKey") != workload.az_key
+        ):
+            raise ReadinessError("workload EC2 ownership tags differ from its protected identity")
+        peer = deployment.workloads.target(_opposite(workload.site), _opposite_workload_role(workload.role))
+        self.base._install_agent(workload)
+        self.base._workload_readiness_details(
+            workload,
+            peer,
+            interface=TRANSPORT_UNDERLAY_INTERFACE,
+            timeout_seconds=120,
+        )
+        tables = self.aws.json(
+            ["ec2", "describe-route-tables", "--route-table-ids", workload.route_table_id],
+            region=workload.region,
+        ).get("RouteTables")
+        if not isinstance(tables, list) or len(tables) != 1 or not isinstance(tables[0], Mapping):
+            raise ReadinessError("symmetric workload route-table lookup was not exact")
+        table = tables[0]
+        associations = table.get("Associations")
+        matching = [
+            association
+            for association in associations or []
+            if isinstance(association, Mapping)
+            and association.get("SubnetId") == network_identity["subnet_id"]
+            and association.get("Main") is False
+            and association.get("AssociationState", {}).get("State") == "associated"
+        ]
+        if (
+            table.get("RouteTableId") != workload.route_table_id
+            or table.get("VpcId") != deployment.vpc_ids[workload.site]
+            or len(matching) != 1
+        ):
+            raise ReadinessError(
+                "symmetric workload route table is not actively associated with its exact subnet"
+            )
+        routes = table.get("Routes")
+        if not isinstance(routes, list):
+            raise ReadinessError("symmetric workload route table omitted routes")
+        endpoint = deployment.endpoint_ids[workload.site][workload.az_key]
+        self._verify_gwlbe_route_domain(
+            routes,
+            deployment.topology.site(workload.site).remote_site_cidrs,
+            endpoint,
+            "workload remote-site route domain",
+        )
+
+    def _verify_target(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        member: SymmetricFleetMember,
+        *,
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        instance = self._describe_instance(member)
+        tags = self.base._tags(instance)
+        network_identity = self._primary_network_identity(
+            instance,
+            expected_availability_zone=self.config.sites[member.site]["azs"][
+                member.az_key
+            ],
+            expected_source_dest_check=True,
+        )
+        self._verify_primary_network_binding(
+            deployment,
+            member,
+            network_identity,
+            expected_cidr=self.config.sites[member.site]["target_subnet_cidrs"][
+                member.az_key
+            ],
+            expected_source_dest_check=True,
+        )
+        if (
+            tags.get("EnvelopeRun") != self.config.run_id
+            or tags.get("Role") != "target"
+            or tags.get("Site") != member.site
+            or tags.get("ZoneKey") != member.az_key
+        ):
+            raise ReadinessError("packet-return target EC2 ownership or running state is invalid")
+        runtime = deployment.runtime.get(member.site)
+        if not isinstance(runtime, Mapping):
+            raise ReadinessError("packet-return target runtime identity is absent")
+        command = f"""set -euo pipefail
+metrics=$(mktemp /run/envelope-target-metrics.XXXXXX)
+failed_check=unknown
+report_failure() {{
+  status=$?
+  trap - EXIT
+  rm -f "$metrics"
+  if (( status != 0 )); then
+    printf '{{"exit_code":%d,"failed_check":"%s","success":false}}\n' "$status" "$failed_check" >&2
+  fi
+  exit "$status"
+}}
+trap report_failure EXIT
+failed_check=cloud-init
+timeout 120 cloud-init status --wait >/dev/null
+failed_check=envelope-service
+systemctl is-active --quiet envelope.service
+failed_check=target-isolation
+for unit in tailscaled.service envelope-host-network.service envelope-transport-router-network.service; do
+  ! systemctl is-active --quiet "$unit"
+  ! systemctl is-enabled --quiet "$unit" 2>/dev/null
+done
+! command -v tailscale >/dev/null 2>&1
+! ip link show dev envelope0 >/dev/null 2>&1
+failed_check=runtime-configuration
+runtime_file=/etc/envelope/site.env
+test -r "$runtime_file"
+for setting in \
+  ENVELOPE_CONFIG_VERSION=2 \
+  ENVELOPE_MODE=packet-return \
+  ENVELOPE_UDP_BIND=0.0.0.0:6081 \
+  ENVELOPE_MAX_INNER_PACKET_SIZE=1280; do
+  grep -Fxq -- "$setting" "$runtime_file"
+done
+! grep -Eq '^ENVELOPE_(TUN|TAILSCALE|ROUTING|LOCAL_SITE|REMOTE_SITE|GWLB_RETURN|LOCAL_DELIVERY|REMOTE_TAILNET)' "$runtime_file"
+failed_check=artifact-identity
+grep -Fxq {shlex.quote('ENVELOPE_DEPLOYED_ARTIFACT_SHA256=' + str(runtime['artifact_sha256']))} /etc/envelope/artifact.env
+grep -Fxq {shlex.quote('ENVELOPE_DEPLOYED_ARTIFACT_REVISION=' + str(runtime['artifact_revision']))} /etc/envelope/artifact.env
+printf '%s  %s\n' {shlex.quote(str(runtime['artifact_sha256']))} /usr/local/bin/envelope | sha256sum -c - >/dev/null
+failed_check=service-capabilities
+for property in AmbientCapabilities CapabilityBoundingSet; do
+  [[ $(systemctl show envelope.service -p "$property" --value | tr '[:upper:]' '[:lower:]') == cap_net_raw ]]
+done
+failed_check=geneve-listener
+ss -H -lun 'sport = :6081' | grep -Eq '(^|[[:space:]])0\.0\.0\.0:6081([[:space:]]|$)'
+failed_check=health-endpoint
+curl --fail --silent --max-time 3 http://127.0.0.1:9090/healthz >/dev/null
+failed_check=metrics-endpoint
+curl --fail --silent --max-time 3 http://127.0.0.1:9090/metrics >"$metrics"
+failed_check=geneve-counters
+grep -Eq '^geneve_rx_packets(_total)?([[:space:]]|\\{{)' "$metrics"
+grep -Eq '^geneve_rx_bytes(_total)?([[:space:]]|\\{{)' "$metrics"
+grep -Eq '^geneve_tx_packets(_total)?([[:space:]]|\\{{)' "$metrics"
+grep -Eq '^geneve_tx_bytes(_total)?([[:space:]]|\\{{)' "$metrics"
+failed_check=failure-counters
+for metric in \
+  geneve_options_validation_errors \
+  gwlb_profile_rejections_total \
+  gwlb_receive_drops_total \
+  gwlb_inner_validation_failures_total \
+  gwlb_return_build_failures_total \
+  gwlb_send_failures_total \
+  drops; do
+  grep -Eq "^${{metric}}([[:space:]]|\\{{)" "$metrics"
+done
+failed_check=aggregate-readiness
+grep -Eq '^gwlb_target_ready 1(\.0)?$' "$metrics"
+for component in receiver validation sender; do
+  failed_check="component-readiness-$component"
+  grep -Eq "^gwlb_target_component_ready\\{{[^}}]*component=\\\"$component\\\"[^}}]*\\}} 1(\.0)?$" "$metrics"
+done
+failed_check=obsolete-metrics
+! grep -Eq '^(tun_|routing_|decap_errors|encap_errors|gwlb_(missing_contexts|conflicted_contexts|possible_loops|context_|unsupported_inner))' "$metrics"
+failed_check=process-identity
+pid=$(systemctl show envelope.service -p MainPID --value)
+[[ $pid =~ ^[1-9][0-9]*$ ]]
+start_ticks=$(awk '{{print $22}}' "/proc/$pid/stat")
+[[ $start_ticks =~ ^[1-9][0-9]*$ ]]
+process_generation=$(printf '%s:%s:%s' "$(cat /proc/sys/kernel/random/boot_id)" "$pid" "$start_ticks" | sha256sum | cut -d' ' -f1)
+[[ $process_generation =~ ^[0-9a-f]{{64}}$ ]]
+failed_check=complete
+printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_ready":true,"geneve_send_ready":true,"health_ready":true,"metrics_ready":true,"pid":%s,"process_generation_sha256":"%s","ready":true,"target_isolated":true,"success":true}}\n' "$pid" "$process_generation"
+"""
+        value = self.base._execute_json(
+            self._remote(member),
+            command,
+            timeout_seconds=max(30, timeout_seconds),
+            comment="Envelope packet-return target readiness",
+        )
+        required = {
+            "ready",
+            "envelope_active",
+            "health_ready",
+            "geneve_receive_ready",
+            "geneve_validation_ready",
+            "geneve_send_ready",
+            "metrics_ready",
+            "target_isolated",
+        }
+        if (
+            any(value.get(field) is not True for field in required)
+            or isinstance(value.get("pid"), bool)
+            or not isinstance(value.get("pid"), int)
+            or value["pid"] <= 1
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(value.get("process_generation_sha256", ""))
+            )
+            is None
+        ):
+            raise ReadinessError("packet-return target readiness did not prove receive/send isolation")
+        return {
+            "instance_id": member.instance_id,
+            "target_group_arn": member.target_group_arn,
+            "registration_port": 6081,
+            **network_identity,
+            "pid": value["pid"],
+            "process_generation_sha256": value["process_generation_sha256"],
+        }
+
+    def _verify_target_route_domain(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        member: SymmetricFleetMember,
+    ) -> None:
+        instance = self._describe_instance(member)
+        subnet_id = instance.get("SubnetId")
+        if not isinstance(subnet_id, str) or _SUBNET_ID_RE.fullmatch(subnet_id) is None:
+            raise ReadinessError("symmetric target omitted its exact subnet identity")
+        tables = self.aws.json(
+            ["ec2", "describe-route-tables", "--filters", f"Name=association.subnet-id,Values={subnet_id}"],
+            region=member.region,
+        ).get("RouteTables")
+        if not isinstance(tables, list) or len(tables) != 1 or not isinstance(tables[0], Mapping):
+            raise ReadinessError("symmetric target subnet does not select one explicit route table")
+        table = tables[0]
+        associations = table.get("Associations")
+        matching = [
+            association
+            for association in associations or []
+            if isinstance(association, Mapping)
+            and association.get("SubnetId") == subnet_id
+            and association.get("Main") is False
+            and association.get("AssociationState", {}).get("State") == "associated"
+        ]
+        if table.get("VpcId") != deployment.vpc_ids[member.site] or len(matching) != 1:
+            raise ReadinessError("symmetric target route-table association is not exact")
+        routes = table.get("Routes")
+        endpoint_ids = {
+            endpoint
+            for values in deployment.endpoint_ids.values()
+            for endpoint in values.values()
+        }
+        if not isinstance(routes, list) or any(
+            isinstance(route, Mapping)
+            and (
+                route.get("GatewayId") in endpoint_ids
+                or route.get("NetworkInterfaceId")
+                in {
+                    router.network_interface_id
+                    for site in (deployment.topology.west, deployment.topology.east)
+                    for router in site.transport_router_fleet
+                }
+            )
+            for route in routes
+        ):
+            raise ReadinessError("symmetric target route domain contains an inner transit next hop")
+        local_prefixes = [
+            ipaddress.ip_network(prefix, strict=True)
+            for prefix in deployment.topology.site(member.site).local_site_cidrs
+        ]
+        remote_prefixes = [
+            ipaddress.ip_network(prefix, strict=True)
+            for prefix in deployment.topology.site(member.site).remote_site_cidrs
+        ]
+        for route in routes:
+            if not isinstance(route, Mapping) or not isinstance(route.get("DestinationCidrBlock"), str):
+                continue
+            try:
+                network = ipaddress.ip_network(cast(str, route["DestinationCidrBlock"]), strict=False)
+            except ValueError as error:
+                raise ReadinessError("symmetric target route table contains an invalid destination") from error
+            if isinstance(network, ipaddress.IPv4Network) and (
+                any(network.subnet_of(prefix) for prefix in local_prefixes)
+                or (
+                    network.prefixlen > 0
+                    and any(network.overlaps(prefix) for prefix in remote_prefixes)
+                )
+            ):
+                raise ReadinessError("symmetric target route domain contains an inner site route")
+
+    def verify_readiness(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        *,
+        timeout_seconds: int,
+    ) -> Mapping[str, Any]:
+        self.current_deployment = deployment
+        deadline = self.base.monotonic() + timeout_seconds
+        tailnet_preflight(self.config, build_tailscale(self.config))
+        result: dict[str, Any] = {
+            "tailnet_policy_valid": True,
+            "transport_router_contract_sha256": {
+                site: deployment.transport_router_readiness_expectations[site][
+                    "contract_sha256"
+                ]
+                for site in SITES
+            },
+            "sites": {},
+        }
+        for site in SITES:
+            endpoint_subnets = self._verify_gwlbe_endpoints(deployment, site, deadline=deadline)
+            topology_site = deployment.topology.site(site)
+            registrations = self._verify_target_group_registrations(deployment, site)
+            targets: dict[str, dict[str, Any]] = {}
+            routers: dict[str, dict[str, Any]] = {}
+            for member in topology_site.target_fleet:
+                if not self.adapter.owned(member, self.config.run_id):
+                    raise ReadinessError("symmetric target is not a running run-owned member")
+                self._verify_no_route_mutation_authority(
+                    deployment,
+                    member,
+                    self._describe_instance(member),
+                )
+                target_identity = self._verify_target(
+                    deployment,
+                    member,
+                    timeout_seconds=max(20, int(deadline - self.base.monotonic())),
+                )
+                if (
+                    target_identity.get("target_group_arn")
+                    != registrations[member.instance_id]["target_group_arn"]
+                    or target_identity.get("registration_port")
+                    != registrations[member.instance_id]["port"]
+                ):
+                    raise ReadinessError(
+                        "target service generation is not bound to its exact GWLB registration"
+                    )
+                identities = getattr(self, "_target_readiness_identities", {})
+                identities[member.instance_id] = target_identity
+                self._target_readiness_identities = identities
+                self._wait_target_health(
+                    member,
+                    {"healthy"},
+                    timeout_seconds=max(15, deadline - self.base.monotonic()),
+                )
+                self._verify_target_route_domain(deployment, member)
+                targets[member.instance_id] = {
+                    "ready": True,
+                    "target_group_arn": target_identity["target_group_arn"],
+                    "registration_port": target_identity["registration_port"],
+                    "process_generation_sha256": target_identity[
+                        "process_generation_sha256"
+                    ],
+                }
+            for member in topology_site.transport_router_fleet:
+                self._verify_no_route_mutation_authority(
+                    deployment,
+                    member,
+                    self._describe_instance(member),
+                )
+                router_identity = self._verify_transport_router(deployment, member)
+                self._verify_gwlbe_post_inspection_routes(
+                    deployment,
+                    member,
+                    endpoint_subnets[member.az_key],
+                )
+                routers[member.instance_id] = router_identity
+            result["sites"][site] = {
+                "route_domains": {"workload": True, "transport": True, "target": True},
+                "targets": targets,
+                "transport_routers": routers,
+            }
+        for workload in deployment.workloads.targets:
+            self._verify_workload(deployment, workload)
+        return result
+
+    def run_traversal(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        source_site: Site,
+        flows: Sequence[FlowRecord],
+        *,
+        timeout_seconds: int,
+    ) -> Mapping[str, Any]:
+        if [flow.protocol for flow in flows] != list(PROTOCOLS) * len(WORKLOAD_ROLES) or [
+            flow.source.role for flow in flows
+        ] != [role for role in WORKLOAD_ROLES for _protocol in PROTOCOLS]:
+            raise ProbeError("symmetric traversal requires both workload roles and ordered ICMP, TCP, and UDP probes")
+        probes = [
+            self._run_probe_with_path(
+                deployment,
+                flow,
+                timeout_seconds=max(15, timeout_seconds // len(flows)),
+            )
+            for flow in flows
+        ]
+        return {
+            "source_site": source_site,
+            "destination_site": _opposite(source_site),
+            "probes": probes,
+        }
+
+    def run_cold_probe(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        flow: FlowRecord,
+        *,
+        start_barrier: threading.Barrier,
+        timeout_seconds: int,
+    ) -> Mapping[str, Any]:
+        if flow.protocol not in PROTOCOLS or flow.source.site == flow.destination.site:
+            raise ProbeError("simultaneous cold initiation requires one cross-site ICMP, TCP, or UDP flow")
+        dispatched = 0
+
+        def synchronized_dispatch() -> None:
+            nonlocal dispatched
+            start_barrier.wait(timeout=30)
+            dispatched = time.monotonic_ns()
+
+        try:
+            probe = (
+                self.base._run_icmp_probe(
+                    flow,
+                    payload_bytes=56,
+                    timeout_seconds=max(15, min(60, timeout_seconds)),
+                    before_client=synchronized_dispatch,
+                )
+                if flow.protocol == "icmp"
+                else self.base._run_probe(
+                    flow,
+                    timeout_seconds=max(15, min(60, timeout_seconds)),
+                    before_client=synchronized_dispatch,
+                )
+            )
+        except BaseException as error:
+            if dispatched > 0:
+                setattr(error, "dispatch_monotonic_ns", dispatched)
+            raise
+        _validate_probe_evidence(flow, probe, kind="simultaneous-cold")
+        if dispatched <= 0 or flow.source.az_key is None:
+            raise ProbeError("simultaneous cold probe did not record its synchronized protected dispatch")
+        return {
+            "source_site": flow.source.site,
+            "destination_site": flow.destination.site,
+            "source_role": flow.source.role,
+            "destination_role": flow.destination.role,
+            "protocol": flow.protocol,
+            "source_az_key": flow.source.az_key,
+            "source_gwlbe_id": deployment.endpoint_ids[flow.source.site][flow.source.az_key],
+            "dispatch_monotonic_ns": dispatched,
+            "succeeded": True,
+        }
+
+    def _restore_target(
+        self, deployment: SymmetricProtectedDeployment, member: SymmetricFleetMember
+    ) -> None:
+        self.adapter.command(member, "systemctl start envelope.service")
+        self._verify_target(deployment, member, timeout_seconds=90)
+        self._wait_target_health(member, {"healthy"}, timeout_seconds=90)
+
+    def _process_mutation(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        failed: SymmetricFleetMember,
+        new_flows: Sequence[FlowRecord],
+    ) -> Mapping[str, Any]:
+        started = self.base.monotonic()
+        controller = SymmetricLifecycle(deployment.topology, self.adapter, dry_run=False)
+        controller.quiesce_target(failed)
+        control_flow_interrupted = False
+        try:
+            self._wait_target_health(failed, {"unhealthy", "unused"}, timeout_seconds=90)
+            paths = {
+                flow.protocol: self._wait_probe_path(
+                    deployment,
+                    flow,
+                    timeout_seconds=60,
+                    exclude_targets={failed.instance_id},
+                )
+                for flow in new_flows
+            }
+        except PROTECTED_CONTROL_FLOW:
+            control_flow_interrupted = True
+            raise
+        finally:
+            if not control_flow_interrupted:
+                self._restore_target(deployment, failed)
+        return {
+            "paths": paths,
+            "recovery_duration_ms": max(1, int((self.base.monotonic() - started) * 1000)),
+        }
+
+    @staticmethod
+    def _stream_failure_evidence(
+        flow: FlowRecord,
+        analysis: StreamAnalysis | None,
+        *,
+        interrupted: bool,
+        threshold_ms: int,
+    ) -> dict[str, Any]:
+        if analysis is None:
+            if flow.protocol != "tcp" or not interrupted:
+                raise StreamAnalysisError("only TCP may have a bounded interrupted stream outcome")
+            return {
+                "protocol": "tcp",
+                "flow_id": flow.flow_id,
+                "outcome": "interrupted",
+                "one_socket": True,
+                "analysis_available": False,
+                "sent_markers": None,
+                "received_markers": None,
+                "lost_markers": None,
+                "loss_percent": None,
+                "maximum_interruption_ms": None,
+                "threshold_ms": threshold_ms,
+                "within_threshold": True,
+            }
+        sent = analysis.last_sequence - analysis.first_sequence + 1
+        received = analysis.marker_count
+        maximum_interruption_ms = max(
+            (math.ceil(window.duration_ns / 1_000_000) for window in analysis.loss_windows),
+            default=0,
+        )
+        if maximum_interruption_ms > threshold_ms:
+            raise StreamAnalysisError(
+                f"{flow.protocol} failure interruption exceeded its reviewed threshold"
+            )
+        return {
+            "protocol": flow.protocol,
+            "flow_id": flow.flow_id,
+            "outcome": "resumed",
+            "one_socket": True,
+            "analysis_available": True,
+            "sent_markers": sent,
+            "received_markers": received,
+            "lost_markers": sent - received,
+            "loss_percent": (sent - received) * 100.0 / sent,
+            "maximum_interruption_ms": maximum_interruption_ms,
+            "threshold_ms": threshold_ms,
+            "within_threshold": True,
+        }
+
+    def _measure_tcp_udp_failure(
+        self,
+        tcp_flow: FlowRecord,
+        udp_flow: FlowRecord,
+        *,
+        timeout_seconds: int,
+        label: str,
+        mutate_and_restore: Callable[[], Mapping[str, Any]],
+    ) -> tuple[Mapping[str, Any], dict[str, Any]]:
+        if (
+            tcp_flow.protocol != "tcp"
+            or udp_flow.protocol != "udp"
+            or tcp_flow.source != udp_flow.source
+            or tcp_flow.destination != udp_flow.destination
+        ):
+            raise StreamAnalysisError(
+                "failure measurement requires one TCP and one UDP flow on the same directional lane"
+            )
+        threshold_ms = timeout_seconds * 1000
+        udp_result: dict[str, Any] = {}
+
+        def run_udp_during_tcp() -> Mapping[str, Any]:
+            analysis, receiver, mutation = self.base._run_stream_mutation(
+                udp_flow,
+                timeout_seconds=max(90, timeout_seconds),
+                maximum_loss_ns=threshold_ms * 1_000_000,
+                label=f"{label}-udp",
+                mutate_and_restore=mutate_and_restore,
+                expose_interval=True,
+            )
+            udp_result.update(
+                {
+                    "analysis": analysis,
+                    "receiver": receiver,
+                }
+            )
+            return mutation
+
+        tcp_analysis, tcp_receiver, mutation = self.base._run_stream_mutation(
+            tcp_flow,
+            timeout_seconds=max(90, timeout_seconds),
+            maximum_loss_ns=threshold_ms * 1_000_000,
+            label=f"{label}-tcp",
+            mutate_and_restore=run_udp_during_tcp,
+            allow_interrupted=True,
+        )
+        udp_analysis = udp_result.get("analysis")
+        if not isinstance(udp_analysis, StreamAnalysis):
+            raise StreamAnalysisError("UDP failure measurement did not retain its stream analysis")
+        tcp_interrupted = mutation.get("stream_client_interrupted") is True
+        mutation = {
+            key: value
+            for key, value in mutation.items()
+            if key != "stream_client_interrupted"
+        }
+        return mutation, {
+            "tcp": self._stream_failure_evidence(
+                tcp_flow,
+                tcp_analysis,
+                interrupted=tcp_interrupted,
+                threshold_ms=threshold_ms,
+            ),
+            "udp": self._stream_failure_evidence(
+                udp_flow,
+                udp_analysis,
+                interrupted=False,
+                threshold_ms=threshold_ms,
+            ),
+            "receivers": {
+                "tcp_sessions": tcp_receiver.get("sessions"),
+                "tcp_duplicates": tcp_receiver.get("duplicates"),
+                "udp_sessions": cast(Mapping[str, Any], udp_result["receiver"]).get(
+                    "sessions"
+                ),
+                "udp_duplicates": cast(Mapping[str, Any], udp_result["receiver"]).get(
+                    "duplicates"
+                ),
+            },
+        }
+
+    def run_target_process_recovery(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        failed: SymmetricFleetMember,
+        new_flow: FlowRecord,
+        new_tcp_flow: FlowRecord,
+        tcp_flow: FlowRecord,
+        udp_flow: FlowRecord,
+        *,
+        timeout_seconds: int,
+    ) -> Mapping[str, Any]:
+        if failed not in deployment.topology.site(failed.site).target_fleet:
+            raise ResilienceError("requested process-recovery target is outside the protected fleet")
+        tcp_failed: SymmetricFleetMember | None = None
+
+        def mutate_tcp() -> Mapping[str, Any]:
+            nonlocal tcp_failed
+            tcp_failed = self._selected_established_target(
+                deployment,
+                tcp_flow,
+                timeout_seconds=max(8, min(timeout_seconds, 30)),
+            )
+            return self._process_mutation(deployment, tcp_failed, ())
+
+        tcp_analysis, tcp_receiver, tcp_mutation = self.base._run_stream_mutation(
+            tcp_flow,
+            timeout_seconds=max(90, timeout_seconds),
+            maximum_loss_ns=7_200_000_000_000,
+            label="symmetric-target-process-tcp",
+            mutate_and_restore=mutate_tcp,
+            allow_interrupted=True,
+        )
+        udp_failed: SymmetricFleetMember | None = None
+
+        def mutate_udp() -> Mapping[str, Any]:
+            nonlocal udp_failed
+            udp_failed = self._selected_established_target(
+                deployment,
+                udp_flow,
+                timeout_seconds=max(8, min(timeout_seconds, 30)),
+            )
+            return self._process_mutation(
+                deployment, udp_failed, (new_tcp_flow, new_flow)
+            )
+
+        udp_analysis, udp_receiver, udp_mutation = self.base._run_stream_mutation(
+            udp_flow,
+            timeout_seconds=max(90, timeout_seconds),
+            maximum_loss_ns=7_200_000_000_000,
+            label="symmetric-target-process-udp",
+            mutate_and_restore=mutate_udp,
+        )
+        assert udp_analysis is not None
+        if tcp_failed is None or udp_failed is None:
+            raise ResilienceError("established transport did not identify its selected source targets")
+        paths = udp_mutation.get("paths")
+        if (
+            not isinstance(paths, Mapping)
+            or set(paths) != {"tcp", "udp"}
+            or any(not isinstance(path, Mapping) for path in paths.values())
+            or any(
+                cast(Mapping[str, Any], path).get("source_target_id")
+                == udp_failed.instance_id
+                for path in paths.values()
+            )
+        ):
+            raise ResilienceError("target process failure did not select an alternate healthy target")
+        path = cast(Mapping[str, Any], paths["udp"])
+        threshold_ms = timeout_seconds * 1000
+        return {
+            "recovery": {
+                "kind": "target-process",
+                "site": udp_failed.site,
+                "failed_id": udp_failed.instance_id,
+                "alternate_id": path["source_target_id"],
+                "new_flow_succeeded": True,
+                "new_flows": {
+                    protocol: {"succeeded": True, "path": sanitize_evidence_value(value)}
+                    for protocol, value in paths.items()
+                },
+                "recovery_duration_ms": cast(Mapping[str, Any], udp_mutation)["recovery_duration_ms"],
+            },
+            "health_transitions": [
+                {
+                    "kind": "target-process",
+                    "member_id": member_id,
+                    "states": ["healthy", "unavailable", "healthy"],
+                }
+                for member_id in sorted({tcp_failed.instance_id, udp_failed.instance_id})
+            ],
+            "transport": {
+                "failed_ids": {
+                    "tcp": tcp_failed.instance_id,
+                    "udp": udp_failed.instance_id,
+                },
+                "tcp": self._stream_failure_evidence(
+                    tcp_flow,
+                    tcp_analysis,
+                    interrupted=tcp_mutation.get("stream_client_interrupted") is True,
+                    threshold_ms=threshold_ms,
+                ),
+                "udp": self._stream_failure_evidence(
+                    udp_flow,
+                    udp_analysis,
+                    interrupted=False,
+                    threshold_ms=threshold_ms,
+                ),
+                "receivers": {
+                    "tcp_sessions": tcp_receiver.get("sessions"),
+                    "tcp_duplicates": tcp_receiver.get("duplicates"),
+                    "udp_sessions": udp_receiver.get("sessions"),
+                    "udp_duplicates": udp_receiver.get("duplicates"),
+                },
+            },
+        }
+
+    def _replace_target(self, member: SymmetricFleetMember) -> SymmetricFleetMember:
+        replace = getattr(self.lifecycle, "replace_target_instance", None)
+        if not callable(replace):
+            raise ResilienceError("protected lifecycle exposes no target replacement authority")
+        raw = replace(member)
+        if not isinstance(raw, Mapping):
+            raise ResilienceError("protected target replacement returned no deployment output")
+        deployment = parse_symmetric_protected_deployment_output(raw, site_regions={
+            site: self.config.sites[site]["region"] for site in SITES
+        })
+        self.current_deployment = deployment
+        matches = [
+            candidate
+            for candidate in deployment.topology.site(member.site).target_fleet
+            if candidate.az_key == member.az_key
+        ]
+        if len(matches) != 1:
+            raise ResilienceError("replacement output did not identify one same-AZ target")
+        return matches[0]
+
+    def run_target_instance_recovery(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        failed: SymmetricFleetMember,
+        new_flow: FlowRecord,
+        new_tcp_flow: FlowRecord,
+        tcp_flow: FlowRecord,
+        udp_flow: FlowRecord,
+        *,
+        timeout_seconds: int,
+    ) -> tuple[SymmetricProtectedDeployment, Mapping[str, Any]]:
+        if failed not in deployment.topology.site(failed.site).target_fleet:
+            raise ResilienceError("requested instance-recovery target is outside the protected fleet")
+        started = self.base.monotonic()
+        identities = getattr(self, "_target_readiness_identities", {})
+        old_identity: Mapping[str, Any] | None = None
+        controller = SymmetricLifecycle(deployment.topology, self.adapter, dry_run=False)
+        current: SymmetricProtectedDeployment | None = None
+        selected_failed: SymmetricFleetMember | None = None
+        replacement: SymmetricFleetMember | None = None
+        replacement_identity: Mapping[str, Any] | None = None
+
+        def replace_during_streams() -> Mapping[str, Any]:
+            nonlocal current, selected_failed, replacement, replacement_identity
+            nonlocal identities, old_identity
+            tcp_selected = self._selected_established_target(
+                deployment,
+                tcp_flow,
+                timeout_seconds=max(8, min(timeout_seconds, 30)),
+            )
+            udp_selected = self._selected_established_target(
+                deployment,
+                udp_flow,
+                timeout_seconds=max(8, min(timeout_seconds, 30)),
+            )
+            if tcp_selected.instance_id != udp_selected.instance_id:
+                raise ResilienceError(
+                    "target-instance TCP and UDP streams did not select one packet-correlated target"
+                )
+            selected_failed = tcp_selected
+            old_identity = identities.get(selected_failed.instance_id)
+            if not isinstance(old_identity, Mapping):
+                old_identity = self._verify_target(
+                    deployment,
+                    selected_failed,
+                    timeout_seconds=max(30, min(timeout_seconds, 120)),
+                )
+            controller.quiesce_target(selected_failed)
+            drain = controller.drain_target(selected_failed)
+            paths = {
+                flow.protocol: self._wait_probe_path(
+                    deployment,
+                    flow,
+                    timeout_seconds=max(20, min(timeout_seconds, 60)),
+                    exclude_targets={selected_failed.instance_id},
+                )
+                for flow in (new_tcp_flow, new_flow)
+            }
+            if any(
+                path["source_target_id"] == selected_failed.instance_id
+                for path in paths.values()
+            ):
+                raise ResilienceError("drained target still carried the replacement recovery probe")
+            replacement = self.adapter.replace(selected_failed)
+            current = self.current_deployment
+            if current is None or replacement.instance_id == selected_failed.instance_id:
+                raise ResilienceError(
+                    "target replacement did not produce a distinct healthy same-AZ target"
+                )
+            replacement_identity = self._verify_target(
+                current, replacement, timeout_seconds=max(30, min(timeout_seconds, 120))
+            )
+            if self._target_health(replacement) != "healthy":
+                raise ResilienceError(
+                    "target replacement did not produce a distinct healthy same-AZ target"
+                )
+            registrations = self._verify_target_group_registrations(
+                current, replacement.site
+            )
+            if (
+                selected_failed.instance_id in registrations
+                or replacement.instance_id not in registrations
+                or replacement_identity.get("target_group_arn")
+                != registrations[replacement.instance_id]["target_group_arn"]
+                or replacement_identity.get("registration_port")
+                != registrations[replacement.instance_id]["port"]
+                or replacement_identity.get("process_generation_sha256")
+                == old_identity.get("process_generation_sha256")
+            ):
+                raise ResilienceError(
+                    "target replacement is not bound to a new service generation and exact registration"
+                )
+            identities = {
+                key: value
+                for key, value in identities.items()
+                if key != selected_failed.instance_id
+            }
+            identities[replacement.instance_id] = replacement_identity
+            self._target_readiness_identities = identities
+            return {
+                "paths": paths,
+                "drain": drain,
+            }
+
+        mutation, transport = self._measure_tcp_udp_failure(
+            tcp_flow,
+            udp_flow,
+            timeout_seconds=timeout_seconds,
+            label="target-instance-failure",
+            mutate_and_restore=replace_during_streams,
+        )
+        paths = mutation.get("paths")
+        drain = mutation.get("drain")
+        if (
+            current is None
+            or selected_failed is None
+            or replacement is None
+            or not isinstance(old_identity, Mapping)
+            or not isinstance(replacement_identity, Mapping)
+            or not isinstance(paths, Mapping)
+            or set(paths) != {"tcp", "udp"}
+            or any(not isinstance(path, Mapping) for path in paths.values())
+            or not isinstance(drain, Mapping)
+        ):
+            raise ResilienceError("target replacement measurement lost its exact identities")
+        return current, {
+            "recovery": {
+                "kind": "target-instance",
+                "site": selected_failed.site,
+                "failed_id": selected_failed.instance_id,
+                "alternate_id": cast(Mapping[str, Any], paths["udp"])[
+                    "source_target_id"
+                ],
+                "replacement_id": replacement.instance_id,
+                "replacement_ready": True,
+                "old_process_generation_sha256": old_identity[
+                    "process_generation_sha256"
+                ],
+                "replacement_process_generation_sha256": replacement_identity[
+                    "process_generation_sha256"
+                ],
+                "target_group_arn": replacement.target_group_arn,
+                "registration_port": 6081,
+                "drain_state": drain["health"],
+                "drain_duration_ms": drain["drain_duration_ms"],
+                "new_flow_succeeded": True,
+                "new_flows": {
+                    protocol: {"succeeded": True, "path": sanitize_evidence_value(value)}
+                    for protocol, value in paths.items()
+                },
+                "recovery_duration_ms": max(1, int((self.base.monotonic() - started) * 1000)),
+            },
+            "health_transition": {
+                "kind": "target-instance",
+                "member_id": selected_failed.instance_id,
+                "states": ["healthy", drain["health"], "replaced"],
+            },
+            "transport": {
+                **transport,
+                "failed_ids": {
+                    "tcp": selected_failed.instance_id,
+                    "udp": selected_failed.instance_id,
+                },
+            },
+        }
+
+    def _wait_transport_running(
+        self, member: SymmetricFleetMember, *, timeout_seconds: int
+    ) -> None:
+        self.base._wait_until(
+            lambda: self.base._execute_json(
+                self._remote(member),
+                "set -euo pipefail; state=$(tailscale status --json | python3 -c 'import json,sys; print(json.load(sys.stdin).get(\"BackendState\",\"\"))'); "
+                "printf '{\"running\":%s,\"success\":true}\\n' \"$([[ $state == Running ]] && printf true || printf false)\"",
+                timeout_seconds=15,
+                comment="Envelope transport-router state",
+            ),
+            lambda value: value.get("running") is True,
+            timeout_seconds=timeout_seconds,
+            description=f"{member.site} transport router Running",
+            interval_seconds=3,
+        )
+
+    def _restore_transport_router(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        member: SymmetricFleetMember,
+    ) -> None:
+        routes = cast(str, member.advertised_prefix)
+        contract = deployment.transport_router_readiness_expectations[member.site]
+        readiness_marker = shlex.quote(cast(str, contract["readiness_marker"]))
+        runtime_state = shlex.quote(cast(str, contract["runtime_state"]))
+        recovery_marker = shlex.quote(cast(str, contract["recovery_marker"]))
+        try:
+            self.adapter.command(member, "systemctl start tailscaled.service")
+            self._wait_transport_running(member, timeout_seconds=90)
+            self.adapter.command(
+                member,
+                "tailscale set --accept-routes=true --snat-subnet-routes=false "
+                "--advertise-routes="
+                + shlex.quote(routes),
+            )
+            self.adapter.command(
+                member,
+                f"touch {recovery_marker} && "
+                "systemctl enable envelope-transport-router-network.service && "
+                "systemctl restart envelope-transport-router-network.service && "
+                "systemctl is-enabled --quiet "
+                "envelope-transport-router-network.service && "
+                "systemctl is-active --quiet envelope-transport-router-network.service "
+                "tailscaled.service && "
+                f"test -f {readiness_marker} {runtime_state} {recovery_marker}",
+            )
+            self._verify_transport_router(deployment, member)
+        except PROTECTED_CONTROL_FLOW:
+            raise
+        except BaseException:
+            try:
+                self.adapter.command(
+                    member,
+                    "systemctl stop envelope-transport-router-network.service; "
+                    "/usr/sbin/sysctl -q -w net.ipv4.ip_forward=0; "
+                    "/usr/sbin/sysctl -q -w net.ipv6.conf.all.forwarding=0; "
+                    "/usr/sbin/sysctl -q -w net.ipv6.conf.default.forwarding=0; "
+                    "! systemctl is-active --quiet "
+                    "envelope-transport-router-network.service; "
+                    "[[ $(sysctl -n net.ipv4.ip_forward) == 0 ]]",
+                )
+            except PROTECTED_CONTROL_FLOW:
+                raise
+            except BaseException as fail_closed_error:
+                raise ResilienceError(
+                    "transport-router restoration and fail-closed deactivation both failed"
+                ) from fail_closed_error
+            raise
+
+    def _transport_failure_with_restoration(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        member: SymmetricFleetMember,
+        exercise: Callable[[], Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
+        primary_error: BaseException | None = None
+        control_flow_interrupted = False
+        try:
+            return exercise()
+        except PROTECTED_CONTROL_FLOW:
+            control_flow_interrupted = True
+            raise
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            if not control_flow_interrupted:
+                try:
+                    self._restore_transport_router(deployment, member)
+                except PROTECTED_CONTROL_FLOW:
+                    raise
+                except BaseException as restoration_error:
+                    if isinstance(primary_error, RouteRestorationError):
+                        if hasattr(primary_error, "add_note"):
+                            primary_error.add_note("transport-router service restoration also failed")
+                        raise primary_error from restoration_error
+                    message = "transport-router service restoration failed"
+                    if primary_error is not None:
+                        message += f" after {type(primary_error).__name__}"
+                    raise ResilienceError(message) from restoration_error
+
+    def run_transport_router_recovery(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        graceful_failed: SymmetricFleetMember,
+        abrupt_failed: SymmetricFleetMember,
+        graceful_flow: FlowRecord,
+        abrupt_flow: FlowRecord,
+        graceful_new_tcp_flow: FlowRecord,
+        abrupt_new_tcp_flow: FlowRecord,
+        graceful_tcp_flow: FlowRecord,
+        graceful_udp_flow: FlowRecord,
+        abrupt_tcp_flow: FlowRecord,
+        abrupt_udp_flow: FlowRecord,
+        *,
+        timeout_seconds: int,
+    ) -> Mapping[str, Any]:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int)
+            or not 1 <= timeout_seconds <= 7200
+        ):
+            raise ResilienceError("transport-router exercise timeout must be between 1 and 7200 seconds")
+        if deployment.topology.route_failover.mutation_timeout_seconds > timeout_seconds:
+            raise ResilienceError(
+                "reviewed route mutation timeout exceeds the acceptance phase budget"
+            )
+        if graceful_flow.destination.az_key is None:
+            raise ResilienceError("graceful transport flow has no destination GWLBE AZ")
+        graceful_route_table_owner = next(
+            member
+            for member in deployment.topology.site(
+                graceful_failed.site
+            ).transport_router_fleet
+            if member.az_key == graceful_flow.destination.az_key
+        )
+        if (
+            graceful_failed.site != graceful_flow.destination.site
+            or graceful_failed.advertised_prefix != graceful_flow.destination.cidr
+            or deployment.topology.route_failover.initial_router_az(
+                graceful_failed.site, graceful_flow.destination.az_key
+            )
+            != graceful_failed.az_key
+        ):
+            raise ResilienceError(
+                "graceful transport failure is not the deterministic owner of the probe destination prefix"
+            )
+        if abrupt_flow.source.az_key is None:
+            raise ResilienceError("abrupt transport flow has no source GWLBE AZ")
+        route_table_owner = next(
+            member
+            for member in deployment.topology.site(abrupt_failed.site).transport_router_fleet
+            if member.az_key == abrupt_flow.source.az_key
+        )
+        if (
+            abrupt_failed.site != abrupt_flow.source.site
+            or abrupt_failed.advertised_prefix != abrupt_flow.source.cidr
+            or deployment.topology.route_failover.initial_router_az(
+                abrupt_failed.site, abrupt_flow.source.az_key
+            )
+            != abrupt_failed.az_key
+        ):
+            raise ResilienceError("abrupt transport failure is not selected by the probe's source GWLBE")
+
+        def alternate_for(member: SymmetricFleetMember) -> SymmetricFleetMember:
+            alternates = [
+                candidate
+                for candidate in deployment.topology.site(
+                    member.site
+                ).transport_router_fleet
+                if candidate != member
+            ]
+            if not alternates:
+                raise ResilienceError(
+                    "transport failover has no eligible same-site alternate"
+                )
+            return sorted(
+                alternates, key=lambda candidate: (candidate.az_key, candidate.instance_id)
+            )[0]
+
+        graceful_alternate = alternate_for(graceful_failed)
+        abrupt_alternate = alternate_for(abrupt_failed)
+
+        def verify_ready(member: SymmetricFleetMember) -> None:
+            if not self.adapter.owned(member, self.config.run_id):
+                raise ResilienceError(
+                    "transport failover router is not a running run-owned member"
+                )
+            self._verify_transport_router(deployment, member)
+
+        def failover() -> GWLBERouteFailover:
+            return GWLBERouteFailover(
+                deployment.topology,
+                deployment.vpc_ids,
+                self.aws,
+                authorize=self.lifecycle.authorize_gwlbe_route_replacement,
+                durability=self.lifecycle,
+                verify_ready=verify_ready,
+                advertisement_control=self._advertisement_control(deployment),
+                evidence_path=self.run_dir / "gwlbe-route-replacement.json",
+                monotonic=self.base.monotonic,
+                sleep=self.base.sleep,
+            )
+
+        route_timeout = deployment.topology.route_failover.mutation_timeout_seconds
+        graceful_reservation = (
+            deployment.topology.route_failover.transaction_reservation_seconds(
+                len(
+                    deployment.topology.site(
+                        graceful_failed.site
+                    ).remote_site_cidrs
+                )
+            )
+            + STREAM_MUTATION_OVERHEAD_SECONDS
+        )
+        abrupt_reservation = (
+            deployment.topology.route_failover.transaction_reservation_seconds(
+                len(deployment.topology.site(abrupt_failed.site).remote_site_cidrs)
+            )
+            + STREAM_MUTATION_OVERHEAD_SECONDS
+        )
+        if max(graceful_reservation, abrupt_reservation) > MAX_STREAM_MUTATION_RESERVATION_SECONDS:
+            raise ResilienceError(
+                "transport failover configuration cannot fit a bounded continuity stream"
+            )
+
+        graceful_started = self.base.monotonic()
+
+        def graceful_exercise() -> Mapping[str, Any]:
+            def probe(remaining: float) -> Mapping[str, Any]:
+                paths = {
+                    flow.protocol: self._wait_probe_path(
+                        deployment,
+                        flow,
+                        timeout_seconds=max(1, int(remaining)),
+                    )
+                    for flow in (graceful_new_tcp_flow, graceful_flow)
+                }
+                if any(
+                    path["destination_transport_router_id"]
+                    != graceful_alternate.instance_id
+                    for path in paths.values()
+                ):
+                    raise ResilienceError(
+                        "graceful failover probe did not traverse the transferred destination owner"
+                    )
+                path = dict(paths["udp"])
+                path["succeeded"] = True
+                path["new_flows"] = {
+                    protocol: {
+                        "succeeded": True,
+                        "path": sanitize_evidence_value(value),
+                    }
+                    for protocol, value in paths.items()
+                }
+                return path
+
+            return failover().replace(
+                graceful_failed,
+                graceful_alternate,
+                route_table_owner=graceful_route_table_owner,
+                probe=probe,
+                timeout_seconds=route_timeout,
+                restoration_timeout_seconds=(
+                    deployment.topology.route_failover.restoration_timeout_seconds
+                ),
+                failure_mode="graceful",
+            )
+
+        graceful_route_result, graceful_transport = self._measure_tcp_udp_failure(
+            graceful_tcp_flow,
+            graceful_udp_flow,
+            timeout_seconds=max(timeout_seconds, graceful_reservation),
+            label="transport-router-graceful-failure",
+            mutate_and_restore=graceful_exercise,
+        )
+        graceful_duration_ms = max(1, int((self.base.monotonic() - graceful_started) * 1000))
+
+        abrupt_started = self.base.monotonic()
+
+        def abrupt_probe(remaining: float) -> Mapping[str, Any]:
+            paths = {
+                flow.protocol: self._wait_probe_path(
+                    deployment,
+                    flow,
+                    timeout_seconds=max(1, int(remaining)),
+                )
+                for flow in (abrupt_new_tcp_flow, abrupt_flow)
+            }
+            if any(
+                path.get("source_transport_router_id")
+                != abrupt_alternate.instance_id
+                or path.get("source_transport_eni_id")
+                != abrupt_alternate.network_interface_id
+                for path in paths.values()
+            ):
+                raise ResilienceError("GWLBE replacement probe did not traverse the authorized alternate ENI")
+            path = dict(paths["udp"])
+            path["succeeded"] = True
+            path["new_flows"] = {
+                protocol: {"succeeded": True, "path": sanitize_evidence_value(value)}
+                for protocol, value in paths.items()
+            }
+            return path
+
+        route_result, abrupt_transport = self._measure_tcp_udp_failure(
+            abrupt_tcp_flow,
+            abrupt_udp_flow,
+            timeout_seconds=max(timeout_seconds, abrupt_reservation),
+            label="transport-router-abrupt-failure",
+            mutate_and_restore=lambda: failover().replace(
+                abrupt_failed,
+                abrupt_alternate,
+                route_table_owner=route_table_owner,
+                probe=abrupt_probe,
+                timeout_seconds=route_timeout,
+                restoration_timeout_seconds=(
+                    deployment.topology.route_failover.restoration_timeout_seconds
+                ),
+                failure_mode="abrupt",
+            ),
+        )
+        abrupt_duration_ms = max(1, int((self.base.monotonic() - abrupt_started) * 1000))
+        abrupt_path = route_result.get("probe")
+        if not isinstance(abrupt_path, Mapping):
+            raise ResilienceError("GWLBE replacement did not retain its bounded alternate probe")
+        graceful_path = graceful_route_result.get("probe")
+        if not isinstance(graceful_path, Mapping):
+            raise ResilienceError(
+                "graceful transport failover did not retain its bounded alternate probe"
+            )
+        graceful_evidence = sanitize_evidence_value(graceful_path)
+        abrupt_evidence = sanitize_evidence_value(abrupt_path)
+        if not isinstance(graceful_evidence, Mapping) or not isinstance(abrupt_evidence, Mapping):
+            raise EvidenceError("transport-router probes did not sanitize to evidence objects")
+        return {
+            "recovery": {
+                "kind": "transport-router",
+                "site": abrupt_failed.site,
+                "failed_id": abrupt_failed.instance_id,
+                "alternate_id": abrupt_alternate.instance_id,
+                "new_flow_succeeded": True,
+                "new_flows": abrupt_evidence["new_flows"],
+                "recovery_duration_ms": abrupt_duration_ms,
+            },
+            "health_transition": {
+                "kind": "transport-router",
+                "member_id": abrupt_failed.instance_id,
+                "states": ["healthy", "unavailable", "healthy"],
+            },
+            "transport": {
+                "graceful": {
+                    **graceful_transport,
+                    "failed_ids": {
+                        "tcp": graceful_failed.instance_id,
+                        "udp": graceful_failed.instance_id,
+                    },
+                },
+                "abrupt": {
+                    **abrupt_transport,
+                    "failed_ids": {
+                        "tcp": abrupt_failed.instance_id,
+                        "udp": abrupt_failed.instance_id,
+                    },
+                },
+            },
+            "graceful": {
+                "control_plane": "tailnet-and-gwlbe-route",
+                "failed_id": graceful_failed.instance_id,
+                "alternate_id": graceful_alternate.instance_id,
+                "probe": dict(graceful_evidence),
+                "new_flows": graceful_evidence["new_flows"],
+                "new_flow_succeeded": True,
+                "recovery_duration_ms": graceful_duration_ms,
+                "route_replacement": graceful_route_result,
+                "restored": True,
+            },
+            "abrupt": {
+                "control_plane": "tailnet-and-gwlbe-route",
+                "failed_id": abrupt_failed.instance_id,
+                "alternate_id": abrupt_alternate.instance_id,
+                "probe": dict(abrupt_evidence),
+                "new_flows": abrupt_evidence["new_flows"],
+                "new_flow_succeeded": True,
+                "recovery_duration_ms": abrupt_duration_ms,
+                "route_replacement": route_result,
+                "restored": True,
+            },
+        }
+
+    def collect_diagnostics(
+        self, deployment: SymmetricProtectedDeployment | None
+    ) -> Mapping[str, Any]:
+        if deployment is None:
+            return {"collection": "not-started", "reason": "symmetric deployment output did not parse"}
+        counters = {
+            "hosts_attempted": 0,
+            "hosts_completed": 0,
+            "hosts_failed": 0,
+            "target_health_attempted": 0,
+            "target_health_completed": 0,
+            "target_health_failed": 0,
+        }
+        diagnostics: dict[str, Any] = {
+            "collection": "complete",
+            "counters": counters,
+            "hosts": {},
+            "target_health": {},
+            "geneve_capture_cleanup": list(
+                getattr(self, "_geneve_capture_events", [])
+            ),
+        }
+        diagnostic_sysctls = " ".join(
+            shlex.quote(value)
+            for value in (
+                "net.ipv4.ip_forward",
+                "net.ipv6.conf.all.forwarding",
+                "net.ipv4.conf.all.rp_filter",
+                "net.ipv4.conf.default.rp_filter",
+                f"net.ipv4.conf.{TRANSPORT_UNDERLAY_INTERFACE}.rp_filter",
+                f"net.ipv4.conf.{TRANSPORT_TAILSCALE_INTERFACE}.rp_filter",
+            )
+        )
+
+        def collect_host(
+            key: str,
+            target: RemoteTarget,
+            command: str,
+            comment: str,
+        ) -> None:
+            counters["hosts_attempted"] += 1
+            try:
+                result = self.base._execute(
+                    target,
+                    command,
+                    timeout_seconds=45,
+                    comment=comment,
+                )
+                diagnostics["hosts"][key] = {
+                    "status": result.status,
+                    "command_id": result.command_id,
+                    "stdout": _sanitize_string(result.stdout)[:8192],
+                    "stderr": _sanitize_string(result.stderr)[:8192],
+                }
+                counters["hosts_completed"] += 1
+            except (TimeoutError, InterruptedError, KeyboardInterrupt):
+                raise
+            except Exception as error:
+                diagnostics["hosts"][key] = {
+                    "collection": "failed",
+                    "error": _sanitize_string(str(error)),
+                    "stdout": _bounded_exception_output(error, "stdout"),
+                    "stderr": _bounded_exception_output(error, "stderr"),
+                }
+                counters["hosts_failed"] += 1
+
+        for site in SITES:
+            for member in deployment.topology.site(site).target_fleet:
+                key = f"{site}-target-{member.az_key}"
+                collect_host(
+                    key,
+                    self._remote(member),
+                    "set +e; printf '%s\\n' '[metrics]'; "
+                    "curl --silent --max-time 5 http://127.0.0.1:9090/metrics 2>&1 | "
+                    "grep -E '^(geneve_(rx|tx)_(packets|bytes)|geneve_options_validation_errors|"
+                    "gwlb_(profile_rejections|receive_drops|inner_validation_failures|return_build_failures|send_failures|"
+                    "target_(ready|component_ready))|drops)' || true; "
+                    "printf '%s\\n' '[routes]'; ip -j rule show 2>&1; ip -j route show table all 2>&1; "
+                    "printf '%s\\n' '[firewall]'; iptables-save 2>&1 || true; ip6tables-save 2>&1 || true; "
+                    "printf '%s\\n' '[services]'; systemctl --no-pager --full status envelope.service 2>&1; "
+                    "journalctl --no-pager -n 80 -u envelope.service 2>&1; true",
+                    "Envelope packet-return target diagnostics",
+                )
+                counters["target_health_attempted"] += 1
+                try:
+                    diagnostics["target_health"][key] = self._target_health(member)
+                    counters["target_health_completed"] += 1
+                except (TimeoutError, InterruptedError, KeyboardInterrupt):
+                    raise
+                except Exception as error:
+                    diagnostics["target_health"][key] = {
+                        "collection": "failed",
+                        "error": _sanitize_string(str(error)),
+                    }
+                    counters["target_health_failed"] += 1
+            for member in deployment.topology.site(site).transport_router_fleet:
+                key = f"{site}-transport-{member.az_key}"
+                collect_host(
+                    key,
+                    self._remote(member),
+                    "set +e; printf '%s\\n' '[metrics]'; "
+                    "tailscale status --json 2>/dev/null | python3 -c 'import json,sys; value=json.load(sys.stdin); "
+                    "print(json.dumps({\"BackendState\":value.get(\"BackendState\"),\"HealthCount\":len(value.get(\"Health\",[])),\"PeerCount\":len(value.get(\"Peer\",{}))}))' || true; "
+                    "printf '%s\\n' '[routes]'; ip -j rule show 2>&1; ip -j route show table 52 2>&1; "
+                    "ip -j route show table main 2>&1; "
+                    "printf '%s\\n' '[firewall]'; iptables -S 2>&1; iptables -t mangle -S 2>&1; "
+                    "iptables -t nat -S 2>&1; ip6tables -S 2>&1; ip6tables -t mangle -S 2>&1; "
+                    "ip6tables -t nat -S 2>&1; nft -j list ruleset 2>&1; "
+                    "printf '%s\\n' '[services]'; sysctl "
+                    + diagnostic_sysctls
+                    + " 2>&1; systemctl status tailscaled.service envelope-transport-router-network.service "
+                    "--no-pager --full 2>&1; cloud-init status --long 2>&1; true",
+                    "Envelope transport-router diagnostics",
+                )
+            for role in WORKLOAD_ROLES:
+                workload = deployment.workloads.target(site, role)
+                key = f"{site}-{role}"
+                collect_host(
+                    key,
+                    workload,
+                    "set +e; printf '%s\\n' '[metrics]'; true; "
+                    "printf '%s\\n' '[routes]'; ip -j rule show 2>&1; ip -j route show table all 2>&1; "
+                    "printf '%s\\n' '[firewall]'; iptables-save 2>&1 || true; "
+                    "printf '%s\\n' '[services]'; systemctl is-active amazon-ssm-agent.service 2>&1; "
+                    "cloud-init status --long 2>&1; true",
+                    "Envelope symmetric workload diagnostics",
+                )
+        safe = cast(dict[str, Any], sanitize_evidence_value(diagnostics))
+        _write_private_json(self.run_dir / "diagnostics.json", safe)
+        return safe
 
 
 class RunAllOperations(Protocol):
@@ -10168,9 +19759,22 @@ def _is_inner_ownership_block(result: LiveRunResult, *, run_id: str) -> bool:
     ]
     category = failure.get("category") if isinstance(failure, Mapping) else None
     expected_resolution = {
+        ConcurrentLifecycleError.__name__: "competing-claim",
         ConcurrentRunError.__name__: "competing-claim",
         AmbiguousOwnershipError.__name__: "ambiguous-ownership",
     }.get(category)
+    symmetric_resolution = lifecycle.get("ownership_resolution") if isinstance(lifecycle, Mapping) else None
+    if (
+        result.exit_code == EXIT_ACCEPTANCE_FAILED
+        and evidence.get("schema") == SYMMETRIC_EVIDENCE_SCHEMA
+        and evidence.get("kind") == SYMMETRIC_EVIDENCE_KIND
+        and evidence.get("run_id") == run_id
+        and evidence.get("status") == "failed"
+        and symmetric_resolution in {"competing-claim", "ambiguous-ownership"}
+        and isinstance(lifecycle, Mapping)
+        and lifecycle.get("cleanup") == "skipped"
+    ):
+        return True
     cleanup = cleanup_records[0] if len(cleanup_records) == 1 else None
     cleanup_summary = cleanup.get("summary") if isinstance(cleanup, Mapping) else None
     return (
@@ -10213,11 +19817,43 @@ class _RunAllLifecycleProxy:
         self.delegate = delegate
         self.cleanup_once = cleanup
 
-    def claim(self, raw_deployment: Mapping[str, Any], deployment: ProtectedDeployment) -> Mapping[str, Any]:
+    @property
+    def manifest(self) -> Mapping[str, Any] | None:
+        return getattr(self.delegate, "manifest", None)
+
+    def claim(
+        self,
+        raw_deployment: Mapping[str, Any],
+        deployment: ProtectedDeployment | SymmetricProtectedDeployment,
+    ) -> Mapping[str, Any]:
         return self.delegate.claim(raw_deployment, deployment)
 
     def verify_no_drift(self, stage: Literal["before", "after"]) -> Mapping[str, Any]:
         return self.delegate.verify_no_drift(stage)
+
+    def authorize_gwlbe_route_replacement(
+        self,
+        current: SymmetricFleetMember,
+        alternate: SymmetricFleetMember,
+        prefixes: tuple[str, ...],
+        route_table_owner: SymmetricFleetMember,
+    ) -> Mapping[str, Any]:
+        return self.delegate.authorize_gwlbe_route_replacement(
+            current, alternate, prefixes, route_table_owner
+        )
+
+    def reconcile_gwlbe_route_replacement(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        *,
+        timeout_seconds: int,
+    ) -> Mapping[str, Any]:
+        return self.delegate.reconcile_gwlbe_route_replacement(
+            deployment, timeout_seconds=timeout_seconds
+        )
+
+    def replace_target_instance(self, member: SymmetricFleetMember) -> Mapping[str, Any]:
+        return self.delegate.replace_target_instance(member)
 
     def finish(self, passed: bool) -> Mapping[str, Any]:
         return self.delegate.finish(passed)
@@ -10240,11 +19876,43 @@ class _BoundedCleanupLifecycleProxy:
         self.cleanup_result: Mapping[str, Any] | None = None
         self.cleanup_error: BaseException | None = None
 
-    def claim(self, raw_deployment: Mapping[str, Any], deployment: ProtectedDeployment) -> Mapping[str, Any]:
+    @property
+    def manifest(self) -> Mapping[str, Any] | None:
+        return getattr(self.delegate, "manifest", None)
+
+    def claim(
+        self,
+        raw_deployment: Mapping[str, Any],
+        deployment: ProtectedDeployment | SymmetricProtectedDeployment,
+    ) -> Mapping[str, Any]:
         return self.delegate.claim(raw_deployment, deployment)
 
     def verify_no_drift(self, stage: Literal["before", "after"]) -> Mapping[str, Any]:
         return self.delegate.verify_no_drift(stage)
+
+    def authorize_gwlbe_route_replacement(
+        self,
+        current: SymmetricFleetMember,
+        alternate: SymmetricFleetMember,
+        prefixes: tuple[str, ...],
+        route_table_owner: SymmetricFleetMember,
+    ) -> Mapping[str, Any]:
+        return self.delegate.authorize_gwlbe_route_replacement(
+            current, alternate, prefixes, route_table_owner
+        )
+
+    def reconcile_gwlbe_route_replacement(
+        self,
+        deployment: SymmetricProtectedDeployment,
+        *,
+        timeout_seconds: int,
+    ) -> Mapping[str, Any]:
+        return self.delegate.reconcile_gwlbe_route_replacement(
+            deployment, timeout_seconds=timeout_seconds
+        )
+
+    def replace_target_instance(self, member: SymmetricFleetMember) -> Mapping[str, Any]:
+        return self.delegate.replace_target_instance(member)
 
     def finish(self, passed: bool) -> Mapping[str, Any]:
         return self.delegate.finish(passed)
@@ -10352,6 +20020,26 @@ class RunAllCoordinator:
                 return cast(str, failure["category"])
         return type(error).__name__
 
+    def _inner_acceptance_failure(self) -> dict[str, Any] | None:
+        evidence = self.live_result.evidence if self.live_result is not None else None
+        diagnostics = evidence.get("diagnostics") if isinstance(evidence, Mapping) else None
+        value = diagnostics.get("acceptance_failure_before_cleanup") if isinstance(diagnostics, Mapping) else None
+        if (
+            not isinstance(value, Mapping)
+            or not isinstance(value.get("phase"), str)
+            or not isinstance(value.get("category"), str)
+            or not isinstance(value.get("message"), str)
+        ):
+            return None
+        return {
+            "stage": RUN_ALL_STAGES[6],
+            "phase": value["phase"],
+            "category": value["category"],
+            "message": value["message"],
+            "exit_code": EXIT_ACCEPTANCE_FAILED,
+            "artifacts": self._failure_artifacts(),
+        }
+
     def _artifact_record(self, path: pathlib.Path, *, guaranteed: bool = False) -> dict[str, Any]:
         return {
             "path": str(path),
@@ -10428,8 +20116,11 @@ class RunAllCoordinator:
             )
             self.primary_exit_code = exit_code
             self._record_failure(name, error, exit_code)
-            self._checkpoint()
-            raise
+            try:
+                self._checkpoint()
+            except BaseException as checkpoint_error:
+                record["summary"]["checkpoint_error"] = _sanitize_string(str(checkpoint_error))
+            raise error
         record.update({"status": "passed", "exit_code": EXIT_OK, "summary": sanitize_evidence_value(value)})
         self._checkpoint()
         return value
@@ -10456,7 +20147,7 @@ class RunAllCoordinator:
         self.document["cleanup"].update({"attempted": True, "attempts": 1, "status": "running"})
         try:
             self._checkpoint()
-        except Exception:
+        except BaseException:
             # Stage-record persistence must never prevent the authorized cleanup attempt.
             pass
         try:
@@ -10475,12 +20166,18 @@ class RunAllCoordinator:
                 }
             )
             self.document["cleanup"]["status"] = "failed"
-            self._checkpoint()
-            raise
+            try:
+                self._checkpoint()
+            except BaseException:
+                pass
+            raise error
         summary = {"authorized": True, "complete": True, **dict(self.cleanup_result)}
         cleanup_record.update({"status": "passed", "exit_code": EXIT_OK, "summary": sanitize_evidence_value(summary)})
         self.document["cleanup"]["status"] = "passed"
-        self._checkpoint()
+        try:
+            self._checkpoint()
+        except BaseException:
+            pass
         return summary
 
     def _run_locked(self) -> RunAllResult:
@@ -10539,14 +20236,14 @@ class RunAllCoordinator:
             self._stage(RUN_ALL_STAGES[6], e2e)
         except BaseException as error:
             primary_error = error
-            prepare_rejected = self.current_stage == RUN_ALL_STAGES[2] and isinstance(
-                error, (ConcurrentLifecycleError, ConcurrentRunError)
+            lifecycle_ownership_rejected = isinstance(
+                error, (ConcurrentLifecycleError, ConcurrentRunError, AmbiguousOwnershipError)
             )
             inner_ownership_blocked = isinstance(
                 error, _RunAllE2EResultError
             ) and _is_inner_ownership_block(error.result, run_id=self.config.run_id)
-            if prepare_rejected:
-                self._suppress_cleanup("concurrent lifecycle ownership was rejected before this process acquired a claim")
+            if lifecycle_ownership_rejected:
+                self._suppress_cleanup("concurrent or ambiguous lifecycle ownership makes cleanup unauthorized")
             elif inner_ownership_blocked:
                 self._suppress_cleanup("inner evidence proved competing or ambiguous durable E2E ownership")
             if self.document["failure"] is None:
@@ -10582,7 +20279,14 @@ class RunAllCoordinator:
                     }
                 )
         if self.cleanup_error is not None:
-            if self.document["failure"] is not None:
+            inner_acceptance = self._inner_acceptance_failure()
+            if inner_acceptance is not None:
+                self.document["primary_failure"] = inner_acceptance
+            elif (
+                self.live_result is None
+                or not isinstance(self.live_result.evidence.get("failure"), Mapping)
+                or self.live_result.evidence["failure"].get("phase") != Phase.CLEANUP.value
+            ) and self.document["failure"] is not None:
                 self.document["primary_failure"] = self.document["failure"]
             self._record_failure(RUN_ALL_STAGES[-1], self.cleanup_error, EXIT_CLEANUP_FAILED)
             exit_code = EXIT_CLEANUP_FAILED
@@ -10735,12 +20439,17 @@ class AwsRunAllOperations:
         evidence_path: pathlib.Path,
         budgets: TimeoutBudgets,
     ) -> LiveRunResult:
-        runner = TwoRegionE2ERunner(
+        runner = SymmetricTwoRegionE2ERunner(
             run_id=self.config.run_id,
             raw_deployment=deployment,
             site_regions={site: self.config.sites[site]["region"] for site in SITES},
             lifecycle=lifecycle,
-            operations=AwsLiveOperations(self.config, self.aws, self.run_dir),
+            operations=AwsSymmetricLiveOperations(
+                self.config,
+                self.aws,
+                self.run_dir,
+                lifecycle,
+            ),
             evidence_path=evidence_path,
             budgets=budgets,
         )
@@ -10761,11 +20470,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
-    validate_parser = subparsers.add_parser("validate-evidence", help="validate a schema-1 core or schema-2 live file")
+    validate_parser = subparsers.add_parser(
+        "validate-evidence", help="validate a schema-1 core, schema-2 legacy, or schema-3 symmetric file"
+    )
     validate_parser.add_argument("path", type=pathlib.Path)
 
     verify_parser = subparsers.add_parser(
-        "verify-evidence", help="strictly verify a complete passing schema-2 live evidence bundle"
+        "verify-evidence", help="strictly verify a complete passing live evidence bundle"
     )
     verify_parser.add_argument("path", type=pathlib.Path)
 
@@ -10945,9 +20656,6 @@ def _live_cli(args: argparse.Namespace) -> int:
     total_timeout = args.hard_timeout_seconds + DEFAULT_TIMEOUTS.cleanup
     if expiry <= dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=total_timeout):
         raise E2EError("protected run TTL does not reserve both acceptance and cleanup timeout budgets")
-    raw = _load_json(args.deployment.expanduser().resolve())
-    if not isinstance(raw, Mapping):
-        raise DeploymentError("protected deployment file must contain a JSON object")
     subprocess_runner = SubprocessRunner(config.oauth_environment_names)
     aws = AwsCLI(subprocess_runner, config.oauth_environment_names)
     run_dir = run_directory(args.run_root, config.run_id).expanduser().resolve()
@@ -10961,18 +20669,53 @@ def _live_cli(args: argparse.Namespace) -> int:
     budgets = dataclasses.replace(DEFAULT_TIMEOUTS, hard_timeout=args.hard_timeout_seconds)
     lifecycle = ProtectedLifecycleAdapter(config, aws, subprocess_runner, run_dir, args.terraform_dir)
     bounded_lifecycle = _BoundedCleanupLifecycleProxy(lifecycle)
-    operations = AwsLiveOperations(config, aws, run_dir)
-    runner = TwoRegionE2ERunner(
+    operations = AwsSymmetricLiveOperations(config, aws, run_dir, bounded_lifecycle)
+    load_error: E2EError | None = None
+    raw: Mapping[str, Any] = {}
+    try:
+        loaded = _load_json(args.deployment.expanduser().resolve())
+        if not isinstance(loaded, Mapping):
+            raise DeploymentError("protected deployment file must contain a JSON object")
+        raw = cast(Mapping[str, Any], loaded)
+    except E2EError as error:
+        load_error = error
+    runner = SymmetricTwoRegionE2ERunner(
         run_id=config.run_id,
-        raw_deployment=cast(Mapping[str, Any], raw),
+        raw_deployment=raw,
         site_regions={site: config.sites[site]["region"] for site in SITES},
         lifecycle=bounded_lifecycle,
         operations=operations,
         evidence_path=evidence_path,
         budgets=budgets,
     )
-    with lifecycle_lock(run_dir), hard_timeout(budgets.hard_timeout, operation="live E2E acceptance"):
-        result = runner.run()
+    with lifecycle_lock(run_dir):
+        try:
+            with hard_timeout(
+                budgets.hard_timeout, operation="live E2E acceptance"
+            ):
+                result = runner.run()
+        except PROTECTED_CONTROL_FLOW:
+            bounded_lifecycle.cleanup()
+            raise
+    if load_error is not None:
+        evidence = copy.deepcopy(result.evidence)
+        failure = {
+            "phase": Phase.CONSUME_DEPLOYMENT.value,
+            "category": type(load_error).__name__,
+            "message": _sanitize_string(str(load_error)),
+        }
+        diagnostics = evidence.get("diagnostics")
+        if not isinstance(diagnostics, dict):
+            diagnostics = {}
+            evidence["diagnostics"] = diagnostics
+        if result.exit_code == EXIT_CLEANUP_FAILED:
+            diagnostics["acceptance_failure_before_cleanup"] = failure
+        else:
+            evidence["failure"] = failure
+        normalized = validate_symmetric_evidence(evidence)
+        _write_private_json(run_dir / "diagnostics.json", cast(Mapping[str, Any], normalized["diagnostics"]))
+        write_evidence(evidence_path, normalized)
+        result = LiveRunResult(result.exit_code, evidence_path, normalized, failure["message"])
     print(
         json.dumps(
             {
@@ -11022,8 +20765,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.west_region is None or args.east_region is None:
                     raise DeploymentError("both --west-region and --east-region are required together")
                 regions = {"west": args.west_region, "east": args.east_region}
-            deployment = parse_protected_deployment_output(_load_json(args.path), site_regions=regions)
-            print(json.dumps(deployment.as_dict(), sort_keys=True))
+            deployment = parse_symmetric_protected_deployment_output(_load_json(args.path), site_regions=regions)
+            print(
+                json.dumps(
+                    {
+                        "cost": deployment.cost_evidence(),
+                        "endpoint_ids": {site: dict(values) for site, values in deployment.endpoint_ids.items()},
+                        "output_sha256": deployment.output_sha256,
+                        "topology": deployment.topology.as_dict(),
+                        "workloads": deployment.workloads.as_dict(),
+                    },
+                    sort_keys=True,
+                )
+            )
             return 0
         if args.subcommand == "run-all":
             return _run_all_cli(args)
@@ -11031,6 +20785,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _live_cli(args)
         raise E2EError(f"unknown subcommand: {args.subcommand}")
     except EvidenceVerificationError as error:
+        print(redact_runtime_text(str(error)), file=sys.stderr)
+        return EXIT_ACCEPTANCE_FAILED
+    except PROTECTED_CONTROL_FLOW as error:
         print(redact_runtime_text(str(error)), file=sys.stderr)
         return EXIT_ACCEPTANCE_FAILED
     except (LifecycleError, OSError) as error:

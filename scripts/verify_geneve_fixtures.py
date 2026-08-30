@@ -63,10 +63,10 @@ GWLB_FIXTURES = (
     ("gwlb-wrong-destination-port.pcap", {"destination_port": 6080}, "listener"),
     ("gwlb-bad-ip-checksum.pcap", {"bad_ip_checksum": True}, "outer_checksum"),
     ("gwlb-bad-udp-checksum.pcap", {"bad_udp_checksum": True}, "outer_checksum"),
-    ("gwlb-inner-ipv4-fragment.pcap", {"inner": "ipv4_fragment"}, "ipv4_fragment"),
-    ("gwlb-inner-udp-truncated.pcap", {"inner": "udp_truncated"}, "transport_truncated"),
-    ("gwlb-inner-ipv6-fragment.pcap", {"inner": "ipv6_fragment", "protocol": 0x86DD}, "ipv6_fragment"),
-    ("gwlb-inner-ipv6-extension.pcap", {"inner": "ipv6_extension", "protocol": 0x86DD}, "ipv6_extension"),
+    ("gwlb-inner-ipv4-fragment.pcap", {"inner": "ipv4_fragment"}, None),
+    ("gwlb-inner-udp-truncated.pcap", {"inner": "udp_truncated"}, None),
+    ("gwlb-inner-ipv6-fragment.pcap", {"inner": "ipv6_fragment", "protocol": 0x86DD}, None),
+    ("gwlb-inner-ipv6-extension.pcap", {"inner": "ipv6_extension", "protocol": 0x86DD}, None),
 )
 
 
@@ -334,30 +334,19 @@ def validate_gwlb_packet(packet):
 def validate_inner(inner):
     version = inner[0] >> 4
     if version == 4:
+        if len(inner) < 20:
+            return "protocol"
         ihl = (inner[0] & 0x0F) * 4
         total = struct.unpack("!H", inner[2:4])[0]
-        fragment = struct.unpack("!H", inner[6:8])[0]
-        if fragment & 0x3FFF:
-            return "ipv4_fragment"
-        protocol = inner[9]
-        transport = inner[ihl:total]
-        if protocol == 6 and len(transport) < 20:
-            return "transport_truncated"
-        if protocol == 17 and len(transport) < 8:
-            return "transport_truncated"
+        if ihl < 20 or ihl > len(inner) or total < ihl or total != len(inner):
+            return "protocol"
         return None
     if version == 6:
-        next_header = inner[6]
-        offset = 40
-        saw_extension = False
-        while next_header in (0, 43, 44, 60):
-            if next_header == 44:
-                return "ipv6_fragment"
-            saw_extension = True
-            next_header = inner[offset]
-            offset += (inner[offset + 1] + 1) * 8
-        if saw_extension:
-            return "ipv6_extension"
+        if len(inner) < 40:
+            return "protocol"
+        total = 40 + struct.unpack("!H", inner[4:6])[0]
+        if total != len(inner):
+            return "protocol"
         return None
     return "protocol"
 

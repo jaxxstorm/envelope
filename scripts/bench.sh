@@ -4,8 +4,8 @@ set -euo pipefail
 output=$(mktemp)
 trap 'rm -f "$output"' EXIT
 
-printf '%s\n' "running GENEVE, datapath, and routing microbenchmarks"
-go test -run '^$' -bench=. -benchmem ./internal/geneve ./internal/datapath ./internal/routing | tee "$output"
+printf '%s\n' "running GENEVE and packet-turnaround microbenchmarks"
+go test -run '^$' -bench=. -benchmem ./internal/geneve ./internal/datapath | tee "$output"
 
 check_threshold() {
   local benchmark=$1
@@ -33,7 +33,6 @@ check_threshold() {
   ' <<<"$line"
 }
 
-check_threshold BenchmarkEnsureManagedIdempotent 250000 32768 400
-check_threshold BenchmarkEffectiveRouteValidation 200000 24576 300
-check_threshold BenchmarkDirectionalPacketPath 100000 16384 200
+check_threshold BenchmarkTLVValidationLoggingDisabled 2000 0 0
+check_threshold BenchmarkPacketConstruction 5000 0 0
 printf '%s\n' "benchmark thresholds passed"

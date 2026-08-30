@@ -24,6 +24,7 @@ import pathlib
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -32,9 +33,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Any, Callable, Iterable, Protocol
 
 from inspect_artifact import inspect as inspect_artifact
+from transport_router_readiness import build_readiness_contract
 
 
 SCHEMA = 2
@@ -48,6 +51,9 @@ SECRET_PATTERNS = (
 RUN_RE = re.compile(r"^[a-z][a-z0-9-]{2,17}[a-z0-9]$")
 DEPLOYMENT_SITES = ("west", "east")
 WORKLOAD_ROLES = ("initiator", "responder")
+TARGET_REPLACEMENT_ADDRESS_RE = re.compile(
+    r'aws_instance\.envelope_target_(west|east)\["([a-z][a-z0-9-]{0,15})"\]'
+)
 WORKLOAD_OUTPUT_FIELDS = (
     "instance_id",
     "private_ip",
@@ -57,10 +63,89 @@ WORKLOAD_OUTPUT_FIELDS = (
     "cidr",
     "route_table_id",
 )
+SYMMETRIC_DEPLOYMENT_OUTPUT_FIELDS = frozenset(
+    {
+        "artifact_identity",
+        "cost_profile",
+        "e2e_load_profile",
+        "envelope_runtime_config",
+        "flow_log_evidence",
+        "gwlb_endpoint_ids",
+        "gwlb_target_group_arns",
+        "route_failover",
+        "symmetric_topology",
+        "transport_router_readiness_expectations",
+        "vpc_ids",
+        "workload_instances",
+    }
+)
+TERRAFORM_VARIABLE_FIELDS = frozenset(
+    {
+        "name",
+        "expires_at",
+        "tags",
+        "west_region",
+        "east_region",
+        "symmetric_topology",
+        "architecture",
+        "west_ami_id",
+        "east_ami_id",
+        "instance_type",
+        "test_instance_type",
+        "artifact_path",
+        "artifact_sha256",
+        "artifact_revision",
+        "artifact_version",
+        "west_tailscale_secret_arn",
+        "east_tailscale_secret_arn",
+        "west_tailscale_kms_key_arn",
+        "east_tailscale_kms_key_arn",
+        "tailscale_tag",
+        "tailscale_version",
+        "estimated_fixed_hourly_usd",
+        "approved_max_fixed_hourly_usd",
+        "e2e_load_profile",
+    }
+)
+TERRAFORM_PLAN_VARIABLE_FIELDS = TERRAFORM_VARIABLE_FIELDS | {
+    "envelope_tailscale_iface",
+    "envelope_underlay_interface",
+}
+INSTANCE_SSM_CORE_ACTIONS = frozenset(
+    {
+        "ec2messages:AcknowledgeMessage",
+        "ec2messages:DeleteMessage",
+        "ec2messages:FailMessage",
+        "ec2messages:GetEndpoint",
+        "ec2messages:GetMessages",
+        "ec2messages:SendReply",
+        "ssm:DescribeAssociation",
+        "ssm:DescribeDocument",
+        "ssm:GetDeployablePatchSnapshotForInstance",
+        "ssm:GetDocument",
+        "ssm:GetManifest",
+        "ssm:ListAssociations",
+        "ssm:ListInstanceAssociations",
+        "ssm:PutComplianceItems",
+        "ssm:PutConfigurePackageResult",
+        "ssm:PutInventory",
+        "ssm:UpdateAssociationStatus",
+        "ssm:UpdateInstanceAssociationStatus",
+        "ssm:UpdateInstanceInformation",
+        "ssmmessages:CreateControlChannel",
+        "ssmmessages:CreateDataChannel",
+        "ssmmessages:OpenControlChannel",
+        "ssmmessages:OpenDataChannel",
+    }
+)
 DEPLOYMENT_INSTANCE_ID_RE = re.compile(r"i-[A-Za-z0-9][A-Za-z0-9-]{0,127}")
+DEPLOYMENT_NETWORK_INTERFACE_ID_RE = re.compile(r"eni-[A-Za-z0-9][A-Za-z0-9-]{0,127}")
 DEPLOYMENT_SUBNET_ID_RE = re.compile(r"subnet-[A-Za-z0-9][A-Za-z0-9-]{0,127}")
 DEPLOYMENT_ROUTE_TABLE_ID_RE = re.compile(r"rtb-[A-Za-z0-9][A-Za-z0-9-]{0,127}")
 DEPLOYMENT_TARGET_GROUP_ARN_RE = re.compile(r"arn:[A-Za-z0-9:/._-]{1,2048}")
+OPERATION_CLAIM_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+)
 DEPLOYMENT_REGION_RE = re.compile(r"[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+")
 DEPLOYMENT_AZ_RE = re.compile(r"([a-z]{2}(?:-[a-z0-9]+)+-[0-9]+)[a-z]")
 E2E_LOAD_PROFILE_FIELDS = (
@@ -638,6 +723,52 @@ class CommandError(LifecycleError):
         self.raw_stderr = stderr
 
 
+class CommandTimeoutError(TimeoutError, LifecycleError):
+    def __init__(
+        self,
+        args: list[str],
+        timeout_seconds: float,
+        *,
+        stdout: str = "",
+        stderr: str = "",
+    ):
+        safe_command = " ".join(shlex.quote(part) for part in args)
+        super().__init__(
+            redact(
+                f"command exceeded its {timeout_seconds:g}-second timeout: {safe_command}"
+            )
+        )
+        self.args_list = args
+        self.timeout_seconds = timeout_seconds
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def validate_timeout_seconds(
+    timeout_seconds: float | None,
+    timeout: float | None = None,
+    *,
+    field: str = "command timeout",
+    maximum: float | None = None,
+) -> float | None:
+    if timeout_seconds is not None and timeout is not None:
+        raise LifecycleError(f"{field} may be supplied only once")
+    value = timeout_seconds if timeout_seconds is not None else timeout
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) <= 0
+        or maximum is not None
+        and float(value) > maximum
+    ):
+        suffix = f" and no greater than {maximum:g}" if maximum is not None else ""
+        raise LifecycleError(f"{field} must be a positive finite number{suffix}")
+    return float(value)
+
+
 class CommandRunner(Protocol):
     def run(
         self,
@@ -646,7 +777,29 @@ class CommandRunner(Protocol):
         env: dict[str, str] | None = None,
         cwd: pathlib.Path | None = None,
         input_text: str | None = None,
+        timeout_seconds: float | None = None,
+        timeout: float | None = None,
     ) -> str: ...
+
+
+class ImmediateCommandRunnerAdapter:
+    """Explicitly adapt an immediate fake that has no native timeout API."""
+
+    def __init__(self, runner: Any):
+        self.runner = runner
+
+    def run(
+        self,
+        args: list[str],
+        *,
+        env: dict[str, str] | None = None,
+        cwd: pathlib.Path | None = None,
+        input_text: str | None = None,
+        timeout_seconds: float | None = None,
+        timeout: float | None = None,
+    ) -> str:
+        validate_timeout_seconds(timeout_seconds, timeout)
+        return self.runner.run(args, env=env, cwd=cwd, input_text=input_text)
 
 
 class SubprocessRunner:
@@ -660,23 +813,55 @@ class SubprocessRunner:
         env: dict[str, str] | None = None,
         cwd: pathlib.Path | None = None,
         input_text: str | None = None,
+        timeout_seconds: float | None = None,
+        timeout: float | None = None,
     ) -> str:
+        command_timeout = validate_timeout_seconds(timeout_seconds, timeout)
         child_env = os.environ.copy() if env is None else dict(env)
         for name in self.excluded_environment:
             child_env.pop(name, None)
-        completed = subprocess.run(
+        process = subprocess.Popen(
             args,
             cwd=cwd,
             env=child_env,
-            input=input_text,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            check=False,
+            start_new_session=True,
         )
-        if completed.returncode:
-            raise CommandError(args, completed.returncode, completed.stderr)
-        return completed.stdout
+        try:
+            stdout, stderr = process.communicate(input_text, timeout=command_timeout)
+        except subprocess.TimeoutExpired:
+            self._kill_and_reap(process)
+            stdout, stderr = process.communicate()
+            assert command_timeout is not None
+            raise CommandTimeoutError(
+                args,
+                command_timeout,
+                stdout=stdout,
+                stderr=stderr,
+            ) from None
+        except BaseException:
+            self._kill_and_reap(process)
+            raise
+        if process.returncode:
+            raise CommandError(args, process.returncode, stderr)
+        return stdout
+
+    @staticmethod
+    def _kill_and_reap(process: subprocess.Popen[str]) -> None:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                process.kill()
+        try:
+            process.wait()
+        except BaseException:
+            process.kill()
+            process.wait()
 
 
 _LIFECYCLE_LOCKS: dict[pathlib.Path, threading.RLock] = {}
@@ -737,7 +922,15 @@ class AwsCLI:
         self.runner = runner
         self.excluded_environment = frozenset(excluded_environment)
 
-    def call(self, args: list[str], *, region: str | None = None) -> str:
+    def call(
+        self,
+        args: list[str],
+        *,
+        region: str | None = None,
+        timeout_seconds: float | None = None,
+        timeout: float | None = None,
+    ) -> str:
+        command_timeout = validate_timeout_seconds(timeout_seconds, timeout, field="AWS CLI timeout")
         command = ["aws"]
         if region:
             command.extend(["--region", region])
@@ -747,15 +940,53 @@ class AwsCLI:
         env["AWS_PAGER"] = ""
         for name in self.excluded_environment:
             env.pop(name, None)
+        deadline = time.monotonic() + command_timeout if command_timeout is not None else None
+
+        def invoke() -> str:
+            if deadline is None:
+                return self.runner.run(command, env=env)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                assert command_timeout is not None
+                raise CommandTimeoutError(command, command_timeout)
+            return self.runner.run(command, env=env, timeout_seconds=remaining)
+
         try:
-            return self.runner.run(command, env=env)
+            return invoke()
         except CommandError as error:
             if "InvalidSignatureException" not in error.raw_stderr or "Signature expired:" not in error.raw_stderr:
                 raise
-        return self.runner.run(command, env=env)
+        return invoke()
 
-    def json(self, args: list[str], *, region: str | None = None) -> dict[str, Any]:
-        output = self.call(args, region=region)
+    def text(
+        self,
+        args: list[str],
+        *,
+        region: str | None = None,
+        timeout_seconds: float | None = None,
+        timeout: float | None = None,
+    ) -> str:
+        return self.call(
+            args,
+            region=region,
+            timeout_seconds=timeout_seconds,
+            timeout=timeout,
+        )
+
+    def json(
+        self,
+        args: list[str],
+        *,
+        region: str | None = None,
+        timeout_seconds: float | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        output = self.call(
+            args,
+            region=region,
+            timeout_seconds=timeout_seconds,
+            timeout=timeout,
+        )
         if not output.strip():
             return {}
         try:
@@ -766,9 +997,64 @@ class AwsCLI:
             raise LifecycleError("AWS CLI returned a non-object JSON response")
         return parsed
 
-    def object_exists(self, bucket: str, key: str, region: str) -> bool:
+    def object_exists(
+        self,
+        bucket: str,
+        key: str,
+        region: str,
+        *,
+        timeout_seconds: float | None = None,
+        timeout: float | None = None,
+    ) -> bool:
         try:
-            self.json(["s3api", "head-object", "--bucket", bucket, "--key", key], region=region)
+            self.json(
+                ["s3api", "head-object", "--bucket", bucket, "--key", key],
+                region=region,
+                timeout_seconds=timeout_seconds,
+                timeout=timeout,
+            )
+            return True
+        except CommandError as error:
+            if any(marker in error.raw_stderr for marker in ("(404)", "Not Found", "NoSuchKey")):
+                return False
+            raise
+
+
+class ImmediateAwsCLIAdapter:
+    """Explicitly adapt an immediate fake AWS API that has no timeout keyword."""
+
+    def __init__(self, aws: Any):
+        self.aws = aws
+
+    def json(
+        self,
+        args: list[str],
+        *,
+        region: str | None = None,
+        timeout_seconds: float | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        validate_timeout_seconds(timeout_seconds, timeout, field="fake AWS API timeout")
+        return self.aws.json(args, region=region)
+
+    def object_exists(
+        self,
+        bucket: str,
+        key: str,
+        region: str,
+        *,
+        timeout_seconds: float | None = None,
+        timeout: float | None = None,
+    ) -> bool:
+        validate_timeout_seconds(timeout_seconds, timeout, field="fake AWS API timeout")
+        method = getattr(self.aws, "object_exists", None)
+        if callable(method):
+            return bool(method(bucket, key, region))
+        try:
+            self.aws.json(
+                ["s3api", "head-object", "--bucket", bucket, "--key", key],
+                region=region,
+            )
             return True
         except CommandError as error:
             if any(marker in error.raw_stderr for marker in ("(404)", "Not Found", "NoSuchKey")):
@@ -1087,8 +1373,17 @@ def network_covers(candidate: str, required: str) -> bool:
     return parent.version == child.version and child.subnet_of(parent)
 
 
+def network_is_exact(candidate: str, required: str) -> bool:
+    if candidate != required:
+        return False
+    try:
+        return ipaddress.ip_network(candidate, strict=True) == ipaddress.ip_network(required, strict=True)
+    except ValueError:
+        return False
+
+
 def policy_endpoint_covers(candidate: str, required: str) -> bool:
-    if candidate == "*":
+    if candidate == "*" or candidate == "*:*":
         return True
     if network_covers(candidate, required):
         return True
@@ -1097,6 +1392,10 @@ def policy_endpoint_covers(candidate: str, required: str) -> bool:
     elif candidate.count(":") == 1 and "/" in candidate:
         candidate = candidate.rsplit(":", 1)[0]
     return network_covers(candidate, required)
+
+
+def policy_endpoint_is_exact(candidate: str, required: str) -> bool:
+    return network_is_exact(candidate, required)
 
 
 def validate_tailnet_policy(
@@ -1111,45 +1410,93 @@ def validate_tailnet_policy(
     errors: list[str] = []
     if snat_subnet_routes:
         errors.append("subnet-route SNAT must be disabled")
+    required_owners = [str(owner) for owner in tag_owners]
     owners = policy.get("tagOwners", {}).get(tag, []) if isinstance(policy.get("tagOwners"), dict) else []
-    if not isinstance(owners, list) or not set(tag_owners).issubset(set(str(owner) for owner in owners)):
-        errors.append(f"tagOwners for {tag} do not include every required owner")
+    if (
+        not isinstance(owners, list)
+        or not all(isinstance(owner, str) for owner in owners)
+        or len(set(owners)) != len(owners)
+        or set(owners) != set(required_owners)
+    ):
+        errors.append(f"tagOwners for {tag} do not exactly match every reviewed owner")
     auto = policy.get("autoApprovers", {})
     routes = auto.get("routes", {}) if isinstance(auto, dict) else {}
     if not isinstance(routes, dict):
         routes = {}
-    for required in advertised_routes:
-        approved = any(
-            network_covers(str(candidate), required)
-            and isinstance(approvers, list)
-            and tag in [str(approver) for approver in approvers]
-            for candidate, approvers in routes.items()
+    required_routes = {str(route) for route in advertised_routes}
+    approved_routes = {
+        str(candidate)
+        for candidate, approvers in routes.items()
+        if isinstance(approvers, list)
+        and all(isinstance(approver, str) for approver in approvers)
+        and tag in approvers
+    }
+    extra_routes = approved_routes - required_routes
+    if (
+        not required_routes.issubset(approved_routes)
+        or any(not network_is_exact(candidate, candidate) for candidate in approved_routes)
+        or any(
+            network_covers(candidate, required) or network_covers(required, candidate)
+            for candidate in extra_routes
+            for required in required_routes
         )
-        if not approved:
-            errors.append(f"route autoApprovers do not authorize {tag} for {required}")
+    ):
+        errors.append(
+            f"route autoApprovers for {tag} must include every reviewed exact prefix; extras must be canonical and disjoint"
+        )
     grants = policy.get("grants", [])
     if not isinstance(grants, list):
         grants = []
+    required_pairs = {
+        (source, destination)
+        for source_site, destination_site in (("west", "east"), ("east", "west"))
+        for source in site_cidrs[source_site]
+        for destination in site_cidrs[destination_site]
+    }
+    exact_pairs: set[tuple[str, str]] = set()
+    broad_pairs: set[tuple[str, str]] = set()
+    for grant in grants:
+        if not isinstance(grant, dict):
+            continue
+        sources = grant.get("src", [])
+        destinations = grant.get("dst", [])
+        protocols = grant.get("ip", [])
+        if not all(isinstance(item, list) for item in (sources, destinations, protocols)):
+            continue
+        if not protocols or not all(isinstance(protocol, str) for protocol in protocols):
+            continue
+        all_protocols = set(protocols) == {"*"}
+        for source, destination in required_pairs:
+            source_matches = [
+                str(item) for item in sources if policy_endpoint_covers(str(item), source)
+            ]
+            destination_matches = [
+                str(item)
+                for item in destinations
+                if policy_endpoint_covers(str(item), destination)
+            ]
+            if not source_matches or not destination_matches:
+                continue
+            if all_protocols and any(
+                policy_endpoint_is_exact(candidate_source, source)
+                and policy_endpoint_is_exact(candidate_destination, destination)
+                for candidate_source in source_matches
+                for candidate_destination in destination_matches
+            ):
+                exact_pairs.add((source, destination))
+            if any(
+                not policy_endpoint_is_exact(candidate_source, source)
+                or not policy_endpoint_is_exact(candidate_destination, destination)
+                for candidate_source in source_matches
+                for candidate_destination in destination_matches
+            ):
+                broad_pairs.add((source, destination))
+    if broad_pairs:
+        errors.append("grants use a supernet or wildcard source/destination for a reviewed protected prefix")
     for source_site, destination_site in (("west", "east"), ("east", "west")):
         for source in site_cidrs[source_site]:
             for destination in site_cidrs[destination_site]:
-                allowed = False
-                for grant in grants:
-                    if not isinstance(grant, dict):
-                        continue
-                    sources = grant.get("src", [])
-                    destinations = grant.get("dst", [])
-                    protocols = grant.get("ip", [])
-                    if not all(isinstance(item, list) for item in (sources, destinations, protocols)):
-                        continue
-                    if (
-                        "*" in protocols
-                        and any(policy_endpoint_covers(str(item), source) for item in sources)
-                        and any(policy_endpoint_covers(str(item), destination) for item in destinations)
-                    ):
-                        allowed = True
-                        break
-                if not allowed:
+                if (source, destination) not in exact_pairs:
                     errors.append(f"grants do not allow {source} to {destination}")
     if errors:
         raise LifecycleError("Tailnet policy preflight failed: " + "; ".join(errors))
@@ -1217,6 +1564,7 @@ class RunConfig:
     expires_at: str
     backend: dict[str, Any]
     sites: dict[str, dict[str, Any]]
+    route_failover: dict[str, Any]
     tailnet: dict[str, Any]
     architecture: str
     artifact_manifest: pathlib.Path
@@ -1237,7 +1585,6 @@ class RunConfig:
             "artifact_manifest",
             "instance_type",
             "test_instance_type",
-            "ebs_root_volume_size",
             "tailscale_version",
             "tags",
             "backend",
@@ -1271,12 +1618,56 @@ class RunConfig:
         backend = raw.get("backend")
         topology = raw.get("symmetric_topology")
         sites = topology.get("sites") if isinstance(topology, dict) else None
+        route_failover = topology.get("route_failover") if isinstance(topology, dict) else None
         tailnet = raw.get("tailnet")
         architecture = str(raw.get("architecture", ""))
-        if not isinstance(backend, dict) or not isinstance(topology, dict) or not isinstance(sites, dict) or not isinstance(tailnet, dict):
+        if (
+            not isinstance(backend, dict)
+            or not isinstance(topology, dict)
+            or not isinstance(sites, dict)
+            or not isinstance(tailnet, dict)
+        ):
             raise LifecycleError("backend, symmetric_topology, and tailnet objects are required")
-        if set(topology) != {"version", "sites"} or topology.get("version") != 2:
-            raise LifecycleError("symmetric_topology must be version 2 with exactly version and sites")
+        if set(topology) != {"version", "sites", "route_failover"} or topology.get("version") != 2:
+            raise LifecycleError(
+                "symmetric_topology must be version 2 with exactly version, sites, and route_failover"
+            )
+        if not isinstance(route_failover, dict):
+            raise LifecycleError("symmetric_topology.route_failover must be an object")
+        route_failover_fields = {
+            "initial_transport_router_az_by_gwlbe_az",
+            "mutation_timeout_seconds",
+            "restoration_timeout_seconds",
+            "recovery_timeout_seconds",
+        }
+        if set(route_failover) != route_failover_fields:
+            raise LifecycleError("symmetric_topology.route_failover must contain exactly the reviewed fields")
+        for field in (
+            "mutation_timeout_seconds",
+            "restoration_timeout_seconds",
+            "recovery_timeout_seconds",
+        ):
+            value = route_failover[field]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not 1 <= float(value) <= 7200
+                or not float(value).is_integer()
+            ):
+                raise LifecycleError(
+                    f"symmetric_topology.route_failover.{field} must be a whole number between 1 and 7200"
+                )
+        restoration_timeout = int(route_failover["restoration_timeout_seconds"])
+        ownership_quiet_window = min(10, max(1, restoration_timeout // 10))
+        if restoration_timeout < 2:
+            raise LifecycleError(
+                "symmetric_topology.route_failover.restoration_timeout_seconds must leave time for a quiet window"
+            )
+        if int(route_failover["recovery_timeout_seconds"]) <= ownership_quiet_window:
+            raise LifecycleError(
+                "symmetric_topology.route_failover.recovery_timeout_seconds must exceed the derived ownership quiet window"
+            )
         backend_keys = {"bucket", "region", "kms_key_arn", "state_key", "operator_principal_arns"}
         if set(backend) - backend_keys:
             raise LifecycleError(f"backend has unsupported fields: {sorted(set(backend) - backend_keys)}")
@@ -1324,13 +1715,13 @@ class RunConfig:
                 "local_site_cidrs",
                 "remote_site_cidrs",
                 "workload_subnet_cidrs",
-                "ingress_subnet_cidrs",
+                "transport_subnet_cidrs",
                 "gwlbe_subnet_cidrs",
                 "gwlb_subnet_cidrs",
                 "target_subnet_cidrs",
                 "management_subnet_cidr",
                 "target_az_keys",
-                "ingress_router_az_keys",
+                "transport_router_az_keys",
             )
             if set(value) - set(required):
                 raise LifecycleError(f"sites.{site} has unsupported fields: {sorted(set(value) - set(required))}")
@@ -1349,14 +1740,14 @@ class RunConfig:
                 isinstance(key, str)
                 and re.fullmatch(r"[a-z][a-z0-9-]{0,7}", key)
                 and isinstance(zone, str)
-                and zone.startswith(region)
+                and re.fullmatch(re.escape(region) + r"[a-z]", zone)
                 for key, zone in azs.items()
             ) or len(set(azs.values())) != len(azs):
                 raise LifecycleError(f"symmetric_topology.sites.{site}.azs must contain exactly two unique explicit regional AZs")
             role_maps: dict[str, dict[str, str]] = {}
             for field in (
                 "workload_subnet_cidrs",
-                "ingress_subnet_cidrs",
+                "transport_subnet_cidrs",
                 "gwlbe_subnet_cidrs",
                 "gwlb_subnet_cidrs",
                 "target_subnet_cidrs",
@@ -1399,17 +1790,28 @@ class RunConfig:
                 remote_networks = [ipaddress.ip_network(cidr, strict=True) for cidr in remote]
             except ValueError as error:
                 raise LifecycleError(f"symmetric_topology.sites.{site} contains an invalid site CIDR") from error
+            vpc_resolver = ipaddress.ip_address(int(vpc.network_address) + 2)
+            if any(vpc_resolver in network for network in local_networks):
+                raise LifecycleError(
+                    f"symmetric_topology.sites.{site}.local_site_cidrs must exclude the VPC DNS resolver address"
+                )
             if any(left.overlaps(right) for left in local_networks for right in remote_networks):
                 raise LifecycleError(f"symmetric_topology.sites.{site} local and remote site CIDRs must be disjoint")
             target_az_keys = value["target_az_keys"]
-            ingress_az_keys = value["ingress_router_az_keys"]
+            transport_az_keys = value["transport_router_az_keys"]
             if (
                 not isinstance(target_az_keys, list)
-                or not isinstance(ingress_az_keys, list)
+                or not isinstance(transport_az_keys, list)
+                or len(target_az_keys) != len(azs)
+                or len(transport_az_keys) != len(azs)
+                or not all(isinstance(value, str) for value in target_az_keys)
+                or not all(isinstance(value, str) for value in transport_az_keys)
+                or len(set(target_az_keys)) != len(target_az_keys)
+                or len(set(transport_az_keys)) != len(transport_az_keys)
                 or set(target_az_keys) != set(azs)
-                or set(ingress_az_keys) != set(azs)
+                or set(transport_az_keys) != set(azs)
             ):
-                raise LifecycleError(f"symmetric_topology.sites.{site} target and ingress-router fleets must cover every AZ")
+                raise LifecycleError(f"symmetric_topology.sites.{site} target and transport-router fleets must cover every AZ")
             normalized_sites[site] = {
                 "region": region,
                 "ami_id": str(value["ami_id"]),
@@ -1421,10 +1823,39 @@ class RunConfig:
                 "local_site_cidrs": local,
                 "remote_site_cidrs": remote,
                 "target_az_keys": sorted(target_az_keys),
-                "ingress_router_az_keys": sorted(ingress_az_keys),
+                "transport_router_az_keys": sorted(transport_az_keys),
             }
             site_networks[site] = vpc
         sites = normalized_sites
+        initial_selection = route_failover["initial_transport_router_az_by_gwlbe_az"]
+        if not isinstance(initial_selection, dict) or set(initial_selection) != set(DEPLOYMENT_SITES):
+            raise LifecycleError(
+                "symmetric_topology.route_failover.initial_transport_router_az_by_gwlbe_az "
+                "must contain exactly west and east"
+            )
+        normalized_initial_selection: dict[str, dict[str, str]] = {}
+        for site in DEPLOYMENT_SITES:
+            selection = initial_selection[site]
+            if (
+                not isinstance(selection, dict)
+                or set(selection) != set(sites[site]["azs"])
+                or not all(isinstance(value, str) for value in selection.values())
+                or not set(selection.values()).issubset(sites[site]["transport_router_az_keys"])
+                or any(gwlbe_az != router_az for gwlbe_az, router_az in selection.items())
+            ):
+                raise LifecycleError(
+                    "symmetric_topology.route_failover.initial_transport_router_az_by_gwlbe_az."
+                    f"{site} must map every GWLBE AZ to its enabled same-AZ transport router"
+                )
+            normalized_initial_selection[site] = {
+                str(az_key): str(selection[az_key]) for az_key in sorted(selection)
+            }
+        route_failover = {
+            "initial_transport_router_az_by_gwlbe_az": normalized_initial_selection,
+            "mutation_timeout_seconds": int(route_failover["mutation_timeout_seconds"]),
+            "restoration_timeout_seconds": int(route_failover["restoration_timeout_seconds"]),
+            "recovery_timeout_seconds": int(route_failover["recovery_timeout_seconds"]),
+        }
         backend_partition = str(backend["kms_key_arn"]).split(":", 2)[1]
         configured_partitions = {
             backend_partition,
@@ -1470,7 +1901,18 @@ class RunConfig:
         if auth_expiry < 300 or auth_expiry > 3600:
             raise LifecycleError("tailnet.auth_key_expiry_seconds must be between 300 and 3600")
         owners = tailnet.get("tag_owners")
-        if not isinstance(owners, list) or not owners or not all(isinstance(value, str) and value for value in owners):
+        if (
+            not isinstance(owners, list)
+            or not owners
+            or not all(
+                isinstance(value, str)
+                and value
+                and value != "*"
+                and not any(character.isspace() for character in value)
+                for value in owners
+            )
+            or len(set(owners)) != len(owners)
+        ):
             raise LifecycleError("tailnet.tag_owners must be a non-empty string list")
         tailnet = {
             "name": str(tailnet["name"]),
@@ -1504,58 +1946,61 @@ class RunConfig:
             raise LifecycleError("tags must be a string map")
         if set(tags).intersection({"EnvelopeRun", "ExpiresAt", "ManagedBy", "Profile"}):
             raise LifecycleError("tags cannot override protected ownership tags")
-        envelope = raw.get("envelope", {})
+        envelope = raw.get("envelope")
         if not isinstance(envelope, dict):
-            raise LifecycleError("envelope must be an object")
-        envelope_keys = {
-            "routing_mode",
-            "tun_name",
-            "tailscale_iface",
-            "underlay_interface",
-            "routing_table_id",
-            "routing_rule_priority",
+            raise LifecycleError("envelope must be a required version-2 packet-return object")
+        envelope_keys = {"mode", "udp_bind", "max_inner_packet_size"}
+        unsupported_envelope_keys = set(envelope) - envelope_keys
+        if unsupported_envelope_keys:
+            raise LifecycleError(f"envelope has unsupported fields: {sorted(unsupported_envelope_keys)}")
+        if set(envelope) != envelope_keys:
+            raise LifecycleError("envelope must contain exactly mode, udp_bind, and max_inner_packet_size")
+        if envelope["mode"] != "packet-return":
+            raise LifecycleError("version-2 protected runs require envelope.mode=packet-return")
+        if envelope["udp_bind"] != "0.0.0.0:6081":
+            raise LifecycleError("version-2 protected runs require envelope.udp_bind=0.0.0.0:6081")
+        if (
+            isinstance(envelope["max_inner_packet_size"], bool)
+            or not isinstance(envelope["max_inner_packet_size"], int)
+            or envelope["max_inner_packet_size"] != 1280
+        ):
+            raise LifecycleError("version-2 protected runs require envelope.max_inner_packet_size=1280")
+        normalized_envelope = {
+            "mode": "packet-return",
+            "udp_bind": "0.0.0.0:6081",
+            "max_inner_packet_size": 1280,
         }
-        if set(envelope) - envelope_keys:
-            raise LifecycleError(f"envelope has unsupported fields: {sorted(set(envelope) - envelope_keys)}")
-        try:
-            normalized_envelope = {
-                "routing_mode": str(envelope.get("routing_mode", "manage")),
-                "tun_name": str(envelope.get("tun_name", "envelope0")),
-                "tailscale_iface": str(envelope.get("tailscale_iface", "tailscale0")),
-                "underlay_interface": str(envelope.get("underlay_interface", "ens5")),
-                "routing_table_id": int(envelope.get("routing_table_id", 100)),
-                "routing_rule_priority": int(envelope.get("routing_rule_priority", 100)),
-            }
-        except (TypeError, ValueError) as error:
-            raise LifecycleError("envelope routing table and priority must be integers") from error
-        if normalized_envelope["routing_mode"] not in {"off", "verify", "manage"}:
-            raise LifecycleError("envelope.routing_mode is invalid")
-        if normalized_envelope["tun_name"] == normalized_envelope["tailscale_iface"]:
-            raise LifecycleError("Envelope and Tailscale interface names must differ")
-        if not 1 <= normalized_envelope["routing_table_id"] <= 252 or normalized_envelope["routing_table_id"] == 52:
-            raise LifecycleError("envelope.routing_table_id must be 1-252 except 52")
-        if not 1 <= normalized_envelope["routing_rule_priority"] <= 32765:
-            raise LifecycleError("envelope.routing_rule_priority must be 1-32765")
         cost = raw.get("cost", {})
         if not isinstance(cost, dict):
             raise LifecycleError("cost must be an object")
         cost_keys = {"estimated_fixed_hourly_usd", "approved_max_fixed_hourly_usd"}
         if set(cost) - cost_keys:
             raise LifecycleError(f"cost has unsupported fields: {sorted(set(cost) - cost_keys)}")
+        raw_estimated = cost.get("estimated_fixed_hourly_usd", 4.0)
+        raw_approved = cost.get("approved_max_fixed_hourly_usd", 5.0)
+        if (
+            isinstance(raw_estimated, bool)
+            or not isinstance(raw_estimated, (int, float))
+            or isinstance(raw_approved, bool)
+            or not isinstance(raw_approved, (int, float))
+        ):
+            raise LifecycleError("cost values must be finite numbers")
         try:
-            estimated = float(cost.get("estimated_fixed_hourly_usd", 1.50))
-            approved = float(cost.get("approved_max_fixed_hourly_usd", 2.00))
-            root_size = int(raw.get("ebs_root_volume_size", 20))
-        except (TypeError, ValueError) as error:
-            raise LifecycleError("cost and root-volume values must be numeric") from error
-        if estimated <= 0 or approved <= 0 or estimated > approved:
+            estimated = float(raw_estimated)
+            approved = float(raw_approved)
+        except (OverflowError, TypeError, ValueError) as error:
+            raise LifecycleError("cost values must be finite numbers") from error
+        if (
+            not math.isfinite(estimated)
+            or not math.isfinite(approved)
+            or estimated <= 0
+            or approved <= 0
+            or estimated > approved
+        ):
             raise LifecycleError("cost estimate must be positive and within the approved ceiling")
-        if not 8 <= root_size <= 100:
-            raise LifecycleError("ebs_root_volume_size must be 8-100")
         normalized_raw = {
             "instance_type": str(raw["instance_type"]),
             "test_instance_type": str(raw["test_instance_type"]),
-            "ebs_root_volume_size": root_size,
             "tags": {str(key): str(value) for key, value in tags.items()},
             "tailscale_version": TAILSCALE_VERSION,
             "envelope": normalized_envelope,
@@ -1565,7 +2010,18 @@ class RunConfig:
             },
             "e2e_load_profile": e2e_load_profile,
         }
-        return cls(path, normalized_raw, run_id, expires_at, backend, sites, tailnet, architecture, artifact_manifest)
+        return cls(
+            path,
+            normalized_raw,
+            run_id,
+            expires_at,
+            backend,
+            sites,
+            route_failover,
+            tailnet,
+            architecture,
+            artifact_manifest,
+        )
 
     @property
     def manifest_key(self) -> str:
@@ -1593,6 +2049,7 @@ class RunConfig:
             "expires_at": self.expires_at,
             "backend": self.backend,
             "sites": self.sites,
+            "route_failover": self.route_failover,
             "tailnet": self.tailnet,
             "architecture": self.architecture,
             "runtime": self.raw,
@@ -2200,6 +2657,7 @@ class ManifestStore:
         if_match: str | None = None,
         if_none_match: bool = False,
     ) -> None:
+        validate_manifest(manifest, self.config)
         self.run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         effective_if_match = if_match if if_match is not None else self.remote_etag
         fd, temporary = tempfile.mkstemp(prefix="manifest.", dir=self.run_dir)
@@ -2275,6 +2733,35 @@ class ManifestStore:
         return self.load_local()
 
 
+def persist_manifest_transition(
+    store: ManifestStore,
+    original: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    description: str,
+    if_match: str | None = None,
+) -> str:
+    expected_etag = store.remote_etag if if_match is None else if_match
+    if not isinstance(expected_etag, str) or not expected_etag:
+        raise LifecycleError(f"{description} requires the current durable manifest ETag")
+    try:
+        store.write(candidate, if_match=expected_etag)
+    except BaseException as error:
+        try:
+            recovered = store.recover()
+            recovered_etag = store.remote_etag
+        except BaseException as recovery_error:
+            raise LifecycleError(f"{description} write outcome is ambiguous and requires protected recovery") from recovery_error
+        if recovered == candidate and isinstance(recovered_etag, str) and recovered_etag:
+            if isinstance(error, (KeyboardInterrupt, InterruptedError, TimeoutError)) or not isinstance(error, Exception):
+                raise
+            return "recovered-committed"
+        if recovered == original and recovered_etag == expected_etag:
+            raise
+        raise ConcurrentLifecycleError(f"{description} collided with another durable lifecycle transition") from None
+    return "conditional-write"
+
+
 def validate_manifest(manifest: dict[str, Any], config: RunConfig) -> None:
     if manifest.get("schema") != SCHEMA or manifest.get("run_id") != config.run_id:
         raise LifecycleError("cleanup manifest identity does not match the requested run")
@@ -2307,12 +2794,53 @@ def validate_manifest(manifest: dict[str, Any], config: RunConfig) -> None:
         if not isinstance(actual, dict) or any(actual.get(key) != expected[key] for key in ("site", "region", "name", "arn", "kms_key_arn")):
             raise LifecycleError("cleanup manifest SSM intent differs from the requested run identity")
     tailnet = manifest.get("tailnet", {})
+    if not isinstance(tailnet, dict):
+        raise LifecycleError("cleanup manifest Tailnet identity differs from the requested run")
+    expected_hostnames = expected_tailnet_hostnames(config)
+    device_ids = tailnet.get("device_ids")
+    expected_device_roles = {hostname: "transport-router" for hostname in expected_hostnames}
+    required_tailnet_fields = {
+        "name",
+        "tag",
+        "auth_key_description",
+        "auth_key_id",
+        "key_generation",
+        "pending_revoke_key_ids",
+        "expected_hostnames",
+        "nodes_expected",
+        "device_ids",
+        "device_roles",
+    }
+    pending_revoke_key_ids = tailnet.get("pending_revoke_key_ids")
     if (
-        tailnet.get("name") != config.tailnet["name"]
+        set(tailnet) not in (required_tailnet_fields, required_tailnet_fields | {"rotation"})
+        or tailnet.get("name") != config.tailnet["name"]
         or tailnet.get("tag") != config.tailnet["tag"]
-        or not isinstance(tailnet.get("device_ids"), dict)
+        or tailnet.get("auth_key_description") != f"Envelope acceptance {config.run_id}"
+        or (
+            tailnet.get("auth_key_id") is not None
+            and (not isinstance(tailnet.get("auth_key_id"), str) or not tailnet.get("auth_key_id"))
+        )
+        or isinstance(tailnet.get("key_generation"), bool)
+        or not isinstance(tailnet.get("key_generation"), int)
+        or tailnet.get("key_generation", -1) < 0
+        or not isinstance(pending_revoke_key_ids, list)
+        or any(not isinstance(value, str) or not value for value in pending_revoke_key_ids)
+        or len(set(pending_revoke_key_ids)) != len(pending_revoke_key_ids)
+        or tailnet.get("expected_hostnames") != expected_hostnames
+        or not isinstance(tailnet.get("nodes_expected"), bool)
+        or not isinstance(device_ids, dict)
+        or not set(device_ids).issubset(expected_hostnames)
+        or any(not isinstance(value, str) or not value for value in device_ids.values())
+        or len(set(device_ids.values())) != len(device_ids)
+        or tailnet.get("device_roles") != expected_device_roles
     ):
         raise LifecycleError("cleanup manifest Tailnet identity differs from the requested run")
+    deployment = manifest.get("deployment")
+    if deployment is not None:
+        if not isinstance(deployment, dict):
+            raise LifecycleError("cleanup manifest deployment identity is invalid")
+        validate_symmetric_deployment_output(deployment, config)
     source = manifest.get("terraform_source")
     if source is not None:
         if not isinstance(source, dict):
@@ -2328,10 +2856,15 @@ def validate_manifest(manifest: dict[str, Any], config: RunConfig) -> None:
     phase = manifest.get("phase")
     if not isinstance(phase, str) or not phase:
         raise LifecycleError("cleanup manifest lifecycle phase is invalid")
+    cleanup_phases = {"cleanup_started", "destroy_started", "secrets_only_cleanup_complete", "cleanup_incomplete"}
+    if phase in cleanup_phases:
+        validate_canonical_utc_timestamp(manifest.get("cleanup_claimed_at"), "cleanup_claimed_at")
+        if OPERATION_CLAIM_ID_RE.fullmatch(str(manifest.get("cleanup_claim_id", ""))) is None:
+            raise LifecycleError("cleanup manifest active cleanup phase has no unique claim ID")
+    elif "cleanup_claimed_at" in manifest or "cleanup_claim_id" in manifest:
+        raise LifecycleError("cleanup manifest retains a stale cleanup claim")
     active_apply_phases = {
         "apply_claimed",
-        "replacement_device_retirement_started",
-        "replacement_device_retired",
         "apply_started",
     }
     applied_phases = {"applied", "readiness_started", "readiness_failed", "ready"}
@@ -2352,8 +2885,32 @@ def validate_manifest(manifest: dict[str, Any], config: RunConfig) -> None:
         if not isinstance(saved_plan, dict) or saved_plan.get("apply_started") is not True or saved_plan.get("applied") is not False:
             raise LifecycleError("cleanup manifest active apply phase has no exact saved-plan claim")
         validate_canonical_utc_timestamp(manifest.get("apply_claimed_at"), "apply_claimed_at")
+        if OPERATION_CLAIM_ID_RE.fullmatch(str(manifest.get("apply_claim_id", ""))) is None:
+            raise LifecycleError("cleanup manifest active apply phase has no unique claim ID")
     elif "apply_claimed_at" in manifest:
         raise LifecycleError("cleanup manifest retains a stale active apply claim")
+    elif "apply_claim_id" in manifest:
+        raise LifecycleError("cleanup manifest retains a stale apply claim ID")
+    if phase == "readiness_started":
+        validate_canonical_utc_timestamp(manifest.get("readiness_started_at"), "readiness_started_at")
+        if OPERATION_CLAIM_ID_RE.fullmatch(str(manifest.get("readiness_claim_id", ""))) is None:
+            raise LifecycleError("cleanup manifest active readiness phase has no unique claim ID")
+    elif "readiness_started_at" in manifest:
+        raise LifecycleError("cleanup manifest retains a stale readiness claim timestamp")
+    elif "readiness_claim_id" in manifest:
+        raise LifecycleError("cleanup manifest retains a stale readiness claim ID")
+    rotation = tailnet.get("rotation")
+    if "rotation" in tailnet and rotation is None:
+        raise LifecycleError("cleanup manifest key rotation has an invalid unique claim")
+    if rotation is not None:
+        if (
+            not isinstance(rotation, dict)
+            or set(rotation) != {"claim_id", "description", "new_key_id", "updated_sites"}
+            or OPERATION_CLAIM_ID_RE.fullmatch(str(rotation.get("claim_id", ""))) is None
+            or not isinstance(rotation.get("description"), str)
+            or not isinstance(rotation.get("updated_sites"), list)
+        ):
+            raise LifecycleError("cleanup manifest key rotation has an invalid unique claim")
     if phase in applied_phases and (
         not isinstance(saved_plan, dict)
         or saved_plan.get("apply_started") is not True
@@ -2374,8 +2931,13 @@ def validate_manifest(manifest: dict[str, Any], config: RunConfig) -> None:
     if isinstance(e2e, dict):
         base_fields = {"claim_id", "output_sha256", "started_at"}
         terminal_fields = base_fields | {"finished_at", "passed"}
+        replacement_fields = {"replacement"}
         e2e_fields = set(e2e)
-        if e2e_fields != base_fields and e2e_fields != terminal_fields:
+        core_fields = e2e_fields - replacement_fields
+        if core_fields not in (base_fields, terminal_fields) or e2e_fields - core_fields not in (
+            set(),
+            replacement_fields,
+        ):
             raise LifecycleError("cleanup manifest E2E claim has an invalid schema")
         if (
             not isinstance(e2e.get("claim_id"), str)
@@ -2388,16 +2950,74 @@ def validate_manifest(manifest: dict[str, Any], config: RunConfig) -> None:
         ):
             raise LifecycleError("cleanup manifest E2E claim identity is invalid")
         validate_canonical_utc_timestamp(e2e.get("started_at"), "e2e.started_at")
-        if e2e_fields == terminal_fields:
+        if "replacement" in e2e:
+            replacement = e2e["replacement"]
+            replacement_base = {"address", "old_instance_id", "started_at"}
+            replacement_success = replacement_base | {"finished_at", "new_output_sha256"}
+            replacement_failed = replacement_base | {"failed_at"}
+            if not isinstance(replacement, dict) or frozenset(replacement) not in {
+                frozenset(replacement_base),
+                frozenset(replacement_success),
+                frozenset(replacement_failed),
+            }:
+                raise LifecycleError("cleanup manifest E2E replacement journal has an invalid schema")
+            if (
+                TARGET_REPLACEMENT_ADDRESS_RE.fullmatch(str(replacement.get("address", ""))) is None
+                or DEPLOYMENT_INSTANCE_ID_RE.fullmatch(str(replacement.get("old_instance_id", ""))) is None
+            ):
+                raise LifecycleError("cleanup manifest E2E replacement identity is invalid")
+            validate_canonical_utc_timestamp(replacement.get("started_at"), "e2e.replacement.started_at")
+            if set(replacement) == replacement_success:
+                validate_canonical_utc_timestamp(replacement.get("finished_at"), "e2e.replacement.finished_at")
+                if re.fullmatch(r"[0-9a-f]{64}", str(replacement.get("new_output_sha256", ""))) is None:
+                    raise LifecycleError("cleanup manifest E2E replacement output identity is invalid")
+                if phase not in {"e2e_running", "e2e_passed", "e2e_failed"}:
+                    raise LifecycleError("cleanup manifest completed replacement journal has an invalid phase")
+            elif set(replacement) == replacement_failed:
+                validate_canonical_utc_timestamp(replacement.get("failed_at"), "e2e.replacement.failed_at")
+                if phase not in {"e2e_running", "e2e_failed"}:
+                    raise LifecycleError("cleanup manifest failed replacement journal has an invalid phase")
+            elif phase not in {
+                "e2e_replacement_ready",
+                "replacement_planned",
+                "apply_claimed",
+                "apply_started",
+                "apply_failed",
+                "applied",
+                "readiness_started",
+                "readiness_failed",
+                "e2e_replacement_complete",
+                "e2e_running",
+                "e2e_failed",
+            }:
+                raise LifecycleError("cleanup manifest active replacement journal has an invalid phase")
+        if core_fields == terminal_fields:
             validate_canonical_utc_timestamp(e2e.get("finished_at"), "e2e.finished_at")
             if type(e2e.get("passed")) is not bool:
                 raise LifecycleError("cleanup manifest E2E result is invalid")
-        if phase == "e2e_running" and e2e_fields != base_fields:
+        if phase == "e2e_running" and core_fields != base_fields:
             raise LifecycleError("cleanup manifest running E2E claim already has terminal fields")
         if phase in {"e2e_passed", "e2e_failed"} and (
-            e2e_fields != terminal_fields or e2e["passed"] != (phase == "e2e_passed")
+            core_fields != terminal_fields or e2e["passed"] != (phase == "e2e_passed")
         ):
             raise LifecycleError("cleanup manifest terminal E2E phase differs from its result")
+    if isinstance(saved_plan, dict) and saved_plan.get("replacement") is not None:
+        replacement_address = saved_plan.get("replacement")
+        replacement_instance_id = saved_plan.get("replacement_instance_id")
+        if (
+            TARGET_REPLACEMENT_ADDRESS_RE.fullmatch(str(replacement_address)) is None
+            or DEPLOYMENT_INSTANCE_ID_RE.fullmatch(str(replacement_instance_id)) is None
+        ):
+            raise LifecycleError("cleanup manifest saved replacement identity is invalid")
+        journal = e2e.get("replacement") if isinstance(e2e, dict) else None
+        if journal is not None and (
+            not isinstance(journal, dict)
+            or journal.get("address") != replacement_address
+            or journal.get("old_instance_id") != replacement_instance_id
+        ):
+            raise LifecycleError("cleanup manifest saved replacement differs from its E2E journal")
+    elif isinstance(saved_plan, dict) and saved_plan.get("replacement_instance_id") is not None:
+        raise LifecycleError("cleanup manifest retains a replacement instance without an address")
     serialized = json.dumps(manifest)
     if "tskey-" in serialized.lower() or "oauth_client_secret" in serialized.lower():
         raise LifecycleError("cleanup manifest contains prohibited secret material")
@@ -3603,7 +4223,7 @@ def run_instances_dry_run_preflight(config: RunConfig, aws: AwsCLI) -> dict[str,
         summary[site] = {}
         for instance_class, instance_type in (
             ("target", str(config.raw["instance_type"])),
-            ("ingress_router", str(config.raw["instance_type"])),
+            ("transport_router", str(config.raw["instance_type"])),
             ("workload", str(config.raw["test_instance_type"])),
         ):
             gate = f"AWS RunInstances dry-run gate {site}/{instance_class}"
@@ -4336,7 +4956,7 @@ def validate_aws_preflight_summary(summary: Any, config: RunConfig, account_id: 
     expected_run_instances_dry_run = {
         site: {
             "target": str(config.raw["instance_type"]),
-            "ingress_router": str(config.raw["instance_type"]),
+            "transport_router": str(config.raw["instance_type"]),
             "workload": str(config.raw["test_instance_type"]),
         }
         for site in ("west", "east")
@@ -4405,7 +5025,7 @@ def validate_aws_preflight_summary(summary: Any, config: RunConfig, account_id: 
             value.get("site") != site
             or value.get("planned_instances") != 6
             or not isinstance(instance_vcpus, dict)
-            or set(instance_vcpus) != {"target", "ingress_router", "workload"}
+            or set(instance_vcpus) != {"target", "transport_router", "workload"}
             or any(isinstance(number, bool) or not isinstance(number, int) or number <= 0 for number in instance_vcpus.values())
             or isinstance(value.get("excluded_regional_nat_gateways"), bool)
             or not isinstance(value.get("excluded_regional_nat_gateways"), int)
@@ -4449,7 +5069,7 @@ def validate_aws_preflight_summary(summary: Any, config: RunConfig, account_id: 
             raise LifecycleError(f"AWS preflight summary for {region} has an incomplete quota contract")
         for gate, (service, quota_name, quota_code, source, fixed_limit) in expected_capacity.items():
             record = quotas[gate]
-            required = 2 * (instance_vcpus["target"] + instance_vcpus["ingress_router"] + instance_vcpus["workload"]) if gate == "standard-vcpus" else 1
+            required = 2 * (instance_vcpus["target"] + instance_vcpus["transport_router"] + instance_vcpus["workload"]) if gate == "standard-vcpus" else 1
             if (
                 not isinstance(record, dict)
                 or set(record)
@@ -4555,7 +5175,7 @@ def aws_capability_quota_preflight(
             raise LifecycleError(f"AWS preflight for {region} lacks exact instance vCPU metadata")
         per_role_vcpus = {
             "target": type_values[appliance_type],
-            "ingress_router": type_values[appliance_type],
+            "transport_router": type_values[appliance_type],
             "workload": type_values[workload_type],
         }
         if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in per_role_vcpus.values()):
@@ -4573,7 +5193,7 @@ def aws_capability_quota_preflight(
         usage = regional_quota_usage(config, aws, site)
         quotas: dict[str, dict[str, Any]] = {}
         for gate in sorted(AWS_REGIONAL_QUOTA_CONTRACT):
-            required = 2 * (per_role_vcpus["target"] + per_role_vcpus["ingress_router"] + per_role_vcpus["workload"]) if gate == "standard-vcpus" else 1
+            required = 2 * (per_role_vcpus["target"] + per_role_vcpus["transport_router"] + per_role_vcpus["workload"]) if gate == "standard-vcpus" else 1
             quotas[gate] = quota_capacity_record(gate, quota_values[gate], used=usage[gate], required=required)
         for gate, name in sorted(AWS_ELBV2_ACCOUNT_LIMIT_CONTRACT.items()):
             quotas[gate] = capacity_record(
@@ -4651,20 +5271,22 @@ def terraform_variables(
 ) -> dict[str, Any]:
     by_site = {str(parameter["site"]): parameter for parameter in parameters}
     west, east = config.sites["west"], config.sites["east"]
-    envelope = config.raw["envelope"]
-    return {
+    values = {
         "name": config.run_id,
         "expires_at": config.expires_at,
         "tags": config.raw["tags"],
         "west_region": west["region"],
         "east_region": east["region"],
-        "symmetric_topology": {"version": 2, "sites": copy.deepcopy(config.sites)},
+        "symmetric_topology": {
+            "version": 2,
+            "sites": copy.deepcopy(config.sites),
+            "route_failover": copy.deepcopy(config.route_failover),
+        },
         "architecture": config.architecture,
         "west_ami_id": west["ami_id"],
         "east_ami_id": east["ami_id"],
         "instance_type": config.raw["instance_type"],
         "test_instance_type": config.raw["test_instance_type"],
-        "ebs_root_volume_size": config.raw["ebs_root_volume_size"],
         "artifact_path": str(pathlib.Path(str(artifact["path"])).resolve()),
         "artifact_sha256": artifact["sha256"],
         "artifact_revision": artifact["revision"],
@@ -4675,16 +5297,21 @@ def terraform_variables(
         "east_tailscale_kms_key_arn": by_site["east"]["kms_key_arn"],
         "tailscale_tag": config.tailnet["tag"],
         "tailscale_version": TAILSCALE_VERSION,
-        "envelope_routing_mode": envelope["routing_mode"],
-        "envelope_tun_name": envelope["tun_name"],
-        "envelope_tailscale_iface": envelope["tailscale_iface"],
-        "envelope_underlay_interface": envelope["underlay_interface"],
-        "envelope_routing_table_id": envelope["routing_table_id"],
-        "envelope_routing_rule_priority": envelope["routing_rule_priority"],
         "estimated_fixed_hourly_usd": config.raw["cost"]["estimated_fixed_hourly_usd"],
         "approved_max_fixed_hourly_usd": config.raw["cost"]["approved_max_fixed_hourly_usd"],
         "e2e_load_profile": dict(config.raw["e2e_load_profile"]),
     }
+    if set(values) != TERRAFORM_VARIABLE_FIELDS:
+        raise RuntimeError("protected Terraform variable contract is internally inconsistent")
+    return values
+
+
+def expected_tailnet_hostnames(config: RunConfig) -> list[str]:
+    return [
+        f"{config.run_id}-{site}-transport-{az_key}"
+        for site in DEPLOYMENT_SITES
+        for az_key in config.sites[site]["transport_router_az_keys"]
+    ]
 
 
 def new_manifest(config: RunConfig, artifact: dict[str, Any], account_id: str) -> dict[str, Any]:
@@ -4693,6 +5320,7 @@ def new_manifest(config: RunConfig, artifact: dict[str, Any], account_id: str) -
     parameters = intended_ssm_parameters(config, account_id)
     artifact_bucket = f"{config.run_id}-{account_id}-{config.sites['west']['region']}-artifact"
     artifact_key = f"artifacts/{artifact['revision']}/envelope-linux-{config.architecture}"
+    expected_hostnames = expected_tailnet_hostnames(config)
     return {
         "schema": SCHEMA,
         "run_id": config.run_id,
@@ -4725,9 +5353,10 @@ def new_manifest(config: RunConfig, artifact: dict[str, Any], account_id: str) -
             "auth_key_id": None,
             "key_generation": 0,
             "pending_revoke_key_ids": [],
-            "expected_hostnames": [f"{config.run_id}-west", f"{config.run_id}-east"],
+            "expected_hostnames": expected_hostnames,
             "nodes_expected": False,
             "device_ids": {},
+            "device_roles": {hostname: "transport-router" for hostname in expected_hostnames},
         },
         "ssm_parameters": parameters,
         "terraform_variables": terraform_variables(config, artifact, parameters),
@@ -5036,13 +5665,24 @@ def rotate_auth_key(
     new_material: str | None = None
     new_id: str | None = None
     updated: list[dict[str, Any]] = []
+    durable = copy.deepcopy(manifest)
+
+    def persist_rotation(candidate: dict[str, Any], description: str) -> None:
+        nonlocal durable
+        persist_manifest_transition(store, durable, candidate, description=description)
+        durable = copy.deepcopy(candidate)
+
     try:
         for parameter in manifest["ssm_parameters"]:
             old_values[str(parameter["site"])] = get_ssm_parameter_value(aws, parameter)
         generation = int(manifest["tailnet"].get("key_generation", 0)) + 1
-        rotation_description = f"{manifest['tailnet']['auth_key_description']} rotation-{generation}"
+        rotation_claim_id = str(uuid.uuid4())
+        rotation_description = (
+            f"{manifest['tailnet']['auth_key_description']} rotation-{generation}-{rotation_claim_id[:8]}"
+        )
         in_progress = copy.deepcopy(manifest)
         in_progress["tailnet"]["rotation"] = {
+            "claim_id": rotation_claim_id,
             "description": rotation_description,
             "new_key_id": None,
             "updated_sites": [],
@@ -5051,7 +5691,7 @@ def rotate_auth_key(
             "+00:00", "Z"
         )
         in_progress["phase"] = "key_rotation_create_started"
-        store.write(in_progress, if_match=store.remote_etag)
+        persist_rotation(in_progress, "key-rotation create-start boundary")
         new_id, new_material = tailscale.create_auth_key(
             str(config.tailnet["tag"]),
             rotation_description,
@@ -5059,16 +5699,16 @@ def rotate_auth_key(
         )
         in_progress["tailnet"]["rotation"]["new_key_id"] = new_id
         in_progress["phase"] = "key_rotation_key_created"
-        store.write(in_progress)
+        persist_rotation(in_progress, "key-rotation key-created boundary")
         for parameter in manifest["ssm_parameters"]:
             in_progress["phase"] = f"key_rotation_{parameter['site']}_update_started"
-            store.write(in_progress)
+            persist_rotation(in_progress, f"key-rotation {parameter['site']} update-start boundary")
 
             def track_mutation(parameter: dict[str, Any] = parameter) -> None:
                 updated.append(parameter)
                 in_progress["tailnet"]["rotation"]["updated_sites"].append(str(parameter["site"]))
                 in_progress["phase"] = f"key_rotation_{parameter['site']}_write_succeeded"
-                store.write(in_progress)
+                persist_rotation(in_progress, f"key-rotation {parameter['site']} write boundary")
 
             put_ssm_parameter(
                 aws,
@@ -5084,7 +5724,7 @@ def rotate_auth_key(
                 mutation_callback=track_mutation,
             )
             in_progress["phase"] = f"key_rotation_{parameter['site']}_verified"
-            store.write(in_progress)
+            persist_rotation(in_progress, f"key-rotation {parameter['site']} verification boundary")
         candidate = copy.deepcopy(manifest)
         candidate["tailnet"]["auth_key_id"] = new_id
         candidate["tailnet"]["key_generation"] = generation
@@ -5092,8 +5732,8 @@ def rotate_auth_key(
         candidate["tailnet"].pop("rotation", None)
         candidate.pop("key_rotation_started_at", None)
         candidate["phase"] = "key_rotation_parameters_updated"
-        store.write(candidate)
-    except Exception as error:
+        persist_rotation(candidate, "key-rotation parameter-completion boundary")
+    except BaseException as error:
         rollback_failures: list[str] = []
         for parameter in reversed(updated):
             try:
@@ -5126,10 +5766,11 @@ def rotate_auth_key(
                 tailscale.revoke_auth_key(recovery_id)
             except Exception:
                 rollback_failures.append("new-auth-key")
-        try:
-            store.write(manifest)
-        except Exception:
-            rollback_failures.append("durable-manifest")
+        if not isinstance(error, ConcurrentLifecycleError):
+            try:
+                persist_rotation(manifest, "key-rotation rollback boundary")
+            except BaseException:
+                rollback_failures.append("durable-manifest")
         if rollback_failures:
             raise LifecycleError(
                 f"key rotation failed and rollback requires operator recovery for {','.join(rollback_failures)}"
@@ -5141,13 +5782,13 @@ def rotate_auth_key(
 
     try:
         tailscale.revoke_auth_key(old_id)
-    except Exception:
+    except BaseException:
         candidate["phase"] = "key_rotation_pending_old_key_revoke"
-        store.write(candidate)
+        persist_rotation(candidate, "key-rotation pending old-key revocation boundary")
         raise
     candidate["tailnet"]["pending_revoke_key_ids"] = []
     candidate["phase"] = "key_rotated"
-    store.write(candidate)
+    persist_rotation(candidate, "key-rotation completion boundary")
     return candidate
 
 
@@ -5439,7 +6080,871 @@ def protected_plan_path(run_dir: pathlib.Path, requested: pathlib.Path | None, f
     return path
 
 
-def validate_symmetric_saved_plan(document: Any, config: RunConfig) -> list[str]:
+def symmetric_managed_resource_addresses() -> set[str]:
+    addresses = {
+        "terraform_data.input_validation",
+        "aws_s3_bucket.artifact",
+        "aws_s3_bucket_public_access_block.artifact",
+        "aws_s3_bucket_ownership_controls.artifact",
+        "aws_s3_bucket_versioning.artifact",
+        "aws_s3_bucket_server_side_encryption_configuration.artifact",
+        "aws_s3_bucket_policy.artifact",
+        "aws_s3_object.envelope",
+        "aws_iam_role.flow_logs",
+        "aws_iam_role_policy.flow_logs",
+    }
+    for site in DEPLOYMENT_SITES:
+        addresses.update(
+            {
+                f"aws_iam_role.runtime_{site}",
+                f"aws_iam_role_policy.runtime_{site}",
+                f"aws_iam_instance_profile.runtime_{site}",
+                f"aws_iam_role.workload_{site}",
+                f"aws_iam_role_policy.workload_{site}",
+                f"aws_iam_instance_profile.workload_{site}",
+                f"aws_iam_role.transport_{site}",
+                f"aws_iam_role_policy.transport_{site}",
+                f"aws_iam_instance_profile.transport_{site}",
+                f"aws_vpc.{site}",
+                f"aws_internet_gateway.{site}",
+                f"aws_subnet.management_{site}",
+                f"aws_route_table.management_{site}",
+                f"aws_route_table_association.management_{site}",
+                f"aws_eip.nat_{site}",
+                f"aws_nat_gateway.{site}",
+                f"aws_route.management_default_{site}",
+                f"aws_lb.{site}",
+                f"aws_lb_target_group.{site}",
+                f"aws_lb_listener.{site}",
+                f"aws_vpc_endpoint_service.{site}",
+                f"aws_security_group.target_{site}",
+                f"aws_security_group.transport_{site}",
+                f"aws_cloudwatch_log_group.flow_{site}",
+                f"aws_flow_log.{site}",
+            }
+        )
+        for name in ("workload", "transport", "gwlbe", "gwlb", "target"):
+            addresses.add(f"aws_subnet.{name}_{site}")
+        for name in ("workload", "transport", "gwlbe", "target"):
+            addresses.add(f"aws_route_table.{name}_{site}")
+            addresses.add(f"aws_route_table_association.{name}_{site}")
+        for name in ("target_default", "transport_default", "workload_default"):
+            addresses.add(f"aws_route.{name}_{site}")
+        addresses.update(
+            {
+                f"aws_vpc_endpoint.{site}",
+                f"aws_route.workload_to_remote_{site}",
+                f"aws_route.transport_to_local_{site}",
+                f"aws_route.gwlbe_to_remote_{site}",
+                f"aws_security_group.workload_{site}",
+                f"aws_instance.envelope_target_{site}",
+                f"aws_instance.transport_router_{site}",
+                f"aws_instance.workload_{site}",
+                f"aws_lb_target_group_attachment.{site}",
+            }
+        )
+    return addresses
+
+
+def contract_values_equal(actual: Any, expected: Any) -> bool:
+    if isinstance(expected, dict):
+        return (
+            isinstance(actual, dict)
+            and set(actual) == set(expected)
+            and all(
+                contract_values_equal(actual[key], expected_value)
+                for key, expected_value in expected.items()
+            )
+        )
+    if isinstance(expected, list):
+        return (
+            isinstance(actual, list)
+            and len(actual) == len(expected)
+            and all(
+                contract_values_equal(actual_value, expected_value)
+                for actual_value, expected_value in zip(actual, expected, strict=True)
+            )
+        )
+    if type(expected) is float:
+        return (
+            not isinstance(actual, bool)
+            and isinstance(actual, (int, float))
+            and math.isfinite(float(actual))
+            and float(actual) == expected
+        )
+    return type(actual) is type(expected) and actual == expected
+
+
+def expected_transport_router_readiness_expectations(config: RunConfig) -> dict[str, Any]:
+    sites: dict[str, dict[str, Any]] = {}
+    for site in DEPLOYMENT_SITES:
+        contract = build_readiness_contract(
+            config.sites[site]["local_site_cidrs"],
+            config.sites[site]["remote_site_cidrs"],
+            "ens5",
+            "tailscale0",
+            config.raw["e2e_load_profile"]["maximum_tcp_mss"],
+        )
+        contract_sha256 = hashlib.sha256(
+            json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        sites[site] = {**contract, "contract_sha256": contract_sha256}
+    return {"config_version": 2, "sites": sites}
+
+
+def initial_transport_router_advertised_prefixes(
+    config: RunConfig,
+) -> dict[str, dict[str, str]]:
+    result: dict[str, dict[str, str]] = {}
+    selections = config.route_failover[
+        "initial_transport_router_az_by_gwlbe_az"
+    ]
+    for site in DEPLOYMENT_SITES:
+        assignments: dict[str, list[str]] = {
+            az_key: []
+            for az_key in config.sites[site]["transport_router_az_keys"]
+        }
+        for gwlbe_az, router_az in selections[site].items():
+            try:
+                assignments[router_az].append(
+                    config.sites[site]["workload_subnet_cidrs"][gwlbe_az]
+                )
+            except KeyError as error:
+                raise LifecycleError(
+                    f"{site} initial transport-router ownership is incomplete"
+                ) from error
+        if (
+            any(len(prefixes) != 1 for prefixes in assignments.values())
+            or len({prefix for prefixes in assignments.values() for prefix in prefixes})
+            != len(assignments)
+            or {
+                prefix for prefixes in assignments.values() for prefix in prefixes
+            }
+            != set(config.sites[site]["local_site_cidrs"])
+        ):
+            raise LifecycleError(
+                f"{site} initial transport-router advertisements do not partition local-site CIDRs"
+            )
+        result[site] = {
+            az_key: prefixes[0] for az_key, prefixes in assignments.items()
+        }
+    return result
+
+
+def expected_route_failover_output(
+    config: RunConfig,
+    transport_fleets: dict[str, dict[str, dict[str, str]]],
+) -> dict[str, Any]:
+    selections = config.route_failover[
+        "initial_transport_router_az_by_gwlbe_az"
+    ]
+    return {
+        "config_version": 2,
+        "mutation_timeout_seconds": config.route_failover[
+            "mutation_timeout_seconds"
+        ],
+        "restoration_timeout_seconds": config.route_failover[
+            "restoration_timeout_seconds"
+        ],
+        "recovery_timeout_seconds": config.route_failover[
+            "recovery_timeout_seconds"
+        ],
+        "same_az_preferred": {
+            site: all(
+                gwlbe_az == transport_az
+                for gwlbe_az, transport_az in selections[site].items()
+            )
+            for site in DEPLOYMENT_SITES
+        },
+        "sites": {
+            site: {
+                gwlbe_az: {
+                    "route_table_id": transport_fleets[site][gwlbe_az][
+                        "gwlbe_route_table_id"
+                    ],
+                    "source_workload_prefix": config.sites[site][
+                        "workload_subnet_cidrs"
+                    ][gwlbe_az],
+                    "remote_site_cidrs": sorted(
+                        config.sites[site]["remote_site_cidrs"]
+                    ),
+                    "initial_transport_router_az_key": transport_az,
+                    "initial_network_interface_id": transport_fleets[site][
+                        transport_az
+                    ]["network_interface_id"],
+                }
+                for gwlbe_az, transport_az in selections[site].items()
+            }
+            for site in DEPLOYMENT_SITES
+        },
+    }
+
+
+def expected_symmetric_cost_profile(config: RunConfig) -> dict[str, Any]:
+    return {
+        "profile": "symmetric-gwlb-ha-v2",
+        "estimated_fixed_hourly_usd": config.raw["cost"][
+            "estimated_fixed_hourly_usd"
+        ],
+        "approved_max_hourly_usd": config.raw["cost"][
+            "approved_max_fixed_hourly_usd"
+        ],
+        "resource_counts": {
+            "gwlbe_endpoints": sum(
+                len(config.sites[site]["azs"]) for site in DEPLOYMENT_SITES
+            ),
+            "target_instances": {
+                site: len(config.sites[site]["target_az_keys"])
+                for site in DEPLOYMENT_SITES
+            },
+            "transport_routers": {
+                site: len(config.sites[site]["transport_router_az_keys"])
+                for site in DEPLOYMENT_SITES
+            },
+            "workload_instances": len(DEPLOYMENT_SITES) * len(WORKLOAD_ROLES),
+            "nat_gateways": len(DEPLOYMENT_SITES),
+            "elastic_ips": len(DEPLOYMENT_SITES),
+            "gateway_load_balancers": len(DEPLOYMENT_SITES),
+            "vpc_flow_logs": len(DEPLOYMENT_SITES),
+            "cloudwatch_log_groups": len(DEPLOYMENT_SITES),
+            "flow_log_iam_roles": 1,
+            "iam_roles": {
+                "target": len(DEPLOYMENT_SITES),
+                "workload": len(DEPLOYMENT_SITES),
+                "transport": len(DEPLOYMENT_SITES),
+                "flow_log": 1,
+            },
+            "iam_instance_profiles": {
+                "target": len(DEPLOYMENT_SITES),
+                "workload": len(DEPLOYMENT_SITES),
+                "transport": len(DEPLOYMENT_SITES),
+            },
+        },
+        "route_failover_bounds": {
+            field: config.route_failover[field]
+            for field in (
+                "mutation_timeout_seconds",
+                "restoration_timeout_seconds",
+                "recovery_timeout_seconds",
+            )
+        },
+        "nat_topology_limit": {
+            "gateways_per_site": 1,
+            "expanded_for_ha": False,
+            "placement": (
+                "one shared NAT gateway in each site's single management subnet"
+            ),
+            "limitation": (
+                "private egress is not multi-AZ within a site and remains outside the "
+                "protected data path"
+            ),
+        },
+    }
+
+
+def symmetric_topology_fleets(
+    value: Any,
+    config: RunConfig,
+    target_groups: dict[str, str],
+) -> tuple[dict[str, tuple[str, ...]], dict[str, dict[str, dict[str, str]]]]:
+    if not isinstance(value, dict) or set(value) != {
+        "config_version",
+        "run_id",
+        "route_failover",
+        "sites",
+    }:
+        raise LifecycleError("deployment output symmetric_topology has an invalid shape")
+    if (
+        type(value["config_version"]) is not int
+        or value["config_version"] != 2
+        or value["run_id"] != config.run_id
+        or not contract_values_equal(value["route_failover"], config.route_failover)
+    ):
+        raise LifecycleError("deployment output symmetric_topology has an invalid version or run identity")
+    sites = value["sites"]
+    if not isinstance(sites, dict) or set(sites) != set(DEPLOYMENT_SITES):
+        raise LifecycleError("deployment output symmetric_topology.sites must contain exactly west and east")
+    if not isinstance(target_groups, dict) or set(target_groups) != set(DEPLOYMENT_SITES):
+        raise LifecycleError("deployment target groups must contain exactly west and east")
+
+    target_result: dict[str, tuple[str, ...]] = {}
+    transport_result: dict[str, dict[str, dict[str, str]]] = {}
+    all_target_ids: list[str] = []
+    all_transport_ids: list[str] = []
+    all_network_interface_ids: list[str] = []
+    all_route_table_ids: list[str] = []
+    site_fields = {
+        "region",
+        "local_site_cidrs",
+        "remote_site_cidrs",
+        "target_fleet",
+        "transport_router_fleet",
+    }
+    target_fields = {"region", "az_key", "instance_id", "target_group_arn"}
+    transport_fields = {
+        "region",
+        "az_key",
+        "instance_id",
+        "network_interface_id",
+        "gwlbe_route_table_id",
+        "advertised_prefix",
+    }
+    advertised_prefixes = initial_transport_router_advertised_prefixes(config)
+    for site in DEPLOYMENT_SITES:
+        site_value = sites[site]
+        expected = config.sites[site]
+        if (
+            not isinstance(site_value, dict)
+            or set(site_value) != site_fields
+            or site_value["region"] != expected["region"]
+            or site_value["local_site_cidrs"]
+            != sorted(expected["local_site_cidrs"])
+            or site_value["remote_site_cidrs"]
+            != sorted(expected["remote_site_cidrs"])
+        ):
+            raise LifecycleError(f"deployment output symmetric_topology.sites.{site} contradicts the run config")
+
+        target_fleet = site_value["target_fleet"]
+        expected_target_az_keys = set(expected["target_az_keys"])
+        if not isinstance(target_fleet, list) or len(target_fleet) != len(expected_target_az_keys):
+            raise LifecycleError(f"deployment output symmetric_topology.sites.{site}.target_fleet has invalid capacity")
+        target_ids: list[str] = []
+        target_az_keys: list[str] = []
+        for member in target_fleet:
+            if (
+                not isinstance(member, dict)
+                or set(member) != target_fields
+                or member["region"] != expected["region"]
+                or not isinstance(member["az_key"], str)
+                or member["az_key"] not in expected_target_az_keys
+                or member["target_group_arn"] != target_groups[site]
+                or not isinstance(member["instance_id"], str)
+                or not DEPLOYMENT_INSTANCE_ID_RE.fullmatch(member["instance_id"])
+                or redact(member["instance_id"]) != member["instance_id"]
+            ):
+                raise LifecycleError(
+                    f"deployment output symmetric_topology.sites.{site}.target_fleet has an invalid member"
+                )
+            target_ids.append(member["instance_id"])
+            target_az_keys.append(member["az_key"])
+        if set(target_az_keys) != expected_target_az_keys or len(set(target_ids)) != len(target_ids):
+            raise LifecycleError(
+                f"deployment output symmetric_topology.sites.{site}.target_fleet does not cover each configured AZ"
+            )
+
+        transport_fleet = site_value["transport_router_fleet"]
+        expected_transport_az_keys = set(expected["transport_router_az_keys"])
+        if not isinstance(transport_fleet, list) or len(transport_fleet) != len(expected_transport_az_keys):
+            raise LifecycleError(
+                f"deployment output symmetric_topology.sites.{site}.transport_router_fleet has invalid capacity"
+            )
+        transport_members: dict[str, dict[str, str]] = {}
+        for member in transport_fleet:
+            if (
+                not isinstance(member, dict)
+                or set(member) != transport_fields
+                or member["region"] != expected["region"]
+                or not isinstance(member["az_key"], str)
+                or member["az_key"] not in expected_transport_az_keys
+                or not isinstance(member["instance_id"], str)
+                or not DEPLOYMENT_INSTANCE_ID_RE.fullmatch(member["instance_id"])
+                or not isinstance(member["network_interface_id"], str)
+                or not DEPLOYMENT_NETWORK_INTERFACE_ID_RE.fullmatch(member["network_interface_id"])
+                or not isinstance(member["gwlbe_route_table_id"], str)
+                or not DEPLOYMENT_ROUTE_TABLE_ID_RE.fullmatch(member["gwlbe_route_table_id"])
+                or member.get("advertised_prefix")
+                != advertised_prefixes[site].get(str(member.get("az_key", "")))
+                or any(redact(str(item)) != item for item in member.values() if isinstance(item, str))
+                or member["az_key"] in transport_members
+            ):
+                raise LifecycleError(
+                    f"deployment output symmetric_topology.sites.{site}.transport_router_fleet has an invalid member"
+                )
+            transport_members[member["az_key"]] = {
+                key: str(member[key]) for key in transport_fields
+            }
+        if set(transport_members) != expected_transport_az_keys:
+            raise LifecycleError(
+                f"deployment output symmetric_topology.sites.{site}.transport_router_fleet does not cover each configured AZ"
+            )
+        if {
+            member["advertised_prefix"] for member in transport_members.values()
+        } != set(expected["local_site_cidrs"]):
+            raise LifecycleError(
+                f"deployment output symmetric_topology.sites.{site}.transport_router_fleet does not partition local-site CIDRs"
+            )
+
+        target_result[site] = tuple(target_ids)
+        transport_result[site] = transport_members
+        all_target_ids.extend(target_ids)
+        all_transport_ids.extend(member["instance_id"] for member in transport_members.values())
+        all_network_interface_ids.extend(
+            member["network_interface_id"] for member in transport_members.values()
+        )
+        all_route_table_ids.extend(member["gwlbe_route_table_id"] for member in transport_members.values())
+    if len(set(all_target_ids)) != len(all_target_ids):
+        raise LifecycleError("deployment output symmetric target fleets contain duplicate instance identities")
+    if (
+        len(set(all_transport_ids)) != len(all_transport_ids)
+        or len(set(all_network_interface_ids)) != len(all_network_interface_ids)
+        or len(set(all_route_table_ids)) != len(all_route_table_ids)
+        or set(all_target_ids).intersection(all_transport_ids)
+    ):
+        raise LifecycleError("deployment output symmetric transport fleets contain duplicate identities")
+    return target_result, transport_result
+
+
+_OUTPUT_VALUE_MISSING = object()
+
+
+def computed_output_value(pattern: re.Pattern[str]) -> tuple[str, re.Pattern[str]]:
+    return ("computed", pattern)
+
+
+def symmetric_computed_output_schemas(config: RunConfig) -> dict[str, Any]:
+    vpc_id = computed_output_value(re.compile(r"vpc-[A-Za-z0-9][A-Za-z0-9-]{0,127}"))
+    endpoint_id = computed_output_value(re.compile(r"vpce-[A-Za-z0-9][A-Za-z0-9-]{0,127}"))
+    flow_log_id = computed_output_value(re.compile(r"fl-[A-Za-z0-9][A-Za-z0-9-]{0,127}"))
+    private_ip = computed_output_value(re.compile(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}"))
+    instance_id = computed_output_value(DEPLOYMENT_INSTANCE_ID_RE)
+    subnet_id = computed_output_value(DEPLOYMENT_SUBNET_ID_RE)
+    route_table_id = computed_output_value(DEPLOYMENT_ROUTE_TABLE_ID_RE)
+    network_interface_id = computed_output_value(DEPLOYMENT_NETWORK_INTERFACE_ID_RE)
+    target_group_arn = computed_output_value(DEPLOYMENT_TARGET_GROUP_ARN_RE)
+
+    workload_instances: dict[str, Any] = {}
+    symmetric_sites: dict[str, Any] = {}
+    failover_sites: dict[str, Any] = {}
+    flow_log_evidence: dict[str, Any] = {}
+    for site in DEPLOYMENT_SITES:
+        site_config = config.sites[site]
+        az_keys = sorted(site_config["azs"])
+        workload_instances[site] = {
+            role: {
+                "instance_id": instance_id,
+                "private_ip": private_ip,
+                "az_key": az_key,
+                "availability_zone": site_config["azs"][az_key],
+                "subnet_id": subnet_id,
+                "cidr": site_config["workload_subnet_cidrs"][az_key],
+                "route_table_id": route_table_id,
+            }
+            for role, az_key in zip(WORKLOAD_ROLES, az_keys, strict=True)
+        }
+        symmetric_sites[site] = {
+            "region": site_config["region"],
+            "local_site_cidrs": sorted(site_config["local_site_cidrs"]),
+            "remote_site_cidrs": sorted(site_config["remote_site_cidrs"]),
+            "target_fleet": [
+                {
+                    "region": site_config["region"],
+                    "az_key": az_key,
+                    "instance_id": instance_id,
+                    "target_group_arn": target_group_arn,
+                }
+                for az_key in sorted(site_config["target_az_keys"])
+            ],
+            "transport_router_fleet": [
+                {
+                    "region": site_config["region"],
+                    "az_key": az_key,
+                    "instance_id": instance_id,
+                    "network_interface_id": network_interface_id,
+                    "gwlbe_route_table_id": route_table_id,
+                    "advertised_prefix": site_config["workload_subnet_cidrs"][
+                        az_key
+                    ],
+                }
+                for az_key in sorted(site_config["transport_router_az_keys"])
+            ],
+        }
+        selections = config.route_failover[
+            "initial_transport_router_az_by_gwlbe_az"
+        ][site]
+        failover_sites[site] = {
+            gwlbe_az: {
+                "route_table_id": route_table_id,
+                "source_workload_prefix": site_config["workload_subnet_cidrs"][
+                    gwlbe_az
+                ],
+                "remote_site_cidrs": sorted(site_config["remote_site_cidrs"]),
+                "initial_transport_router_az_key": transport_az,
+                "initial_network_interface_id": network_interface_id,
+            }
+            for gwlbe_az, transport_az in sorted(selections.items())
+        }
+        flow_log_evidence[site] = {
+            "flow_log_id": flow_log_id,
+            "log_group_arn": computed_output_value(
+                re.compile(
+                    rf"arn:aws:logs:{re.escape(site_config['region'])}:[0-9]{{12}}:"
+                    rf"log-group:/aws/vpc-flow-logs/{re.escape(config.run_id)}/{site}"
+                )
+            ),
+            "region": site_config["region"],
+        }
+
+    return {
+        "vpc_ids": {site: vpc_id for site in DEPLOYMENT_SITES},
+        "gwlb_target_group_arns": {
+            site: target_group_arn for site in DEPLOYMENT_SITES
+        },
+        "gwlb_endpoint_ids": {
+            site: {
+                az_key: endpoint_id for az_key in sorted(config.sites[site]["azs"])
+            }
+            for site in DEPLOYMENT_SITES
+        },
+        "workload_instances": workload_instances,
+        "flow_log_evidence": flow_log_evidence,
+        "symmetric_topology": {
+            "config_version": 2,
+            "run_id": config.run_id,
+            "route_failover": config.route_failover,
+            "sites": symmetric_sites,
+        },
+        "route_failover": {
+            "config_version": 2,
+            "mutation_timeout_seconds": config.route_failover[
+                "mutation_timeout_seconds"
+            ],
+            "restoration_timeout_seconds": config.route_failover[
+                "restoration_timeout_seconds"
+            ],
+            "recovery_timeout_seconds": config.route_failover[
+                "recovery_timeout_seconds"
+            ],
+            "same_az_preferred": {
+                site: all(
+                    gwlbe_az == transport_az
+                    for gwlbe_az, transport_az in config.route_failover[
+                        "initial_transport_router_az_by_gwlbe_az"
+                    ][site].items()
+                )
+                for site in DEPLOYMENT_SITES
+            },
+            "sites": failover_sites,
+        },
+    }
+
+
+def output_change_matches_schema(after: Any, after_unknown: Any, schema: Any) -> bool:
+    def unknown_absent(value: Any) -> bool:
+        return value is _OUTPUT_VALUE_MISSING or value is False or value == {}
+
+    def visit(after_value: Any, unknown_value: Any, expected: Any) -> bool:
+        if (
+            isinstance(expected, tuple)
+            and len(expected) == 2
+            and expected[0] == "computed"
+            and isinstance(expected[1], re.Pattern)
+        ):
+            if unknown_value is True:
+                return after_value is _OUTPUT_VALUE_MISSING or after_value is None
+            return (
+                unknown_absent(unknown_value)
+                and isinstance(after_value, str)
+                and expected[1].fullmatch(after_value) is not None
+                and redact(after_value) == after_value
+            )
+        if isinstance(expected, dict):
+            if not isinstance(after_value, dict) or set(after_value) - set(expected):
+                return False
+            if unknown_absent(unknown_value):
+                unknown_items: dict[str, Any] = {}
+            elif isinstance(unknown_value, dict) and not set(unknown_value) - set(expected):
+                unknown_items = unknown_value
+            else:
+                return False
+            return all(
+                visit(
+                    after_value.get(key, _OUTPUT_VALUE_MISSING),
+                    unknown_items.get(key, _OUTPUT_VALUE_MISSING),
+                    child,
+                )
+                for key, child in expected.items()
+            )
+        if isinstance(expected, list):
+            if not isinstance(after_value, list) or len(after_value) != len(expected):
+                return False
+            if unknown_absent(unknown_value):
+                unknown_items = [_OUTPUT_VALUE_MISSING] * len(expected)
+            elif isinstance(unknown_value, list) and len(unknown_value) == len(expected):
+                unknown_items = unknown_value
+            else:
+                return False
+            return all(
+                visit(after_item, unknown_item, expected_item)
+                for after_item, unknown_item, expected_item in zip(
+                    after_value, unknown_items, expected, strict=True
+                )
+            )
+        return (
+            after_value is not _OUTPUT_VALUE_MISSING
+            and unknown_absent(unknown_value)
+            and contract_values_equal(after_value, expected)
+        )
+
+    return visit(after, after_unknown, schema)
+
+
+def output_has_unknown(value: Any) -> bool:
+    if value is True:
+        return True
+    if isinstance(value, dict):
+        return any(output_has_unknown(child) for child in value.values())
+    if isinstance(value, list):
+        return any(output_has_unknown(child) for child in value)
+    return False
+
+
+def symmetric_output_reference_roots() -> dict[str, set[str]]:
+    return {
+        "artifact_identity": {
+            "local.artifact_bucket_name",
+            "local.artifact_object_key",
+            "local.ec2_architecture",
+            "var.architecture",
+            "var.artifact_revision",
+            "var.artifact_sha256",
+            "var.artifact_version",
+        },
+        "vpc_ids": {"aws_vpc.west", "aws_vpc.east"},
+        "gwlb_target_group_arns": {
+            "aws_lb_target_group.west",
+            "aws_lb_target_group.east",
+        },
+        "gwlb_endpoint_ids": {
+            "aws_vpc_endpoint.west",
+            "aws_vpc_endpoint.east",
+        },
+        "workload_instances": {
+            "local.workload_roles",
+            "local.sites",
+            "aws_instance.workload_west",
+            "aws_instance.workload_east",
+            "aws_subnet.workload_west",
+            "aws_subnet.workload_east",
+            "aws_route_table.workload_west",
+            "aws_route_table.workload_east",
+        },
+        "flow_log_evidence": {
+            "aws_flow_log.west",
+            "aws_flow_log.east",
+            "aws_cloudwatch_log_group.flow_west",
+            "aws_cloudwatch_log_group.flow_east",
+            "var.west_region",
+            "var.east_region",
+        },
+        "e2e_load_profile": {"var.e2e_load_profile"},
+        "symmetric_topology": {
+            "var.symmetric_topology",
+            "var.name",
+            "var.west_region",
+            "var.east_region",
+            "local.route_failover",
+            "local.sites",
+            "local.initial_transport_router_advertise_routes",
+            "aws_instance.envelope_target_west",
+            "aws_instance.envelope_target_east",
+            "aws_lb_target_group.west",
+            "aws_lb_target_group.east",
+            "aws_instance.transport_router_west",
+            "aws_instance.transport_router_east",
+            "aws_route_table.gwlbe_west",
+            "aws_route_table.gwlbe_east",
+        },
+        "envelope_runtime_config": {
+            "local.sites",
+            "local.packet_return_runtime",
+        },
+        "transport_router_readiness_expectations": {
+            "local.transport_router_contracts",
+            "local.transport_router_contract_sha256",
+        },
+        "route_failover": {
+            "local.route_failover",
+            "local.sites",
+            "aws_route_table.gwlbe_west",
+            "aws_route_table.gwlbe_east",
+            "aws_instance.transport_router_west",
+            "aws_instance.transport_router_east",
+        },
+        "cost_profile": {
+            "var.estimated_fixed_hourly_usd",
+            "var.approved_max_fixed_hourly_usd",
+            "local.route_failover",
+            "aws_vpc_endpoint.west",
+            "aws_vpc_endpoint.east",
+            "aws_instance.envelope_target_west",
+            "aws_instance.envelope_target_east",
+            "aws_instance.transport_router_west",
+            "aws_instance.transport_router_east",
+            "aws_instance.workload_west",
+            "aws_instance.workload_east",
+            "aws_nat_gateway.west",
+            "aws_nat_gateway.east",
+            "aws_eip.nat_west",
+            "aws_eip.nat_east",
+            "aws_lb.west",
+            "aws_lb.east",
+            "aws_flow_log.west",
+            "aws_flow_log.east",
+            "aws_cloudwatch_log_group.flow_west",
+            "aws_cloudwatch_log_group.flow_east",
+            "aws_iam_role.flow_logs",
+            "aws_iam_role.runtime_west",
+            "aws_iam_role.runtime_east",
+            "aws_iam_role.workload_west",
+            "aws_iam_role.workload_east",
+            "aws_iam_role.transport_west",
+            "aws_iam_role.transport_east",
+            "aws_iam_instance_profile.runtime_west",
+            "aws_iam_instance_profile.runtime_east",
+            "aws_iam_instance_profile.workload_west",
+            "aws_iam_instance_profile.workload_east",
+            "aws_iam_instance_profile.transport_west",
+            "aws_iam_instance_profile.transport_east",
+        },
+    }
+
+
+def output_reference_root(value: str) -> str | None:
+    match = re.match(r"((?:aws|terraform)_[^.]+\.[^.\[]+)", value)
+    if match is not None:
+        return match.group(1)
+    match = re.match(r"((?:local|var)\.[^.\[]+)", value)
+    if match is not None:
+        return match.group(1)
+    match = re.match(r"(data\.[^.]+\.[^.\[]+)", value)
+    return match.group(1) if match is not None else None
+
+
+def valid_symmetric_artifact_identity(artifact: Any, config: RunConfig) -> bool:
+    artifact_account = config.sites["west"]["ssm_kms_key_arn"].split(":", 5)[4]
+    artifact_fields = {
+        "bucket",
+        "key",
+        "sha256",
+        "architecture",
+        "ec2_arch",
+        "revision",
+        "version",
+    }
+    return (
+        isinstance(artifact, dict)
+        and set(artifact) == artifact_fields
+        and all(isinstance(artifact[field], str) for field in artifact_fields)
+        and artifact.get("architecture") == config.architecture
+        and artifact.get("ec2_arch") == ARCHITECTURES[config.architecture]
+        and re.fullmatch(r"[0-9a-f]{64}", str(artifact.get("sha256", "")))
+        is not None
+        and re.fullmatch(r"[0-9a-f]{40}", str(artifact.get("revision", "")))
+        is not None
+        and re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}", str(artifact.get("version", ""))
+        )
+        is not None
+        and artifact.get("bucket")
+        == f"{config.run_id}-{artifact_account}-{config.sites['west']['region']}-artifact"
+        and artifact.get("key")
+        == f"artifacts/{artifact.get('revision')}/envelope-linux-{config.architecture}"
+    )
+
+
+def validate_complete_symmetric_output_values(
+    outputs: Any, config: RunConfig
+) -> list[str]:
+    """Require the complete concrete 12-output contract after Terraform apply."""
+
+    if not isinstance(outputs, dict):
+        return ["saved plan omits planned outputs"]
+    failures: list[str] = []
+    if set(outputs) != SYMMETRIC_DEPLOYMENT_OUTPUT_FIELDS or any(
+        not isinstance(wrapper, dict) or "value" not in wrapper
+        for wrapper in outputs.values()
+    ):
+        failures.append(
+            "saved plan does not declare the complete symmetric deployment output contract"
+        )
+    values = {
+        name: wrapper.get("value") if isinstance(wrapper, dict) else None
+        for name, wrapper in outputs.items()
+    }
+    runtime = values.get("envelope_runtime_config")
+    cost = values.get("cost_profile")
+    artifact = values.get("artifact_identity")
+    load_profile = values.get("e2e_load_profile")
+    if not isinstance(runtime, dict) or set(runtime) != set(DEPLOYMENT_SITES):
+        failures.append("saved plan omits symmetric runtime identities")
+    else:
+        for site in DEPLOYMENT_SITES:
+            expected_runtime = {
+                "config_version": 2,
+                **config.raw["envelope"],
+                "artifact_sha256": artifact.get("sha256")
+                if isinstance(artifact, dict)
+                else None,
+                "artifact_revision": artifact.get("revision")
+                if isinstance(artifact, dict)
+                else None,
+            }
+            if not contract_values_equal(runtime.get(site), expected_runtime):
+                failures.append(
+                    f"saved plan {site} runtime is not the canonical packet-return configuration"
+                )
+    if not contract_values_equal(cost, expected_symmetric_cost_profile(config)):
+        failures.append("saved plan does not declare the symmetric HA cost profile")
+    if not valid_symmetric_artifact_identity(artifact, config):
+        failures.append("saved plan omits a valid reviewed artifact identity")
+    if not contract_values_equal(load_profile, config.raw["e2e_load_profile"]):
+        failures.append(
+            "saved plan load profile differs from the protected configuration"
+        )
+
+    schemas = symmetric_computed_output_schemas(config)
+    for name, schema in schemas.items():
+        if not output_change_matches_schema(values.get(name), False, schema):
+            failures.append(
+                f"saved plan {name} does not contain a complete concrete output value"
+            )
+
+    concrete_transport_members: dict[str, dict[str, dict[str, str]]] | None = None
+    try:
+        _planned_targets, concrete_transport_members = symmetric_topology_fleets(
+            values.get("symmetric_topology"),
+            config,
+            values.get("gwlb_target_group_arns"),
+        )
+    except LifecycleError as error:
+        failures.append(str(error).replace("deployment output", "saved plan output"))
+
+    if not contract_values_equal(
+        values.get("transport_router_readiness_expectations"),
+        expected_transport_router_readiness_expectations(config),
+    ):
+        failures.append(
+            "saved plan transport-router readiness expectations differ from the exact reviewed contract"
+        )
+    if concrete_transport_members is not None and not contract_values_equal(
+        values.get("route_failover"),
+        expected_route_failover_output(config, concrete_transport_members),
+    ):
+        failures.append(
+            "saved plan route_failover output differs from the exact reviewed bounds and route identities"
+        )
+    return failures
+
+
+def validate_symmetric_saved_plan(
+    document: Any,
+    config: RunConfig,
+    *,
+    validate_resource_graph: bool = True,
+    replace_address: str | None = None,
+    replace_instance_id: str | None = None,
+    replace_target_group_arn: str | None = None,
+) -> list[str]:
     """Check the reviewed v2 output contract before a protected apply."""
 
     if not isinstance(document, dict):
@@ -5448,48 +6953,1476 @@ def validate_symmetric_saved_plan(document: Any, config: RunConfig) -> list[str]
     outputs = planned.get("outputs") if isinstance(planned, dict) else None
     if not isinstance(outputs, dict):
         return ["saved plan omits planned outputs"]
-    required_outputs = {
-        "artifact_identity",
-        "cost_profile",
-        "e2e_load_profile",
-        "envelope_runtime_config",
-        "flow_log_evidence",
-        "gwlb_endpoint_ids",
-        "gwlb_target_group_arns",
-        "instance_ids",
-        "symmetric_topology",
-        "vpc_ids",
-        "workload_instances",
-    }
-    runtime = outputs.get("envelope_runtime_config", {}).get("value") if isinstance(outputs.get("envelope_runtime_config"), dict) else None
-    cost = outputs.get("cost_profile", {}).get("value") if isinstance(outputs.get("cost_profile"), dict) else None
-    artifact = outputs.get("artifact_identity", {}).get("value") if isinstance(outputs.get("artifact_identity"), dict) else None
+    configuration = document.get("configuration")
+    configured_root = (
+        configuration.get("root_module") if isinstance(configuration, dict) else None
+    )
+    configured_outputs = (
+        configured_root.get("outputs") if isinstance(configured_root, dict) else None
+    )
+    output_changes = document.get("output_changes")
     failures: list[str] = []
-    if set(outputs) != required_outputs:
-        failures.append("saved plan does not declare the complete symmetric deployment output contract")
-    if not isinstance(runtime, dict) or set(runtime) != set(DEPLOYMENT_SITES):
-        failures.append("saved plan omits symmetric runtime identities")
-    else:
-        for site in DEPLOYMENT_SITES:
-            value = runtime.get(site)
-            expected = config.sites[site]
-            if not isinstance(value, dict) or any(
-                value.get(key) != expected_value
-                for key, expected_value in {
-                    "config_version": 2,
-                    "local_site_cidrs": expected["local_site_cidrs"],
-                    "remote_site_cidrs": expected["remote_site_cidrs"],
-                }.items()
-            ):
-                failures.append(f"saved plan {site} runtime does not match symmetric topology v2")
-    if not isinstance(cost, dict) or cost.get("profile") != "symmetric-gwlb-ha-v2":
-        failures.append("saved plan does not declare the symmetric HA cost profile")
-    if not isinstance(artifact, dict) or artifact.get("architecture") != config.architecture or artifact.get(
-        "ec2_arch"
-    ) != ARCHITECTURES[config.architecture] or not re.fullmatch(r"[0-9a-f]{64}", str(artifact.get("sha256", ""))) or not re.fullmatch(
-        r"[0-9a-f]{40}", str(artifact.get("revision", ""))
+    expected_output_names = set(SYMMETRIC_DEPLOYMENT_OUTPUT_FIELDS)
+    if (
+        set(outputs) != expected_output_names
+        or not isinstance(configured_outputs, dict)
+        or set(configured_outputs) != expected_output_names
+        or not isinstance(output_changes, dict)
+        or set(output_changes) != expected_output_names
     ):
+        failures.append(
+            "saved plan does not declare the complete symmetric deployment output contract"
+        )
+
+    expected_reference_roots = symmetric_output_reference_roots()
+    after_values: dict[str, Any] = {}
+    after_unknown_values: dict[str, Any] = {}
+    for name in sorted(expected_output_names):
+        wrapper = outputs.get(name)
+        declaration = (
+            configured_outputs.get(name)
+            if isinstance(configured_outputs, dict)
+            else None
+        )
+        expression = declaration.get("expression") if isinstance(declaration, dict) else None
+        raw_references = expression.get("references") if isinstance(expression, dict) else None
+        roots = (
+            [output_reference_root(reference) for reference in raw_references]
+            if isinstance(raw_references, list)
+            and all(isinstance(reference, str) for reference in raw_references)
+            else []
+        )
+        declaration_valid = (
+            isinstance(declaration, dict)
+            and set(declaration) in ({"expression"}, {"expression", "sensitive"})
+            and declaration.get("sensitive", False) is False
+            and isinstance(expression, dict)
+            and set(expression) == {"references"}
+            and bool(raw_references)
+            and all(root is not None for root in roots)
+            and set(roots) == expected_reference_roots[name]
+        )
+        if not declaration_valid:
+            failures.append(
+                f"saved plan {name} output expression is not bound to the exact authorized references"
+            )
+
+        change = output_changes.get(name) if isinstance(output_changes, dict) else None
+        change_keys = {
+            "actions",
+            "before",
+            "after",
+            "after_unknown",
+            "before_sensitive",
+            "after_sensitive",
+        }
+        actions_value = change.get("actions") if isinstance(change, dict) else None
+        allowed_actions = (
+            (["no-op"], ["update"])
+            if replace_address is not None
+            else (["create"],)
+        )
+        base_change_valid = (
+            isinstance(change, dict)
+            and set(change) == change_keys
+            and actions_value in allowed_actions
+            and change.get("before_sensitive") is False
+            and change.get("after_sensitive") is False
+            and (
+                change.get("before") is not None
+                if replace_address is not None
+                else change.get("before") is None
+            )
+            and (
+                actions_value != ["no-op"]
+                or (
+                    contract_values_equal(change.get("before"), change.get("after"))
+                    and not output_has_unknown(change.get("after_unknown"))
+                )
+            )
+        )
+        if not base_change_valid:
+            failures.append(
+                f"saved plan {name} output change does not have the exact protected action shape"
+            )
+        if isinstance(change, dict):
+            after_values[name] = change.get("after")
+            after_unknown_values[name] = change.get("after_unknown")
+
+        wrapper_valid = (
+            isinstance(wrapper, dict)
+            and set(wrapper).issubset({"sensitive", "type", "value"})
+            and wrapper.get("sensitive") is False
+        )
+        has_unknown = (
+            output_has_unknown(change.get("after_unknown"))
+            if isinstance(change, dict)
+            else False
+        )
+        if wrapper_valid and isinstance(change, dict):
+            if "value" in wrapper:
+                wrapper_valid = contract_values_equal(
+                    wrapper["value"], change.get("after")
+                )
+            elif not has_unknown:
+                wrapper_valid = False
+        if not wrapper_valid:
+            failures.append(
+                f"saved plan {name} planned output wrapper contradicts its known/unknown change"
+            )
+
+    artifact = after_values.get("artifact_identity")
+    if not valid_symmetric_artifact_identity(artifact, config):
         failures.append("saved plan omits a valid reviewed artifact identity")
+    expected_known_outputs = {
+        "artifact_identity": artifact,
+        "envelope_runtime_config": {
+            site: {
+                "config_version": 2,
+                **config.raw["envelope"],
+                "artifact_sha256": artifact.get("sha256")
+                if isinstance(artifact, dict)
+                else None,
+                "artifact_revision": artifact.get("revision")
+                if isinstance(artifact, dict)
+                else None,
+            }
+            for site in DEPLOYMENT_SITES
+        },
+        "e2e_load_profile": config.raw["e2e_load_profile"],
+        "transport_router_readiness_expectations": expected_transport_router_readiness_expectations(
+            config
+        ),
+        "cost_profile": expected_symmetric_cost_profile(config),
+    }
+    known_failures = {
+        "envelope_runtime_config": "saved plan runtime is not the canonical packet-return configuration",
+        "e2e_load_profile": "saved plan load profile differs from the protected configuration",
+        "transport_router_readiness_expectations": (
+            "saved plan transport-router readiness expectations differ from the exact reviewed contract"
+        ),
+        "cost_profile": "saved plan does not declare the symmetric HA cost profile",
+    }
+    for name, expected in expected_known_outputs.items():
+        if (
+            not contract_values_equal(after_values.get(name), expected)
+            or output_has_unknown(after_unknown_values.get(name))
+        ):
+            if name != "artifact_identity":
+                failures.append(known_failures[name])
+
+    for name, schema in symmetric_computed_output_schemas(config).items():
+        if not output_change_matches_schema(
+            after_values.get(name), after_unknown_values.get(name), schema
+        ):
+            failures.append(
+                f"saved plan {name} output change has an invalid known/unknown shape"
+            )
+
+    concrete_transport_members: dict[str, dict[str, dict[str, str]]] | None = None
+    if not validate_resource_graph:
+        return failures
+    plan_variables = document.get("variables")
+    if (
+        not isinstance(plan_variables, dict)
+        or set(plan_variables) != TERRAFORM_PLAN_VARIABLE_FIELDS
+        or any(
+            not isinstance(wrapper, dict) or set(wrapper) != {"value"}
+            for wrapper in plan_variables.values()
+        )
+    ):
+        failures.append("saved plan Terraform variable schema contains obsolete or unsupported inputs")
+    elif (
+        plan_variables["symmetric_topology"]["value"]
+        != {
+            "version": 2,
+            "sites": config.sites,
+            "route_failover": config.route_failover,
+        }
+        or plan_variables["e2e_load_profile"]["value"] != config.raw["e2e_load_profile"]
+        or plan_variables["envelope_tailscale_iface"]["value"] != "tailscale0"
+        or plan_variables["envelope_underlay_interface"]["value"] != "ens5"
+        or plan_variables["estimated_fixed_hourly_usd"]["value"]
+        != config.raw["cost"]["estimated_fixed_hourly_usd"]
+        or plan_variables["approved_max_fixed_hourly_usd"]["value"]
+        != config.raw["cost"]["approved_max_fixed_hourly_usd"]
+    ):
+        failures.append("saved plan Terraform variables differ from the protected transport topology")
+    if (
+        document.get("applyable") is not True
+        or document.get("complete") is not True
+        or document.get("errored") is not False
+    ):
+        failures.append("saved plan is not complete, applyable, and error-free")
+    deferred = document.get("deferred_changes", [])
+    if not isinstance(deferred, list) or deferred:
+        failures.append("saved plan contains deferred resource changes")
+    changes = document.get("resource_changes")
+    if not isinstance(changes, list) or not all(isinstance(change, dict) for change in changes):
+        failures.append("saved plan omits its exact resource change graph")
+        return failures
+    managed_changes = [change for change in changes if change.get("mode", "managed") == "managed"]
+
+    def planned_resource_addresses(module: Any) -> set[str] | None:
+        if not isinstance(module, dict):
+            return None
+        resources = module.get("resources", [])
+        children = module.get("child_modules", [])
+        if not isinstance(resources, list) or not isinstance(children, list):
+            return None
+        addresses: set[str] = set()
+        for resource in resources:
+            if not isinstance(resource, dict) or not isinstance(resource.get("address"), str):
+                return None
+            if resource.get("mode", "managed") == "managed":
+                addresses.add(resource["address"])
+        for child in children:
+            child_addresses = planned_resource_addresses(child)
+            if child_addresses is None:
+                return None
+            addresses.update(child_addresses)
+        return addresses
+
+    def configured_resource_addresses(module: Any, prefix: str = "") -> set[str] | None:
+        if not isinstance(module, dict):
+            return None
+        resources = module.get("resources", [])
+        calls = module.get("module_calls", {})
+        if not isinstance(resources, list) or not isinstance(calls, dict):
+            return None
+        addresses: set[str] = set()
+        for resource in resources:
+            if not isinstance(resource, dict) or not isinstance(resource.get("address"), str):
+                return None
+            if resource.get("mode", "managed") == "managed":
+                addresses.add(prefix + resource["address"])
+        for name, call in calls.items():
+            nested = call.get("module") if isinstance(call, dict) else None
+            nested_addresses = configured_resource_addresses(nested, prefix + f"module.{name}.")
+            if nested_addresses is None:
+                return None
+            addresses.update(nested_addresses)
+        return addresses
+
+    planned_root = planned.get("root_module") if isinstance(planned, dict) else None
+    configuration = document.get("configuration")
+    configured_root = configuration.get("root_module") if isinstance(configuration, dict) else None
+    planned_addresses = planned_resource_addresses(planned_root)
+    configured_addresses = configured_resource_addresses(configured_root)
+
+    def planned_resource_map(module: Any) -> dict[str, dict[str, Any]] | None:
+        if not isinstance(module, dict):
+            return None
+        resources = module.get("resources", [])
+        children = module.get("child_modules", [])
+        if not isinstance(resources, list) or not isinstance(children, list):
+            return None
+        result: dict[str, dict[str, Any]] = {}
+        for resource in resources:
+            if not isinstance(resource, dict) or not isinstance(resource.get("address"), str):
+                return None
+            if resource.get("mode", "managed") == "managed":
+                if resource["address"] in result:
+                    return None
+                result[resource["address"]] = resource
+        for child in children:
+            nested = planned_resource_map(child)
+            if nested is None or set(result).intersection(nested):
+                return None
+            result.update(nested)
+        return result
+
+    def configured_resource_map(module: Any, prefix: str = "") -> dict[str, dict[str, Any]] | None:
+        if not isinstance(module, dict):
+            return None
+        resources = module.get("resources", [])
+        calls = module.get("module_calls", {})
+        if not isinstance(resources, list) or not isinstance(calls, dict):
+            return None
+        result: dict[str, dict[str, Any]] = {}
+        for resource in resources:
+            if not isinstance(resource, dict) or not isinstance(resource.get("address"), str):
+                return None
+            if resource.get("mode", "managed") == "managed":
+                address = prefix + resource["address"]
+                if address in result:
+                    return None
+                result[address] = resource
+        for name, call in calls.items():
+            nested_module = call.get("module") if isinstance(call, dict) else None
+            nested = configured_resource_map(nested_module, prefix + f"module.{name}.")
+            if nested is None or set(result).intersection(nested):
+                return None
+            result.update(nested)
+        return result
+
+    def configured_all_resource_map(module: Any, prefix: str = "") -> dict[str, dict[str, Any]] | None:
+        if not isinstance(module, dict):
+            return None
+        resources = module.get("resources", [])
+        calls = module.get("module_calls", {})
+        if not isinstance(resources, list) or not isinstance(calls, dict):
+            return None
+        result: dict[str, dict[str, Any]] = {}
+        for resource in resources:
+            if not isinstance(resource, dict) or not isinstance(resource.get("address"), str):
+                return None
+            address = prefix + resource["address"]
+            if address in result:
+                return None
+            result[address] = resource
+        for name, call in calls.items():
+            nested_module = call.get("module") if isinstance(call, dict) else None
+            nested = configured_all_resource_map(nested_module, prefix + f"module.{name}.")
+            if nested is None or set(result).intersection(nested):
+                return None
+            result.update(nested)
+        return result
+
+    planned_resources = planned_resource_map(planned_root)
+    configured_resources = configured_resource_map(configured_root)
+    configured_all_resources = configured_all_resource_map(configured_root)
+    if planned_resources is not None:
+        transport_members: dict[str, dict[str, dict[str, str]]] = {
+            site: {} for site in DEPLOYMENT_SITES
+        }
+        for site in DEPLOYMENT_SITES:
+            for az_key in config.sites[site]["transport_router_az_keys"]:
+                instance = planned_resources.get(
+                    f'aws_instance.transport_router_{site}[{json.dumps(az_key)}]'
+                )
+                route_table = planned_resources.get(
+                    f'aws_route_table.gwlbe_{site}[{json.dumps(az_key)}]'
+                )
+                instance_values = (
+                    instance.get("values") if isinstance(instance, dict) else None
+                )
+                route_table_values = (
+                    route_table.get("values")
+                    if isinstance(route_table, dict)
+                    else None
+                )
+                instance_id = (
+                    instance_values.get("id")
+                    if isinstance(instance_values, dict)
+                    else None
+                )
+                network_interface_id = (
+                    instance_values.get("primary_network_interface_id")
+                    if isinstance(instance_values, dict)
+                    else None
+                )
+                route_table_id = (
+                    route_table_values.get("id")
+                    if isinstance(route_table_values, dict)
+                    else None
+                )
+                if all(
+                    isinstance(value, str) and value
+                    for value in (instance_id, network_interface_id, route_table_id)
+                ):
+                    transport_members[site][az_key] = {
+                        "region": str(config.sites[site]["region"]),
+                        "az_key": az_key,
+                        "instance_id": str(instance_id),
+                        "network_interface_id": str(network_interface_id),
+                        "gwlbe_route_table_id": str(route_table_id),
+                    }
+        if all(
+            set(transport_members[site])
+            == set(config.sites[site]["transport_router_az_keys"])
+            for site in DEPLOYMENT_SITES
+        ):
+            concrete_transport_members = transport_members
+    change_addresses = [str(change.get("address")) for change in managed_changes]
+    approved_managed_addresses = symmetric_managed_resource_addresses()
+    if (
+        planned_addresses is None
+        or configured_addresses is None
+        or planned_resources is None
+        or configured_resources is None
+        or configured_all_resources is None
+        or len(change_addresses) != len(set(change_addresses))
+        or any(change.get("deposed") is not None for change in managed_changes)
+        or set(change_addresses) != planned_addresses
+        or {re.sub(r"\[[^]]+\]", "", address) for address in planned_addresses} != configured_addresses
+        or configured_addresses != approved_managed_addresses
+    ):
+        failures.append(
+            "saved plan configuration, planned values, exact changes, and approved symmetric resource graph differ"
+        )
+
+    def references(value: Any) -> set[str] | None:
+        raw = value.get("references") if isinstance(value, dict) else None
+        if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+            return None
+        return set(raw)
+
+    def all_references(value: Any) -> set[str]:
+        result: set[str] = set()
+        if isinstance(value, dict):
+            raw = value.get("references")
+            if isinstance(raw, list):
+                result.update(str(item) for item in raw if isinstance(item, str))
+            depends_on = value.get("depends_on")
+            if isinstance(depends_on, list):
+                result.update(str(item) for item in depends_on if isinstance(item, str))
+            for item in value.values():
+                result.update(all_references(item))
+        elif isinstance(value, list):
+            for item in value:
+                result.update(all_references(item))
+        return result
+
+    route_target_fields = {
+        "carrier_gateway_id",
+        "core_network_arn",
+        "egress_only_gateway_id",
+        "gateway_id",
+        "local_gateway_id",
+        "nat_gateway_id",
+        "network_interface_id",
+        "transit_gateway_id",
+        "vpc_endpoint_id",
+        "vpc_peering_connection_id",
+    }
+    expected_route_addresses: dict[str, tuple[str, str, str]] = {}
+    if (
+        configured_resources is not None
+        and configured_all_resources is not None
+        and planned_resources is not None
+    ):
+        route_table_ids: dict[tuple[str, str, str], str] = {}
+        subnet_ids: dict[tuple[str, str, str], str] = {}
+        route_domains = ("workload", "transport", "gwlbe", "target")
+        route_domain_invalid = False
+        for site in DEPLOYMENT_SITES:
+            az_keys = set(config.sites[site]["azs"])
+            for domain in route_domains:
+                table_base = f"aws_route_table.{domain}_{site}"
+                subnet_base = f"aws_subnet.{domain}_{site}"
+                association_base = f"aws_route_table_association.{domain}_{site}"
+                association = configured_resources.get(association_base)
+                association_expressions = (
+                    association.get("expressions") if isinstance(association, dict) else None
+                )
+                if (
+                    not isinstance(association_expressions, dict)
+                    or set(association_expressions) != {"subnet_id", "route_table_id"}
+                    or references(association_expressions.get("subnet_id"))
+                    != {subnet_base, "each.key"}
+                    or references(association_expressions.get("route_table_id"))
+                    != {table_base, "each.key"}
+                    or references(
+                        association.get("for_each_expression")
+                        if isinstance(association, dict)
+                        else None
+                    )
+                    != {
+                        f"local.sites.{site}.azs",
+                        f"local.sites.{site}",
+                        "local.sites",
+                    }
+                ):
+                    route_domain_invalid = True
+
+                expected_tables = {
+                    f'{table_base}[{json.dumps(az_key)}]' for az_key in az_keys
+                }
+                expected_subnets = {
+                    f'{subnet_base}[{json.dumps(az_key)}]' for az_key in az_keys
+                }
+                expected_associations = {
+                    f'{association_base}[{json.dumps(az_key)}]' for az_key in az_keys
+                }
+                if (
+                    {address for address in planned_resources if address.startswith(table_base + "[")}
+                    != expected_tables
+                    or {address for address in planned_resources if address.startswith(subnet_base + "[")}
+                    != expected_subnets
+                    or {
+                        address
+                        for address in planned_resources
+                        if address.startswith(association_base + "[")
+                    }
+                    != expected_associations
+                ):
+                    route_domain_invalid = True
+                for az_key in az_keys:
+                    table = planned_resources.get(f'{table_base}[{json.dumps(az_key)}]')
+                    subnet = planned_resources.get(f'{subnet_base}[{json.dumps(az_key)}]')
+                    association_value = planned_resources.get(
+                        f'{association_base}[{json.dumps(az_key)}]'
+                    )
+                    table_values = table.get("values") if isinstance(table, dict) else None
+                    subnet_values = subnet.get("values") if isinstance(subnet, dict) else None
+                    association_values = (
+                        association_value.get("values")
+                        if isinstance(association_value, dict)
+                        else None
+                    )
+                    if (
+                        not isinstance(table, dict)
+                        or table.get("index") != az_key
+                        or not isinstance(table_values, dict)
+                        or not isinstance(subnet, dict)
+                        or subnet.get("index") != az_key
+                        or not isinstance(subnet_values, dict)
+                        or not isinstance(association_value, dict)
+                        or association_value.get("index") != az_key
+                        or not isinstance(association_values, dict)
+                    ):
+                        route_domain_invalid = True
+                        continue
+                    table_id = table_values.get("id")
+                    subnet_id = subnet_values.get("id")
+                    if isinstance(table_id, str) and table_id:
+                        route_table_ids[(site, domain, az_key)] = table_id
+                        if association_values.get("route_table_id") not in (None, table_id):
+                            route_domain_invalid = True
+                    if isinstance(subnet_id, str) and subnet_id:
+                        subnet_ids[(site, domain, az_key)] = subnet_id
+                        if association_values.get("subnet_id") not in (None, subnet_id):
+                            route_domain_invalid = True
+                    if domain == "transport" and (
+                        table_values.get("tags", {}).get("Role") != "transport-router"
+                        or subnet_values.get("tags", {}).get("Role") != "transport-router"
+                    ):
+                        route_domain_invalid = True
+            visible_table_ids = [
+                value for (owner_site, _domain, _az_key), value in route_table_ids.items()
+                if owner_site == site
+            ]
+            if len(visible_table_ids) != len(set(visible_table_ids)):
+                route_domain_invalid = True
+        if route_domain_invalid:
+            failures.append(
+                "saved plan workload, transport, GWLBE, and target route domains are not distinct exact same-AZ subnet/table pairs"
+            )
+
+        endpoint_ids: dict[tuple[str, str], str] = {}
+        endpoint_invalid = False
+        for site in DEPLOYMENT_SITES:
+            endpoint_base = f"aws_vpc_endpoint.{site}"
+            endpoint_config = configured_resources.get(endpoint_base)
+            endpoint_expressions = (
+                endpoint_config.get("expressions") if isinstance(endpoint_config, dict) else None
+            )
+            if (
+                not isinstance(endpoint_expressions, dict)
+                or references(endpoint_expressions.get("subnet_ids"))
+                != {f"aws_subnet.gwlbe_{site}", "each.key"}
+                or references(
+                    endpoint_config.get("for_each_expression")
+                    if isinstance(endpoint_config, dict)
+                    else None
+                )
+                != {
+                    f"local.sites.{site}.azs",
+                    f"local.sites.{site}",
+                    "local.sites",
+                }
+            ):
+                endpoint_invalid = True
+            for az_key in config.sites[site]["azs"]:
+                endpoint = planned_resources.get(
+                    f'{endpoint_base}[{json.dumps(az_key)}]'
+                )
+                values = endpoint.get("values") if isinstance(endpoint, dict) else None
+                if (
+                    not isinstance(endpoint, dict)
+                    or endpoint.get("index") != az_key
+                    or not isinstance(values, dict)
+                ):
+                    endpoint_invalid = True
+                    continue
+                endpoint_id = values.get("id")
+                if isinstance(endpoint_id, str) and endpoint_id:
+                    endpoint_ids[(site, az_key)] = endpoint_id
+        if len(endpoint_ids.values()) != len(set(endpoint_ids.values())):
+            endpoint_invalid = True
+        if endpoint_invalid:
+            failures.append("saved plan GWLBE endpoints are not exact same-AZ route-domain members")
+
+        route_contracts = (
+            ("workload_to_remote", "workload", "remote_site_cidrs", "vpc_endpoint_id"),
+            ("transport_to_local", "transport", "local_site_cidrs", "vpc_endpoint_id"),
+            ("gwlbe_to_remote", "gwlbe", "remote_site_cidrs", "network_interface_id"),
+        )
+        for family, domain, cidr_field, target_field in route_contracts:
+            family_expected: dict[str, tuple[str, str, str]] = {}
+            for site in DEPLOYMENT_SITES:
+                route_base = f"aws_route.{family}_{site}"
+                route_resource = configured_resources.get(route_base)
+                expressions = (
+                    route_resource.get("expressions")
+                    if isinstance(route_resource, dict)
+                    else None
+                )
+                target_base = (
+                    f"aws_vpc_endpoint.{site}"
+                    if target_field == "vpc_endpoint_id"
+                    else f"aws_instance.transport_router_{site}"
+                )
+                expected_references = {
+                    "route_table_id": {
+                        f"aws_route_table.{domain}_{site}",
+                        "each.value.az_key",
+                        "each.value",
+                    },
+                    "destination_cidr_block": {"each.value.cidr", "each.value"},
+                    target_field: (
+                        {
+                            target_base,
+                            f"local.route_failover.initial_transport_router_az_by_gwlbe_az.{site}",
+                            "local.route_failover.initial_transport_router_az_by_gwlbe_az",
+                            "local.route_failover",
+                            "each.value.az_key",
+                            "each.value",
+                        }
+                        if target_field == "network_interface_id"
+                        else {target_base, "each.value.az_key", "each.value"}
+                    ),
+                }
+                if (
+                    not isinstance(expressions, dict)
+                    or set(expressions) != set(expected_references)
+                    or any(
+                        references(expressions.get(field)) != expected
+                        for field, expected in expected_references.items()
+                    )
+                    or references(
+                        route_resource.get("for_each_expression")
+                        if isinstance(route_resource, dict)
+                        else None
+                    )
+                    != {
+                        f"local.sites.{site}.azs",
+                        f"local.sites.{site}.{cidr_field}",
+                        f"local.sites.{site}",
+                        "local.sites",
+                    }
+                ):
+                    detail = (
+                        "reviewed same-site transport ENI selection"
+                        if target_field == "network_interface_id"
+                        else "same-AZ GWLBE"
+                    )
+                    failures.append(
+                        f"saved plan {site} {family} routes do not select the exact {detail}"
+                    )
+                for az_key in config.sites[site]["azs"]:
+                    for cidr in config.sites[site][cidr_field]:
+                        index = f"{az_key}:{cidr}"
+                        address = f'{route_base}[{json.dumps(index)}]'
+                        family_expected[address] = (site, az_key, cidr)
+                        expected_route_addresses[address] = (site, az_key, cidr)
+
+            actual = {
+                address
+                for address in planned_resources
+                if any(
+                    address.startswith(f"aws_route.{family}_{site}[")
+                    for site in DEPLOYMENT_SITES
+                )
+            }
+            if actual != set(family_expected):
+                failures.append(
+                    f"saved plan {family} routes do not cover every exact AZ and approved prefix pair"
+                )
+            for address, (site, az_key, cidr) in family_expected.items():
+                resource = planned_resources.get(address)
+                values = resource.get("values") if isinstance(resource, dict) else None
+                expected_target = (
+                    endpoint_ids.get((site, az_key))
+                    if target_field == "vpc_endpoint_id"
+                    else (
+                        concrete_transport_members.get(site, {})
+                        .get(
+                            config.route_failover[
+                                "initial_transport_router_az_by_gwlbe_az"
+                            ][site][az_key],
+                            {},
+                        )
+                        .get("network_interface_id")
+                        if concrete_transport_members is not None
+                        else None
+                    )
+                )
+                expected_table_id = route_table_ids.get((site, domain, az_key))
+                invalid = (
+                    not isinstance(resource, dict)
+                    or resource.get("index") != f"{az_key}:{cidr}"
+                    or not isinstance(values, dict)
+                    or values.get("destination_cidr_block") != cidr
+                    or any(
+                        values.get(field) not in (None, "")
+                        for field in route_target_fields - {target_field}
+                    )
+                    or (
+                        expected_target is not None
+                        and values.get(target_field) != expected_target
+                    )
+                    or (
+                        expected_table_id is not None
+                        and values.get("route_table_id") != expected_table_id
+                    )
+                )
+                if invalid:
+                    if target_field == "network_interface_id":
+                        failures.append(
+                            f"saved plan GWLBE route {address} does not target its reviewed same-site transport ENI selection"
+                        )
+                    else:
+                        failures.append(
+                            f"saved plan pre-inspection route {address} does not target its same-AZ GWLBE"
+                        )
+
+        endpoint_output_value = after_values.get("gwlb_endpoint_ids")
+        if isinstance(endpoint_output_value, dict) and any(
+            isinstance(endpoint_output_value.get(site), dict)
+            and any(
+                isinstance(endpoint_output_value[site].get(az_key), str)
+                and endpoint_ids.get((site, az_key)) is not None
+                and endpoint_output_value[site][az_key]
+                != endpoint_ids[(site, az_key)]
+                for az_key in config.sites[site]["azs"]
+            )
+            for site in DEPLOYMENT_SITES
+        ):
+            failures.append(
+                "saved plan GWLBE endpoint output does not preserve exact site/AZ identity"
+            )
+
+        for site in DEPLOYMENT_SITES:
+            target_table_ids = {
+                route_table_ids[(site, "target", az_key)]
+                for az_key in config.sites[site]["azs"]
+                if (site, "target", az_key) in route_table_ids
+            }
+            target_prefix = f"aws_route_table.target_{site}["
+            for address, resource in planned_resources.items():
+                if address.startswith(target_prefix):
+                    values = resource.get("values")
+                    inline_routes = values.get("route", []) if isinstance(values, dict) else []
+                    if not isinstance(inline_routes, list) or inline_routes:
+                        failures.append(f"saved plan {site} target route tables contain an inner route")
+                if not address.startswith("aws_route."):
+                    continue
+                values = resource.get("values")
+                if (
+                    isinstance(values, dict)
+                    and values.get("route_table_id") in target_table_ids
+                    and not address.startswith(f"aws_route.target_default_{site}[")
+                ):
+                    failures.append(f"saved plan {site} target route tables contain an inner route")
+
+            target_default = configured_resources.get(f"aws_route.target_default_{site}")
+            target_default_expressions = (
+                target_default.get("expressions")
+                if isinstance(target_default, dict)
+                else None
+            )
+            if (
+                not isinstance(target_default_expressions, dict)
+                or references(target_default_expressions.get("route_table_id"))
+                != {f"aws_route_table.target_{site}", "each.key"}
+                or references(target_default_expressions.get("nat_gateway_id"))
+                != {f"aws_nat_gateway.{site}.id", f"aws_nat_gateway.{site}"}
+                or references(
+                    target_default.get("for_each_expression")
+                    if isinstance(target_default, dict)
+                    else None
+                )
+                != {
+                    f"local.sites.{site}.azs",
+                    f"local.sites.{site}",
+                    "local.sites",
+                }
+            ):
+                failures.append(f"saved plan {site} target route domain is not isolated")
+            for az_key in config.sites[site]["azs"]:
+                address = f'aws_route.target_default_{site}[{json.dumps(az_key)}]'
+                resource = planned_resources.get(address)
+                values = resource.get("values") if isinstance(resource, dict) else None
+                expected_table = route_table_ids.get((site, "target", az_key))
+                if (
+                    not isinstance(resource, dict)
+                    or resource.get("index") != az_key
+                    or not isinstance(values, dict)
+                    or values.get("destination_cidr_block") != "0.0.0.0/0"
+                    or any(
+                        values.get(field) not in (None, "")
+                        for field in route_target_fields - {"nat_gateway_id"}
+                    )
+                    or (
+                        expected_table is not None
+                        and values.get("route_table_id") != expected_table
+                    )
+                ):
+                    failures.append(f"saved plan {site} target route domain is not isolated")
+
+            target_address = f"aws_instance.envelope_target_{site}"
+            target = configured_resources.get(target_address)
+            target_expressions = target.get("expressions") if isinstance(target, dict) else None
+            expected_runtime_profile = f"aws_iam_instance_profile.runtime_{site}"
+            expected_target_user_data = f"data.cloudinit_config.target_{site}"
+            required_dependencies = {
+                f"aws_iam_role_policy.runtime_{site}",
+                f"aws_route_table_association.target_{site}",
+                f"aws_route.target_default_{site}",
+                "aws_s3_object.envelope",
+            }
+            target_references = all_references(target)
+            target_data = configured_all_resources.get(expected_target_user_data)
+            target_data_references = all_references(target_data)
+            if (
+                not isinstance(target_expressions, dict)
+                or references(target_expressions.get("subnet_id"))
+                != {f"aws_subnet.target_{site}", "each.key"}
+                or references(target_expressions.get("vpc_security_group_ids"))
+                != {
+                    f"aws_security_group.target_{site}.id",
+                    f"aws_security_group.target_{site}",
+                }
+                or references(target_expressions.get("iam_instance_profile"))
+                != {expected_runtime_profile + ".name", expected_runtime_profile}
+                or references(target_expressions.get("user_data_base64"))
+                != {expected_target_user_data + ".rendered", expected_target_user_data}
+                or references(
+                    target.get("for_each_expression") if isinstance(target, dict) else None
+                )
+                != {
+                    f"local.sites.{site}.target_az_keys",
+                    f"local.sites.{site}",
+                    "local.sites",
+                }
+                or not required_dependencies.issubset(target_references)
+                or not isinstance(target_data, dict)
+                or not {
+                    f"local.{site}_artifact_installer",
+                    f"local.{site}_target_bootstrap",
+                }.issubset(target_data_references)
+                or any(
+                    marker in reference.lower()
+                    for reference in target_references | target_data_references
+                    for marker in (
+                        "tailscale",
+                        "tailnet",
+                        "transport_",
+                        "secret_arn",
+                        "kms_key_arn",
+                    )
+                )
+            ):
+                failures.append(
+                    f"saved plan {site} targets retain a Tailnet secret, transport role, Tailscale user-data, or incomplete bootstrap dependency"
+                )
+            for az_key in config.sites[site]["target_az_keys"]:
+                address = f'{target_address}[{json.dumps(az_key)}]'
+                resource = planned_resources.get(address)
+                values = resource.get("values") if isinstance(resource, dict) else None
+                expected_subnet = subnet_ids.get((site, "target", az_key))
+                if (
+                    not isinstance(resource, dict)
+                    or resource.get("index") != az_key
+                    or not isinstance(values, dict)
+                    or values.get("source_dest_check") is not True
+                    or values.get("associate_public_ip_address") is not False
+                    or (
+                        expected_subnet is not None
+                        and values.get("subnet_id") != expected_subnet
+                    )
+                    or values.get("iam_instance_profile") != f"{config.run_id}-{site}-runtime"
+                    or not isinstance(values.get("user_data_base64"), str)
+                    or not values.get("user_data_base64")
+                ):
+                    failures.append(
+                        f"saved plan target {address} lacks packet-return source-dest-check enforcement, isolation, least privilege, or bootstrap"
+                    )
+
+            transport_address = f"aws_instance.transport_router_{site}"
+            transport = configured_resources.get(transport_address)
+            transport_expressions = (
+                transport.get("expressions") if isinstance(transport, dict) else None
+            )
+            transport_references = all_references(transport)
+            if (
+                not isinstance(transport_expressions, dict)
+                or references(transport_expressions.get("subnet_id"))
+                != {f"aws_subnet.transport_{site}", "each.key"}
+                or references(transport_expressions.get("vpc_security_group_ids"))
+                != {
+                    f"aws_security_group.transport_{site}.id",
+                    f"aws_security_group.transport_{site}",
+                }
+                or references(transport_expressions.get("iam_instance_profile"))
+                != {
+                    f"aws_iam_instance_profile.transport_{site}.name",
+                    f"aws_iam_instance_profile.transport_{site}",
+                }
+                or references(transport_expressions.get("user_data_base64"))
+                != {f"module.tailscale_transport_{site}", "each.key"}
+                or references(
+                    transport.get("for_each_expression")
+                    if isinstance(transport, dict)
+                    else None
+                )
+                != {
+                    f"local.sites.{site}.transport_router_az_keys",
+                    f"local.sites.{site}",
+                    "local.sites",
+                }
+                or not {
+                    f"aws_iam_role_policy.transport_{site}",
+                    f"aws_route_table_association.transport_{site}",
+                    f"aws_route.transport_default_{site}",
+                    f"aws_route.transport_to_local_{site}",
+                }.issubset(transport_references)
+            ):
+                failures.append(f"saved plan {site} transport bootstrap is not same-AZ and role-isolated")
+            for az_key in config.sites[site]["transport_router_az_keys"]:
+                address = f'{transport_address}[{json.dumps(az_key)}]'
+                resource = planned_resources.get(address)
+                values = resource.get("values") if isinstance(resource, dict) else None
+                concrete = (
+                    concrete_transport_members.get(site, {}).get(az_key)
+                    if concrete_transport_members is not None
+                    else None
+                )
+                expected_subnet = subnet_ids.get((site, "transport", az_key))
+                if (
+                    not isinstance(resource, dict)
+                    or resource.get("index") != az_key
+                    or not isinstance(values, dict)
+                    or values.get("source_dest_check") is not False
+                    or values.get("associate_public_ip_address") is not False
+                    or values.get("tags", {}).get("Role") != "transport-router"
+                    or values.get("volume_tags", {}).get("Role") != "transport-router"
+                    or (
+                        expected_subnet is not None
+                        and values.get("subnet_id") != expected_subnet
+                    )
+                    or (
+                        concrete is not None
+                        and values.get("primary_network_interface_id")
+                        != concrete["network_interface_id"]
+                    )
+                ):
+                    failures.append(
+                        f"saved plan transport {address} does not expose its exact same-AZ eligible ENI"
+                    )
+
+            for address in (
+                f"aws_iam_role.transport_{site}",
+                f"aws_security_group.transport_{site}",
+            ):
+                resource = planned_resources.get(address)
+                values = resource.get("values") if isinstance(resource, dict) else None
+                if (
+                    not isinstance(values, dict)
+                    or values.get("tags", {}).get("Role") != "transport-router"
+                ):
+                    failures.append(
+                        f"saved plan {site} transport resources do not use the transport-router role tag"
+                    )
+
+        module_calls = configured_root.get("module_calls") if isinstance(configured_root, dict) else None
+        for site in DEPLOYMENT_SITES:
+            call = module_calls.get(f"tailscale_transport_{site}") if isinstance(module_calls, dict) else None
+            expressions = call.get("expressions") if isinstance(call, dict) else None
+            if (
+                not isinstance(expressions, dict)
+                or references(expressions.get("advertise_routes"))
+                != {
+                    "local.initial_transport_router_advertise_routes",
+                    f"local.initial_transport_router_advertise_routes.{site}",
+                    "each.key",
+                }
+                or references(expressions.get("auth_key"))
+                != {f"local.{site}_transport_auth_resolver"}
+                or expressions.get("accept_routes", {}).get("constant_value") is not True
+                or expressions.get("snat_subnet_routes", {}).get("constant_value") is not False
+            ):
+                failures.append(
+                    f"saved plan {site} transport routers do not own exact advertisements, accepted routes, and no-SNAT bootstrap"
+                )
+
+    if (
+        configured_resources is not None
+        and configured_all_resources is not None
+        and planned_resources is not None
+    ):
+        expected_secrets: dict[str, tuple[str, str]] = {}
+        for site in DEPLOYMENT_SITES:
+            kms_key_arn = config.sites[site]["ssm_kms_key_arn"]
+            account_id = kms_key_arn.split(":", 5)[4]
+            expected_secrets[site] = (
+                f"arn:aws:ssm:{config.sites[site]['region']}:{account_id}:parameter/{config.run_id}/tailscale-auth",
+                kms_key_arn,
+            )
+
+        planned_policies: dict[str, dict[str, Any]] = {}
+        policy_error = False
+        for address, resource in planned_resources.items():
+            if not address.startswith("aws_iam_role_policy."):
+                continue
+            values = resource.get("values")
+            raw_policy = values.get("policy") if isinstance(values, dict) else None
+            if not isinstance(raw_policy, str):
+                policy_error = True
+                continue
+            try:
+                policy = json.loads(raw_policy)
+            except json.JSONDecodeError:
+                policy_error = True
+                continue
+            if not isinstance(policy, dict) or not isinstance(policy.get("Statement"), list):
+                policy_error = True
+                continue
+            planned_policies[address] = policy
+        if policy_error:
+            failures.append("saved plan IAM policies do not expose an exact JSON access contract")
+
+        def action_statements(policy: dict[str, Any], action: str) -> list[dict[str, Any]]:
+            result: list[dict[str, Any]] = []
+            for statement in policy.get("Statement", []):
+                if not isinstance(statement, dict) or statement.get("Effect") != "Allow":
+                    continue
+                raw_actions = statement.get("Action", [])
+                actions = [raw_actions] if isinstance(raw_actions, str) else raw_actions
+                if isinstance(actions, list) and action in actions:
+                    result.append(statement)
+            return result
+
+        def statement_actions(statement: dict[str, Any]) -> set[str]:
+            raw_actions = statement.get("Action", [])
+            actions = [raw_actions] if isinstance(raw_actions, str) else raw_actions
+            return (
+                set(actions)
+                if isinstance(actions, list) and all(isinstance(item, str) for item in actions)
+                else set()
+            )
+
+        def statement_resources(statement: dict[str, Any]) -> set[str]:
+            raw_resources = statement.get("Resource", [])
+            resources = [raw_resources] if isinstance(raw_resources, str) else raw_resources
+            return (
+                set(resources)
+                if isinstance(resources, list) and all(isinstance(item, str) for item in resources)
+                else set()
+            )
+
+        artifact_revision = artifact.get("revision") if isinstance(artifact, dict) else None
+        artifact_account = config.sites["west"]["ssm_kms_key_arn"].split(":", 5)[4]
+        expected_artifact_arn = (
+            f"arn:aws:s3:::{config.run_id}-{artifact_account}-{config.sites['west']['region']}-artifact/"
+            f"artifacts/{artifact_revision}/envelope-linux-{config.architecture}"
+        )
+        flow_policy_address = "aws_iam_role_policy.flow_logs"
+        flow_policy_resource = configured_resources.get(flow_policy_address)
+        flow_policy_expressions = (
+            flow_policy_resource.get("expressions")
+            if isinstance(flow_policy_resource, dict)
+            else None
+        )
+        flow_policy = planned_policies.get(flow_policy_address)
+        expected_flow_policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "logs:CreateLogStream",
+                        "logs:DescribeLogStreams",
+                        "logs:PutLogEvents",
+                    ],
+                    "Resource": [
+                        f"arn:aws:logs:{config.sites[site]['region']}:{artifact_account}:"
+                        f"log-group:/aws/vpc-flow-logs/{config.run_id}/{site}:*"
+                        for site in DEPLOYMENT_SITES
+                    ],
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": ["logs:DescribeLogGroups"],
+                    "Resource": ["*"],
+                },
+            ],
+        }
+        if (
+            not isinstance(flow_policy_expressions, dict)
+            or references(flow_policy_expressions.get("role"))
+            != {"aws_iam_role.flow_logs.id", "aws_iam_role.flow_logs"}
+            or references(flow_policy_expressions.get("policy"))
+            != {"local.flow_log_delivery_policy"}
+            or flow_policy != expected_flow_policy
+        ):
+            failures.append(
+                "saved plan flow-log IAM is not the exact regional CloudWatch delivery role"
+            )
+        for site in DEPLOYMENT_SITES:
+            role_address = f"aws_iam_role.runtime_{site}"
+            policy_address = f"aws_iam_role_policy.runtime_{site}"
+            profile_address = f"aws_iam_instance_profile.runtime_{site}"
+            policy_resource = configured_resources.get(policy_address)
+            profile_resource = configured_resources.get(profile_address)
+            policy_role_references = references(
+                policy_resource.get("expressions", {}).get("role")
+                if isinstance(policy_resource, dict)
+                and isinstance(policy_resource.get("expressions"), dict)
+                else None
+            )
+            profile_role_references = references(
+                profile_resource.get("expressions", {}).get("role")
+                if isinstance(profile_resource, dict)
+                and isinstance(profile_resource.get("expressions"), dict)
+                else None
+            )
+            policy = planned_policies.get(policy_address)
+            statements = policy.get("Statement") if isinstance(policy, dict) else None
+            exact_statements = (
+                isinstance(statements, list)
+                and len(statements) == 2
+                and all(
+                    isinstance(statement, dict)
+                    and set(statement) == {"Effect", "Action", "Resource"}
+                    and statement.get("Effect") == "Allow"
+                    for statement in statements
+                )
+            )
+            s3_statements = action_statements(policy, "s3:GetObject") if isinstance(policy, dict) else []
+            ssm_statements = [
+                statement
+                for statement in statements or []
+                if isinstance(statement, dict)
+                and statement_actions(statement) == INSTANCE_SSM_CORE_ACTIONS
+            ]
+            if (
+                policy_role_references
+                != {role_address + ".id", role_address}
+                or profile_role_references
+                != {role_address + ".name", role_address}
+                or not isinstance(policy, dict)
+                or set(policy) != {"Version", "Statement"}
+                or policy.get("Version") != "2012-10-17"
+                or not exact_statements
+                or len(s3_statements) != 1
+                or statement_actions(s3_statements[0]) != {"s3:GetObject"}
+                or statement_resources(s3_statements[0]) != {expected_artifact_arn}
+                or s3_statements[0].get("Action") != ["s3:GetObject"]
+                or s3_statements[0].get("Resource") != [expected_artifact_arn]
+                or len(ssm_statements) != 1
+                or statement_resources(ssm_statements[0]) != {"*"}
+                or ssm_statements[0].get("Action")
+                != sorted(INSTANCE_SSM_CORE_ACTIONS)
+                or ssm_statements[0].get("Resource") != ["*"]
+            ):
+                failures.append(
+                    f"saved plan {site} target runtime IAM is not the exact least-privilege artifact/SSM role"
+                )
+
+        for site in DEPLOYMENT_SITES:
+            role_address = f"aws_iam_role.workload_{site}"
+            policy_address = f"aws_iam_role_policy.workload_{site}"
+            profile_address = f"aws_iam_instance_profile.workload_{site}"
+            instance_address = f"aws_instance.workload_{site}"
+            policy_resource = configured_resources.get(policy_address)
+            profile_resource = configured_resources.get(profile_address)
+            instance_resource = configured_resources.get(instance_address)
+            policy_role_references = references(
+                policy_resource.get("expressions", {}).get("role")
+                if isinstance(policy_resource, dict)
+                and isinstance(policy_resource.get("expressions"), dict)
+                else None
+            )
+            profile_role_references = references(
+                profile_resource.get("expressions", {}).get("role")
+                if isinstance(profile_resource, dict)
+                and isinstance(profile_resource.get("expressions"), dict)
+                else None
+            )
+            instance_profile_references = references(
+                instance_resource.get("expressions", {}).get("iam_instance_profile")
+                if isinstance(instance_resource, dict)
+                and isinstance(instance_resource.get("expressions"), dict)
+                else None
+            )
+            policy = planned_policies.get(policy_address)
+            statements = policy.get("Statement") if isinstance(policy, dict) else None
+            exact_core = (
+                isinstance(statements, list)
+                and len(statements) == 1
+                and isinstance(statements[0], dict)
+                and set(statements[0]) == {"Effect", "Action", "Resource"}
+                and statements[0].get("Effect") == "Allow"
+                and statement_actions(statements[0]) == INSTANCE_SSM_CORE_ACTIONS
+                and statement_resources(statements[0]) == {"*"}
+                and statements[0].get("Action")
+                == sorted(INSTANCE_SSM_CORE_ACTIONS)
+                and statements[0].get("Resource") == ["*"]
+            )
+            if (
+                policy_role_references
+                != {role_address + ".id", role_address}
+                or profile_role_references
+                != {role_address + ".name", role_address}
+                or instance_profile_references
+                != {profile_address + ".name", profile_address}
+                or not isinstance(policy, dict)
+                or set(policy) != {"Version", "Statement"}
+                or policy.get("Version") != "2012-10-17"
+                or not exact_core
+            ):
+                failures.append(
+                    f"saved plan {site} workload IAM is not the exact SSM-core-only role"
+                )
+
+        secret_owners: dict[str, str] = {}
+        for site in DEPLOYMENT_SITES:
+            role_address = f"aws_iam_role.transport_{site}"
+            policy_address = f"aws_iam_role_policy.transport_{site}"
+            profile_address = f"aws_iam_instance_profile.transport_{site}"
+            instance_address = f"aws_instance.transport_router_{site}"
+            policy_resource = configured_resources.get(policy_address)
+            profile_resource = configured_resources.get(profile_address)
+            instance_resource = configured_resources.get(instance_address)
+            policy_role_references = references(
+                policy_resource.get("expressions", {}).get("role")
+                if isinstance(policy_resource, dict)
+                and isinstance(policy_resource.get("expressions"), dict)
+                else None
+            )
+            profile_role_references = references(
+                profile_resource.get("expressions", {}).get("role")
+                if isinstance(profile_resource, dict)
+                and isinstance(profile_resource.get("expressions"), dict)
+                else None
+            )
+            transport_profile_references = references(
+                instance_resource.get("expressions", {}).get("iam_instance_profile")
+                if isinstance(instance_resource, dict)
+                and isinstance(instance_resource.get("expressions"), dict)
+                else None
+            )
+            if (
+                policy_role_references
+                != {role_address + ".id", role_address}
+                or profile_role_references
+                != {role_address + ".name", role_address}
+                or transport_profile_references
+                != {profile_address + ".name", profile_address}
+            ):
+                failures.append(f"saved plan {site} transport IAM resources are not bound to the transport fleet")
+
+            policy = planned_policies.get(policy_address)
+            secret_arn, kms_key_arn = expected_secrets[site]
+            kms_condition = {
+                "StringEquals": {
+                    "kms:CallerAccount": kms_key_arn.split(":", 5)[4],
+                    "kms:EncryptionContext:PARAMETER_ARN": secret_arn,
+                    "kms:ViaService": f"ssm.{config.sites[site]['region']}.amazonaws.com",
+                }
+            }
+            if policy is None:
+                failures.append(f"saved plan {site} transport role omits its exact Tailnet secret policy")
+                continue
+            ssm_statements = action_statements(policy, "ssm:GetParameter")
+            kms_statements = action_statements(policy, "kms:Decrypt")
+            core_statements = [
+                statement
+                for statement in policy.get("Statement", [])
+                if isinstance(statement, dict)
+                and statement_actions(statement) == INSTANCE_SSM_CORE_ACTIONS
+            ]
+
+            if (
+                set(policy) != {"Version", "Statement"}
+                or policy.get("Version") != "2012-10-17"
+                or len(policy.get("Statement", [])) != 3
+                or len(ssm_statements) != 1
+                or set(ssm_statements[0]) != {"Effect", "Action", "Resource"}
+                or ssm_statements[0].get("Effect") != "Allow"
+                or statement_actions(ssm_statements[0]) != {"ssm:GetParameter"}
+                or statement_resources(ssm_statements[0]) != {secret_arn}
+                or ssm_statements[0].get("Action") != ["ssm:GetParameter"]
+                or ssm_statements[0].get("Resource") != [secret_arn]
+                or len(kms_statements) != 1
+                or set(kms_statements[0]) != {"Effect", "Action", "Resource", "Condition"}
+                or kms_statements[0].get("Effect") != "Allow"
+                or statement_actions(kms_statements[0]) != {"kms:Decrypt"}
+                or statement_resources(kms_statements[0]) != {kms_key_arn}
+                or kms_statements[0].get("Action") != ["kms:Decrypt"]
+                or kms_statements[0].get("Resource") != [kms_key_arn]
+                or kms_statements[0].get("Condition") != kms_condition
+                or len(core_statements) != 1
+                or set(core_statements[0]) != {"Effect", "Action", "Resource"}
+                or core_statements[0].get("Effect") != "Allow"
+                or statement_resources(core_statements[0]) != {"*"}
+                or core_statements[0].get("Action")
+                != sorted(INSTANCE_SSM_CORE_ACTIONS)
+                or core_statements[0].get("Resource") != ["*"]
+            ):
+                failures.append(
+                    f"saved plan {site} transport role does not own exact secret access through the reviewed KMS context"
+                )
+            secret_owners[secret_arn] = policy_address
+            secret_owners[kms_key_arn] = policy_address
+
+        artifact_policy_owners = {
+            f"aws_iam_role_policy.runtime_{site}" for site in DEPLOYMENT_SITES
+        }
+        for address, policy in planned_policies.items():
+            serialized_policy = json.dumps(policy, sort_keys=True, separators=(",", ":"))
+            for protected_arn, owner in secret_owners.items():
+                if protected_arn in serialized_policy and address != owner:
+                    failures.append("saved plan grants a Tailnet secret outside its exact transport role")
+                    break
+            for statement in policy.get("Statement", []):
+                raw_actions = statement.get("Action", []) if isinstance(statement, dict) else []
+                actions = [raw_actions] if isinstance(raw_actions, str) else raw_actions
+                if isinstance(actions, list) and any(
+                    isinstance(action, str)
+                    and action.endswith("*")
+                    and action.split(":", 1)[0] in {"ssm", "kms"}
+                    for action in actions
+                ):
+                    failures.append("saved plan IAM policy grants wildcard Tailnet secret access")
+                    break
+            if not address.startswith("aws_iam_role_policy.transport_") and any(
+                statement_actions(statement).intersection({"ssm:GetParameter", "kms:Decrypt"})
+                for statement in policy.get("Statement", [])
+                if isinstance(statement, dict)
+            ):
+                failures.append("saved plan grants Tailnet secret actions outside an exact transport role")
+            if address not in artifact_policy_owners and any(
+                any(
+                    fnmatch.fnmatchcase("s3:GetObject", action)
+                    for action in statement_actions(statement)
+                )
+                and any(
+                    fnmatch.fnmatchcase(expected_artifact_arn, resource)
+                    for resource in statement_resources(statement)
+                )
+                for statement in policy.get("Statement", [])
+                if isinstance(statement, dict)
+                and statement.get("Effect") == "Allow"
+            ):
+                failures.append(
+                    "saved plan grants artifact access outside the exact target runtime roles"
+                )
+
+        variable_owners = {
+            f"var.{site}_tailscale_secret_arn": f"aws_iam_role_policy.transport_{site}"
+            for site in DEPLOYMENT_SITES
+        }
+        variable_owners.update(
+            {
+                f"var.{site}_tailscale_kms_key_arn": f"aws_iam_role_policy.transport_{site}"
+                for site in DEPLOYMENT_SITES
+            }
+        )
+        for address, resource in configured_all_resources.items():
+            resource_references = all_references(resource)
+            if any(reference in resource_references and address != owner for reference, owner in variable_owners.items()):
+                failures.append("saved plan configuration exposes Tailnet secret variables outside transport IAM")
+                break
+
+    def actions(change: dict[str, Any]) -> tuple[str, ...]:
+        value = change.get("change")
+        raw = value.get("actions") if isinstance(value, dict) else None
+        return tuple(str(action) for action in raw) if isinstance(raw, list) else ()
+
+    if any(
+        not actions(change)
+        or not set(actions(change)).issubset({"no-op", "create", "read", "update", "delete"})
+        for change in managed_changes
+    ):
+        failures.append("saved plan contains a managed resource with invalid actions")
+    if replace_address is not None:
+        match = TARGET_REPLACEMENT_ADDRESS_RE.fullmatch(replace_address)
+        if (
+            match is None
+            or not isinstance(replace_instance_id, str)
+            or not DEPLOYMENT_INSTANCE_ID_RE.fullmatch(replace_instance_id)
+            or not isinstance(replace_target_group_arn, str)
+            or not DEPLOYMENT_TARGET_GROUP_ARN_RE.fullmatch(replace_target_group_arn)
+        ):
+            failures.append("replacement plan has no exact authorized target identity")
+        else:
+            site, az_key = match.groups()
+            attachment_address = f'aws_lb_target_group_attachment.{site}["{az_key}"]'
+            allowed = {replace_address, attachment_address}
+            mutations = {
+                str(change.get("address")): change
+                for change in managed_changes
+                if actions(change) not in {("no-op",), ()}
+            }
+            if set(mutations) - allowed:
+                failures.append("replacement plan mutates resources outside the authorized target and attachment")
+            target = mutations.get(replace_address)
+            target_change = target.get("change") if isinstance(target, dict) else None
+            before = target_change.get("before") if isinstance(target_change, dict) else None
+            if (
+                not isinstance(target, dict)
+                or set(actions(target)) != {"create", "delete"}
+                or target.get("action_reason") != "replace_by_request"
+                or not isinstance(before, dict)
+                or before.get("id") != replace_instance_id
+            ):
+                failures.append("replacement plan does not replace the exact authorized current target")
+            attachment = mutations.get(attachment_address)
+            if attachment is None or actions(attachment) not in {
+                ("create",),
+                ("create", "delete"),
+                ("delete", "create"),
+            }:
+                failures.append("replacement plan does not refresh the exact target attachment")
+            else:
+                attachment_change = attachment.get("change")
+                attachment_before = (
+                    attachment_change.get("before") if isinstance(attachment_change, dict) else None
+                )
+                attachment_after = (
+                    attachment_change.get("after") if isinstance(attachment_change, dict) else None
+                )
+                if (
+                    not isinstance(attachment_after, dict)
+                    or attachment_after.get("target_group_arn") != replace_target_group_arn
+                    or (
+                        "delete" in actions(attachment)
+                        and (
+                            not isinstance(attachment_before, dict)
+                            or attachment_before.get("target_id") != replace_instance_id
+                            or attachment_before.get("target_group_arn") != replace_target_group_arn
+                        )
+                    )
+                    or (actions(attachment) == ("create",) and attachment_before is not None)
+                ):
+                    failures.append("replacement plan target attachment is not bound to the authorized target")
+    else:
+        if any("delete" in actions(change) or "update" in actions(change) for change in managed_changes):
+            failures.append("fresh symmetric plan contains an update or destroy action")
+        addresses = {str(change.get("address")) for change in managed_changes}
+        expected_addresses = {
+            *(f'aws_vpc_endpoint.{site}["{az_key}"]' for site in DEPLOYMENT_SITES for az_key in config.sites[site]["azs"]),
+            *(f'aws_instance.envelope_target_{site}["{az_key}"]' for site in DEPLOYMENT_SITES for az_key in config.sites[site]["target_az_keys"]),
+            *(f'aws_instance.transport_router_{site}["{az_key}"]' for site in DEPLOYMENT_SITES for az_key in config.sites[site]["transport_router_az_keys"]),
+            *(f'aws_instance.workload_{site}["{role}"]' for site in DEPLOYMENT_SITES for role in WORKLOAD_ROLES),
+            *(f'aws_lb_target_group_attachment.{site}["{az_key}"]' for site in DEPLOYMENT_SITES for az_key in config.sites[site]["target_az_keys"]),
+            *expected_route_addresses,
+        }
+        missing_addresses = expected_addresses - addresses
+        if missing_addresses:
+            failures.append("fresh symmetric plan omits required fleet resources: " + ",".join(sorted(missing_addresses)))
+        not_created = sorted(
+            address
+            for address in expected_addresses
+            if address in addresses
+            and actions(next(change for change in managed_changes if change.get("address") == address)) != ("create",)
+        )
+        if not_created:
+            failures.append("fresh symmetric plan does not create required fleet resources: " + ",".join(not_created))
     return failures
 
 
@@ -5517,7 +8450,11 @@ def terraform_plan(
         and previous_plan.get("applied") is not True
     ):
         raise LifecycleError("a previous apply started without reaching readiness; only cleanup is safe")
-    allowed_phases = {"key_rotated", "replacement_planned"} if replace_address else {"prepared", "planned"}
+    allowed_phases = (
+        {"ready", "e2e_replacement_ready", "replacement_planned"}
+        if replace_address
+        else {"prepared", "planned"}
+    )
     if manifest.get("phase") not in allowed_phases:
         raise LifecycleError("protected plan is not allowed from the current durable lifecycle phase")
     artifact = artifact_for_recovery(config, manifest, aws, run_dir)
@@ -5541,7 +8478,7 @@ def terraform_plan(
         f"-var-file={variable_file.resolve()}",
     ]
     if replace_address:
-        if re.fullmatch(r'aws_instance\.envelope_target_(west|east)\["[a-z][a-z0-9-]{0,15}"\]', replace_address) is None:
+        if TARGET_REPLACEMENT_ADDRESS_RE.fullmatch(replace_address) is None:
             raise LifecycleError("replacement address must be one exact symmetric Envelope target instance")
         args.append(f"-replace={replace_address}")
     env = child_environment(config, TF_DATA_DIR=str((run_dir / "terraform-data").resolve()), TF_IN_AUTOMATION="1")
@@ -5555,22 +8492,63 @@ def terraform_plan(
         document = json.loads(rendered)
     except json.JSONDecodeError as error:
         raise LifecycleError("Terraform produced invalid saved-plan JSON") from error
-    failures = validate_symmetric_saved_plan(document, config)
+    replace_instance_id: str | None = None
+    replace_target_group_arn: str | None = None
+    if replace_address:
+        match = TARGET_REPLACEMENT_ADDRESS_RE.fullmatch(replace_address)
+        deployment = manifest.get("deployment")
+        topology = deployment_output_value(deployment, "symmetric_topology") if isinstance(deployment, dict) else None
+        sites = topology.get("sites") if isinstance(topology, dict) else None
+        if match is not None and isinstance(sites, dict):
+            site, az_key = match.groups()
+            site_value = sites.get(site)
+            fleet = site_value.get("target_fleet") if isinstance(site_value, dict) else None
+            matches = [
+                member
+                for member in fleet or []
+                if isinstance(member, dict) and member.get("az_key") == az_key
+            ]
+            if len(matches) == 1 and isinstance(matches[0].get("instance_id"), str):
+                replace_instance_id = matches[0]["instance_id"]
+                if isinstance(matches[0].get("target_group_arn"), str):
+                    replace_target_group_arn = matches[0]["target_group_arn"]
+        e2e = manifest.get("e2e")
+        replacement = e2e.get("replacement") if isinstance(e2e, dict) else None
+        if replacement is not None and (
+            not isinstance(replacement, dict)
+            or replacement.get("address") != replace_address
+            or replacement.get("old_instance_id") != replace_instance_id
+        ):
+            raise LifecycleError("replacement plan differs from the active durable E2E replacement journal")
+    failures = validate_symmetric_saved_plan(
+        document,
+        config,
+        replace_address=replace_address,
+        replace_instance_id=replace_instance_id,
+        replace_target_group_arn=replace_target_group_arn,
+    )
     if failures:
         raise LifecycleError("saved plan failed protected shape validation: " + "; ".join(failures))
     plan_json.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n")
     os.chmod(plan_json, 0o600)
+    plan_original = copy.deepcopy(manifest)
     manifest["phase"] = "replacement_planned" if replace_address else "planned"
     manifest["saved_plan"] = {
         "path": str(destination),
         "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
         "replacement": replace_address,
+        "replacement_instance_id": replace_instance_id,
         "source": source_identity,
         "apply_started": False,
         "applied": False,
     }
     manifest["terraform_source"] = durable_source if replace_address else source_record
-    store.write(manifest, if_match=store.remote_etag)
+    persist_manifest_transition(
+        store,
+        plan_original,
+        manifest,
+        description="saved-plan completion boundary",
+    )
     return destination
 
 
@@ -5599,32 +8577,77 @@ def terraform_apply(
     expected_phase = "replacement_planned" if saved.get("replacement") else "planned"
     if manifest.get("phase") != expected_phase:
         raise LifecycleError("protected apply requires the exact durably planned lifecycle phase")
+    replacement = saved.get("replacement")
+    if replacement:
+        replacement_instance_id = saved.get("replacement_instance_id")
+        if (
+            TARGET_REPLACEMENT_ADDRESS_RE.fullmatch(str(replacement)) is None
+            or DEPLOYMENT_INSTANCE_ID_RE.fullmatch(str(replacement_instance_id)) is None
+        ):
+            raise LifecycleError("protected replacement apply has no exact saved target identity")
+        e2e = manifest.get("e2e")
+        journal = e2e.get("replacement") if isinstance(e2e, dict) else None
+        if journal is not None and (
+            not isinstance(journal, dict)
+            or journal.get("address") != replacement
+            or journal.get("old_instance_id") != replacement_instance_id
+        ):
+            raise LifecycleError("protected replacement apply differs from the active durable E2E journal")
     durable_source = manifest.get("terraform_source")
     if not isinstance(durable_source, dict):
         raise LifecycleError("apply has no durable Terraform source bundle")
     source_identity = terraform_source_identity(durable_source)
     if saved.get("source") != source_identity:
         raise LifecycleError("apply Terraform source identity differs from the durably reviewed saved plan")
+    claim_original = copy.deepcopy(manifest)
+    claim_etag = store.remote_etag
     manifest["saved_plan"]["apply_started"] = True
     manifest["phase"] = "apply_claimed"
     apply_claimed_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace(
         "+00:00", "Z"
     )
     manifest["apply_claimed_at"] = apply_claimed_at
-    store.write(manifest, if_match=store.remote_etag)
+    apply_claim_id = str(uuid.uuid4())
+    manifest["apply_claim_id"] = apply_claim_id
+    try:
+        store.write(manifest, if_match=claim_etag)
+    except BaseException as error:
+        try:
+            recovered = store.recover()
+            recovered_etag = store.remote_etag
+        except BaseException as recovery_error:
+            raise LifecycleError(
+                "apply claim write outcome is ambiguous and requires protected recovery"
+            ) from recovery_error
+        if recovered == manifest and isinstance(recovered_etag, str) and recovered_etag:
+            if isinstance(error, (KeyboardInterrupt, InterruptedError, TimeoutError)) or not isinstance(error, Exception):
+                try:
+                    store.write(claim_original, if_match=recovered_etag)
+                except BaseException as rollback_error:
+                    raise LifecycleError(
+                        "interrupted apply claim committed but could not be rolled back before Terraform started"
+                    ) from rollback_error
+                raise
+        elif recovered == claim_original and recovered_etag == claim_etag:
+            raise
+        else:
+            raise ConcurrentLifecycleError(
+                "apply claim write collided with another durable lifecycle transition"
+            ) from None
     try:
         source_dir, materialized_identity = materialize_durable_terraform_source(durable_source, run_dir)
         if materialized_identity != source_identity:
             raise LifecycleError("apply Terraform source bundle changed after its durable claim")
         terraform_init(config, aws, runner, run_dir, source_dir)
-        replacement = saved.get("replacement")
-        if replacement:
-            if tailscale_factory is None:
-                raise LifecycleError("target replacement requires an exact Tailnet retirement authority")
-            retire_replacement_devices(tailscale_factory(), store, manifest, str(replacement))
+        apply_started_original = copy.deepcopy(manifest)
         manifest["tailnet"]["nodes_expected"] = True
         manifest["phase"] = "apply_started"
-        store.write(manifest)
+        persist_manifest_transition(
+            store,
+            apply_started_original,
+            manifest,
+            description="apply-start boundary",
+        )
         env = child_environment(config, TF_DATA_DIR=str((run_dir / "terraform-data").resolve()), TF_IN_AUTOMATION="1")
         runner.run(["terraform", "apply", "-input=false", str(destination)], env=env, cwd=source_dir)
         output = runner.run(["terraform", "output", "-json"], env=env, cwd=source_dir)
@@ -5633,28 +8656,68 @@ def terraform_apply(
         deployment_path = run_dir / "deployment.json"
         deployment_path.write_text(json.dumps(deployment, sort_keys=True, separators=(",", ":")) + "\n")
         os.chmod(deployment_path, 0o600)
+        completion_original = copy.deepcopy(manifest)
         manifest["phase"] = "applied"
         manifest["saved_plan"]["applied"] = True
         manifest["saved_plan"]["applied_at"] = apply_claimed_at
         manifest.pop("apply_claimed_at", None)
+        manifest.pop("apply_claim_id", None)
         manifest["deployment"] = deployment
         completion_etag = store.remote_etag
-        store.write(manifest, if_match=completion_etag)
+        persist_manifest_transition(
+            store,
+            completion_original,
+            manifest,
+            description="apply-completion boundary",
+            if_match=completion_etag,
+        )
         return deployment
-    except Exception as error:
+    except BaseException as error:
+        if isinstance(error, ConcurrentLifecycleError):
+            raise
         if manifest["saved_plan"].get("applied") is True:
             try:
-                store.write(manifest, if_match=completion_etag)
-            except Exception as persistence_error:
+                recovered = store.recover()
+                recovered_etag = store.remote_etag
+                if recovered == completion_original and recovered_etag == completion_etag:
+                    persist_manifest_transition(
+                        store,
+                        completion_original,
+                        manifest,
+                        description="apply-completion recovery boundary",
+                        if_match=completion_etag,
+                    )
+                elif recovered != manifest or not isinstance(recovered_etag, str) or not recovered_etag:
+                    raise ConcurrentLifecycleError(
+                        "apply completion collided with another durable lifecycle transition"
+                    )
+            except BaseException as persistence_error:
                 raise LifecycleError(
                     f"Terraform apply completed but its durable applied boundary could not be persisted: {persistence_error}"
                 ) from error
+            if isinstance(error, (KeyboardInterrupt, InterruptedError, TimeoutError)) or not isinstance(error, Exception):
+                raise
             return deployment
+        try:
+            failure_original = store.recover()
+        except BaseException as recovery_error:
+            raise LifecycleError("apply failed and its durable boundary could not be recovered") from recovery_error
+        if failure_original.get("apply_claim_id") != apply_claim_id:
+            raise ConcurrentLifecycleError(
+                "apply failure recovery found a different durable operation owner"
+            ) from None
+        manifest = copy.deepcopy(failure_original)
         manifest["phase"] = "apply_failed"
         manifest.pop("apply_claimed_at", None)
+        manifest.pop("apply_claim_id", None)
         try:
-            store.write(manifest)
-        except Exception as persistence_error:
+            persist_manifest_transition(
+                store,
+                failure_original,
+                manifest,
+                description="apply-failure boundary",
+            )
+        except BaseException as persistence_error:
             raise LifecycleError(f"apply failed and its durable failure boundary could not be persisted: {persistence_error}") from error
         raise
 
@@ -5702,11 +8765,7 @@ READINESS_COMMANDS = [
     """if /usr/bin/timeout --signal=KILL 120s /bin/bash <<'ENVELOPE_READINESS'
 set -uo pipefail
 while true; do
-  units_ready=true
-  for unit in tailscaled.service envelope-host-network.service envelope.service; do
-    systemctl is-active --quiet "$unit" || units_ready=false
-  done
-  if [[ "$units_ready" == true ]] &&
+  if systemctl is-active --quiet envelope.service &&
     PREFLIGHT_MAX_ATTEMPTS=1 PREFLIGHT_RETRY_SECONDS=0 /usr/bin/timeout --signal=TERM --kill-after=2s 20s /usr/local/sbin/envelope-preflight >/dev/null 2>&1 &&
     curl --fail --silent --max-time 5 http://127.0.0.1:9090/healthz >/dev/null 2>&1; then
     exit 0
@@ -5718,19 +8777,123 @@ then
   exit 0
 fi
 failed=0
-for unit in tailscaled.service envelope-host-network.service envelope.service; do
-  systemctl is-active "$unit" >&2 || failed=1
-done
+systemctl is-active envelope.service >&2 || failed=1
 PREFLIGHT_MAX_ATTEMPTS=1 PREFLIGHT_RETRY_SECONDS=0 /usr/bin/timeout --signal=TERM --kill-after=2s 20s /usr/local/sbin/envelope-preflight >&2 || failed=1
 curl --fail --silent --show-error --max-time 5 http://127.0.0.1:9090/healthz >&2 || failed=1
 exit 1""",
 ]
+
+
+def transport_readiness_commands(config: RunConfig, site: str, az_key: str) -> list[str]:
+    if site not in DEPLOYMENT_SITES:
+        raise LifecycleError("transport readiness site is invalid")
+    local_az_keys = config.sites[site]["transport_router_az_keys"]
+    if az_key not in local_az_keys:
+        raise LifecycleError("transport readiness AZ key is invalid")
+    expected_local = shlex.quote(
+        json.dumps(sorted(config.sites[site]["local_site_cidrs"]), separators=(",", ":"))
+    )
+    expected_remote = shlex.quote(
+        json.dumps(sorted(config.sites[site]["remote_site_cidrs"]), separators=(",", ":"))
+    )
+    peer_site = "east" if site == "west" else "west"
+    advertised_prefixes = initial_transport_router_advertised_prefixes(config)
+    expected_self_prefix = shlex.quote(advertised_prefixes[site][az_key])
+    expected_remote_owners = shlex.quote(
+        json.dumps(
+            {
+                prefix: f"{config.run_id}-{peer_site}-transport-{peer_az}"
+                for peer_az, prefix in advertised_prefixes[peer_site].items()
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    expected_self = shlex.quote(f"{config.run_id}-{site}-transport-{az_key}")
+    command = f"""if /usr/bin/timeout --signal=KILL 120s /bin/bash <<'TRANSPORT_READINESS'
+set -uo pipefail
+expected_local={expected_local}
+expected_remote={expected_remote}
+expected_self_prefix={expected_self_prefix}
+expected_remote_owners={expected_remote_owners}
+expected_self={expected_self}
+while true; do
+  if systemctl is-active --quiet envelope-transport-router-network.service &&
+    systemctl is-active --quiet tailscaled.service &&
+    status=$(/usr/bin/timeout --signal=TERM --kill-after=2s 20s /usr/bin/tailscale status --json) &&
+    prefs=$(/usr/bin/timeout --signal=TERM --kill-after=2s 20s /usr/bin/tailscale debug prefs) &&
+    /usr/bin/jq -e --arg expected_self "$expected_self" --arg expected_self_prefix "$expected_self_prefix" --argjson expected_local "$expected_local" --argjson expected_remote "$expected_remote" --argjson expected_remote_owners "$expected_remote_owners" --argjson prefs "$prefs" '
+      . as $status
+      | ($status.BackendState == "Running")
+        and ($status.Self.Online == true)
+        and ((($status.Self.HostName // $status.Self.DNSName // "") | split(".")[0]) == $expected_self)
+        and ($prefs.RouteAll == true)
+        and ($prefs.NoSNAT == true)
+        and ((($prefs.AdvertiseRoutes // []) | sort) == [$expected_self_prefix])
+        and (([
+            ($status.Peer // {{}})
+            | if type == "object" then .[] elif type == "array" then .[] else empty end
+            | {{
+                hostname: ((.HostName // .DNSName // "") | split(".")[0]),
+                online: .Online,
+                routes: (.PrimaryRoutes // [])
+              }}
+          ]) as $peers
+          | (all($peers[]; (.routes | type) == "array" and all(.routes[]; type == "string"))) as $valid_peer_shapes
+          | ([
+            $peers[] as $peer
+            | $peer.routes[]
+            | {{hostname: $peer.hostname, online: $peer.online, route: .}}
+          ]) as $claims
+          | ($expected_local + $expected_remote) as $expected_routes
+          | ([$claims[] | . as $claim
+            | select($expected_routes | index($claim.route) != null)]) as $protected_claims
+          | $valid_peer_shapes
+          and all($expected_remote[]; . as $prefix
+            | [$protected_claims[] | select(.route == $prefix)] as $owners
+            | ($owners | length) == 1
+              and $owners[0].online == true
+              and $owners[0].hostname == $expected_remote_owners[$prefix])
+          and all($expected_local[]; . as $prefix
+            | [$protected_claims[] | select(.route == $prefix)] as $owners
+            | ($owners | length) == 0))
+    ' <<<"$status" >/dev/null; then
+    exit 0
+  fi
+  sleep 2
+done
+TRANSPORT_READINESS
+then
+  exit 0
+fi
+systemctl is-active envelope-transport-router-network.service >&2 || true
+systemctl is-active tailscaled.service >&2 || true
+printf '%s\n' 'transport router did not expose exact protected primary-route ownership' >&2
+exit 1"""
+    return [
+        "set -euo pipefail",
+        "/usr/bin/timeout --signal=TERM --kill-after=5s 600s cloud-init status --wait --long",
+        command,
+    ]
+
 
 WORKLOAD_DIAGNOSTIC_COMMANDS = [
     "set +e",
     "/usr/bin/timeout --signal=TERM --kill-after=2s 20s cloud-init status --long",
     "/usr/bin/timeout --signal=TERM --kill-after=2s 20s systemctl status amazon-ssm-agent.service --no-pager --full",
     "/usr/bin/timeout --signal=TERM --kill-after=2s 20s /usr/sbin/ip -brief address show",
+]
+
+TRANSPORT_DIAGNOSTIC_COMMANDS = [
+    "set +e",
+    "/usr/bin/timeout --signal=TERM --kill-after=2s 20s cloud-init status --long",
+    "/usr/bin/timeout --signal=TERM --kill-after=2s 20s systemctl status envelope-transport-router-network.service tailscaled.service --no-pager --full",
+    "/usr/bin/timeout --signal=TERM --kill-after=2s 20s journalctl -u envelope-transport-router-network.service -n 200 --no-pager --output=short-iso",
+    "/usr/bin/timeout --signal=TERM --kill-after=2s 20s /usr/sbin/ip -j -details -4 rule show",
+    "/usr/bin/timeout --signal=TERM --kill-after=2s 20s /usr/sbin/ip -j -details -4 route show table main",
+    "/usr/bin/timeout --signal=TERM --kill-after=2s 20s /usr/sbin/ip -j -details -4 route show table 52",
+    "/usr/bin/timeout --signal=TERM --kill-after=2s 20s /usr/sbin/iptables-save",
+    "/usr/bin/timeout --signal=TERM --kill-after=2s 20s /usr/sbin/ip6tables-save",
 ]
 
 
@@ -6026,9 +9189,38 @@ def parse_deployment_json(value: str, description: str = "deployment output") ->
 def validate_symmetric_deployment_output(document: dict[str, Any], config: RunConfig) -> None:
     """Accept the complete v2 Terraform output contract after apply."""
 
-    failures = validate_symmetric_saved_plan({"planned_values": {"outputs": document}}, config)
+    failures = validate_complete_symmetric_output_values(document, config)
     if failures:
         raise LifecycleError("deployment output failed symmetric validation: " + "; ".join(failures))
+    _instances, target_groups, workloads = deployment_values(
+        document,
+        expected_sites=config.sites,
+    )
+    topology = deployment_output_value(document, "symmetric_topology")
+    target_fleets, transport_fleets = symmetric_topology_fleets(
+        topology, config, target_groups
+    )
+    instance_ids = [
+        *(
+            target_id
+            for site in DEPLOYMENT_SITES
+            for target_id in target_fleets[site]
+        ),
+        *(
+            member["instance_id"]
+            for site in DEPLOYMENT_SITES
+            for member in transport_fleets[site].values()
+        ),
+        *(
+            workloads[site][role]["instance_id"]
+            for site in DEPLOYMENT_SITES
+            for role in WORKLOAD_ROLES
+        ),
+    ]
+    if len(set(instance_ids)) != len(instance_ids):
+        raise LifecycleError(
+            "deployment output workload, target, and transport instance identities must be globally disjoint"
+        )
 
 
 def deployment_output_value(document: dict[str, Any], name: str) -> Any:
@@ -6046,61 +9238,8 @@ def deployment_target_fleets(
     document: dict[str, Any], config: RunConfig, target_groups: dict[str, str]
 ) -> dict[str, tuple[str, ...]]:
     value = deployment_output_value(document, "symmetric_topology")
-    if not isinstance(value, dict) or set(value) != {"config_version", "run_id", "sites"}:
-        raise LifecycleError("deployment output symmetric_topology has an invalid shape")
-    if value["config_version"] != 2 or value["run_id"] != config.run_id:
-        raise LifecycleError("deployment output symmetric_topology has an invalid version or run identity")
-    sites = value["sites"]
-    if not isinstance(sites, dict) or set(sites) != set(DEPLOYMENT_SITES):
-        raise LifecycleError("deployment output symmetric_topology.sites must contain exactly west and east")
-
-    result: dict[str, tuple[str, ...]] = {}
-    all_ids: list[str] = []
-    site_fields = {"region", "local_site_cidrs", "remote_site_cidrs", "target_fleet", "ingress_router_fleet"}
-    member_fields = {"region", "az_key", "instance_id", "target_group_arn"}
-    for site in DEPLOYMENT_SITES:
-        site_value = sites[site]
-        expected = config.sites[site]
-        if (
-            not isinstance(site_value, dict)
-            or set(site_value) != site_fields
-            or site_value["region"] != expected["region"]
-            or site_value["local_site_cidrs"] != expected["local_site_cidrs"]
-            or site_value["remote_site_cidrs"] != expected["remote_site_cidrs"]
-        ):
-            raise LifecycleError(f"deployment output symmetric_topology.sites.{site} contradicts the run config")
-        fleet = site_value["target_fleet"]
-        expected_az_keys = set(expected["target_az_keys"])
-        if not isinstance(fleet, list) or len(fleet) != len(expected_az_keys):
-            raise LifecycleError(f"deployment output symmetric_topology.sites.{site}.target_fleet has invalid capacity")
-        ids: list[str] = []
-        az_keys: list[str] = []
-        for member in fleet:
-            if (
-                not isinstance(member, dict)
-                or set(member) != member_fields
-                or member["region"] != expected["region"]
-                or not isinstance(member["az_key"], str)
-                or member["az_key"] not in expected_az_keys
-                or member["target_group_arn"] != target_groups[site]
-                or not isinstance(member["instance_id"], str)
-                or not DEPLOYMENT_INSTANCE_ID_RE.fullmatch(member["instance_id"])
-                or redact(member["instance_id"]) != member["instance_id"]
-            ):
-                raise LifecycleError(
-                    f"deployment output symmetric_topology.sites.{site}.target_fleet has an invalid member"
-                )
-            ids.append(member["instance_id"])
-            az_keys.append(member["az_key"])
-        if set(az_keys) != expected_az_keys or len(set(ids)) != len(ids):
-            raise LifecycleError(
-                f"deployment output symmetric_topology.sites.{site}.target_fleet does not cover each configured AZ"
-            )
-        result[site] = tuple(ids)
-        all_ids.extend(ids)
-    if len(set(all_ids)) != len(all_ids):
-        raise LifecycleError("deployment output symmetric target fleets contain duplicate instance identities")
-    return result
+    target_fleets, _transport_fleets = symmetric_topology_fleets(value, config, target_groups)
+    return target_fleets
 
 
 def deployment_values(
@@ -6135,8 +9274,29 @@ def deployment_values(
             raise LifecycleError(f"deployment output {name} contains duplicate identities")
         return result
 
-    instances = exact_site_strings("instance_ids", DEPLOYMENT_INSTANCE_ID_RE)
     target_groups = exact_site_strings("gwlb_target_group_arns", DEPLOYMENT_TARGET_GROUP_ARN_RE)
+    topology = deployment_output_value(document, "symmetric_topology")
+    topology_sites = topology.get("sites") if isinstance(topology, dict) else None
+    if not isinstance(topology_sites, dict) or set(topology_sites) != set(DEPLOYMENT_SITES):
+        raise LifecycleError("deployment output symmetric_topology must identify both target fleets")
+    instances: dict[str, str] = {}
+    for site in DEPLOYMENT_SITES:
+        fleet = topology_sites[site].get("target_fleet") if isinstance(topology_sites[site], dict) else None
+        if not isinstance(fleet, list) or not fleet:
+            raise LifecycleError(f"deployment output symmetric_topology.sites.{site}.target_fleet is empty")
+        ordered = sorted(
+            fleet,
+            key=lambda member: str(member.get("az_key", "")) if isinstance(member, dict) else "",
+        )
+        member = ordered[0]
+        if (
+            not isinstance(member, dict)
+            or not isinstance(member.get("instance_id"), str)
+            or not DEPLOYMENT_INSTANCE_ID_RE.fullmatch(member["instance_id"])
+            or member.get("target_group_arn") != target_groups[site]
+        ):
+            raise LifecycleError(f"deployment output symmetric_topology.sites.{site} has no primary target")
+        instances[site] = member["instance_id"]
     workload_value = deployment_output_value(document, "workload_instances")
     if not isinstance(workload_value, dict) or set(workload_value) != set(DEPLOYMENT_SITES):
         raise LifecycleError("deployment output workload_instances must contain exactly west and east")
@@ -6298,6 +9458,203 @@ def deployment_values(
     return instances, target_groups, workloads
 
 
+def validate_live_gwlbe_routes(
+    config: RunConfig,
+    aws: AwsCLI,
+    deployment: dict[str, Any],
+) -> None:
+    """Verify live post-inspection routes from config-bound source owners."""
+
+    validate_symmetric_deployment_output(deployment, config)
+    target_groups = deployment_output_value(deployment, "gwlb_target_group_arns")
+    topology = deployment_output_value(deployment, "symmetric_topology")
+    _target_fleets, transport_fleets = symmetric_topology_fleets(
+        topology, config, target_groups
+    )
+    vpc_ids = deployment_output_value(deployment, "vpc_ids")
+    if not isinstance(vpc_ids, dict) or set(vpc_ids) != set(DEPLOYMENT_SITES):
+        raise LifecycleError("deployment output vpc_ids must contain exactly west and east")
+
+    target_fields = {
+        "CarrierGatewayId",
+        "CoreNetworkArn",
+        "EgressOnlyInternetGatewayId",
+        "GatewayId",
+        "LocalGatewayId",
+        "NatGatewayId",
+        "NetworkInterfaceId",
+        "TransitGatewayId",
+        "VpcEndpointId",
+        "VpcPeeringConnectionId",
+    }
+    for site in DEPLOYMENT_SITES:
+        members = transport_fleets[site]
+        allowed_enis = {member["network_interface_id"] for member in members.values()}
+        eni_owners = {
+            member["network_interface_id"]: member["instance_id"]
+            for member in members.values()
+        }
+        allowed_tables = {
+            member["gwlbe_route_table_id"] for member in members.values()
+        }
+        interface_response = aws.json(
+            [
+                "ec2",
+                "describe-network-interfaces",
+                "--network-interface-ids",
+                *sorted(allowed_enis),
+            ],
+            region=config.sites[site]["region"],
+        )
+        interfaces = interface_response.get("NetworkInterfaces")
+        if not isinstance(interfaces, list) or not all(
+            isinstance(interface, dict) for interface in interfaces
+        ):
+            raise LifecycleError(
+                f"{site} live transport ENI response has an invalid shape"
+            )
+        interfaces_by_id = {
+            interface.get("NetworkInterfaceId"): interface for interface in interfaces
+        }
+        if (
+            len(interfaces_by_id) != len(interfaces)
+            or set(interfaces_by_id) != allowed_enis
+        ):
+            raise LifecycleError(
+                f"{site} live transport ENIs differ from the output allowlist"
+            )
+        for interface_id, expected_instance_id in eni_owners.items():
+            interface = interfaces_by_id[interface_id]
+            attachment = interface.get("Attachment")
+            if (
+                interface.get("VpcId") != vpc_ids[site]
+                or interface.get("Status") != "in-use"
+                or not isinstance(attachment, dict)
+                or attachment.get("InstanceId") != expected_instance_id
+                or attachment.get("DeviceIndex") != 0
+                or attachment.get("Status") != "attached"
+            ):
+                raise LifecycleError(
+                    f"{site} live transport ENI is not the source-prefix owner's attached primary interface"
+                )
+        expectations: dict[str, tuple[str, str, tuple[str, ...]]] = {}
+        for az_key in sorted(config.sites[site]["gwlbe_subnet_cidrs"]):
+            source_prefix = config.sites[site]["workload_subnet_cidrs"][az_key]
+            owners = [
+                member
+                for member in members.values()
+                if member["advertised_prefix"] == source_prefix
+            ]
+            if len(owners) != 1:
+                raise LifecycleError(
+                    f"{site} live GWLBE route validation has no unique source-prefix owner"
+                )
+            owner = owners[0]
+            route_table_id = owner["gwlbe_route_table_id"]
+            network_interface_id = owner["network_interface_id"]
+            if (
+                owner["az_key"] != az_key
+                or route_table_id not in allowed_tables
+                or network_interface_id not in allowed_enis
+                or route_table_id in expectations
+            ):
+                raise LifecycleError(
+                    f"{site} live GWLBE route validation contradicts its output allowlist"
+                )
+            expectations[route_table_id] = (
+                az_key,
+                network_interface_id,
+                tuple(sorted(config.sites[site]["remote_site_cidrs"])),
+            )
+
+        route_table_ids = sorted(expectations)
+        response = aws.json(
+            ["ec2", "describe-route-tables", "--route-table-ids", *route_table_ids],
+            region=config.sites[site]["region"],
+        )
+        route_tables = response.get("RouteTables")
+        if not isinstance(route_tables, list) or not all(
+            isinstance(route_table, dict) for route_table in route_tables
+        ):
+            raise LifecycleError(
+                f"{site} live GWLBE route-table response has an invalid shape"
+            )
+        by_id = {
+            route_table.get("RouteTableId"): route_table for route_table in route_tables
+        }
+        if (
+            len(by_id) != len(route_tables)
+            or set(by_id) != set(route_table_ids)
+            or any(not isinstance(identifier, str) for identifier in by_id)
+        ):
+            raise LifecycleError(
+                f"{site} live GWLBE route-table response differs from the output allowlist"
+            )
+
+        for route_table_id, (_az_key, expected_eni, remote_prefixes) in expectations.items():
+            route_table = by_id[route_table_id]
+            routes = route_table.get("Routes")
+            if route_table.get("VpcId") != vpc_ids[site] or not isinstance(routes, list):
+                raise LifecycleError(
+                    f"{site} live GWLBE route table {route_table_id} has invalid VPC or route metadata"
+                )
+            expected_networks = {
+                prefix: ipaddress.ip_network(prefix, strict=True)
+                for prefix in remote_prefixes
+            }
+            protected_routes: dict[str, list[dict[str, Any]]] = {
+                prefix: [] for prefix in remote_prefixes
+            }
+            for route in routes:
+                if not isinstance(route, dict):
+                    raise LifecycleError(
+                        f"{site} live GWLBE route table {route_table_id} contains malformed route metadata"
+                    )
+                destination = route.get("DestinationCidrBlock")
+                if destination is None:
+                    continue
+                if not isinstance(destination, str):
+                    raise LifecycleError(
+                        f"{site} live GWLBE route table {route_table_id} contains malformed route metadata"
+                    )
+                try:
+                    network = ipaddress.ip_network(destination, strict=True)
+                except ValueError:
+                    raise LifecycleError(
+                        f"{site} live GWLBE route table {route_table_id} contains a noncanonical route"
+                    ) from None
+                if not any(
+                    network.overlaps(expected_network)
+                    for expected_network in expected_networks.values()
+                ):
+                    continue
+                canonical = str(network)
+                if canonical not in protected_routes:
+                    raise LifecycleError(
+                        f"{site} live GWLBE route table {route_table_id} contains a route intersecting a protected remote prefix"
+                    )
+                protected_routes[canonical].append(route)
+
+            if any(len(matches) != 1 for matches in protected_routes.values()):
+                raise LifecycleError(
+                    f"{site} live GWLBE route table {route_table_id} does not contain each exact remote-prefix route once"
+                )
+            for route in (matches[0] for matches in protected_routes.values()):
+                if (
+                    route.get("NetworkInterfaceId") != expected_eni
+                    or route.get("NetworkInterfaceId") not in allowed_enis
+                    or route.get("State") != "active"
+                    or route.get("Origin") != "CreateRoute"
+                    or any(
+                        route.get(field) not in (None, "")
+                        for field in target_fields - {"NetworkInterfaceId"}
+                    )
+                ):
+                    raise LifecycleError(
+                        f"{site} live GWLBE route table {route_table_id} does not select its source-prefix owner's allowlisted ENI"
+                    )
+
+
 def wait_deployment(
     config: RunConfig,
     aws: AwsCLI,
@@ -6309,19 +9666,33 @@ def wait_deployment(
 ) -> None:
     if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or timeout_seconds <= 0:
         raise LifecycleError("deployment readiness timeout must be a positive integer")
+    validate_symmetric_deployment_output(deployment, config)
     instances, target_groups, workloads = deployment_values(deployment, expected_sites=config.sites)
-    target_fleets = deployment_target_fleets(deployment, config, target_groups)
+    topology = deployment_output_value(deployment, "symmetric_topology")
+    target_fleets, transport_fleets = symmetric_topology_fleets(topology, config, target_groups)
     deadline = time.monotonic() + timeout_seconds
     try:
         for site in DEPLOYMENT_SITES:
-            wait_for_instance(
-                aws,
-                region=config.sites[site]["region"],
-                instance_id=instances[site],
-                deadline=deadline,
-                node_label=f"{site} appliance",
-                sleep=sleep,
-            )
+            for target_id in target_fleets[site]:
+                wait_for_instance(
+                    aws,
+                    region=config.sites[site]["region"],
+                    instance_id=target_id,
+                    deadline=deadline,
+                    node_label=f"{site} target {target_id}",
+                    sleep=sleep,
+                )
+        for site in DEPLOYMENT_SITES:
+            for az_key, transport in sorted(transport_fleets[site].items()):
+                wait_for_instance(
+                    aws,
+                    region=config.sites[site]["region"],
+                    instance_id=transport["instance_id"],
+                    deadline=deadline,
+                    readiness_commands=transport_readiness_commands(config, site, az_key),
+                    node_label=f"{site} transport router {az_key}",
+                    sleep=sleep,
+                )
         for site in DEPLOYMENT_SITES:
             for role in WORKLOAD_ROLES:
                 workload = workloads[site][role]
@@ -6353,6 +9724,7 @@ def wait_deployment(
             }
 
         diagnostics: dict[str, Any] = {
+            "transport": {site: {} for site in DEPLOYMENT_SITES},
             "workloads": {site: {} for site in DEPLOYMENT_SITES},
             "target_health": {},
         }
@@ -6366,6 +9738,20 @@ def wait_deployment(
                 )
             except Exception as diagnostic_error:
                 diagnostics[site] = collection_failure(diagnostic_error)
+        for site in DEPLOYMENT_SITES:
+            for az_key, transport in sorted(transport_fleets[site].items()):
+                try:
+                    diagnostics["transport"][site][az_key] = collect_diagnostics(
+                        aws,
+                        transport,
+                        transport["instance_id"],
+                        commands=TRANSPORT_DIAGNOSTIC_COMMANDS,
+                        sleep=sleep,
+                    )
+                except Exception as diagnostic_error:
+                    diagnostics["transport"][site][az_key] = collection_failure(
+                        diagnostic_error
+                    )
         for site in DEPLOYMENT_SITES:
             for role in WORKLOAD_ROLES:
                 workload = workloads[site][role]
@@ -6410,6 +9796,13 @@ def wait_deployment(
         diagnostic_ids: dict[str, Any] = {
             site: diagnostics[site]["command_id"] for site in DEPLOYMENT_SITES
         }
+        diagnostic_ids["transport"] = {
+            site: {
+                az_key: diagnostics["transport"][site][az_key]["command_id"]
+                for az_key in sorted(transport_fleets[site])
+            }
+            for site in DEPLOYMENT_SITES
+        }
         diagnostic_ids["workloads"] = {
             site: {
                 role: diagnostics["workloads"][site][role]["command_id"]
@@ -6435,6 +9828,10 @@ def scoped_run_devices(
     include_numeric_suffixes: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
     expected = {str(value) for value in manifest["tailnet"]["expected_hostnames"]}
+    if manifest["tailnet"].get("device_roles") != {
+        hostname: "transport-router" for hostname in expected
+    }:
+        raise LifecycleError("Tailnet device scope is not limited to transport routers")
     required_tag = str(manifest["tailnet"]["tag"])
     result = {hostname: [] for hostname in expected}
     for device in devices:
@@ -6442,31 +9839,124 @@ def scoped_run_devices(
         tags = {str(value) for value in device.get("tags", [])}
         if required_tag not in tags or not device.get("id"):
             continue
-        for expected_hostname in expected:
-            if hostname == expected_hostname or include_numeric_suffixes and re.fullmatch(
-                re.escape(expected_hostname) + r"-[1-9][0-9]*", hostname
-            ):
-                result[expected_hostname].append(device)
-                break
+        if hostname in expected:
+            result[hostname].append(device)
+            continue
+        if include_numeric_suffixes:
+            matches = [
+                expected_hostname
+                for expected_hostname in expected
+                if re.fullmatch(re.escape(expected_hostname) + r"-[1-9][0-9]*", hostname)
+            ]
+            if len(matches) == 1:
+                result[matches[0]].append(device)
     return result
 
 
-def record_ready_devices(tailscale: TailscaleAPI, store: ManifestStore, manifest: dict[str, Any]) -> dict[str, str]:
-    scoped = scoped_run_devices(tailscale.list_devices(), manifest)
-    if any(len(values) != 1 for values in scoped.values()):
-        raise LifecycleError("readiness must identify exactly one full-field Tailnet device for each run hostname")
+def record_ready_devices(
+    tailscale: TailscaleAPI,
+    store: ManifestStore,
+    manifest: dict[str, Any],
+    *,
+    final_phase: str = "ready",
+) -> dict[str, str]:
+    if final_phase not in {"ready", "e2e_replacement_complete"}:
+        raise LifecycleError("Tailnet readiness final phase is invalid")
+    e2e = manifest.get("e2e")
+    has_replacement = isinstance(e2e, dict) and isinstance(e2e.get("replacement"), dict)
+    if has_replacement != (final_phase == "e2e_replacement_complete"):
+        raise LifecycleError("Tailnet readiness final phase differs from the durable replacement journal")
+    original = copy.deepcopy(manifest)
+    devices = tailscale.list_devices()
+    required_tag = str(manifest["tailnet"]["tag"])
+    target_hostname = re.compile(
+        re.escape(str(manifest["run_id"]))
+        + r"-(?:west|east)-target-[a-z][a-z0-9-]{0,15}(?:-[1-9][0-9]*)?"
+    )
+    if any(
+        target_hostname.fullmatch(device_hostname(device))
+        and required_tag in {str(value) for value in device.get("tags", [])}
+        for device in devices
+    ):
+        raise LifecycleError("Envelope targets must not be Tailnet devices")
+    scoped = scoped_run_devices(devices, manifest, include_numeric_suffixes=True)
+    if any(not values for values in scoped.values()):
+        raise LifecycleError(
+            "readiness must identify at least one full-field Tailnet device for each run hostname"
+        )
+    candidate_ids = [str(device["id"]) for values in scoped.values() for device in values]
+    if len(set(candidate_ids)) != len(candidate_ids):
+        raise LifecycleError("Tailnet readiness discovery returned duplicate run device identities")
+    topology_sites = manifest["terraform_variables"]["symmetric_topology"]["sites"]
+    selected: dict[str, dict[str, Any]] = {}
+    for hostname in sorted(scoped):
+        values = scoped[hostname]
+        match = re.fullmatch(
+            re.escape(str(manifest["run_id"])) + r"-(west|east)-transport-([a-z][a-z0-9-]{0,15})",
+            hostname,
+        )
+        if match is None:
+            raise LifecycleError("Tailnet readiness hostname does not identify one transport-router fleet member")
+        site, az_key = match.groups()
+        selections = manifest["terraform_variables"]["symmetric_topology"][
+            "route_failover"
+        ]["initial_transport_router_az_by_gwlbe_az"][site]
+        owned_gwlbe_azs = [
+            gwlbe_az
+            for gwlbe_az, selected_az in selections.items()
+            if selected_az == az_key
+        ]
+        if len(owned_gwlbe_azs) != 1:
+            raise LifecycleError(
+                "Tailnet readiness does not have one deterministic source-prefix assignment"
+            )
+        expected_routes = {
+            topology_sites[site]["workload_subnet_cidrs"][owned_gwlbe_azs[0]]
+        }
+        enabled_advertisers: list[dict[str, Any]] = []
+        for device in sorted(
+            values,
+            key=lambda candidate: (device_hostname(candidate), str(candidate["id"])),
+        ):
+            advertised = device.get("advertisedRoutes", [])
+            enabled = device.get("enabledRoutes", [])
+            if (
+                not isinstance(advertised, list)
+                or not isinstance(enabled, list)
+                or not all(isinstance(value, str) for value in advertised + enabled)
+                or len(set(advertised)) != len(advertised)
+                or len(set(enabled)) != len(enabled)
+                or set(advertised) != expected_routes
+                or set(enabled) not in (set(), expected_routes)
+            ):
+                raise LifecycleError(
+                    "Tailnet device route advertisements are not the exact approved symmetric prefixes"
+                )
+            if set(enabled) == expected_routes:
+                enabled_advertisers.append(device)
+        if len(enabled_advertisers) != 1:
+            raise LifecycleError(
+                "readiness must identify exactly one enabled Tailnet advertiser for each protected prefix"
+            )
+        selected[hostname] = enabled_advertisers[0]
     identifiers = {
-        hostname.rsplit("-", 1)[1]: str(values[0]["id"])
-        for hostname, values in scoped.items()
+        hostname: str(device["id"]) for hostname, device in selected.items()
     }
-    if set(identifiers) != {"west", "east"} or len(set(identifiers.values())) != 2:
-        raise LifecycleError("Tailnet device identities are not distinct west/east run nodes")
+    if set(identifiers) != set(manifest["tailnet"]["expected_hostnames"]) or len(
+        set(identifiers.values())
+    ) != len(identifiers):
+        raise LifecycleError("Tailnet device identities are not distinct exact run nodes")
     manifest["tailnet"]["device_ids"] = identifiers
-    manifest["tailnet"].pop("replacement_retirement", None)
     manifest["tailnet"]["nodes_expected"] = True
     manifest.pop("readiness_started_at", None)
-    manifest["phase"] = "ready"
-    store.write(manifest)
+    manifest.pop("readiness_claim_id", None)
+    manifest["phase"] = final_phase
+    persist_manifest_transition(
+        store,
+        original,
+        manifest,
+        description="readiness completion boundary",
+    )
     return identifiers
 
 
@@ -6479,6 +9969,7 @@ def wait_and_record(
     deployment: dict[str, Any],
     *,
     timeout_seconds: int,
+    final_phase: str = "ready",
 ) -> None:
     store = ManifestStore(config, aws, run_dir)
     manifest = store.recover()
@@ -6486,14 +9977,32 @@ def wait_and_record(
         raise LifecycleError("protected readiness requires the current durable manifest ETag")
     if manifest.get("phase") not in {"applied", "readiness_started", "readiness_failed", "ready"}:
         raise LifecycleError("protected readiness is not allowed from the current durable lifecycle phase")
+    if manifest.get("phase") == "readiness_started":
+        started_value = manifest.get("readiness_started_at")
+        validate_canonical_utc_timestamp(started_value, "readiness_started_at")
+        started = dt.datetime.fromisoformat(str(started_value).replace("Z", "+00:00"))
+        if dt.datetime.now(dt.timezone.utc) - started < dt.timedelta(minutes=30):
+            raise ConcurrentLifecycleError("protected readiness is already owned by a recent durable claim")
     if manifest.get("deployment") != deployment:
         raise LifecycleError("readiness deployment identity differs from the durable applied outputs")
+    e2e = manifest.get("e2e")
+    has_replacement = isinstance(e2e, dict) and isinstance(e2e.get("replacement"), dict)
+    if has_replacement != (final_phase == "e2e_replacement_complete"):
+        raise LifecycleError("readiness final phase differs from the durable replacement journal")
+    readiness_original = copy.deepcopy(manifest)
     manifest["tailnet"]["nodes_expected"] = True
     manifest["phase"] = "readiness_started"
     manifest["readiness_started_at"] = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace(
         "+00:00", "Z"
     )
-    store.write(manifest, if_match=store.remote_etag)
+    readiness_claim_id = str(uuid.uuid4())
+    manifest["readiness_claim_id"] = readiness_claim_id
+    persist_manifest_transition(
+        store,
+        readiness_original,
+        manifest,
+        description="readiness-start boundary",
+    )
     try:
         wait_deployment(
             config,
@@ -6502,63 +10011,35 @@ def wait_and_record(
             timeout_seconds=timeout_seconds,
             evidence_path=run_dir.expanduser().resolve() / "diagnostics.json",
         )
-        record_ready_devices(tailscale, store, manifest)
-    except Exception:
+        validate_live_gwlbe_routes(config, aws, deployment)
+        record_ready_devices(tailscale, store, manifest, final_phase=final_phase)
+    except BaseException as error:
+        if isinstance(error, ConcurrentLifecycleError):
+            raise
+        try:
+            failure_original = store.recover()
+        except BaseException as recovery_error:
+            raise LifecycleError("readiness failed and its durable boundary could not be recovered") from recovery_error
+        if failure_original.get("readiness_claim_id") != readiness_claim_id:
+            if (
+                failure_original.get("phase") == final_phase
+                and "readiness_claim_id" not in failure_original
+            ):
+                raise
+            raise ConcurrentLifecycleError(
+                "readiness failure recovery found a different durable operation owner"
+            ) from None
+        manifest = copy.deepcopy(failure_original)
         manifest.pop("readiness_started_at", None)
+        manifest.pop("readiness_claim_id", None)
         manifest["phase"] = "readiness_failed"
-        store.write(manifest)
+        persist_manifest_transition(
+            store,
+            failure_original,
+            manifest,
+            description="readiness-failure boundary",
+        )
         raise
-
-
-def retire_replacement_devices(
-    tailscale: TailscaleAPI,
-    store: ManifestStore,
-    manifest: dict[str, Any],
-    replacement_address: str,
-) -> list[str]:
-    site = replacement_address.rsplit("_", 1)[-1]
-    if site not in {"west", "east"}:
-        raise LifecycleError("replacement Tailnet retirement site is invalid")
-    expected = [str(value) for value in manifest["tailnet"]["expected_hostnames"] if str(value).endswith(f"-{site}")]
-    if len(expected) != 1:
-        raise LifecycleError("replacement Tailnet retirement has no exact site hostname")
-    scoped = scoped_run_devices(tailscale.list_devices(), manifest, include_numeric_suffixes=True)
-    candidates = scoped[expected[0]]
-    recorded = manifest["tailnet"].get("device_ids", {})
-    pending = manifest["tailnet"].get("replacement_retirement")
-    if pending:
-        if not isinstance(pending, dict) or pending.get("site") != site or not isinstance(pending.get("device_ids"), list):
-            raise LifecycleError("durable replacement Tailnet retirement identity is invalid")
-        candidate_ids = sorted({str(value) for value in pending["device_ids"] if isinstance(value, str) and value})
-        if not candidate_ids or len(candidate_ids) != len(pending["device_ids"]):
-            raise LifecycleError("durable replacement Tailnet retirement IDs are invalid")
-    else:
-        if not isinstance(recorded, dict) or set(recorded) != {"west", "east"}:
-            raise LifecycleError("replacement requires exact durable west/east Tailnet device IDs")
-        if any(not isinstance(value, str) or not value for value in recorded.values()):
-            raise LifecycleError("replacement requires non-empty durable Tailnet device IDs")
-        candidate_ids = sorted({str(recorded[site]), *(str(device["id"]) for device in candidates)})
-        manifest["tailnet"]["device_ids"] = {
-            recorded_site: str(device_id)
-            for recorded_site, device_id in recorded.items()
-            if recorded_site != site
-        }
-        manifest["tailnet"]["replacement_retirement"] = {"site": site, "device_ids": candidate_ids}
-        manifest["phase"] = "replacement_device_retirement_started"
-        store.write(manifest)
-    present_ids = {str(device["id"]) for device in tailscale.list_devices() if device.get("id")}
-    for device_id in candidate_ids:
-        if device_id not in present_ids:
-            continue
-        tailscale.delete_device(device_id)
-    remaining = scoped_run_devices(tailscale.list_devices(), manifest, include_numeric_suffixes=True)[expected[0]]
-    if remaining:
-        raise LifecycleError("replacement Tailnet device retirement left a run-scoped site node")
-    retired = {str(value) for value in manifest["tailnet"].get("retired_device_ids", [])}
-    manifest["tailnet"]["retired_device_ids"] = sorted(retired.union(candidate_ids))
-    manifest["phase"] = "replacement_device_retired"
-    store.write(manifest)
-    return candidate_ids
 
 
 def cleanup_tailnet_devices(tailscale: TailscaleAPI, manifest: dict[str, Any], *, dry_run: bool) -> list[str]:
@@ -6566,64 +10047,35 @@ def cleanup_tailnet_devices(tailscale: TailscaleAPI, manifest: dict[str, Any], *
     expected_hostnames = {str(value) for value in manifest["tailnet"]["expected_hostnames"]}
     required_tag = str(manifest["tailnet"]["tag"])
     recorded = manifest["tailnet"].get("device_ids", {})
-    pending = manifest["tailnet"].get("replacement_retirement")
-    if not isinstance(recorded, dict) or not set(recorded).issubset({"west", "east"}) or any(
+    if manifest["tailnet"].get("device_roles") != {
+        hostname: "transport-router" for hostname in expected_hostnames
+    }:
+        raise LifecycleError("durable Tailnet lifecycle is not scoped to transport routers")
+    if not isinstance(recorded, dict) or not set(recorded).issubset(expected_hostnames) or any(
         not isinstance(value, str) or not value for value in recorded.values()
     ):
-        raise LifecycleError("durable Tailnet node IDs have an invalid site identity")
-    pending_site: str | None = None
-    pending_ids: list[str] = []
-    if pending is not None:
-        if (
-            not isinstance(pending, dict)
-            or pending.get("site") not in {"west", "east"}
-            or not isinstance(pending.get("device_ids"), list)
-            or any(not isinstance(value, str) or not value for value in pending["device_ids"])
-        ):
-            raise LifecycleError("durable replacement Tailnet retirement identity is invalid")
-        pending_site = str(pending["site"])
-        pending_ids = list(pending["device_ids"])
-        if pending_site in recorded:
-            raise LifecycleError("replacement Tailnet retirement site is still present in durable node IDs")
-    selected_set = {str(value) for value in recorded.values()}.union(pending_ids)
+        raise LifecycleError("durable Tailnet node IDs have an invalid hostname identity")
+    if len(set(recorded.values())) != len(recorded):
+        raise LifecycleError("durable Tailnet node IDs are not distinct")
+    selected_set = {str(value) for value in recorded.values()}
     by_id = {str(device.get("id")): device for device in devices if device.get("id")}
-    site_hostnames = {hostname.rsplit("-", 1)[-1]: hostname for hostname in expected_hostnames}
-    for site, device_id in recorded.items():
+    for hostname, device_id in recorded.items():
         device = by_id.get(str(device_id))
         if device is None:
             continue
-        if device_hostname(device) != site_hostnames[site] or required_tag not in {
-            str(value) for value in device.get("tags", [])
-        }:
+        actual_hostname = device_hostname(device)
+        if (
+            actual_hostname != hostname
+            and re.fullmatch(re.escape(hostname) + r"-[1-9][0-9]*", actual_hostname) is None
+        ) or required_tag not in {str(value) for value in device.get("tags", [])}:
             raise LifecycleError("recorded Tailnet device ID no longer has the durable run hostname and tag")
-    if pending_site is not None:
-        expected = site_hostnames[pending_site]
-        for device_id in pending_ids:
-            device = by_id.get(device_id)
-            if device is None:
-                continue
-            hostname = device_hostname(device)
-            if (
-                hostname != expected
-                and re.fullmatch(re.escape(expected) + r"-[1-9][0-9]*", hostname) is None
-            ) or required_tag not in {str(value) for value in device.get("tags", [])}:
-                raise LifecycleError("pending replacement Tailnet device ID left its durable hostname/tag scope")
-        current = [
-            device
-            for device in scoped_run_devices(devices, manifest, include_numeric_suffixes=True)[expected]
-            if str(device["id"]) not in selected_set
-        ]
-        if len(current) > 1:
-            raise LifecycleError("replacement recovery found ambiguous current Tailnet nodes")
-        selected_set.update(str(device["id"]) for device in current)
-    if not selected_set and manifest["tailnet"].get("nodes_expected"):
+    if manifest["tailnet"].get("nodes_expected"):
         scoped = scoped_run_devices(devices, manifest, include_numeric_suffixes=True)
-        if any(len(values) > 1 for values in scoped.values()):
-            raise LifecycleError("partial-recovery Tailnet fallback found an ambiguous duplicate hostname/tag identity")
-        selected_set = {str(values[0]["id"]) for values in scoped.values() if values}
-        if len(selected_set) != sum(1 for values in scoped.values() if values):
+        scoped_ids = [str(device["id"]) for values in scoped.values() for device in values]
+        if len(set(scoped_ids)) != len(scoped_ids):
             raise LifecycleError("partial-recovery Tailnet fallback found one device ID under multiple identities")
-    elif not selected_set:
+        selected_set.update(scoped_ids)
+    if not selected_set:
         return []
     selected = sorted(selected_set)
     if dry_run:
@@ -7240,6 +10692,166 @@ RESIDUAL_DELETE_PRIORITY = {
 }
 
 
+class CleanupDeadlineExceeded(BaseException):
+    """A hard cleanup stop that ordinary operation error handling must not swallow."""
+
+
+class CleanupInterrupted(BaseException):
+    def __init__(self, signum: int):
+        self.signum = signum
+        try:
+            name = signal.Signals(signum).name
+        except ValueError:
+            name = str(signum)
+        super().__init__(f"protected cleanup received {name}")
+
+
+class CleanupDeadline:
+    def __init__(
+        self,
+        timeout_seconds: float,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+    ):
+        value = validate_timeout_seconds(
+            timeout_seconds,
+            field="cleanup timeout",
+            maximum=7200,
+        )
+        assert value is not None
+        self.timeout_seconds = value
+        self.monotonic = monotonic
+        self.expires_at = monotonic() + value
+        self.interrupt_signals: list[int] = []
+
+    def remaining(self) -> float:
+        remaining = self.expires_at - self.monotonic()
+        if remaining <= 0:
+            raise CleanupDeadlineExceeded(
+                f"protected cleanup exceeded its {self.timeout_seconds:g}-second hard timeout"
+            )
+        return remaining
+
+    def record_signal(self, signum: int) -> None:
+        self.interrupt_signals.append(signum)
+
+
+@contextlib.contextmanager
+def cleanup_signal_scope(deadline: CleanupDeadline) -> Iterable[None]:
+    deadline.remaining()
+    if (
+        threading.current_thread() is not threading.main_thread()
+        or not hasattr(signal, "SIGALRM")
+        or not hasattr(signal, "setitimer")
+    ):
+        yield
+        deadline.remaining()
+        return
+
+    signals = [signal.SIGALRM, signal.SIGINT, signal.SIGTERM]
+    previous_handlers = {signum: signal.getsignal(signum) for signum in signals}
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, 0.0)
+    started = time.monotonic()
+
+    def expired(_signum: int, _frame: Any) -> None:
+        raise CleanupDeadlineExceeded(
+            f"protected cleanup exceeded its {deadline.timeout_seconds:g}-second hard timeout"
+        )
+
+    def interrupted(signum: int, _frame: Any) -> None:
+        deadline.record_signal(signum)
+
+    signal.signal(signal.SIGALRM, expired)
+    signal.signal(signal.SIGINT, interrupted)
+    signal.signal(signal.SIGTERM, interrupted)
+    active_timeout = deadline.remaining()
+    if previous_timer[0] > 0:
+        active_timeout = min(active_timeout, previous_timer[0])
+    signal.setitimer(signal.ITIMER_REAL, active_timeout)
+    try:
+        yield
+        deadline.remaining()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        if previous_timer[0] > 0:
+            restored = max(0.0, previous_timer[0] - (time.monotonic() - started))
+            if restored > 0:
+                signal.setitimer(signal.ITIMER_REAL, restored, previous_timer[1])
+
+
+class CleanupAwsCLI:
+    def __init__(self, aws: Any, deadline: CleanupDeadline):
+        self.aws = aws
+        self.deadline = deadline
+
+    def json(
+        self,
+        args: list[str],
+        *,
+        region: str | None = None,
+        timeout_seconds: float | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        requested = validate_timeout_seconds(timeout_seconds, timeout, field="AWS CLI timeout")
+        remaining = self.deadline.remaining()
+        bound = remaining if requested is None else min(remaining, requested)
+        result = self.aws.json(args, region=region, timeout_seconds=bound)
+        self.deadline.remaining()
+        return result
+
+    def object_exists(
+        self,
+        bucket: str,
+        key: str,
+        region: str,
+        *,
+        timeout_seconds: float | None = None,
+        timeout: float | None = None,
+    ) -> bool:
+        requested = validate_timeout_seconds(timeout_seconds, timeout, field="AWS CLI timeout")
+        remaining = self.deadline.remaining()
+        bound = remaining if requested is None else min(remaining, requested)
+        result = self.aws.object_exists(
+            bucket,
+            key,
+            region,
+            timeout_seconds=bound,
+        )
+        self.deadline.remaining()
+        return result
+
+
+class CleanupCommandRunner:
+    def __init__(self, runner: CommandRunner, deadline: CleanupDeadline):
+        self.runner = runner
+        self.deadline = deadline
+
+    def run(
+        self,
+        args: list[str],
+        *,
+        env: dict[str, str] | None = None,
+        cwd: pathlib.Path | None = None,
+        input_text: str | None = None,
+        timeout_seconds: float | None = None,
+        timeout: float | None = None,
+    ) -> str:
+        requested = validate_timeout_seconds(timeout_seconds, timeout)
+        remaining = self.deadline.remaining()
+        bound = remaining if requested is None else min(remaining, requested)
+        result = self.runner.run(
+            args,
+            env=env,
+            cwd=cwd,
+            input_text=input_text,
+            timeout_seconds=bound,
+        )
+        self.deadline.remaining()
+        return result
+
+
 def owned_resource_delete_priority(resource: dict[str, str]) -> tuple[int, str]:
     kind, _ = owned_resource_kind(resource["arn"])
     return RESIDUAL_DELETE_PRIORITY[kind], resource["arn"]
@@ -7254,6 +10866,7 @@ def remove_owned_residuals(
     allow_unexpired: bool,
     sleep: Any = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    cleanup_deadline: CleanupDeadline | None = None,
 ) -> list[str]:
     expiry = dt.datetime.fromisoformat(config.expires_at.replace("Z", "+00:00"))
     if not dry_run and not allow_unexpired and expiry > dt.datetime.now(dt.timezone.utc):
@@ -7301,10 +10914,12 @@ def remove_owned_residuals(
         return []
     retry_errors: dict[str, str] = {}
     observed = list(resources)
-    deadline = monotonic() + RESIDUAL_CLEANUP_TIMEOUT_SECONDS
+    residual_deadline = monotonic() + RESIDUAL_CLEANUP_TIMEOUT_SECONDS
     backoff = RESIDUAL_CLEANUP_INITIAL_BACKOFF_SECONDS
     while pending:
         for resource in sorted(pending, key=owned_resource_delete_priority):
+            if cleanup_deadline is not None:
+                cleanup_deadline.remaining()
             arn = resource["arn"]
             kind, _ = owned_resource_kind(arn)
             try:
@@ -7330,6 +10945,8 @@ def remove_owned_residuals(
             else:
                 retry_errors.pop(arn, None)
         try:
+            if cleanup_deadline is not None:
+                cleanup_deadline.remaining()
             observed = audit_run_resources(config, aws)
         except CommandError as error:
             if any(marker in error.raw_stderr for marker in RESIDUAL_TERMINAL_AUTH_MARKERS):
@@ -7352,7 +10969,9 @@ def remove_owned_residuals(
             return [resource["arn"] for resource in resources]
         if not pending:
             break
-        remaining = deadline - monotonic()
+        remaining = residual_deadline - monotonic()
+        if cleanup_deadline is not None:
+            remaining = min(remaining, cleanup_deadline.remaining())
         if remaining <= 0:
             break
         sleep(min(backoff, remaining))
@@ -7482,8 +11101,35 @@ def clear_recovered_terraform_lock(config: RunConfig, aws: AwsCLI) -> None:
         raise LifecycleError("recovered Terraform lock remains after exact deletion")
 
 
-@serialized_run_operation
-def cleanup(
+def local_cleanup_claim_id(run_dir: pathlib.Path) -> str:
+    path = run_dir / "cleanup.claim"
+    for _attempt in range(2):
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            if path.is_symlink() or not path.is_file():
+                raise LifecycleError("local cleanup claim must be a regular file")
+            try:
+                value = path.read_text(encoding="utf-8").strip()
+            except OSError as error:
+                raise LifecycleError(f"cannot read local cleanup claim: {error}") from error
+            if OPERATION_CLAIM_ID_RE.fullmatch(value) is None:
+                raise LifecycleError("local cleanup claim ID is invalid")
+            return value
+        value = str(uuid.uuid4())
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(value + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        return value
+    raise LifecycleError("could not establish a local cleanup claim")
+
+
+def _cleanup(
     config: RunConfig,
     aws: AwsCLI,
     tailscale: TailscaleAPI,
@@ -7495,6 +11141,7 @@ def cleanup(
     dry_run: bool,
     skip_destroy: bool,
     janitor: bool = False,
+    deadline: CleanupDeadline,
 ) -> dict[str, Any]:
     run_dir = run_dir.expanduser().resolve()
     terraform_dir = terraform_dir.expanduser().resolve()
@@ -7504,7 +11151,9 @@ def cleanup(
         raise ConcurrentLifecycleError("cleanup is not authorized after a rejected durable prepare claim")
     store = ManifestStore(config, aws, run_dir)
     manifest = store.recover() if recover or not dry_run else store.load_local()
-    if manifest.get("phase") == "e2e_running":
+    e2e = manifest.get("e2e")
+    active_e2e_claim = isinstance(e2e, dict) and "finished_at" not in e2e and "passed" not in e2e
+    if active_e2e_claim:
         expiry = dt.datetime.fromisoformat(config.expires_at.replace("Z", "+00:00"))
         if not (janitor and recover and expiry <= dt.datetime.now(dt.timezone.utc)):
             raise LifecycleError(
@@ -7517,10 +11166,22 @@ def cleanup(
     if not dry_run:
         if store.remote_etag is None:
             raise LifecycleError("cleanup requires the current durable manifest ETag")
+        claim_id = local_cleanup_claim_id(run_dir)
+        cleanup_phases = {"cleanup_started", "destroy_started", "secrets_only_cleanup_complete", "cleanup_incomplete"}
+        existing_claim = manifest.get("cleanup_claim_id")
+        existing_started = manifest.get("cleanup_claimed_at")
+        same_claim = (
+            manifest.get("phase") in cleanup_phases
+            and existing_claim == claim_id
+            and isinstance(existing_started, str)
+        )
+        if manifest.get("phase") in cleanup_phases and not same_claim:
+            started = dt.datetime.fromisoformat(str(existing_started).replace("Z", "+00:00"))
+            stale = dt.datetime.now(dt.timezone.utc) - started >= dt.timedelta(minutes=30)
+            if not (recover and stale):
+                raise ConcurrentLifecycleError("another cleanup owner holds the durable run claim")
         active_apply_phases = {
             "apply_claimed",
-            "replacement_device_retirement_started",
-            "replacement_device_retired",
             "apply_started",
         }
         if manifest.get("phase") in active_apply_phases and manifest.get("apply_claimed_at"):
@@ -7546,34 +11207,77 @@ def cleanup(
             if dt.datetime.now(dt.timezone.utc) - started < dt.timedelta(minutes=30):
                 raise LifecycleError("cleanup refuses a recently started preparation")
         manifest.pop("apply_claimed_at", None)
-        manifest["phase"] = "cleanup_started"
-        store.write(manifest, if_match=store.remote_etag)
+        manifest.pop("apply_claim_id", None)
+        manifest.pop("readiness_started_at", None)
+        manifest.pop("readiness_claim_id", None)
+        if not same_claim:
+            manifest["cleanup_claim_id"] = claim_id
+            manifest["cleanup_claimed_at"] = (
+                dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            )
+            manifest["phase"] = "cleanup_started"
+            store.write(manifest, if_match=store.remote_etag)
     failures: list[str] = []
+    first_interrupt: BaseException | None = None
+    recorded_signal_count = 0
 
-    def record_failure(operation: str, error: Exception) -> None:
+    def record_failure(operation: str, error: BaseException) -> None:
         failures.append(redact(f"{operation}: {error}"))
+
+    def record_interrupt(operation: str, error: BaseException) -> None:
+        nonlocal first_interrupt
+        if first_interrupt is None:
+            first_interrupt = error
+        record_failure(f"interrupt during {operation}", error)
+
+    def sync_signal_interrupts() -> None:
+        nonlocal first_interrupt, recorded_signal_count
+        while recorded_signal_count < len(deadline.interrupt_signals):
+            signum = deadline.interrupt_signals[recorded_signal_count]
+            recorded_signal_count += 1
+            error: BaseException
+            if signum == signal.SIGINT:
+                error = KeyboardInterrupt("protected cleanup received SIGINT")
+            else:
+                error = CleanupInterrupted(signum)
+            if first_interrupt is None:
+                first_interrupt = error
+            record_failure("interrupt recorded for protected cleanup", error)
 
     results: dict[str, Any] = {"dry_run": dry_run, "devices": [], "parameters": [], "backend_versions": {}}
     state_exists: bool | None = None
     try:
+        deadline.remaining()
         state_exists = aws.object_exists(config.backend["bucket"], config.backend["state_key"], config.backend["region"])
+    except (KeyboardInterrupt, CleanupInterrupted) as error:
+        record_interrupt("inspect Terraform state object", error)
     except Exception as error:
         record_failure("inspect Terraform state object", error)
+    sync_signal_interrupts()
     results["state_exists"] = state_exists
     if state_exists and not skip_destroy and not dry_run:
         manifest["phase"] = "destroy_started"
         try:
+            deadline.remaining()
             store.write(manifest)
             terraform_destroy(config, aws, runner, run_dir, terraform_dir, manifest)
+        except (KeyboardInterrupt, CleanupInterrupted) as error:
+            record_interrupt("Terraform destroy", error)
         except Exception as error:
             record_failure("Terraform destroy", error)
+        sync_signal_interrupts()
     try:
+        deadline.remaining()
         results["devices"] = cleanup_tailnet_devices(tailscale, manifest, dry_run=dry_run)
+    except (KeyboardInterrupt, CleanupInterrupted) as error:
+        record_interrupt("Tailnet device cleanup", error)
     except Exception as error:
         record_failure("Tailnet device cleanup", error)
+    sync_signal_interrupts()
     if not dry_run:
         for parameter in manifest["ssm_parameters"]:
             try:
+                deadline.remaining()
                 delete_ssm_parameter(aws, parameter)
                 results["parameters"].append(f"{parameter['site']}:{parameter['name']}")
                 remaining = aws.json(
@@ -7582,28 +11286,45 @@ def cleanup(
                 ).get("Parameters", [])
                 if remaining:
                     raise LifecycleError(f"{parameter['site']} SSM parameter remains after deletion")
+            except (KeyboardInterrupt, CleanupInterrupted) as error:
+                record_interrupt(f"{parameter['site']} SSM parameter cleanup", error)
             except Exception as error:
                 record_failure(f"{parameter['site']} SSM parameter cleanup", error)
+            sync_signal_interrupts()
         try:
+            deadline.remaining()
             key_ids = recover_auth_key_ids(tailscale, manifest)
+        except (KeyboardInterrupt, CleanupInterrupted) as error:
+            key_ids = []
+            record_interrupt("discover run auth keys", error)
         except Exception as error:
             key_ids = []
             record_failure("discover run auth keys", error)
+        sync_signal_interrupts()
         for key_id in key_ids:
             try:
+                deadline.remaining()
                 tailscale.revoke_auth_key(key_id)
+            except (KeyboardInterrupt, CleanupInterrupted) as error:
+                record_interrupt(f"revoke run auth key {key_id}", error)
             except Exception as error:
                 record_failure(f"revoke run auth key {key_id}", error)
+            sync_signal_interrupts()
         if key_ids:
             try:
+                deadline.remaining()
                 remaining_key_ids = {str(key.get("id")) for key in tailscale.list_auth_keys() if key.get("id")}
                 if remaining_key_ids.intersection(key_ids):
                     raise LifecycleError("one or more exact run auth-key IDs remain after revocation")
+            except (KeyboardInterrupt, CleanupInterrupted) as error:
+                record_interrupt("verify run auth-key revocation", error)
             except Exception as error:
                 record_failure("verify run auth-key revocation", error)
+            sync_signal_interrupts()
     residuals: list[dict[str, str]] = []
     residual_clean = False
     try:
+        deadline.remaining()
         residuals = audit_run_resources(config, aws)
         results["residual_count"] = len(residuals)
         if skip_destroy:
@@ -7615,14 +11336,26 @@ def cleanup(
                 residuals,
                 dry_run=dry_run,
                 allow_unexpired=not janitor,
+                cleanup_deadline=deadline,
             )
-            residual_clean = not dry_run or not residuals
+            if dry_run:
+                residual_clean = not residuals
+            else:
+                final_residuals = audit_run_resources(config, aws)
+                results["final_residual_count"] = len(final_residuals)
+                residual_clean = not final_residuals
+                if final_residuals:
+                    raise LifecycleError("owned AWS resources remain after residual cleanup")
+    except (KeyboardInterrupt, CleanupInterrupted) as error:
+        record_interrupt("allowlisted AWS residual cleanup", error)
     except Exception as error:
         record_failure("allowlisted AWS residual cleanup", error)
+    sync_signal_interrupts()
     backend_cleanup_allowed = not skip_destroy and (dry_run or (residual_clean and not failures))
     if backend_cleanup_allowed:
         for key in (config.backend["state_key"], config.lock_key):
             try:
+                deadline.remaining()
                 results["backend_versions"][key] = delete_exact_object_versions(
                     aws,
                     bucket=config.backend["bucket"],
@@ -7630,10 +11363,14 @@ def cleanup(
                     region=config.backend["region"],
                     dry_run=dry_run,
                 )
+            except (KeyboardInterrupt, CleanupInterrupted) as error:
+                record_interrupt(f"delete backend versions for {key}", error)
             except Exception as error:
                 record_failure(f"delete backend versions for {key}", error)
+            sync_signal_interrupts()
         if dry_run or not failures:
             try:
+                deadline.remaining()
                 results["backend_versions"][config.manifest_key] = delete_exact_object_versions(
                     aws,
                     bucket=config.backend["bucket"],
@@ -7641,29 +11378,86 @@ def cleanup(
                     region=config.backend["region"],
                     dry_run=dry_run,
                 )
+            except (KeyboardInterrupt, CleanupInterrupted) as error:
+                record_interrupt(f"delete backend versions for {config.manifest_key}", error)
             except Exception as error:
                 record_failure(f"delete backend versions for {config.manifest_key}", error)
+            sync_signal_interrupts()
     if not dry_run and skip_destroy and not failures:
         manifest["phase"] = "secrets_only_cleanup_complete"
         try:
+            deadline.remaining()
             store.write(manifest)
+        except (KeyboardInterrupt, CleanupInterrupted) as error:
+            record_interrupt("persist secrets-only cleanup", error)
         except Exception as error:
             record_failure("persist secrets-only cleanup", error)
+        sync_signal_interrupts()
     if not dry_run and not skip_destroy and not failures:
         for path in (store.path, run_dir / "backend.hcl", run_dir / "runtime.tfvars.json"):
             try:
+                deadline.remaining()
                 path.unlink()
             except FileNotFoundError:
                 pass
+            except (KeyboardInterrupt, CleanupInterrupted) as error:
+                record_interrupt(f"remove local cleanup file {path.name}", error)
+            sync_signal_interrupts()
+    sync_signal_interrupts()
     if failures:
         if not dry_run:
             manifest["phase"] = "cleanup_incomplete"
             try:
+                deadline.remaining()
                 store.write(manifest)
+            except (KeyboardInterrupt, CleanupInterrupted) as error:
+                record_interrupt("persist incomplete cleanup", error)
             except Exception as error:
                 record_failure("persist incomplete cleanup", error)
+        if first_interrupt is not None:
+            if hasattr(first_interrupt, "add_note"):
+                first_interrupt.add_note(
+                    "protected cleanup continued independent owned recovery attempts: "
+                    + "; ".join(failures)
+                )
+            raise first_interrupt
         raise LifecycleError("cleanup completed independent recovery attempts; " + "; ".join(failures))
     return results
+
+
+@serialized_run_operation
+def cleanup(
+    config: RunConfig,
+    aws: AwsCLI,
+    tailscale: TailscaleAPI,
+    runner: CommandRunner,
+    run_dir: pathlib.Path,
+    terraform_dir: pathlib.Path,
+    *,
+    recover: bool,
+    dry_run: bool,
+    skip_destroy: bool,
+    janitor: bool = False,
+    timeout_seconds: float = RESIDUAL_CLEANUP_TIMEOUT_SECONDS,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    deadline = CleanupDeadline(timeout_seconds, monotonic=monotonic)
+    bounded_aws = CleanupAwsCLI(aws, deadline)
+    bounded_runner = CleanupCommandRunner(runner, deadline)
+    with cleanup_signal_scope(deadline):
+        return _cleanup(
+            config,
+            bounded_aws,
+            tailscale,
+            bounded_runner,
+            run_dir,
+            terraform_dir,
+            recover=recover,
+            dry_run=dry_run,
+            skip_destroy=skip_destroy,
+            janitor=janitor,
+            deadline=deadline,
+        )
 
 
 def run_directory(root: pathlib.Path, run_id: str) -> pathlib.Path:
@@ -7694,7 +11488,7 @@ def build_parser() -> argparse.ArgumentParser:
     replacement.add_argument(
         "--replace",
         required=True,
-        choices=("aws_instance.envelope_west", "aws_instance.envelope_east"),
+        metavar='aws_instance.envelope_target_SITE["AZ_KEY"]',
     )
     metadata = subparsers.add_parser("metadata-preflight")
     metadata.add_argument("--artifact-only", action="store_true")
@@ -7706,9 +11500,15 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_parser.add_argument("--recover", action="store_true")
     cleanup_parser.add_argument("--dry-run", action="store_true")
     cleanup_parser.add_argument("--skip-destroy", action="store_true")
+    cleanup_parser.add_argument(
+        "--timeout-seconds", type=float, default=RESIDUAL_CLEANUP_TIMEOUT_SECONDS
+    )
     janitor = subparsers.add_parser("janitor")
     janitor.add_argument("--terraform-dir", type=pathlib.Path, default=pathlib.Path("example/terraform"))
     janitor.add_argument("--dry-run", action="store_true")
+    janitor.add_argument(
+        "--timeout-seconds", type=float, default=RESIDUAL_CLEANUP_TIMEOUT_SECONDS
+    )
     subparsers.add_parser("redact")
     return parser
 
@@ -7743,7 +11543,7 @@ def main() -> int:
         return 0
     tailscale = (
         build_tailscale(config)
-        if args.command in {"preflight", "prepare", "wait", "rotate-key", "plan-replacement", "cleanup", "janitor"}
+        if args.command in {"preflight", "prepare", "wait", "rotate-key", "cleanup", "janitor"}
         else None
     )
     if args.command == "preflight":
@@ -7775,7 +11575,6 @@ def main() -> int:
             run_dir,
             args.terraform_dir,
             args.plan_file,
-            tailscale_factory=lambda: build_tailscale(config),
         )
         print("protected saved plan applied and deployment identity persisted")
     elif args.command == "verify-no-drift":
@@ -7786,12 +11585,9 @@ def main() -> int:
         rotate_auth_key(config, aws, tailscale, run_dir)
         print("rotated regional bootstrap secrets and revoked the previous auth key")
     elif args.command == "plan-replacement":
-        assert tailscale is not None
         with lifecycle_lock(run_dir):
             phase = ManifestStore(config, aws, run_dir).recover().get("phase")
-            if phase == "ready":
-                rotate_auth_key(config, aws, tailscale, run_dir)
-            elif phase not in {"key_rotated", "replacement_planned"}:
+            if phase not in {"ready", "e2e_replacement_ready", "replacement_planned"}:
                 raise LifecycleError("replacement planning cannot resume from the durable lifecycle phase")
             path = terraform_plan(
                 config,
@@ -7802,7 +11598,7 @@ def main() -> int:
                 plan_path=args.plan_file,
                 replace_address=args.replace,
             )
-        print(f"replacement key rotated and protected plan ready at {path}")
+        print(f"protected target replacement plan ready at {path}")
     elif args.command == "wait":
         assert tailscale is not None
         try:
@@ -7818,7 +11614,7 @@ def main() -> int:
             deployment,
             timeout_seconds=args.timeout_seconds,
         )
-        print("both appliances, all four workloads, and both GWLB targets are ready")
+        print("all targets, transport routers, workloads, and GWLB target fleets are ready")
     elif args.command in {"cleanup", "janitor"}:
         assert tailscale is not None
         recover = args.command == "janitor" or args.recover
@@ -7833,6 +11629,7 @@ def main() -> int:
             dry_run=args.dry_run,
             skip_destroy=getattr(args, "skip_destroy", False),
             janitor=args.command == "janitor",
+            timeout_seconds=args.timeout_seconds,
         )
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     return 0
@@ -7841,6 +11638,12 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except CleanupDeadlineExceeded as error:
+        print(redact(f"error: {error}"), file=sys.stderr)
+        raise SystemExit(1)
+    except CleanupInterrupted as error:
+        print(redact(f"error: {error}"), file=sys.stderr)
+        raise SystemExit(128 + error.signum)
     except LifecycleError as error:
         print(redact(f"error: {error}"), file=sys.stderr)
         raise SystemExit(1)

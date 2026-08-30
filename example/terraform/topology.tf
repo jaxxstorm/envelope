@@ -7,9 +7,115 @@ resource "terraform_data" "input_validation" {
         for site, topology in local.sites :
         toset(topology.local_site_cidrs) == toset(values(topology.workload_subnet_cidrs)) &&
         toset(topology.remote_site_cidrs) == toset(local.sites[site == "west" ? "east" : "west"].local_site_cidrs) &&
-        length(setintersection(toset(topology.local_site_cidrs), toset(topology.remote_site_cidrs))) == 0
+        length(topology.local_site_cidrs) == length(distinct(topology.local_site_cidrs)) &&
+        length(topology.remote_site_cidrs) == length(distinct(topology.remote_site_cidrs))
       ])
-      error_message = "Local site CIDRs must exactly cover local workloads, equal the peer remote CIDRs, and remain disjoint."
+      error_message = "Local and remote site CIDRs must be duplicate-free, exactly cover local workloads, and equal the peer contract."
+    }
+    precondition {
+      condition = alltrue([
+        for site, assignments in local.initial_transport_router_advertise_routes :
+        alltrue([for routes in values(assignments) : length(routes) == 1]) &&
+        length(flatten(values(assignments))) == length(distinct(flatten(values(assignments)))) &&
+        toset(flatten(values(assignments))) == toset(local.sites[site].local_site_cidrs)
+      ])
+      error_message = "Initial transport-router advertisements must assign every local workload prefix to exactly one router."
+    }
+    precondition {
+      condition = alltrue([
+        for topology in values(local.sites) : alltrue([
+          for cidr in topology.local_site_cidrs :
+          !try(
+            local.ipv4_network_bounds[cidr].first <= local.ipv4_network_bounds[topology.vpc_cidr].first + 2 &&
+            local.ipv4_network_bounds[topology.vpc_cidr].first + 2 <= local.ipv4_network_bounds[cidr].last,
+            true,
+          )
+        ])
+      ])
+      error_message = "Local workload CIDRs must exclude the VPC DNS resolver address."
+    }
+    precondition {
+      condition = alltrue(flatten([
+        for cidrs in values(local.site_configured_cidrs) : [
+          for cidr in cidrs : try(
+            cidrnetmask(cidr) != "" &&
+            cidr == "${cidrhost(cidr, 0)}/${split("/", cidr)[1]}",
+            false,
+          )
+        ]
+      ]))
+      error_message = "Every topology CIDR must be a canonical IPv4 network."
+    }
+    precondition {
+      condition = alltrue(flatten([
+        for site, cidrs in local.site_subnet_cidrs : [
+          for cidr in cidrs : try(
+            local.ipv4_network_bounds[cidr].first >= local.ipv4_network_bounds[local.sites[site].vpc_cidr].first &&
+            local.ipv4_network_bounds[cidr].last <= local.ipv4_network_bounds[local.sites[site].vpc_cidr].last,
+            false,
+          )
+        ]
+      ]))
+      error_message = "Every route-domain subnet must be fully contained by its site VPC."
+    }
+    precondition {
+      condition = alltrue(flatten([
+        for cidrs in values(local.site_subnet_cidrs) : [
+          for left_index, left in cidrs : [
+            for right_index, right in cidrs : !try(
+              local.ipv4_network_bounds[left].first <= local.ipv4_network_bounds[right].last &&
+              local.ipv4_network_bounds[right].first <= local.ipv4_network_bounds[left].last,
+              true,
+            ) if left_index < right_index
+          ]
+        ]
+      ]))
+      error_message = "Workload, transport-router, GWLBE, GWLB, target, and management subnet CIDRs must not overlap."
+    }
+    precondition {
+      condition = alltrue(flatten([
+        for topology in values(local.sites) : [
+          for local_cidr in topology.local_site_cidrs : [
+            for remote_cidr in topology.remote_site_cidrs : !try(
+              local.ipv4_network_bounds[local_cidr].first <= local.ipv4_network_bounds[remote_cidr].last &&
+              local.ipv4_network_bounds[remote_cidr].first <= local.ipv4_network_bounds[local_cidr].last,
+              true,
+            )
+          ]
+        ]
+      ]))
+      error_message = "Local and remote site CIDRs must not overlap at any prefix length."
+    }
+    precondition {
+      condition = !try(
+        local.ipv4_network_bounds[local.sites.west.vpc_cidr].first <= local.ipv4_network_bounds[local.sites.east.vpc_cidr].last &&
+        local.ipv4_network_bounds[local.sites.east.vpc_cidr].first <= local.ipv4_network_bounds[local.sites.west.vpc_cidr].last,
+        true,
+      )
+      error_message = "West and east VPC CIDRs must not overlap."
+    }
+    precondition {
+      condition = (
+        local.sites.west.region == var.west_region &&
+        local.sites.east.region == var.east_region &&
+        local.sites.west.ami_id == var.west_ami_id &&
+        local.sites.east.ami_id == var.east_ami_id &&
+        local.sites.west.ssm_kms_key_arn == var.west_tailscale_kms_key_arn &&
+        local.sites.east.ssm_kms_key_arn == var.east_tailscale_kms_key_arn &&
+        var.west_region != var.east_region &&
+        var.envelope_underlay_interface != var.envelope_tailscale_iface
+      )
+      error_message = "Topology region, AMI, KMS, and interface identities must match the reviewed explicit inputs."
+    }
+    precondition {
+      condition = try(
+        split(":", var.west_tailscale_secret_arn)[4] == data.aws_caller_identity.current.account_id &&
+        split(":", var.east_tailscale_secret_arn)[4] == data.aws_caller_identity.current.account_id &&
+        split(":", var.west_tailscale_kms_key_arn)[4] == data.aws_caller_identity.current.account_id &&
+        split(":", var.east_tailscale_kms_key_arn)[4] == data.aws_caller_identity.current.account_id,
+        false,
+      )
+      error_message = "Tailnet SSM parameters and KMS keys must be exact ARNs in the deployment account."
     }
     precondition {
       condition     = var.estimated_fixed_hourly_usd <= var.approved_max_fixed_hourly_usd
@@ -58,20 +164,20 @@ resource "aws_subnet" "workload_east" {
   cidr_block        = local.sites.east.workload_subnet_cidrs[each.key]
   tags              = merge(local.common_tags, { Name = "${var.name}-east-workload-${each.key}", Role = "workload", ZoneKey = each.key })
 }
-resource "aws_subnet" "ingress_west" {
+resource "aws_subnet" "transport_west" {
   for_each          = local.sites.west.azs
   vpc_id            = aws_vpc.west.id
   availability_zone = each.value
-  cidr_block        = local.sites.west.ingress_subnet_cidrs[each.key]
-  tags              = merge(local.common_tags, { Name = "${var.name}-west-ingress-${each.key}", Role = "tailnet-ingress", ZoneKey = each.key })
+  cidr_block        = local.sites.west.transport_subnet_cidrs[each.key]
+  tags              = merge(local.common_tags, { Name = "${var.name}-west-transport-${each.key}", Role = "transport-router", ZoneKey = each.key })
 }
-resource "aws_subnet" "ingress_east" {
+resource "aws_subnet" "transport_east" {
   provider          = aws.east
   for_each          = local.sites.east.azs
   vpc_id            = aws_vpc.east.id
   availability_zone = each.value
-  cidr_block        = local.sites.east.ingress_subnet_cidrs[each.key]
-  tags              = merge(local.common_tags, { Name = "${var.name}-east-ingress-${each.key}", Role = "tailnet-ingress", ZoneKey = each.key })
+  cidr_block        = local.sites.east.transport_subnet_cidrs[each.key]
+  tags              = merge(local.common_tags, { Name = "${var.name}-east-transport-${each.key}", Role = "transport-router", ZoneKey = each.key })
 }
 resource "aws_subnet" "gwlbe_west" {
   for_each          = local.sites.west.azs
@@ -143,16 +249,16 @@ resource "aws_route_table" "workload_east" {
   vpc_id   = aws_vpc.east.id
   tags     = merge(local.common_tags, { Name = "${var.name}-east-workload-${each.key}", Role = "workload", ZoneKey = each.key })
 }
-resource "aws_route_table" "ingress_west" {
+resource "aws_route_table" "transport_west" {
   for_each = local.sites.west.azs
   vpc_id   = aws_vpc.west.id
-  tags     = merge(local.common_tags, { Name = "${var.name}-west-ingress-${each.key}", Role = "tailnet-ingress", ZoneKey = each.key })
+  tags     = merge(local.common_tags, { Name = "${var.name}-west-transport-${each.key}", Role = "transport-router", ZoneKey = each.key })
 }
-resource "aws_route_table" "ingress_east" {
+resource "aws_route_table" "transport_east" {
   provider = aws.east
   for_each = local.sites.east.azs
   vpc_id   = aws_vpc.east.id
-  tags     = merge(local.common_tags, { Name = "${var.name}-east-ingress-${each.key}", Role = "tailnet-ingress", ZoneKey = each.key })
+  tags     = merge(local.common_tags, { Name = "${var.name}-east-transport-${each.key}", Role = "transport-router", ZoneKey = each.key })
 }
 resource "aws_route_table" "gwlbe_west" {
   for_each = local.sites.west.azs
@@ -197,16 +303,16 @@ resource "aws_route_table_association" "workload_east" {
   subnet_id      = aws_subnet.workload_east[each.key].id
   route_table_id = aws_route_table.workload_east[each.key].id
 }
-resource "aws_route_table_association" "ingress_west" {
+resource "aws_route_table_association" "transport_west" {
   for_each       = local.sites.west.azs
-  subnet_id      = aws_subnet.ingress_west[each.key].id
-  route_table_id = aws_route_table.ingress_west[each.key].id
+  subnet_id      = aws_subnet.transport_west[each.key].id
+  route_table_id = aws_route_table.transport_west[each.key].id
 }
-resource "aws_route_table_association" "ingress_east" {
+resource "aws_route_table_association" "transport_east" {
   provider       = aws.east
   for_each       = local.sites.east.azs
-  subnet_id      = aws_subnet.ingress_east[each.key].id
-  route_table_id = aws_route_table.ingress_east[each.key].id
+  subnet_id      = aws_subnet.transport_east[each.key].id
+  route_table_id = aws_route_table.transport_east[each.key].id
 }
 resource "aws_route_table_association" "gwlbe_west" {
   for_each       = local.sites.west.azs
@@ -251,11 +357,13 @@ resource "aws_eip" "nat_east" {
 resource "aws_nat_gateway" "west" {
   allocation_id = aws_eip.nat_west.id
   subnet_id     = aws_subnet.management_west.id
+  depends_on    = [aws_route_table_association.management_west, aws_route.management_default_west]
 }
 resource "aws_nat_gateway" "east" {
   provider      = aws.east
   allocation_id = aws_eip.nat_east.id
   subnet_id     = aws_subnet.management_east.id
+  depends_on    = [aws_route_table_association.management_east, aws_route.management_default_east]
 }
 resource "aws_route" "management_default_west" {
   route_table_id         = aws_route_table.management_west.id
@@ -281,16 +389,16 @@ resource "aws_route" "target_default_east" {
   destination_cidr_block = "0.0.0.0/0"
   nat_gateway_id         = aws_nat_gateway.east.id
 }
-resource "aws_route" "ingress_default_west" {
+resource "aws_route" "transport_default_west" {
   for_each               = local.sites.west.azs
-  route_table_id         = aws_route_table.ingress_west[each.key].id
+  route_table_id         = aws_route_table.transport_west[each.key].id
   destination_cidr_block = "0.0.0.0/0"
   nat_gateway_id         = aws_nat_gateway.west.id
 }
-resource "aws_route" "ingress_default_east" {
+resource "aws_route" "transport_default_east" {
   provider               = aws.east
   for_each               = local.sites.east.azs
-  route_table_id         = aws_route_table.ingress_east[each.key].id
+  route_table_id         = aws_route_table.transport_east[each.key].id
   destination_cidr_block = "0.0.0.0/0"
   nat_gateway_id         = aws_nat_gateway.east.id
 }
@@ -406,24 +514,97 @@ resource "aws_route" "workload_to_remote_east" {
   destination_cidr_block = each.value.cidr
   vpc_endpoint_id        = aws_vpc_endpoint.east[each.value.az_key].id
 }
-resource "aws_route" "ingress_to_local_west" {
+resource "aws_route" "transport_to_local_west" {
   for_each = {
     for pair in setproduct(toset(keys(local.sites.west.azs)), toset(local.sites.west.local_site_cidrs)) :
     "${pair[0]}:${pair[1]}" => { az_key = pair[0], cidr = pair[1] }
   }
-  route_table_id         = aws_route_table.ingress_west[each.value.az_key].id
+  route_table_id         = aws_route_table.transport_west[each.value.az_key].id
   destination_cidr_block = each.value.cidr
   vpc_endpoint_id        = aws_vpc_endpoint.west[each.value.az_key].id
 }
-resource "aws_route" "ingress_to_local_east" {
+resource "aws_route" "transport_to_local_east" {
   provider = aws.east
   for_each = {
     for pair in setproduct(toset(keys(local.sites.east.azs)), toset(local.sites.east.local_site_cidrs)) :
     "${pair[0]}:${pair[1]}" => { az_key = pair[0], cidr = pair[1] }
   }
-  route_table_id         = aws_route_table.ingress_east[each.value.az_key].id
+  route_table_id         = aws_route_table.transport_east[each.value.az_key].id
   destination_cidr_block = each.value.cidr
   vpc_endpoint_id        = aws_vpc_endpoint.east[each.value.az_key].id
+}
+resource "aws_route" "gwlbe_to_remote_west" {
+  for_each = {
+    for pair in setproduct(toset(keys(local.sites.west.azs)), toset(local.sites.west.remote_site_cidrs)) :
+    "${pair[0]}:${pair[1]}" => { az_key = pair[0], cidr = pair[1] }
+  }
+  route_table_id         = aws_route_table.gwlbe_west[each.value.az_key].id
+  destination_cidr_block = each.value.cidr
+  network_interface_id = aws_instance.transport_router_west[
+    local.route_failover.initial_transport_router_az_by_gwlbe_az.west[each.value.az_key]
+  ].primary_network_interface_id
+
+  lifecycle {
+    precondition {
+      condition = contains(
+        local.sites.west.transport_router_az_keys,
+        local.route_failover.initial_transport_router_az_by_gwlbe_az.west[each.value.az_key],
+        ) && (
+        local.route_failover.initial_transport_router_az_by_gwlbe_az.west[each.value.az_key] == each.value.az_key
+      )
+      error_message = "West GWLBE routes must select the transport router in the same AZ."
+    }
+    precondition {
+      condition = contains(
+        local.initial_transport_router_advertise_routes.west[
+          local.route_failover.initial_transport_router_az_by_gwlbe_az.west[each.value.az_key]
+        ],
+        local.sites.west.workload_subnet_cidrs[each.value.az_key],
+      )
+      error_message = "West GWLBE routes must select the Tailnet owner of their source workload prefix."
+    }
+    precondition {
+      condition     = length(toset([for instance in values(aws_instance.transport_router_west) : instance.primary_network_interface_id])) == length(aws_instance.transport_router_west)
+      error_message = "West transport routers must expose distinct eligible primary ENIs."
+    }
+  }
+}
+resource "aws_route" "gwlbe_to_remote_east" {
+  provider = aws.east
+  for_each = {
+    for pair in setproduct(toset(keys(local.sites.east.azs)), toset(local.sites.east.remote_site_cidrs)) :
+    "${pair[0]}:${pair[1]}" => { az_key = pair[0], cidr = pair[1] }
+  }
+  route_table_id         = aws_route_table.gwlbe_east[each.value.az_key].id
+  destination_cidr_block = each.value.cidr
+  network_interface_id = aws_instance.transport_router_east[
+    local.route_failover.initial_transport_router_az_by_gwlbe_az.east[each.value.az_key]
+  ].primary_network_interface_id
+
+  lifecycle {
+    precondition {
+      condition = contains(
+        local.sites.east.transport_router_az_keys,
+        local.route_failover.initial_transport_router_az_by_gwlbe_az.east[each.value.az_key],
+        ) && (
+        local.route_failover.initial_transport_router_az_by_gwlbe_az.east[each.value.az_key] == each.value.az_key
+      )
+      error_message = "East GWLBE routes must select the transport router in the same AZ."
+    }
+    precondition {
+      condition = contains(
+        local.initial_transport_router_advertise_routes.east[
+          local.route_failover.initial_transport_router_az_by_gwlbe_az.east[each.value.az_key]
+        ],
+        local.sites.east.workload_subnet_cidrs[each.value.az_key],
+      )
+      error_message = "East GWLBE routes must select the Tailnet owner of their source workload prefix."
+    }
+    precondition {
+      condition     = length(toset([for instance in values(aws_instance.transport_router_east) : instance.primary_network_interface_id])) == length(aws_instance.transport_router_east)
+      error_message = "East transport routers must expose distinct eligible primary ENIs."
+    }
+  }
 }
 
 resource "aws_security_group" "target_west" {
@@ -473,41 +654,61 @@ resource "aws_security_group" "target_east" {
   }
   tags = merge(local.common_tags, { Name = "${var.name}-east-target", Role = "target" })
 }
-resource "aws_security_group" "ingress_west" {
-  name   = "${var.name}-west-ingress"
+resource "aws_security_group" "transport_west" {
+  name   = "${var.name}-west-transport"
   vpc_id = aws_vpc.west.id
+  dynamic "ingress" {
+    for_each = toset(local.sites.west.local_site_cidrs)
+    content {
+      description = "Preserved-source transit from ${ingress.value}"
+      from_port   = 0
+      to_port     = 0
+      protocol    = "-1"
+      cidr_blocks = [ingress.value]
+    }
+  }
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
-  tags = merge(local.common_tags, { Name = "${var.name}-west-ingress", Role = "tailnet-ingress" })
+  tags = merge(local.common_tags, { Name = "${var.name}-west-transport", Role = "transport-router" })
 }
-resource "aws_security_group" "ingress_east" {
+resource "aws_security_group" "transport_east" {
   provider = aws.east
-  name     = "${var.name}-east-ingress"
+  name     = "${var.name}-east-transport"
   vpc_id   = aws_vpc.east.id
+  dynamic "ingress" {
+    for_each = toset(local.sites.east.local_site_cidrs)
+    content {
+      description = "Preserved-source transit from ${ingress.value}"
+      from_port   = 0
+      to_port     = 0
+      protocol    = "-1"
+      cidr_blocks = [ingress.value]
+    }
+  }
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
-  tags = merge(local.common_tags, { Name = "${var.name}-east-ingress", Role = "tailnet-ingress" })
+  tags = merge(local.common_tags, { Name = "${var.name}-east-transport", Role = "transport-router" })
 }
 resource "aws_security_group" "workload_west" {
   for_each = local.workload_roles.west
   name     = "${var.name}-west-${each.key}"
   vpc_id   = aws_vpc.west.id
   dynamic "ingress" {
-    for_each = each.key == "responder" ? local.workload_probe_ingress : {}
+    for_each = local.workload_probe_ingress
     content {
-      description = "${ingress.value.description} from paired east initiator"
+      description = "${ingress.value.description} from east workloads"
       from_port   = ingress.value.from_port
       to_port     = ingress.value.to_port
       protocol    = ingress.value.protocol
-      cidr_blocks = [local.workload_roles.east.initiator.cidr]
+      cidr_blocks = [for role in values(local.workload_roles.east) : role.cidr]
     }
   }
   egress {
@@ -524,13 +725,13 @@ resource "aws_security_group" "workload_east" {
   name     = "${var.name}-east-${each.key}"
   vpc_id   = aws_vpc.east.id
   dynamic "ingress" {
-    for_each = each.key == "responder" ? local.workload_probe_ingress : {}
+    for_each = local.workload_probe_ingress
     content {
-      description = "${ingress.value.description} from paired west initiator"
+      description = "${ingress.value.description} from west workloads"
       from_port   = ingress.value.from_port
       to_port     = ingress.value.to_port
       protocol    = ingress.value.protocol
-      cidr_blocks = [local.workload_roles.west.initiator.cidr]
+      cidr_blocks = [for role in values(local.workload_roles.west) : role.cidr]
     }
   }
   egress {
@@ -564,52 +765,6 @@ locals {
     agent_base64 = base64encode(file("${path.module}/cloud-init/envelope-e2e-agent.py"))
   })
   workload_user_data = base64gzip(local.workload_bootstrap)
-  west_target_bootstrap = templatefile("${path.module}/cloud-init/bootstrap.sh.tftpl", {
-    site                  = "west"
-    run_name              = var.name
-    artifact_region       = var.west_region
-    artifact_bucket       = local.artifact_bucket_name
-    artifact_key          = local.artifact_object_key
-    artifact_sha256       = var.artifact_sha256
-    artifact_revision     = var.artifact_revision
-    artifact_version      = var.artifact_version
-    artifact_architecture = var.architecture
-    tailscale_version     = var.tailscale_version
-    config_version        = var.symmetric_topology.version
-    tun_name              = var.envelope_tun_name
-    tailscale_iface       = var.envelope_tailscale_iface
-    underlay_iface        = var.envelope_underlay_interface
-    routing_mode          = var.envelope_routing_mode
-    local_site_cidrs      = join(",", local.sites.west.local_site_cidrs)
-    remote_site_cidrs     = join(",", local.sites.west.remote_site_cidrs)
-    routing_table_id      = var.envelope_routing_table_id
-    routing_rule_priority = var.envelope_routing_rule_priority
-  })
-  east_target_bootstrap = templatefile("${path.module}/cloud-init/bootstrap.sh.tftpl", {
-    site                  = "east"
-    run_name              = var.name
-    artifact_region       = var.east_region
-    artifact_bucket       = local.artifact_bucket_name
-    artifact_key          = local.artifact_object_key
-    artifact_sha256       = var.artifact_sha256
-    artifact_revision     = var.artifact_revision
-    artifact_version      = var.artifact_version
-    artifact_architecture = var.architecture
-    tailscale_version     = var.tailscale_version
-    config_version        = var.symmetric_topology.version
-    tun_name              = var.envelope_tun_name
-    tailscale_iface       = var.envelope_tailscale_iface
-    underlay_iface        = var.envelope_underlay_interface
-    routing_mode          = var.envelope_routing_mode
-    local_site_cidrs      = join(",", local.sites.east.local_site_cidrs)
-    remote_site_cidrs     = join(",", local.sites.east.remote_site_cidrs)
-    routing_table_id      = var.envelope_routing_table_id
-    routing_rule_priority = var.envelope_routing_rule_priority
-  })
-  target_service_env = {
-    west = local.west_target_bootstrap
-    east = local.east_target_bootstrap
-  }
 }
 
 resource "aws_instance" "envelope_target_west" {
@@ -620,9 +775,31 @@ resource "aws_instance" "envelope_target_west" {
   vpc_security_group_ids      = [aws_security_group.target_west.id]
   iam_instance_profile        = aws_iam_instance_profile.runtime_west.name
   associate_public_ip_address = false
-  source_dest_check           = false
-  user_data_base64            = module.tailscale_target_west[each.key].rendered
-  tags                        = merge(local.common_tags, { Name = "${var.name}-west-target-${each.key}", Site = "west", Role = "target", ZoneKey = each.key })
+  source_dest_check           = true
+  user_data_base64            = data.cloudinit_config.target_west.rendered
+  user_data_replace_on_change = true
+  root_block_device {
+    delete_on_termination = true
+    encrypted             = true
+    volume_size           = 8
+    volume_type           = "gp3"
+  }
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_protocol_ipv6          = "disabled"
+    http_put_response_hop_limit = 1
+    http_tokens                 = "required"
+    instance_metadata_tags      = "disabled"
+  }
+  tags        = merge(local.common_tags, { Name = "${var.name}-west-target-${each.key}", Site = "west", Role = "target", ZoneKey = each.key })
+  volume_tags = merge(local.common_tags, { Name = "${var.name}-west-target-${each.key}", Site = "west", Role = "target", ZoneKey = each.key })
+  depends_on = [
+    aws_iam_role_policy.runtime_west,
+    aws_route_table_association.target_west,
+    aws_route.target_default_west,
+    aws_s3_bucket_policy.artifact,
+    aws_s3_object.envelope,
+  ]
 }
 resource "aws_instance" "envelope_target_east" {
   provider                    = aws.east
@@ -633,42 +810,107 @@ resource "aws_instance" "envelope_target_east" {
   vpc_security_group_ids      = [aws_security_group.target_east.id]
   iam_instance_profile        = aws_iam_instance_profile.runtime_east.name
   associate_public_ip_address = false
-  source_dest_check           = false
-  user_data_base64            = module.tailscale_target_east[each.key].rendered
-  tags                        = merge(local.common_tags, { Name = "${var.name}-east-target-${each.key}", Site = "east", Role = "target", ZoneKey = each.key })
+  source_dest_check           = true
+  user_data_base64            = data.cloudinit_config.target_east.rendered
+  user_data_replace_on_change = true
+  root_block_device {
+    delete_on_termination = true
+    encrypted             = true
+    volume_size           = 8
+    volume_type           = "gp3"
+  }
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_protocol_ipv6          = "disabled"
+    http_put_response_hop_limit = 1
+    http_tokens                 = "required"
+    instance_metadata_tags      = "disabled"
+  }
+  tags        = merge(local.common_tags, { Name = "${var.name}-east-target-${each.key}", Site = "east", Role = "target", ZoneKey = each.key })
+  volume_tags = merge(local.common_tags, { Name = "${var.name}-east-target-${each.key}", Site = "east", Role = "target", ZoneKey = each.key })
+  depends_on = [
+    aws_iam_role_policy.runtime_east,
+    aws_route_table_association.target_east,
+    aws_route.target_default_east,
+    aws_s3_bucket_policy.artifact,
+    aws_s3_object.envelope,
+  ]
 }
-resource "aws_instance" "tailnet_ingress_west" {
-  for_each                    = local.sites.west.ingress_router_az_keys
+resource "aws_instance" "transport_router_west" {
+  for_each                    = local.sites.west.transport_router_az_keys
   ami                         = var.west_ami_id
   instance_type               = var.test_instance_type
-  subnet_id                   = aws_subnet.ingress_west[each.key].id
-  vpc_security_group_ids      = [aws_security_group.ingress_west.id]
-  iam_instance_profile        = aws_iam_instance_profile.runtime_west.name
+  subnet_id                   = aws_subnet.transport_west[each.key].id
+  vpc_security_group_ids      = [aws_security_group.transport_west.id]
+  iam_instance_profile        = aws_iam_instance_profile.transport_west.name
   associate_public_ip_address = false
   source_dest_check           = false
-  user_data_base64            = module.tailscale_ingress_west[each.key].rendered
-  tags                        = merge(local.common_tags, { Name = "${var.name}-west-ingress-${each.key}", Site = "west", Role = "tailnet-ingress", ZoneKey = each.key })
+  user_data_base64            = module.tailscale_transport_west[each.key].rendered
+  user_data_replace_on_change = true
+  root_block_device {
+    delete_on_termination = true
+    encrypted             = true
+    volume_size           = 8
+    volume_type           = "gp3"
+  }
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_protocol_ipv6          = "disabled"
+    http_put_response_hop_limit = 1
+    http_tokens                 = "required"
+    instance_metadata_tags      = "disabled"
+  }
+  tags        = merge(local.common_tags, { Name = "${var.name}-west-transport-${each.key}", Site = "west", Role = "transport-router", ZoneKey = each.key })
+  volume_tags = merge(local.common_tags, { Name = "${var.name}-west-transport-${each.key}", Site = "west", Role = "transport-router", ZoneKey = each.key })
+  depends_on = [
+    aws_iam_role_policy.transport_west,
+    aws_route_table_association.transport_west,
+    aws_route.transport_default_west,
+    aws_route.transport_to_local_west,
+  ]
 }
-resource "aws_instance" "tailnet_ingress_east" {
+resource "aws_instance" "transport_router_east" {
   provider                    = aws.east
-  for_each                    = local.sites.east.ingress_router_az_keys
+  for_each                    = local.sites.east.transport_router_az_keys
   ami                         = var.east_ami_id
   instance_type               = var.test_instance_type
-  subnet_id                   = aws_subnet.ingress_east[each.key].id
-  vpc_security_group_ids      = [aws_security_group.ingress_east.id]
-  iam_instance_profile        = aws_iam_instance_profile.runtime_east.name
+  subnet_id                   = aws_subnet.transport_east[each.key].id
+  vpc_security_group_ids      = [aws_security_group.transport_east.id]
+  iam_instance_profile        = aws_iam_instance_profile.transport_east.name
   associate_public_ip_address = false
   source_dest_check           = false
-  user_data_base64            = module.tailscale_ingress_east[each.key].rendered
-  tags                        = merge(local.common_tags, { Name = "${var.name}-east-ingress-${each.key}", Site = "east", Role = "tailnet-ingress", ZoneKey = each.key })
+  user_data_base64            = module.tailscale_transport_east[each.key].rendered
+  user_data_replace_on_change = true
+  root_block_device {
+    delete_on_termination = true
+    encrypted             = true
+    volume_size           = 8
+    volume_type           = "gp3"
+  }
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_protocol_ipv6          = "disabled"
+    http_put_response_hop_limit = 1
+    http_tokens                 = "required"
+    instance_metadata_tags      = "disabled"
+  }
+  tags        = merge(local.common_tags, { Name = "${var.name}-east-transport-${each.key}", Site = "east", Role = "transport-router", ZoneKey = each.key })
+  volume_tags = merge(local.common_tags, { Name = "${var.name}-east-transport-${each.key}", Site = "east", Role = "transport-router", ZoneKey = each.key })
+  depends_on = [
+    aws_iam_role_policy.transport_east,
+    aws_route_table_association.transport_east,
+    aws_route.transport_default_east,
+    aws_route.transport_to_local_east,
+  ]
 }
+
 resource "aws_instance" "workload_west" {
   for_each                    = local.workload_roles.west
   ami                         = var.west_ami_id
   instance_type               = var.test_instance_type
   subnet_id                   = aws_subnet.workload_west[each.value.az_key].id
   vpc_security_group_ids      = [aws_security_group.workload_west[each.key].id]
-  iam_instance_profile        = aws_iam_instance_profile.runtime_west.name
+  iam_instance_profile        = aws_iam_instance_profile.workload_west.name
   associate_public_ip_address = false
   user_data_base64            = local.workload_user_data
   user_data_replace_on_change = true
@@ -683,7 +925,7 @@ resource "aws_instance" "workload_west" {
   }
   tags        = merge(local.common_tags, { Name = "${var.name}-west-${each.key}", Site = "west", Role = each.key, ZoneKey = each.value.az_key })
   volume_tags = merge(local.common_tags, { Name = "${var.name}-west-${each.key}", Site = "west", Role = each.key, ZoneKey = each.value.az_key })
-  depends_on  = [aws_iam_role_policy.runtime_west, aws_route.workload_default_west, aws_route.workload_to_remote_west]
+  depends_on  = [aws_iam_role_policy.workload_west, aws_route_table_association.workload_west, aws_route.workload_default_west, aws_route.workload_to_remote_west]
 }
 resource "aws_instance" "workload_east" {
   provider                    = aws.east
@@ -692,7 +934,7 @@ resource "aws_instance" "workload_east" {
   instance_type               = var.test_instance_type
   subnet_id                   = aws_subnet.workload_east[each.value.az_key].id
   vpc_security_group_ids      = [aws_security_group.workload_east[each.key].id]
-  iam_instance_profile        = aws_iam_instance_profile.runtime_east.name
+  iam_instance_profile        = aws_iam_instance_profile.workload_east.name
   associate_public_ip_address = false
   user_data_base64            = local.workload_user_data
   user_data_replace_on_change = true
@@ -707,7 +949,7 @@ resource "aws_instance" "workload_east" {
   }
   tags        = merge(local.common_tags, { Name = "${var.name}-east-${each.key}", Site = "east", Role = each.key, ZoneKey = each.value.az_key })
   volume_tags = merge(local.common_tags, { Name = "${var.name}-east-${each.key}", Site = "east", Role = each.key, ZoneKey = each.value.az_key })
-  depends_on  = [aws_iam_role_policy.runtime_east, aws_route.workload_default_east, aws_route.workload_to_remote_east]
+  depends_on  = [aws_iam_role_policy.workload_east, aws_route_table_association.workload_east, aws_route.workload_default_east, aws_route.workload_to_remote_east]
 }
 resource "aws_lb_target_group_attachment" "west" {
   for_each         = aws_instance.envelope_target_west
@@ -764,12 +1006,6 @@ resource "aws_flow_log" "east" {
   depends_on               = [aws_iam_role_policy.flow_logs]
 }
 
-output "instance_ids" {
-  value = {
-    west = aws_instance.envelope_target_west[sort(keys(aws_instance.envelope_target_west))[0]].id
-    east = aws_instance.envelope_target_east[sort(keys(aws_instance.envelope_target_east))[0]].id
-  }
-}
 output "vpc_ids" {
   value = { west = aws_vpc.west.id, east = aws_vpc.east.id }
 }
@@ -821,20 +1057,39 @@ output "symmetric_topology" {
   value = {
     config_version = var.symmetric_topology.version
     run_id         = var.name
+    route_failover = local.route_failover
     sites = {
       west = {
-        region               = var.west_region
-        local_site_cidrs     = local.sites.west.local_site_cidrs
-        remote_site_cidrs    = local.sites.west.remote_site_cidrs
-        target_fleet         = [for key in sort(keys(aws_instance.envelope_target_west)) : { region = var.west_region, az_key = key, instance_id = aws_instance.envelope_target_west[key].id, target_group_arn = aws_lb_target_group.west.arn }]
-        ingress_router_fleet = [for key in sort(keys(aws_instance.tailnet_ingress_west)) : { region = var.west_region, az_key = key, instance_id = aws_instance.tailnet_ingress_west[key].id }]
+        region            = var.west_region
+        local_site_cidrs  = local.sites.west.local_site_cidrs
+        remote_site_cidrs = local.sites.west.remote_site_cidrs
+        target_fleet      = [for key in sort(keys(aws_instance.envelope_target_west)) : { region = var.west_region, az_key = key, instance_id = aws_instance.envelope_target_west[key].id, target_group_arn = aws_lb_target_group.west.arn }]
+        transport_router_fleet = [
+          for key in sort(keys(aws_instance.transport_router_west)) : {
+            region               = var.west_region
+            az_key               = key
+            instance_id          = aws_instance.transport_router_west[key].id
+            network_interface_id = aws_instance.transport_router_west[key].primary_network_interface_id
+            gwlbe_route_table_id = aws_route_table.gwlbe_west[key].id
+            advertised_prefix    = one(local.initial_transport_router_advertise_routes.west[key])
+          }
+        ]
       }
       east = {
-        region               = var.east_region
-        local_site_cidrs     = local.sites.east.local_site_cidrs
-        remote_site_cidrs    = local.sites.east.remote_site_cidrs
-        target_fleet         = [for key in sort(keys(aws_instance.envelope_target_east)) : { region = var.east_region, az_key = key, instance_id = aws_instance.envelope_target_east[key].id, target_group_arn = aws_lb_target_group.east.arn }]
-        ingress_router_fleet = [for key in sort(keys(aws_instance.tailnet_ingress_east)) : { region = var.east_region, az_key = key, instance_id = aws_instance.tailnet_ingress_east[key].id }]
+        region            = var.east_region
+        local_site_cidrs  = local.sites.east.local_site_cidrs
+        remote_site_cidrs = local.sites.east.remote_site_cidrs
+        target_fleet      = [for key in sort(keys(aws_instance.envelope_target_east)) : { region = var.east_region, az_key = key, instance_id = aws_instance.envelope_target_east[key].id, target_group_arn = aws_lb_target_group.east.arn }]
+        transport_router_fleet = [
+          for key in sort(keys(aws_instance.transport_router_east)) : {
+            region               = var.east_region
+            az_key               = key
+            instance_id          = aws_instance.transport_router_east[key].id
+            network_interface_id = aws_instance.transport_router_east[key].primary_network_interface_id
+            gwlbe_route_table_id = aws_route_table.gwlbe_east[key].id
+            advertised_prefix    = one(local.initial_transport_router_advertise_routes.east[key])
+          }
+        ]
       }
     }
   }
@@ -842,21 +1097,50 @@ output "symmetric_topology" {
 
 output "envelope_runtime_config" {
   value = {
-    for site, topology in local.sites : site => {
-      config_version        = var.symmetric_topology.version
-      local_site_cidrs      = topology.local_site_cidrs
-      remote_site_cidrs     = topology.remote_site_cidrs
-      routing_mode          = var.envelope_routing_mode
-      tun_name              = var.envelope_tun_name
-      underlay_interface    = var.envelope_underlay_interface
-      tailscale_iface       = var.envelope_tailscale_iface
-      gwlb_return_cidrs     = [local.workload_roles[site].initiator.cidr]
-      local_delivery_cidrs  = [local.workload_roles[site].responder.cidr]
-      remote_tailnet_cidrs  = topology.remote_site_cidrs
-      routing_table_id      = var.envelope_routing_table_id
-      routing_rule_priority = var.envelope_routing_rule_priority
-      artifact_sha256       = var.artifact_sha256
-      artifact_revision     = var.artifact_revision
+    for site in keys(local.sites) : site => local.packet_return_runtime
+  }
+}
+output "transport_router_readiness_expectations" {
+  value = {
+    config_version = 2
+    sites = {
+      for site, contract in local.transport_router_contracts : site => merge(contract, {
+        contract_sha256 = local.transport_router_contract_sha256[site]
+      })
+    }
+  }
+}
+output "route_failover" {
+  value = {
+    config_version              = 2
+    mutation_timeout_seconds    = local.route_failover.mutation_timeout_seconds
+    restoration_timeout_seconds = local.route_failover.restoration_timeout_seconds
+    recovery_timeout_seconds    = local.route_failover.recovery_timeout_seconds
+    same_az_preferred = {
+      for site, selections in local.route_failover.initial_transport_router_az_by_gwlbe_az :
+      site => alltrue([for gwlbe_az, transport_az in selections : gwlbe_az == transport_az])
+    }
+    sites = {
+      west = {
+        for gwlbe_az, transport_az in local.route_failover.initial_transport_router_az_by_gwlbe_az.west :
+        gwlbe_az => {
+          route_table_id                  = aws_route_table.gwlbe_west[gwlbe_az].id
+          source_workload_prefix          = local.sites.west.workload_subnet_cidrs[gwlbe_az]
+          remote_site_cidrs               = sort(local.sites.west.remote_site_cidrs)
+          initial_transport_router_az_key = transport_az
+          initial_network_interface_id    = aws_instance.transport_router_west[transport_az].primary_network_interface_id
+        }
+      }
+      east = {
+        for gwlbe_az, transport_az in local.route_failover.initial_transport_router_az_by_gwlbe_az.east :
+        gwlbe_az => {
+          route_table_id                  = aws_route_table.gwlbe_east[gwlbe_az].id
+          source_workload_prefix          = local.sites.east.workload_subnet_cidrs[gwlbe_az]
+          remote_site_cidrs               = sort(local.sites.east.remote_site_cidrs)
+          initial_transport_router_az_key = transport_az
+          initial_network_interface_id    = aws_instance.transport_router_east[transport_az].primary_network_interface_id
+        }
+      }
     }
   }
 }
@@ -866,13 +1150,38 @@ output "cost_profile" {
     estimated_fixed_hourly_usd = var.estimated_fixed_hourly_usd
     approved_max_hourly_usd    = var.approved_max_fixed_hourly_usd
     resource_counts = {
-      gwlbe_endpoints       = length(aws_vpc_endpoint.west) + length(aws_vpc_endpoint.east)
-      target_instances      = { west = length(aws_instance.envelope_target_west), east = length(aws_instance.envelope_target_east) }
-      ingress_routers       = { west = length(aws_instance.tailnet_ingress_west), east = length(aws_instance.tailnet_ingress_east) }
-      workload_instances    = length(aws_instance.workload_west) + length(aws_instance.workload_east)
-      vpc_flow_logs         = 2
-      cloudwatch_log_groups = 2
-      flow_log_iam_roles    = 1
+      gwlbe_endpoints        = length(aws_vpc_endpoint.west) + length(aws_vpc_endpoint.east)
+      target_instances       = { west = length(aws_instance.envelope_target_west), east = length(aws_instance.envelope_target_east) }
+      transport_routers      = { west = length(aws_instance.transport_router_west), east = length(aws_instance.transport_router_east) }
+      workload_instances     = length(aws_instance.workload_west) + length(aws_instance.workload_east)
+      nat_gateways           = length(aws_nat_gateway.west[*]) + length(aws_nat_gateway.east[*])
+      elastic_ips            = length(aws_eip.nat_west[*]) + length(aws_eip.nat_east[*])
+      gateway_load_balancers = length(aws_lb.west[*]) + length(aws_lb.east[*])
+      vpc_flow_logs          = length(aws_flow_log.west[*]) + length(aws_flow_log.east[*])
+      cloudwatch_log_groups  = length(aws_cloudwatch_log_group.flow_west[*]) + length(aws_cloudwatch_log_group.flow_east[*])
+      flow_log_iam_roles     = length(aws_iam_role.flow_logs[*])
+      iam_roles = {
+        target    = length(aws_iam_role.runtime_west[*]) + length(aws_iam_role.runtime_east[*])
+        workload  = length(aws_iam_role.workload_west[*]) + length(aws_iam_role.workload_east[*])
+        transport = length(aws_iam_role.transport_west[*]) + length(aws_iam_role.transport_east[*])
+        flow_log  = length(aws_iam_role.flow_logs[*])
+      }
+      iam_instance_profiles = {
+        target    = length(aws_iam_instance_profile.runtime_west[*]) + length(aws_iam_instance_profile.runtime_east[*])
+        workload  = length(aws_iam_instance_profile.workload_west[*]) + length(aws_iam_instance_profile.workload_east[*])
+        transport = length(aws_iam_instance_profile.transport_west[*]) + length(aws_iam_instance_profile.transport_east[*])
+      }
+    }
+    route_failover_bounds = {
+      mutation_timeout_seconds    = local.route_failover.mutation_timeout_seconds
+      restoration_timeout_seconds = local.route_failover.restoration_timeout_seconds
+      recovery_timeout_seconds    = local.route_failover.recovery_timeout_seconds
+    }
+    nat_topology_limit = {
+      gateways_per_site = 1
+      expanded_for_ha   = false
+      placement         = "one shared NAT gateway in each site's single management subnet"
+      limitation        = "private egress is not multi-AZ within a site and remains outside the protected data path"
     }
   }
 }

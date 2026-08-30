@@ -26,6 +26,15 @@ data "cloudinit_config" "main" {
     })
   }
 
+  dynamic "part" {
+    for_each = var.pre_setup_parts
+    content {
+      filename     = part.value.filename
+      content_type = part.value.content_type
+      content      = part.value.content
+    }
+  }
+
   part {
     filename     = "20-setup-tailscale.sh"
     content_type = "text/x-shellscript"
@@ -41,6 +50,7 @@ data "cloudinit_config" "main" {
       max_retries        = var.max_retries
       retry_delay        = var.retry_delay
       package_version    = var.package_version
+      pre_setup_gate     = var.pre_setup_gate
     })
   }
 

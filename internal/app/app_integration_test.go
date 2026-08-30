@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,35 +15,37 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestRunStartStop(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("requires root")
+func TestRunStartStopWithoutTargetForwardingState(t *testing.T) {
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.IPPROTO_RAW)
+	if err != nil {
+		t.Skipf("requires CAP_NET_RAW: %v", err)
 	}
+	_ = unix.Close(fd)
 	lockIntegrationGenevePort(t)
+	before := readTargetNetworkState(t)
 	cfg := &config.Config{
+		ConfigVersion:            2,
+		Mode:                     "packet-return",
 		UDPBind:                  "127.0.0.1:6081",
-		TunName:                  "envtest0",
-		TunMTU:                   1400,
+		MaxInnerPacketSize:       1400,
 		MetricsAddr:              "127.0.0.1:0",
 		LogLevel:                 "error",
-		FlowCapacity:             1024,
-		TCPFlowTimeout:           350 * time.Second,
-		UDPFlowTimeout:           120 * time.Second,
-		OtherFlowTimeout:         120 * time.Second,
 		PersistentErrorThreshold: 3,
 		GeneveOptionsMaxBytes:    252,
-		RoutingTableID:           100,
-		RoutingRulePriority:      100,
-		RoutingMode:              config.RoutingModeOff,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- Run(ctx, cfg, zap.NewNop())
 	}()
 
 	time.Sleep(300 * time.Millisecond)
+	if during := readTargetNetworkState(t); during != before {
+		cancel()
+		t.Fatalf("packet-return target mutated forwarding, routes, or interfaces\nbefore: %+v\nduring: %+v", before, during)
+	}
 	cancel()
 
 	select {
@@ -52,6 +55,40 @@ func TestRunStartStop(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timeout waiting for shutdown")
+	}
+	if after := readTargetNetworkState(t); after != before {
+		t.Fatalf("packet-return target left forwarding, route, or interface state behind\nbefore: %+v\nafter: %+v", before, after)
+	}
+}
+
+type targetNetworkState struct {
+	forwarding string
+	routes     string
+	interfaces string
+}
+
+func readTargetNetworkState(t *testing.T) targetNetworkState {
+	t.Helper()
+	read := func(path string) string {
+		t.Helper()
+		value, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		return string(value)
+	}
+	entries, err := os.ReadDir("/sys/class/net")
+	if err != nil {
+		t.Fatalf("read network interfaces: %v", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	return targetNetworkState{
+		forwarding: read("/proc/sys/net/ipv4/ip_forward"),
+		routes:     read("/proc/net/route"),
+		interfaces: strings.Join(names, ","),
 	}
 }
 
