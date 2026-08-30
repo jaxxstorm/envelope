@@ -10,6 +10,8 @@ Protected run `ha25` failed acceptance but corrected the live-discovered route c
 
 Protected run `ha26` reached corrected deployment readiness, then failed before acceptance mutation because two worst-case failover reservations totaled 5,560 seconds against the 5,400-second active-run bound. Cleanup again proved zero residuals. Run-all bootstrap must therefore reject the combined graceful/abrupt transaction and restoration budget before acquiring resource authority; the next configuration uses a 300-second recovery bound that fits the unchanged active and cleanup reservations.
 
+Protected run `ha27` passed corrected readiness and simultaneous bidirectional cold initiation, then failed its first packet-level traversal proof because the bounded wire inspector had not been installed on any of the four packet-return targets. All four AF_PACKET captures completed and their raw PCAPs were deleted; retained SSM results showed deterministic exit 127 for the absent inspector. Symmetric readiness must install and checksum-verify the inspector on every target before acceptance traffic, and capture failures must retain the redacted underlying command error.
+
 ## What Changes
 
 - Add packet-scoped GWLB turnaround: each valid ingress packet is immediately re-encapsulated and returned to GWLB with the same inner packet, VNI, protocol metadata, ordered options and flow cookie, and AWS outer tuple learned from that packet.

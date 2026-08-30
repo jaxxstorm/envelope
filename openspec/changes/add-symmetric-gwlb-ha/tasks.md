@@ -41,7 +41,7 @@
 - [x] 6.1 Correct the Docsify onboarding pages, root README, AWS appliance runbook, and two-region E2E runbook to remove target direct-forwarding claims and describe packet turnaround, GWLBE route-table delivery, bidirectional no-NAT transport routers, runner-owned ENI failover, retained version 2, HA limits, and cost.
 - [x] 6.2 Add static documentation checks that reject directional-lane production claims, raw credentials, obsolete configuration examples, and hitless-continuity claims.
 - [x] 6.3 Run the corrected repository unit, race, vet, static, Terraform, separated-role local integration, packet-capture, secret-scan, and strict OpenSpec validation suites after all reopened architecture work passes.
-- [ ] 6.4 Execute the approved protected AWS acceptance run with a fresh configuration and expiry, verify the versioned evidence, perform owned cleanup, and record observed recovery and cost results; failed run `ha25` supplied route-contract evidence and `ha26` proved corrected readiness plus zero-residual cleanup before an over-budget acceptance configuration was rejected, but neither satisfied acceptance.
+- [ ] 6.4 Execute the approved protected AWS acceptance run with a fresh configuration and expiry, verify the versioned evidence, perform owned cleanup, and record observed recovery and cost results; failed runs `ha25`-`ha27` supplied route, readiness, budget, and missing-inspector evidence with zero-residual cleanup, but did not satisfy acceptance.
 
 ## 7. Live-Discovered Source-Prefix Ownership Correction
 

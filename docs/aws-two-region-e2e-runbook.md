@@ -70,6 +70,8 @@ Failed protected run `ha25` proved the corrected live route shape: each router i
 
 Failed protected run `ha26` reached corrected deployment readiness and again cleaned up with zero residuals, but its two worst-case failover reservations totaled 5,560 seconds against a 5,400-second active-run bound. Run-all now rejects that mismatch before resource authority; the next reviewed configuration reduces recovery from 600 to 300 seconds without changing the cleanup, mutation, or restoration bounds.
 
+Failed protected run `ha27` passed readiness and simultaneous bidirectional cold initiation, then exposed that the checksum-pinned wire inspector was not installed on the four packet-return targets. Every capture completed and every raw PCAP was deleted, but inspection failed closed with exit 127. Symmetric readiness now installs and verifies the inspector on every target before acceptance traffic and preserves the redacted command failure when inspection fails.
+
 ## Evidence Expectations
 
 Protected acceptance must prove simultaneous cold initiation from both sites for TCP, UDP, and ICMP without directional CIDR partitioning. For each direction, evidence must bind the source and destination GWLBE, GWLB target, transport router, and ENI identities and prove both target turnarounds. Preflight evidence records bounded per-prefix Tailnet ownership from every opposite-site observer, maps stable node IDs to protected transport-router instance IDs, proves local Tailnet routes and claims are absent, and verifies that each source-prefix owner agrees with the GWLBE ENI selection.

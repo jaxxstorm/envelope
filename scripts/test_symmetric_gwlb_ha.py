@@ -734,6 +734,86 @@ class SymmetricTopologyTest(unittest.TestCase):
             hasattr(e2e.AwsSymmetricLiveOperations, "_selected_ingress_router")
         )
 
+    def test_symmetric_readiness_installs_wire_inspector_on_every_target(self) -> None:
+        deployment = e2e.parse_symmetric_protected_deployment_output(
+            symmetric_protected_output()
+        )
+        installed = []
+        operations = object.__new__(e2e.AwsSymmetricLiveOperations)
+        operations.base = SimpleNamespace(
+            _install_wire_inspector=lambda target: installed.append(target)
+        )
+
+        operations._install_target_wire_inspectors(deployment)
+
+        self.assertEqual(
+            {target.instance_id for target in installed},
+            {
+                member.instance_id
+                for site in e2e.SITES
+                for member in deployment.topology.site(site).target_fleet
+            },
+        )
+        self.assertEqual({target.role for target in installed}, {"target"})
+
+    def test_capture_inspection_failure_retains_redacted_underlying_error(self) -> None:
+        deployment = e2e.parse_symmetric_protected_deployment_output(
+            symmetric_protected_output()
+        )
+        member = deployment.topology.west.target_fleet[0]
+        operations = object.__new__(e2e.AwsSymmetricLiveOperations)
+        operations._geneve_capture_events = []
+        cancelled = []
+
+        class SSM:
+            @staticmethod
+            def wait(target, command_id, *, timeout_seconds):
+                del timeout_seconds
+                return e2e.SSMResult(target, command_id, "Success", 0)
+
+            @staticmethod
+            def cancel(_target, command_id, *, timeout_seconds):
+                del timeout_seconds
+                cancelled.append(command_id)
+
+        operations.base = SimpleNamespace(
+            ssm=SSM(),
+            _inspect_capture_summary=mock.Mock(
+                side_effect=e2e.SSMError("wire inspector is absent")
+            ),
+            _execute=lambda target, *_args, **_kwargs: e2e.SSMResult(
+                target, "delete-capture", "Success", 0
+            ),
+        )
+        handle = e2e._SymmetricGeneveCapture(
+            member,
+            "/run/envelope-e2e-capture/fixture.pcap",
+            "capture-command",
+            8,
+        )
+
+        with self.assertRaisesRegex(
+            e2e.WireAssertionError, "wire inspector is absent"
+        ):
+            operations._finish_geneve_captures(
+                {member.instance_id: handle}, inspect=True
+            )
+
+        self.assertEqual(
+            operations._geneve_capture_events,
+            [
+                {
+                    "target_id": member.instance_id,
+                    "capture_method": "linux-af-packet",
+                    "bounded": True,
+                    "completed": True,
+                    "inspected": False,
+                    "raw_pcap_deleted": True,
+                }
+            ],
+        )
+        self.assertEqual(cancelled, ["capture-command"])
+
     def test_dry_run_has_no_adapter_side_effects_and_failure_restarts_quiesced_target(self) -> None:
         topology = e2e.parse_symmetric_topology_v2(topology_document())
         target = topology.west.target_fleet[0]

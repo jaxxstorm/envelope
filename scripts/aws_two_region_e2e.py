@@ -17117,7 +17117,8 @@ class AwsSymmetricLiveOperations:
                 raise control_flow_error
         if primary_error is not None:
             raise WireAssertionError(
-                "target GENEVE capture completion or raw deletion failed"
+                "target GENEVE capture inspection or raw deletion failed: "
+                + _sanitize_string(str(primary_error))
             ) from primary_error
         return summaries
 
@@ -18587,6 +18588,15 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
             ):
                 raise ReadinessError("symmetric target route domain contains an inner site route")
 
+    def _install_target_wire_inspectors(
+        self, deployment: SymmetricProtectedDeployment
+    ) -> None:
+        for site in SITES:
+            for member in deployment.topology.site(site).target_fleet:
+                self.base._install_wire_inspector(
+                    cast(RemoteTarget, self._remote(member))
+                )
+
     def verify_readiness(
         self,
         deployment: SymmetricProtectedDeployment,
@@ -18595,6 +18605,7 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
     ) -> Mapping[str, Any]:
         self.current_deployment = deployment
         deadline = self.base.monotonic() + timeout_seconds
+        self._install_target_wire_inspectors(deployment)
         tailnet_preflight(self.config, build_tailscale(self.config))
         result: dict[str, Any] = {
             "tailnet_policy_valid": True,
