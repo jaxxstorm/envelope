@@ -72,6 +72,8 @@ Failed protected run `ha26` reached corrected deployment readiness and again cle
 
 Failed protected run `ha27` passed readiness and simultaneous bidirectional cold initiation, then exposed that the checksum-pinned wire inspector was not installed on the four packet-return targets. Every capture completed and every raw PCAP was deleted, but inspection failed closed with exit 127. Symmetric readiness now installs and verifies the inspector on every target before acceptance traffic and preserves the redacted command failure when inspection fails.
 
+Failed protected run `ha28` proved the target inspector correction: all four captures completed, were inspected, and had their raw PCAPs deleted. The subsequent target proof exposed that the runner accepted only unlabeled metric samples even though the required production failure counters are labeled by reason. Target proofs now aggregate every finite series in each exact failure-counter family and continue to fail closed on missing or non-finite metrics.
+
 ## Evidence Expectations
 
 Protected acceptance must prove simultaneous cold initiation from both sites for TCP, UDP, and ICMP without directional CIDR partitioning. For each direction, evidence must bind the source and destination GWLBE, GWLB target, transport router, and ENI identities and prove both target turnarounds. Preflight evidence records bounded per-prefix Tailnet ownership from every opposite-site observer, maps stable node IDs to protected transport-router instance IDs, proves local Tailnet routes and claims are absent, and verifies that each source-prefix owner agrees with the GWLBE ENI selection.

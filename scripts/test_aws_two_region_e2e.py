@@ -3475,10 +3475,26 @@ class SymmetricRoleReadinessTest(unittest.TestCase):
                 (
                     e2e.MetricSeries("geneve_rx_packets", (), rx),
                     e2e.MetricSeries("geneve_tx_packets", (), tx),
-                    e2e.MetricSeries("geneve_options_validation_errors", (), 0),
-                    e2e.MetricSeries("gwlb_profile_rejections_total", (), 0),
-                    e2e.MetricSeries("gwlb_receive_drops_total", (), 0),
-                    e2e.MetricSeries("gwlb_inner_validation_failures_total", (), 0),
+                    e2e.MetricSeries(
+                        "geneve_options_validation_errors",
+                        (("reason", "structural"),),
+                        0,
+                    ),
+                    e2e.MetricSeries(
+                        "gwlb_profile_rejections_total",
+                        (("reason", "decode"),),
+                        0,
+                    ),
+                    e2e.MetricSeries(
+                        "gwlb_receive_drops_total",
+                        (("reason", "packet_info"),),
+                        0,
+                    ),
+                    e2e.MetricSeries(
+                        "gwlb_inner_validation_failures_total",
+                        (("reason", "malformed"),),
+                        0,
+                    ),
                     e2e.MetricSeries("gwlb_return_build_failures_total", (), 0),
                     e2e.MetricSeries("gwlb_send_failures_total", (), failures),
                     e2e.MetricSeries("drops", (), 0),
@@ -3517,6 +3533,12 @@ class SymmetricRoleReadinessTest(unittest.TestCase):
         with self.assertRaises(e2e.MetricAssertionError):
             operations._geneve_return_proof(
                 before, failed, "i-6123456789abcdef0", fidelity
+            )
+
+        non_finite = {"i-6123456789abcdef0": snapshot(11, 11, float("inf"))}
+        with self.assertRaisesRegex(e2e.MetricAssertionError, "non-finite"):
+            operations._geneve_return_proof(
+                before, non_finite, "i-6123456789abcdef0", fidelity
             )
 
     def test_target_requires_source_dest_check_and_current_packet_return_metrics(self) -> None:

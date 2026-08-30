@@ -16805,8 +16805,16 @@ class AwsSymmetricLiveOperations:
     @staticmethod
     def _metric_value(snapshot: MetricSnapshot, name: str) -> float:
         for candidate in (f"{name}_total", name):
-            selected = tuple(sample.value for sample in snapshot.samples if sample.name == candidate and not sample.labels)
+            selected = tuple(
+                sample.value
+                for sample in snapshot.samples
+                if sample.name == candidate
+            )
             if selected:
+                if not all(math.isfinite(value) for value in selected):
+                    raise MetricAssertionError(
+                        f"symmetric target metric {name} contains a non-finite series"
+                    )
                 return sum(selected)
         raise MetricAssertionError(f"symmetric target metric {name} is absent")
 

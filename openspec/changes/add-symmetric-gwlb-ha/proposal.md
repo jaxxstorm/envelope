@@ -12,6 +12,8 @@ Protected run `ha26` reached corrected deployment readiness, then failed before 
 
 Protected run `ha27` passed corrected readiness and simultaneous bidirectional cold initiation, then failed its first packet-level traversal proof because the bounded wire inspector had not been installed on any of the four packet-return targets. All four AF_PACKET captures completed and their raw PCAPs were deleted; retained SSM results showed deterministic exit 127 for the absent inspector. Symmetric readiness must install and checksum-verify the inspector on every target before acceptance traffic, and capture failures must retain the redacted underlying command error.
 
+Protected run `ha28` proved that correction by inspecting all four completed captures and deleting every raw PCAP, then failed target metric evaluation because the runner required an unlabeled aggregate for failure counters that the production exporter correctly emits as reason-labeled series. Target proofs must aggregate all finite series in each exact failure-counter family while continuing to reject absent or non-finite metrics.
+
 ## What Changes
 
 - Add packet-scoped GWLB turnaround: each valid ingress packet is immediately re-encapsulated and returned to GWLB with the same inner packet, VNI, protocol metadata, ordered options and flow cookie, and AWS outer tuple learned from that packet.
