@@ -62,10 +62,13 @@ Before billable resources or live traffic, protected preflight must fail closed 
 - Every local prefix, whether self- or sibling-owned in the singleton advertisement map, remains on `main` and the VPC underlay; the higher-priority `iif tailscale0` local-prefix rules make every router capable of delivering all local prefixes during normal and takeover paths.
 - Source-prefix owner/ENI coupling remains mandatory: it is derived from singleton advertisements, control-plane stable identities, and opposite-site observations and must agree with the protected instance ID and initial GWLBE owner ENI selected by the same-AZ map.
 - Fresh plan resource counts, a current fixed-cost estimate within the approved ceiling, and review of variable-cost exposure.
+- Derived graceful and abrupt transaction reservations must fit the active-run and per-stream bounds, and worst-case restoration must fit the independent cleanup reservation, before run-all acquires resource authority.
 
 No preflight result is evidence that live traffic or failover passed.
 
 Failed protected run `ha25` proved the corrected live route shape: each router installed exactly the two opposite-site workload routes in table 52 and formed only opposite-site serving paths. It invalidated the earlier same-site sibling table-52/`PrimaryRoutes` requirement but did not pass acceptance task 6.4.
+
+Failed protected run `ha26` reached corrected deployment readiness and again cleaned up with zero residuals, but its two worst-case failover reservations totaled 5,560 seconds against a 5,400-second active-run bound. Run-all now rejects that mismatch before resource authority; the next reviewed configuration reduces recovery from 600 to 300 seconds without changing the cleanup, mutation, or restoration bounds.
 
 ## Evidence Expectations
 

@@ -1900,6 +1900,40 @@ class GWLBERouteFailoverTest(unittest.TestCase):
             e2e.DEFAULT_TIMEOUTS.hard_timeout,
         )
 
+    def test_ha26_over_budget_configuration_is_rejected_before_resource_authority(self) -> None:
+        selections = self.topology.route_failover.initial_transport_router_az_by_gwlbe_az
+        over_budget = e2e.SymmetricRouteFailover(
+            mutation_timeout_seconds=120,
+            restoration_timeout_seconds=120,
+            recovery_timeout_seconds=600,
+            initial_transport_router_az_by_gwlbe_az=selections,
+        )
+        with self.assertRaisesRegex(
+            e2e.DeploymentError, "active-run reservations"
+        ):
+            e2e._validate_route_failover_run_budget(
+                over_budget,
+                prefix_counts={"west": 2, "east": 2},
+                observer_counts={"west": 2, "east": 2},
+                hard_timeout_seconds=5400,
+                cleanup_timeout_seconds=1200,
+            )
+
+        bounded = e2e.SymmetricRouteFailover(
+            mutation_timeout_seconds=120,
+            restoration_timeout_seconds=120,
+            recovery_timeout_seconds=300,
+            initial_transport_router_az_by_gwlbe_az=selections,
+        )
+        summary = e2e._validate_route_failover_run_budget(
+            bounded,
+            prefix_counts={"west": 2, "east": 2},
+            observer_counts={"west": 2, "east": 2},
+            hard_timeout_seconds=5400,
+            cleanup_timeout_seconds=1200,
+        )
+        self.assertLessEqual(summary["total_transaction_seconds"], 5400)
+
     def pending_journal(
         self,
         aws: RouteTableAWS,
@@ -7786,7 +7820,12 @@ class RunAllCoordinatorTest(unittest.TestCase):
             "GITHUB_EVENT_NAME": "workflow_dispatch",
         }
 
-        def config(run_id: str = approved, *, ttl_seconds: int = 10_000) -> Any:
+        def config(
+            run_id: str = approved,
+            *,
+            ttl_seconds: int = 10_000,
+            recovery_timeout_seconds: int = 300,
+        ) -> Any:
             return SimpleNamespace(
                 run_id=run_id,
                 expires_at=(dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=ttl_seconds))
@@ -7794,6 +7833,25 @@ class RunAllCoordinatorTest(unittest.TestCase):
                 .isoformat()
                 .replace("+00:00", "Z"),
                 oauth_environment_names=(),
+                route_failover={
+                    "initial_transport_router_az_by_gwlbe_az": {
+                        "west": {"a": "a", "b": "b"},
+                        "east": {"a": "a", "b": "b"},
+                    },
+                    "mutation_timeout_seconds": 120,
+                    "restoration_timeout_seconds": 120,
+                    "recovery_timeout_seconds": recovery_timeout_seconds,
+                },
+                sites={
+                    site: {
+                        "remote_site_cidrs": [
+                            f"10.{index}.4.0/24",
+                            f"10.{index}.5.0/24",
+                        ],
+                        "transport_router_az_keys": ["a", "b"],
+                    }
+                    for index, site in enumerate(e2e.SITES, start=10)
+                },
             )
 
         cases = {
@@ -7802,6 +7860,10 @@ class RunAllCoordinatorTest(unittest.TestCase):
             "ttl": (config(ttl_seconds=60), []),
             "timeout-arguments": (config(), ["--hard-timeout-seconds", "0"]),
             "readiness-timeout": (config(), ["--readiness-timeout-seconds", "6000"]),
+            "route-failover-budget": (
+                config(recovery_timeout_seconds=600),
+                [],
+            ),
             "evidence-path": (config(), ["--evidence", "OUTSIDE"]),
         }
         for expected_gate, (loaded, extra) in cases.items():

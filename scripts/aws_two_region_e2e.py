@@ -3209,6 +3209,66 @@ class SymmetricRouteFailover:
         }
 
 
+def _validate_route_failover_run_budget(
+    route_failover: SymmetricRouteFailover,
+    *,
+    prefix_counts: Mapping[Site, int],
+    observer_counts: Mapping[Site, int],
+    hard_timeout_seconds: int,
+    cleanup_timeout_seconds: int,
+) -> dict[str, Any]:
+    if set(prefix_counts) != set(SITES) or set(observer_counts) != set(SITES):
+        raise DeploymentError("route failover budget inputs must cover both sites")
+    transaction_reservations: dict[Site, int] = {}
+    restoration_reservations: dict[Site, int] = {}
+    for site in SITES:
+        prefix_count = prefix_counts[site]
+        observer_count = observer_counts[site]
+        if (
+            isinstance(observer_count, bool)
+            or not isinstance(observer_count, int)
+            or observer_count < 1
+        ):
+            raise DeploymentError("route failover requires a positive observer count")
+        minimum_ownership_window = (
+            2 * observer_count + route_failover.quiet_window_seconds
+        )
+        if min(
+            route_failover.mutation_timeout_seconds,
+            route_failover.restoration_timeout_seconds,
+            route_failover.recovery_timeout_seconds,
+        ) < minimum_ownership_window:
+            raise DeploymentError(
+                "route failover timeouts cannot cover every sequential ownership observer and quiet window"
+            )
+        transaction_reservations[site] = (
+            route_failover.transaction_reservation_seconds(prefix_count)
+            + STREAM_MUTATION_OVERHEAD_SECONDS
+        )
+        restoration_reservations[site] = (
+            route_failover.restoration_reservation_seconds(prefix_count)
+        )
+    if max(restoration_reservations.values()) > cleanup_timeout_seconds:
+        raise DeploymentError(
+            "route restoration cannot fit the protected cleanup reservation"
+        )
+    if (
+        max(transaction_reservations.values())
+        > MAX_STREAM_MUTATION_RESERVATION_SECONDS
+        or sum(transaction_reservations.values()) > hard_timeout_seconds
+    ):
+        raise DeploymentError(
+            "graceful and abrupt route failover cannot fit the stream and active-run reservations"
+        )
+    return {
+        "transaction_seconds_by_site": dict(transaction_reservations),
+        "restoration_seconds_by_site": dict(restoration_reservations),
+        "total_transaction_seconds": sum(transaction_reservations.values()),
+        "active_run_seconds": hard_timeout_seconds,
+        "cleanup_seconds": cleanup_timeout_seconds,
+    }
+
+
 @dataclasses.dataclass(frozen=True)
 class SymmetricTopologyV2:
     run_id: str
@@ -9625,44 +9685,23 @@ class SymmetricTwoRegionE2ERunner:
             if deployment.topology.run_id != self.run_id:
                 raise DeploymentError("symmetric topology run ID differs from the approved live run")
             route_failover = deployment.topology.route_failover
-            transaction_reservations: list[int] = []
-            restoration_reservations: list[int] = []
-            for site in SITES:
-                site_topology = deployment.topology.site(site)
-                observer_count = len(
-                    deployment.topology.site(_opposite(site)).transport_router_fleet
-                )
-                minimum_ownership_window = (
-                    2 * observer_count + route_failover.quiet_window_seconds
-                )
-                if min(
-                    route_failover.mutation_timeout_seconds,
-                    route_failover.restoration_timeout_seconds,
-                    route_failover.recovery_timeout_seconds,
-                ) < minimum_ownership_window:
-                    raise DeploymentError(
-                        "route failover timeouts cannot cover every sequential ownership observer and quiet window"
+            _validate_route_failover_run_budget(
+                route_failover,
+                prefix_counts={
+                    site: len(deployment.topology.site(site).remote_site_cidrs)
+                    for site in SITES
+                },
+                observer_counts={
+                    site: len(
+                        deployment.topology.site(
+                            _opposite(site)
+                        ).transport_router_fleet
                     )
-                prefix_count = len(site_topology.remote_site_cidrs)
-                transaction_reservations.append(
-                    route_failover.transaction_reservation_seconds(prefix_count)
-                    + STREAM_MUTATION_OVERHEAD_SECONDS
-                )
-                restoration_reservations.append(
-                    route_failover.restoration_reservation_seconds(prefix_count)
-                )
-            if max(restoration_reservations) > self.budgets.cleanup:
-                raise DeploymentError(
-                    "route restoration cannot fit the protected cleanup reservation"
-                )
-            if (
-                max(transaction_reservations)
-                > MAX_STREAM_MUTATION_RESERVATION_SECONDS
-                or sum(transaction_reservations) > self.budgets.hard_timeout
-            ):
-                raise DeploymentError(
-                    "graceful and abrupt route failover cannot fit the stream and active-run reservations"
-                )
+                    for site in SITES
+                },
+                hard_timeout_seconds=self.budgets.hard_timeout,
+                cleanup_timeout_seconds=self.budgets.cleanup,
+            )
             claim = self.lifecycle.claim(self.raw_deployment, deployment)
             claimed = True
             if claim.get("load_profile_approved_before_apply") is not True:
@@ -20590,6 +20629,36 @@ def _run_all_cli(args: argparse.Namespace) -> int:
             or not 1 <= args.readiness_timeout_seconds <= args.hard_timeout_seconds
         ):
             raise E2EError("--readiness-timeout-seconds must fit inside the hard-timeout window")
+        gate = "route-failover-budget"
+        route_failover = SymmetricRouteFailover(
+            mutation_timeout_seconds=config.route_failover[
+                "mutation_timeout_seconds"
+            ],
+            restoration_timeout_seconds=config.route_failover[
+                "restoration_timeout_seconds"
+            ],
+            recovery_timeout_seconds=config.route_failover[
+                "recovery_timeout_seconds"
+            ],
+            initial_transport_router_az_by_gwlbe_az=config.route_failover[
+                "initial_transport_router_az_by_gwlbe_az"
+            ],
+        )
+        _validate_route_failover_run_budget(
+            route_failover,
+            prefix_counts={
+                site: len(config.sites[site]["remote_site_cidrs"])
+                for site in SITES
+            },
+            observer_counts={
+                site: len(
+                    config.sites[_opposite(site)]["transport_router_az_keys"]
+                )
+                for site in SITES
+            },
+            hard_timeout_seconds=args.hard_timeout_seconds,
+            cleanup_timeout_seconds=DEFAULT_TIMEOUTS.cleanup,
+        )
         gate = "ttl"
         expiry = dt.datetime.fromisoformat(config.expires_at.replace("Z", "+00:00"))
         total_timeout = args.hard_timeout_seconds + DEFAULT_TIMEOUTS.cleanup

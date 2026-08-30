@@ -8,6 +8,8 @@ Protected run `ha24` proved packet turnaround and complete route readiness but e
 
 Protected run `ha25` failed acceptance but corrected the live-discovered route contract: each router installed exactly the two opposite-site workload routes in table 52 and formed serving paths only to opposite-site peers. Requiring a same-site sibling `PrimaryRoutes` owner and local table-52 route was wrong. At baseline, each enabled advertisement is a singleton, the per-site sets remain pairwise disjoint and exactly cover the site, every opposite-site observer must select each prefix's configured stable owner, and every local prefix stays on the main/VPC underlay with no same-site Tailnet route or protected local `PrimaryRoutes` claim. The higher-priority `iif tailscale0` rules make every router capable of local delivery in both normal and takeover paths. This correction does not change durable failover and restoration ordering, fencing, the non-hitless availability boundary, or evidence requirements.
 
+Protected run `ha26` reached corrected deployment readiness, then failed before acceptance mutation because two worst-case failover reservations totaled 5,560 seconds against the 5,400-second active-run bound. Cleanup again proved zero residuals. Run-all bootstrap must therefore reject the combined graceful/abrupt transaction and restoration budget before acquiring resource authority; the next configuration uses a 300-second recovery bound that fits the unchanged active and cleanup reservations.
+
 ## What Changes
 
 - Add packet-scoped GWLB turnaround: each valid ingress packet is immediately re-encapsulated and returned to GWLB with the same inner packet, VNI, protocol metadata, ordered options and flow cookie, and AWS outer tuple learned from that packet.
