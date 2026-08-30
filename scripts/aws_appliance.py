@@ -7694,7 +7694,59 @@ def validate_symmetric_saved_plan(
                 "saved plan GWLBE endpoint output does not preserve exact site/AZ identity"
             )
 
+        expected_health_check = {
+            "healthy_threshold": 5,
+            "interval": 10,
+            "path": "/healthz",
+            "port": "9090",
+            "protocol": "HTTP",
+            "timeout": 5,
+            "unhealthy_threshold": 2,
+        }
+        expected_health_expression = {
+            name: {"constant_value": value}
+            for name, value in expected_health_check.items()
+        }
         for site in DEPLOYMENT_SITES:
+            target_group_address = f"aws_lb_target_group.{site}"
+            target_group = planned_resources.get(target_group_address)
+            target_group_values = (
+                target_group.get("values")
+                if isinstance(target_group, dict)
+                else None
+            )
+            health_checks = (
+                target_group_values.get("health_check")
+                if isinstance(target_group_values, dict)
+                else None
+            )
+            configured_target_group = configured_resources.get(
+                target_group_address
+            )
+            configured_target_group_expressions = (
+                configured_target_group.get("expressions")
+                if isinstance(configured_target_group, dict)
+                else None
+            )
+            configured_health_checks = (
+                configured_target_group_expressions.get("health_check")
+                if isinstance(configured_target_group_expressions, dict)
+                else None
+            )
+            if (
+                not isinstance(health_checks, list)
+                or len(health_checks) != 1
+                or not isinstance(health_checks[0], dict)
+                or any(
+                    health_checks[0].get(name) != value
+                    for name, value in expected_health_check.items()
+                )
+                or configured_health_checks != [expected_health_expression]
+            ):
+                failures.append(
+                    f"saved plan {site} target group does not use the exact bounded health transition contract"
+                )
+
             target_table_ids = {
                 route_table_ids[(site, "target", az_key)]
                 for az_key in config.sites[site]["azs"]

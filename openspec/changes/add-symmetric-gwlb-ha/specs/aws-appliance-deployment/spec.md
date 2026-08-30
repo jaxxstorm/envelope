@@ -96,7 +96,7 @@ The deployment SHALL create at least two independent Tailscale transport routers
 - **THEN** protected configuration validation fails before AWS resources are created
 
 ### Requirement: Packet-turnaround target readiness and drain
-The deployment SHALL register an Envelope target healthy only after its AWS GENEVE receiver, validation, and packet-scoped compliant-return sender are ready. TUN, target host forwarding, site routes, and Tailscale SHALL not be target prerequisites. A planned target stop or replacement SHALL mark it unready, wait for documented deregistration and drain evidence, and retain redacted diagnostics.
+The deployment SHALL register an Envelope target healthy only after its AWS GENEVE receiver, validation, and packet-scoped compliant-return sender are ready. TUN, target host forwarding, site routes, and Tailscale SHALL not be target prerequisites. Both GWLB target groups SHALL use an explicit 10-second health interval, 5-second timeout, healthy threshold 5, and unhealthy threshold 2, and the protected saved-plan validator SHALL reject any different or implicit timing. A planned target stop SHALL prove the service and `/healthz` are unavailable and observe the exact AWS `unhealthy` transition before alternate-flow evidence; an unrelated `unused` state SHALL not satisfy process-failure evidence. A replacement SHALL wait for documented deregistration and drain evidence. Both workflows SHALL retain redacted diagnostics.
 
 #### Scenario: Premature target registration
 - **WHEN** packet receive, validation, or compliant-return readiness is unhealthy

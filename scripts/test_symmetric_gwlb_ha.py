@@ -835,6 +835,16 @@ class SymmetricTopologyTest(unittest.TestCase):
         )
         self.assertEqual(dry.observe_new_flow_recovery(lambda: True, timeout_seconds=1), 1)
         self.assertEqual(adapter.calls, [])
+        quiesce_adapter = Adapter(replacement=True)
+        quiesced = e2e.SymmetricLifecycle(
+            topology, quiesce_adapter, dry_run=False
+        ).quiesce_target(target)
+        self.assertEqual(quiesced["health"], "unhealthy")
+        quiesce_command = next(
+            call for call in quiesce_adapter.calls if "systemctl stop" in call
+        )
+        self.assertIn("! systemctl is-active --quiet envelope.service", quiesce_command)
+        self.assertIn("! curl --fail --silent --max-time 3", quiesce_command)
         live = e2e.SymmetricLifecycle(topology, Adapter(replacement=True), dry_run=False)
         with self.assertRaisesRegex(e2e.ResilienceError, "distinct healthy"):
             live.replace_target_instance(target)
@@ -2355,7 +2365,7 @@ class SymmetricTopologyTest(unittest.TestCase):
                 alternate = deployment.topology.site(failed.site).target_fleet[1]
                 return {
                     "recovery": {"kind": "target-process", "site": failed.site, "failed_id": failed.instance_id, "alternate_id": alternate.instance_id, "new_flow_succeeded": True, "new_flows": legacy_e2e_test.new_flow_evidence(), "recovery_duration_ms": 10},
-                    "health_transitions": [{"kind": "target-process", "member_id": failed.instance_id, "states": ["healthy", "unavailable", "healthy"]}],
+                    "health_transitions": [{"kind": "target-process", "member_id": failed.instance_id, "states": ["healthy", "unhealthy", "healthy"]}],
                     "transport": legacy_e2e_test.failure_transport_evidence(
                         failed.instance_id, "target-process"
                     ),

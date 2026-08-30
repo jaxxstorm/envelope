@@ -6283,7 +6283,7 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
             )
         }
         expected_states = {
-            "target-process": ["healthy", "unavailable", "healthy"],
+            "target-process": ["healthy", "unhealthy", "healthy"],
             "transport-router": ["healthy", "unavailable", "healthy"],
         }.get(cast(str, kind))
         states = item.get("states") if isinstance(item, Mapping) else None
@@ -6556,7 +6556,13 @@ class SymmetricLifecycle:
         self._authorize(member, "target")
         if self.dry_run:
             return self._planned("target-quiesce", member)
-        self.adapter.command(member, "systemctl stop envelope.service")
+        self.adapter.command(
+            member,
+            "set -euo pipefail; systemctl stop envelope.service; "
+            "! systemctl is-active --quiet envelope.service; "
+            "! curl --fail --silent --max-time 3 "
+            "http://127.0.0.1:9090/healthz >/dev/null",
+        )
         return {"operation": "target-quiesce", "member_id": member.instance_id, "dry_run": False, "mutated": True, "health": self.adapter.target_health(member)}
 
     def drain_target(self, member: SymmetricFleetMember) -> dict[str, Any]:
@@ -18787,7 +18793,9 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
         controller.quiesce_target(failed)
         control_flow_interrupted = False
         try:
-            self._wait_target_health(failed, {"unhealthy", "unused"}, timeout_seconds=90)
+            unhealthy_state = self._wait_target_health(
+                failed, {"unhealthy"}, timeout_seconds=90
+            )
             paths = {
                 flow.protocol: self._wait_probe_path(
                     deployment,
@@ -18805,6 +18813,7 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
                 self._restore_target(deployment, failed)
         return {
             "paths": paths,
+            "health_state": unhealthy_state,
             "recovery_duration_ms": max(1, int((self.base.monotonic() - started) * 1000)),
         }
 
@@ -19024,7 +19033,7 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
                 {
                     "kind": "target-process",
                     "member_id": member_id,
-                    "states": ["healthy", "unavailable", "healthy"],
+                    "states": ["healthy", "unhealthy", "healthy"],
                 }
                 for member_id in sorted({tcp_failed.instance_id, udp_failed.instance_id})
             ],

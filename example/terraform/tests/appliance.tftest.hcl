@@ -278,6 +278,20 @@ run "symmetric_two_az_paths" {
   }
   assert {
     condition = alltrue([
+      for target_group in [aws_lb_target_group.west, aws_lb_target_group.east] : (
+        one(target_group.health_check).healthy_threshold == 5 &&
+        one(target_group.health_check).interval == 10 &&
+        one(target_group.health_check).path == "/healthz" &&
+        one(target_group.health_check).port == "9090" &&
+        one(target_group.health_check).protocol == "HTTP" &&
+        one(target_group.health_check).timeout == 5 &&
+        one(target_group.health_check).unhealthy_threshold == 2
+      )
+    ])
+    error_message = "both target groups must use the exact bounded health transition contract."
+  }
+  assert {
+    condition = alltrue([
       for site in ["west", "east"] :
       alltrue([
         for router in output.symmetric_topology.sites[site].transport_router_fleet :

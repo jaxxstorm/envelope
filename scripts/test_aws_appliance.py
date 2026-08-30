@@ -856,6 +856,22 @@ def symmetric_saved_plan_document(config: appliance.RunConfig) -> dict:
 
     def planned_resource(address: str) -> dict:
         resource = {"address": address, "mode": "managed", "values": {}}
+        target_group_match = re.fullmatch(r"aws_lb_target_group\.(west|east)", address)
+        if target_group_match is not None:
+            resource["values"] = {
+                "health_check": [
+                    {
+                        "enabled": True,
+                        "healthy_threshold": 5,
+                        "interval": 10,
+                        "path": "/healthz",
+                        "port": "9090",
+                        "protocol": "HTTP",
+                        "timeout": 5,
+                        "unhealthy_threshold": 2,
+                    }
+                ]
+            }
         route = route_identity(address)
         if route is not None:
             family, site, az_key, cidr = route
@@ -981,6 +997,21 @@ def symmetric_saved_plan_document(config: appliance.RunConfig) -> dict:
 
     def configured_resource(address: str) -> dict:
         resource = {"address": address, "mode": "managed"}
+        target_group_match = re.fullmatch(r"aws_lb_target_group\.(west|east)", address)
+        if target_group_match is not None:
+            resource["expressions"] = {
+                "health_check": [
+                    {
+                        "healthy_threshold": {"constant_value": 5},
+                        "interval": {"constant_value": 10},
+                        "path": {"constant_value": "/healthz"},
+                        "port": {"constant_value": "9090"},
+                        "protocol": {"constant_value": "HTTP"},
+                        "timeout": {"constant_value": 5},
+                        "unhealthy_threshold": {"constant_value": 2},
+                    }
+                ]
+            }
         association_match = re.fullmatch(
             r"aws_route_table_association\.(workload|transport|gwlbe|target)_(west|east)",
             address,
@@ -1958,6 +1989,51 @@ class ConfigAndPathTest(unittest.TestCase):
                     "sites"
                 ]["west"]["a"]["route_table_id"],
                 True,
+            )
+
+            for field, invalid in (
+                ("healthy_threshold", 3),
+                ("interval", 30),
+                ("timeout", 6),
+                ("unhealthy_threshold", 3),
+            ):
+                with self.subTest(target_health_field=field):
+                    wrong_health = copy.deepcopy(document)
+                    target_group = next(
+                        resource
+                        for resource in wrong_health["planned_values"]["root_module"][
+                            "resources"
+                        ]
+                        if resource["address"] == "aws_lb_target_group.west"
+                    )
+                    target_group["values"]["health_check"][0][field] = invalid
+                    self.assertTrue(
+                        any(
+                            "bounded health transition contract" in failure
+                            for failure in appliance.validate_symmetric_saved_plan(
+                                wrong_health, config
+                            )
+                        )
+                    )
+
+            missing_health_expression = copy.deepcopy(document)
+            configured_target_group = next(
+                resource
+                for resource in missing_health_expression["configuration"][
+                    "root_module"
+                ]["resources"]
+                if resource["address"] == "aws_lb_target_group.east"
+            )
+            configured_target_group["expressions"]["health_check"][0].pop(
+                "interval"
+            )
+            self.assertTrue(
+                any(
+                    "bounded health transition contract" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        missing_health_expression, config
+                    )
+                )
             )
 
             missing = copy.deepcopy(document)

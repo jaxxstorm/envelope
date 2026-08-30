@@ -660,6 +660,29 @@ class SymmetricTerraformContractTest(unittest.TestCase):
             self.assertNotIn(f'allowed["{obsolete_metric}"]', self.bootstrap)
         self.assertIn("emitted < 128", self.bootstrap)
 
+    def test_target_groups_use_the_exact_bounded_health_contract(self) -> None:
+        expected = {
+            "healthy_threshold": "5",
+            "interval": "10",
+            "path": '"/healthz"',
+            "port": '"9090"',
+            "protocol": '"HTTP"',
+            "timeout": "5",
+            "unhealthy_threshold": "2",
+        }
+        for site in ("west", "east"):
+            with self.subTest(site=site):
+                target_group = braced_block(
+                    self.topology, f'resource "aws_lb_target_group" "{site}"'
+                )
+                health_check = braced_block(target_group, "health_check")
+                assignments = dict(
+                    re.findall(
+                        r"(?m)^\s+([a-z_]+)\s*=\s*([^\n]+)$", health_check
+                    )
+                )
+                self.assertEqual(assignments, expected)
+
     def test_transport_firewall_is_owned_fail_closed_and_activated_live(self) -> None:
         host_network = heredoc(
             self.transport_router,

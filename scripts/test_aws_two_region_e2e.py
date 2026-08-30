@@ -1143,7 +1143,7 @@ def symmetric_route_evidence() -> dict[str, Any]:
             {
                 "kind": "target-process",
                 "member_id": target.instance_id,
-                "states": ["healthy", "unavailable", "healthy"],
+                "states": ["healthy", "unhealthy", "healthy"],
             },
             {
                 "kind": "target-instance",
@@ -3900,7 +3900,7 @@ class RouteRestorationCleanupPrecedenceTest(unittest.TestCase):
                         {
                             "kind": "target-process",
                             "member_id": failed.instance_id,
-                            "states": ["healthy", "unavailable", "healthy"],
+                            "states": ["healthy", "unhealthy", "healthy"],
                         }
                     ],
                     "transport": failure_transport_evidence(

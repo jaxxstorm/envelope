@@ -14,6 +14,8 @@ Protected run `ha27` passed corrected readiness and simultaneous bidirectional c
 
 Protected run `ha28` proved that correction by inspecting all four completed captures and deleting every raw PCAP, then failed target metric evaluation because the runner required an unlabeled aggregate for failure counters that the production exporter correctly emits as reason-labeled series. Target proofs must aggregate all finite series in each exact failure-counter family while continuing to reject absent or non-finite metrics.
 
+Protected run `ha29` passed both site traversals, packet fidelity, and labeled target metrics, then reached target-process recovery. After the selected process stopped, implicit provider health timing kept AWS target state `healthy` through the runner's 90-second wait: a 30-second interval and three unhealthy observations left no distributed-consensus or API margin. The protected target groups must instead declare fixed 10-second checks, a 5-second timeout, healthy threshold 5, and unhealthy threshold 2; saved-plan validation must enforce that contract, and the process exercise must prove both service and health endpoint failure before accepting only the exact AWS `unhealthy` transition.
+
 ## What Changes
 
 - Add packet-scoped GWLB turnaround: each valid ingress packet is immediately re-encapsulated and returned to GWLB with the same inner packet, VNI, protocol metadata, ordered options and flow cookie, and AWS outer tuple learned from that packet.

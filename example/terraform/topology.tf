@@ -438,9 +438,13 @@ resource "aws_lb_target_group" "west" {
   target_type = "instance"
   vpc_id      = aws_vpc.west.id
   health_check {
-    protocol = "HTTP"
-    path     = "/healthz"
-    port     = "9090"
+    healthy_threshold   = 5
+    interval            = 10
+    path                = "/healthz"
+    port                = "9090"
+    protocol            = "HTTP"
+    timeout             = 5
+    unhealthy_threshold = 2
   }
 }
 resource "aws_lb_target_group" "east" {
@@ -451,9 +455,13 @@ resource "aws_lb_target_group" "east" {
   target_type = "instance"
   vpc_id      = aws_vpc.east.id
   health_check {
-    protocol = "HTTP"
-    path     = "/healthz"
-    port     = "9090"
+    healthy_threshold   = 5
+    interval            = 10
+    path                = "/healthz"
+    port                = "9090"
+    protocol            = "HTTP"
+    timeout             = 5
+    unhealthy_threshold = 2
   }
 }
 resource "aws_lb_listener" "west" {
