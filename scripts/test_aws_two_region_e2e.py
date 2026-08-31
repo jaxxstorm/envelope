@@ -14,6 +14,7 @@ import json
 import os
 import pathlib
 import queue
+import shlex
 import socket
 import stat
 import struct
@@ -3091,9 +3092,77 @@ class RouteMutationAuthorityTest(unittest.TestCase):
         for command in commands:
             self.assertIn('status.get("BackendState")!="Running"', command)
             self.assertIn('self_status.get("Online") is not True', command)
-            self.assertIn('self_status.get("Expired") is not False', command)
+            self.assertIn('self_status.get("Expired",False) is not False', command)
             self.assertIn('by_id[expected_id].get("Online") is not True', command)
-            self.assertIn('by_id[expected_id].get("Expired") is not False', command)
+            self.assertIn(
+                'by_id[expected_id].get("Expired",False) is not False', command
+            )
+
+        shell_parts = shlex.split(commands[0])
+        self.assertEqual(shell_parts[:2], ["python3", "-c"])
+        self.assertEqual(len(shell_parts), 4)
+        self.assertEqual(json.loads(shell_parts[3]), expected_nodes)
+        subprocess.run(
+            ["bash", "-n", "-c", commands[0]],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        observer_script = compile(shell_parts[2], "<tailnet-ownership-observer>", "exec")
+        status = {
+            "BackendState": "Running",
+            "Self": {"Online": True},
+            "Peer": {
+                node_id: {
+                    "ID": node_id,
+                    "Online": True,
+                    "PrimaryRoutes": [prefix],
+                }
+                for prefix, node_id in expected_nodes.items()
+            },
+        }
+
+        def run_observer(candidate: Mapping[str, Any]) -> dict[str, Any]:
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    subprocess, "check_output", return_value=json.dumps(candidate)
+                ) as check_output,
+                mock.patch.object(sys, "argv", ["-c", shell_parts[3]]),
+                contextlib.redirect_stdout(output),
+            ):
+                try:
+                    exec(observer_script, {})
+                finally:
+                    check_output.assert_called_once_with(
+                        ["/usr/bin/tailscale", "status", "--json"],
+                        text=True,
+                        timeout=20,
+                    )
+            return json.loads(output.getvalue())
+
+        expected_result = {"success": True, "payload": {"owners": expected_nodes}}
+        self.assertEqual(run_observer(status), expected_result)
+        explicit_false = copy.deepcopy(status)
+        explicit_false["Self"]["Expired"] = False
+        for peer in explicit_false["Peer"].values():
+            peer["Expired"] = False
+        self.assertEqual(run_observer(explicit_false), expected_result)
+
+        for invalid in (True, None, 0, "false", [], {}):
+            with self.subTest(scope="self", expired=invalid):
+                invalid_self = copy.deepcopy(status)
+                invalid_self["Self"]["Expired"] = invalid
+                with self.assertRaises(SystemExit) as raised:
+                    run_observer(invalid_self)
+                self.assertEqual(raised.exception.code, 2)
+
+            with self.subTest(scope="peer", expired=invalid):
+                invalid_peer = copy.deepcopy(status)
+                next(iter(invalid_peer["Peer"].values()))["Expired"] = invalid
+                with self.assertRaises(SystemExit) as raised:
+                    run_observer(invalid_peer)
+                self.assertEqual(raised.exception.code, 4)
 
     def test_target_and_router_roles_must_deny_runner_route_actions(self) -> None:
         topology = route_failover_topology()

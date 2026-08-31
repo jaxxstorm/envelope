@@ -7065,7 +7065,7 @@ class TailnetAdvertisementControl:
         }
         script = r'''import json,subprocess,sys
 expected=json.loads(sys.argv[1]); status=json.loads(subprocess.check_output(["/usr/bin/tailscale","status","--json"],text=True,timeout=20)); self_status=status.get("Self"); peers=status.get("Peer",{}); peers=list(peers.values()) if isinstance(peers,dict) else peers if isinstance(peers,list) else []
-if status.get("BackendState")!="Running" or not isinstance(self_status,dict) or self_status.get("Online") is not True or self_status.get("Expired") is not False: raise SystemExit(2)
+if status.get("BackendState")!="Running" or not isinstance(self_status,dict) or self_status.get("Online") is not True or self_status.get("Expired",False) is not False: raise SystemExit(2)
 by_id={}
 for peer in peers:
     if not isinstance(peer,dict) or not isinstance(peer.get("ID"),str) or peer.get("ID") in by_id or not isinstance(peer.get("PrimaryRoutes",[]),list): raise SystemExit(2)
@@ -7075,7 +7075,7 @@ for peer in by_id.values():
     for prefix in peer.get("PrimaryRoutes",[]):
         if prefix in claims: claims[prefix].append(peer.get("ID"))
 if any(owners!=[expected[prefix]] for prefix,owners in claims.items()): raise SystemExit(3)
-if any(expected_id not in by_id or by_id[expected_id].get("Online") is not True or by_id[expected_id].get("Expired") is not False for expected_id in expected.values()): raise SystemExit(4)
+if any(expected_id not in by_id or by_id[expected_id].get("Online") is not True or by_id[expected_id].get("Expired",False) is not False for expected_id in expected.values()): raise SystemExit(4)
 print(json.dumps({"success":True,"payload":{"owners":{prefix:owners[0] for prefix,owners in claims.items()}}},sort_keys=True,separators=(",",":")))'''
         command = (
             "python3 -c "
