@@ -941,6 +941,9 @@ def symmetric_saved_plan_document(config: appliance.RunConfig) -> dict:
                 "destination_cidr_block": "0.0.0.0/0",
                 "nat_gateway_id": f"nat-{site}",
             }
+        nat_gateway_match = re.fullmatch(r"aws_nat_gateway\.(west|east)", address)
+        if nat_gateway_match is not None:
+            resource["values"] = {"id": f"nat-{nat_gateway_match.group(1)}"}
         target_match = re.fullmatch(r'aws_instance\.envelope_target_(west|east)\["([^\"]+)"\]', address)
         if target_match is not None:
             site, az_key = target_match.groups()
@@ -1942,6 +1945,19 @@ class ConfigAndPathTest(unittest.TestCase):
             failed["e2e"]["replacement"]["failed_at"] = "2026-08-20T12:02:00Z"
             appliance.validate_manifest(failed, config)
 
+            active = copy.deepcopy(manifest)
+            active["e2e"].update(
+                {"finished_at": "2026-08-20T12:02:00Z", "passed": False}
+            )
+            for replacement_state in (active, completed, failed):
+                cleanup = copy.deepcopy(replacement_state)
+                cleanup["phase"] = "cleanup_started"
+                cleanup["cleanup_claimed_at"] = "2026-08-20T12:03:00Z"
+                cleanup["cleanup_claim_id"] = (
+                    "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+                )
+                appliance.validate_manifest(cleanup, config)
+
             ambiguous = copy.deepcopy(completed)
             ambiguous["e2e"]["replacement"]["failed_at"] = "2026-08-20T12:03:00Z"
             with self.assertRaisesRegex(appliance.LifecycleError, "replacement journal"):
@@ -2661,6 +2677,38 @@ class ConfigAndPathTest(unittest.TestCase):
                 )
             )
 
+            reflected_target_default = copy.deepcopy(document)
+            target_table = next(
+                resource
+                for resource in reflected_target_default["planned_values"]["root_module"]["resources"]
+                if resource["address"] == 'aws_route_table.target_east["a"]'
+            )
+            target_table["values"]["route"] = [
+                {
+                    "carrier_gateway_id": "",
+                    "cidr_block": "0.0.0.0/0",
+                    "core_network_arn": "",
+                    "destination_prefix_list_id": "",
+                    "egress_only_gateway_id": "",
+                    "gateway_id": "",
+                    "ipv6_cidr_block": "",
+                    "local_gateway_id": "",
+                    "nat_gateway_id": "nat-east",
+                    "network_interface_id": "",
+                    "transit_gateway_id": "",
+                    "vpc_endpoint_id": "",
+                    "vpc_peering_connection_id": "",
+                }
+            ]
+            self.assertTrue(
+                any(
+                    "target route tables contain an inner route" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        reflected_target_default, config
+                    )
+                )
+            )
+
             leaked_secret = copy.deepcopy(document)
             runtime_policy = next(
                 resource
@@ -2969,6 +3017,118 @@ class ConfigAndPathTest(unittest.TestCase):
                     replace_target_group_arn=target_group_arn,
                 ),
                 [],
+            )
+
+            def reflected_default(nat_gateway_id):
+                return {
+                    "carrier_gateway_id": "",
+                    "cidr_block": "0.0.0.0/0",
+                    "core_network_arn": "",
+                    "destination_prefix_list_id": "",
+                    "egress_only_gateway_id": "",
+                    "gateway_id": "",
+                    "ipv6_cidr_block": "",
+                    "local_gateway_id": "",
+                    "nat_gateway_id": nat_gateway_id,
+                    "network_interface_id": "",
+                    "transit_gateway_id": "",
+                    "vpc_endpoint_id": "",
+                    "vpc_peering_connection_id": "",
+                }
+
+            reflected = copy.deepcopy(document)
+            for site in ("west", "east"):
+                for az_key in ("a", "b"):
+                    next(
+                        resource
+                        for resource in reflected["planned_values"]["root_module"][
+                            "resources"
+                        ]
+                        if resource["address"]
+                        == f'aws_route_table.target_{site}["{az_key}"]'
+                    )["values"]["route"] = [reflected_default(f"nat-{site}")]
+            self.assertEqual(
+                appliance.validate_symmetric_saved_plan(
+                    reflected,
+                    config,
+                    replace_address=address,
+                    replace_instance_id=old_instance_id,
+                    replace_target_group_arn=target_group_arn,
+                ),
+                [],
+            )
+
+            configured_inline = copy.deepcopy(reflected)
+            next(
+                resource
+                for resource in configured_inline["configuration"]["root_module"][
+                    "resources"
+                ]
+                if resource["address"] == "aws_route_table.target_east"
+            ).setdefault("expressions", {})["route"] = [{}]
+            self.assertTrue(
+                any(
+                    "target route tables contain an inner route" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        configured_inline,
+                        config,
+                        replace_address=address,
+                        replace_instance_id=old_instance_id,
+                        replace_target_group_arn=target_group_arn,
+                    )
+                )
+            )
+
+            unbound_nat = copy.deepcopy(reflected)
+            next(
+                resource
+                for resource in unbound_nat["planned_values"]["root_module"][
+                    "resources"
+                ]
+                if resource["address"] == 'aws_route_table.target_east["a"]'
+            )["values"]["route"][0]["nat_gateway_id"] = "nat-other"
+            next(
+                resource
+                for resource in unbound_nat["planned_values"]["root_module"][
+                    "resources"
+                ]
+                if resource["address"] == 'aws_route.target_default_east["a"]'
+            )["values"]["nat_gateway_id"] = "nat-other"
+            self.assertTrue(
+                any(
+                    "target route tables contain an inner route" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        unbound_nat,
+                        config,
+                        replace_address=address,
+                        replace_instance_id=old_instance_id,
+                        replace_target_group_arn=target_group_arn,
+                    )
+                )
+            )
+
+            multiple_reflections = copy.deepcopy(reflected)
+            route_table = next(
+                resource
+                for resource in multiple_reflections["planned_values"]["root_module"][
+                    "resources"
+                ]
+                if resource["address"] == 'aws_route_table.target_east["a"]'
+            )
+            route_table["values"]["route"].append(
+                copy.deepcopy(route_table["values"]["route"][0])
+            )
+            self.assertTrue(
+                any(
+                    "target route tables contain an inner route" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        multiple_reflections,
+                        config,
+                        replace_address=address,
+                        replace_instance_id=old_instance_id,
+                        replace_target_group_arn=target_group_arn,
+                    )
+                )
             )
 
             wrong_attachment = copy.deepcopy(document)

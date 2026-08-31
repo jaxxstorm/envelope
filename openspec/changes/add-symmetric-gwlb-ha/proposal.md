@@ -28,6 +28,8 @@ Protected run `ha34` proved that correction and reached target-instance alternat
 
 Protected run `ha35` failed during symmetric readiness because workload SSM availability preceded workload cloud-init completion. The dynamic observer installer attempted to create its fixed temporary file before `/opt/envelope` existed, so the run never exercised the `ha34` correction. Dynamic probe-tool installation must wait for cloud-init, create the reviewed directory idempotently, use a unique private temporary path with unconditional removal, verify the expected digest, and only then install the executable. Cleanup completed in one attempt with zero residuals, but the run did not satisfy acceptance.
 
+Protected run `ha36` passed symmetric readiness and reached target-instance recovery, then replacement saved-plan validation falsely classified provider-reflected `0.0.0.0/0` NAT routes in the target route tables as inner routes. The original cleanup also failed because cleanup-phase manifest validation rejected the failed replacement journal. Replacement validation must accept only exact provider reflections matching the separately planned default NAT routes and concrete NAT gateways, and cleanup phases must accept exact replacement journals for ownership-checked recovery. That recovery later removed all run resources and returned `final_residual_count` 0, but the retained schema-3 symmetric evidence is failed and the run did not satisfy acceptance.
+
 ## What Changes
 
 - Add packet-scoped GWLB turnaround: each valid ingress packet is immediately re-encapsulated and returned to GWLB with the same inner packet, VNI, protocol metadata, ordered options and flow cookie, and AWS outer tuple learned from that packet.

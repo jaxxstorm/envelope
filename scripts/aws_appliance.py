@@ -2971,11 +2971,11 @@ def validate_manifest(manifest: dict[str, Any], config: RunConfig) -> None:
                 validate_canonical_utc_timestamp(replacement.get("finished_at"), "e2e.replacement.finished_at")
                 if re.fullmatch(r"[0-9a-f]{64}", str(replacement.get("new_output_sha256", ""))) is None:
                     raise LifecycleError("cleanup manifest E2E replacement output identity is invalid")
-                if phase not in {"e2e_running", "e2e_passed", "e2e_failed"}:
+                if phase not in {"e2e_running", "e2e_passed", "e2e_failed"} and phase not in cleanup_phases:
                     raise LifecycleError("cleanup manifest completed replacement journal has an invalid phase")
             elif set(replacement) == replacement_failed:
                 validate_canonical_utc_timestamp(replacement.get("failed_at"), "e2e.replacement.failed_at")
-                if phase not in {"e2e_running", "e2e_failed"}:
+                if phase not in {"e2e_running", "e2e_failed"} and phase not in cleanup_phases:
                     raise LifecycleError("cleanup manifest failed replacement journal has an invalid phase")
             elif phase not in {
                 "e2e_replacement_ready",
@@ -2989,7 +2989,7 @@ def validate_manifest(manifest: dict[str, Any], config: RunConfig) -> None:
                 "e2e_replacement_complete",
                 "e2e_running",
                 "e2e_failed",
-            }:
+            } and phase not in cleanup_phases:
                 raise LifecycleError("cleanup manifest active replacement journal has an invalid phase")
         if core_fields == terminal_fields:
             validate_canonical_utc_timestamp(e2e.get("finished_at"), "e2e.finished_at")
@@ -7752,12 +7752,78 @@ def validate_symmetric_saved_plan(
                 for az_key in config.sites[site]["azs"]
                 if (site, "target", az_key) in route_table_ids
             }
+            configured_target_table = configured_resources.get(
+                f"aws_route_table.target_{site}"
+            )
+            configured_target_expressions = (
+                configured_target_table.get("expressions")
+                if isinstance(configured_target_table, dict)
+                else None
+            )
+            configured_inline_route = (
+                isinstance(configured_target_expressions, dict)
+                and "route" in configured_target_expressions
+            )
+            if configured_inline_route:
+                failures.append(
+                    f"saved plan {site} target route tables contain an inner route"
+                )
+            nat_gateway = planned_resources.get(f"aws_nat_gateway.{site}")
+            nat_gateway_values = (
+                nat_gateway.get("values")
+                if isinstance(nat_gateway, dict)
+                else None
+            )
             target_prefix = f"aws_route_table.target_{site}["
             for address, resource in planned_resources.items():
                 if address.startswith(target_prefix):
                     values = resource.get("values")
                     inline_routes = values.get("route", []) if isinstance(values, dict) else []
-                    if not isinstance(inline_routes, list) or inline_routes:
+                    az_key = resource.get("index")
+                    target_default = planned_resources.get(
+                        f"aws_route.target_default_{site}[{json.dumps(az_key)}]"
+                    )
+                    target_default_values = (
+                        target_default.get("values")
+                        if isinstance(target_default, dict)
+                        else None
+                    )
+                    reflected_route_fields = route_target_fields | {
+                        "cidr_block",
+                        "destination_prefix_list_id",
+                        "ipv6_cidr_block",
+                    }
+                    reflected_default = (
+                        inline_routes[0]
+                        if isinstance(inline_routes, list) and len(inline_routes) == 1
+                        else None
+                    )
+                    if not isinstance(inline_routes, list) or (
+                        inline_routes
+                        and (
+                            replace_address is None
+                            or configured_inline_route
+                            or not isinstance(reflected_default, dict)
+                            or set(reflected_default) != reflected_route_fields
+                            or not isinstance(target_default_values, dict)
+                            or not isinstance(nat_gateway_values, dict)
+                            or reflected_default.get("cidr_block") != "0.0.0.0/0"
+                            or target_default_values.get("destination_cidr_block")
+                            != "0.0.0.0/0"
+                            or target_default_values.get("route_table_id")
+                            != values.get("id")
+                            or reflected_default.get("nat_gateway_id")
+                            != target_default_values.get("nat_gateway_id")
+                            or reflected_default.get("nat_gateway_id")
+                            != nat_gateway_values.get("id")
+                            or not reflected_default.get("nat_gateway_id")
+                            or any(
+                                reflected_default.get(field) not in (None, "")
+                                for field in reflected_route_fields
+                                - {"cidr_block", "nat_gateway_id"}
+                            )
+                        )
+                    ):
                         failures.append(f"saved plan {site} target route tables contain an inner route")
                 if not address.startswith("aws_route."):
                     continue
