@@ -18971,6 +18971,9 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
     ) -> Mapping[str, Any]:
         if failed not in deployment.topology.site(failed.site).target_fleet:
             raise ResilienceError("requested process-recovery target is outside the protected fleet")
+        stream_timeout_seconds = max(
+            90, timeout_seconds + STREAM_MUTATION_OVERHEAD_SECONDS
+        )
         tcp_failed: SymmetricFleetMember | None = None
 
         def mutate_tcp() -> Mapping[str, Any]:
@@ -18984,7 +18987,7 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
 
         tcp_analysis, tcp_receiver, tcp_mutation = self.base._run_stream_mutation(
             tcp_flow,
-            timeout_seconds=max(90, timeout_seconds),
+            timeout_seconds=stream_timeout_seconds,
             maximum_loss_ns=7_200_000_000_000,
             label="symmetric-target-process-tcp",
             mutate_and_restore=mutate_tcp,
@@ -19005,7 +19008,7 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
 
         udp_analysis, udp_receiver, udp_mutation = self.base._run_stream_mutation(
             udp_flow,
-            timeout_seconds=max(90, timeout_seconds),
+            timeout_seconds=stream_timeout_seconds,
             maximum_loss_ns=7_200_000_000_000,
             label="symmetric-target-process-udp",
             mutate_and_restore=mutate_udp,

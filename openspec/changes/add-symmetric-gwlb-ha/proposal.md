@@ -18,6 +18,8 @@ Protected run `ha29` passed both site traversals, packet fidelity, and labeled t
 
 Protected run `ha30` proved the exact target-health transition, alternate-flow recovery, and restoration, then failed its long-lived TCP continuity commands. Retained SSM results showed a receiver JSON decode failure and a client execution timeout. The embedded newline-frame reader discarded trailing bytes when a TCP read coalesced multiple frames, and command deadlines left insufficient completion and reporting margin. Long-lived framing must retain a bounded remainder between reads, inject coalesced-frame regression coverage, and reserve bounded SSM execution and wait headroom beyond the measured stream.
 
+Protected run `ha31` proved the framing correction because all four continuity SSM commands completed and both protocols resumed. TCP recorded 158 markers; UDP recorded 39 trailing markers after bounded loss, but its final marker preceded the restoration-end clock by 2.49 seconds. Target-process stream sizing had reserved only the generic 30-second overhead despite bounded control and restoration occurring inside the measured mutation. The caller must reserve a second fixed 30-second mutation margin so strict analysis can retain a real post-mutation sample rather than weakening the interval boundary.
+
 ## What Changes
 
 - Add packet-scoped GWLB turnaround: each valid ingress packet is immediately re-encapsulated and returned to GWLB with the same inner packet, VNI, protocol metadata, ordered options and flow cookie, and AWS outer tuple learned from that packet.

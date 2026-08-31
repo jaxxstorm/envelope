@@ -2167,6 +2167,93 @@ class SymmetricTopologyTest(unittest.TestCase):
 
         operations.adapter.command.assert_not_called()
 
+    def test_target_process_stream_reserves_post_mutation_observation_window(self) -> None:
+        deployment = e2e.parse_symmetric_protected_deployment_output(
+            symmetric_protected_output()
+        )
+        failed, alternate = deployment.topology.west.target_fleet
+        source = deployment.workloads.target("west", "initiator")
+        destination = deployment.workloads.target("east", "responder")
+        ledger = e2e.FlowLedger("symmetric-fixture")
+
+        def flow(protocol: str, purpose: str) -> e2e.FlowRecord:
+            return ledger.allocate(
+                protocol,
+                source,
+                destination,
+                destination_port=5201,
+                purpose=purpose,
+                generation=ledger.begin_generation(purpose),
+            )
+
+        new_udp = flow("udp", "process-new-udp")
+        new_tcp = flow("tcp", "process-new-tcp")
+        established_tcp = flow("tcp", "process-established-tcp")
+        established_udp = flow("udp", "process-established-udp")
+        stream_calls: list[tuple[str, int]] = []
+
+        def run_stream(
+            candidate,
+            *,
+            timeout_seconds,
+            maximum_loss_ns,
+            label,
+            mutate_and_restore,
+            **_kwargs,
+        ):
+            stream_calls.append((label, timeout_seconds))
+            mutation = mutate_and_restore()
+            analysis = e2e.StreamAnalysis(
+                flow_id=candidate.flow_id,
+                connection_id=f"{candidate.flow_id}:fixture",
+                marker_count=2,
+                first_sequence=0,
+                last_sequence=1,
+                missing_sequences=(),
+                loss_windows=(),
+                mutation=e2e.MutationInterval(1, 2, label),
+                maximum_loss_ns=maximum_loss_ns,
+            )
+            return analysis, {"duplicates": 0, "sessions": 1}, mutation
+
+        def process_mutation(_deployment, _failed, new_flows):
+            return {
+                "paths": {
+                    candidate.protocol: {
+                        "source_target_id": alternate.instance_id
+                    }
+                    for candidate in new_flows
+                },
+                "health_state": "unhealthy",
+                "recovery_duration_ms": 1,
+            }
+
+        operations = object.__new__(e2e.AwsSymmetricLiveOperations)
+        operations.base = SimpleNamespace(_run_stream_mutation=run_stream)
+        operations._selected_established_target = mock.Mock(
+            side_effect=(failed, failed)
+        )
+        operations._process_mutation = mock.Mock(side_effect=process_mutation)
+
+        result = operations.run_target_process_recovery(
+            deployment,
+            failed,
+            new_udp,
+            new_tcp,
+            established_tcp,
+            established_udp,
+            timeout_seconds=180,
+        )
+
+        self.assertEqual(
+            stream_calls,
+            [
+                ("symmetric-target-process-tcp", 210),
+                ("symmetric-target-process-udp", 210),
+            ],
+        )
+        self.assertTrue(result["recovery"]["new_flow_succeeded"])
+
     def test_live_cold_probe_uses_the_protocol_specific_sender(self) -> None:
         deployment = e2e.parse_symmetric_protected_deployment_output(symmetric_protected_output())
         operations = object.__new__(e2e.AwsSymmetricLiveOperations)
