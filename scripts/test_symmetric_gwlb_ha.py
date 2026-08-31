@@ -2563,7 +2563,7 @@ class SymmetricTopologyTest(unittest.TestCase):
                 self.calls.append("target-process")
                 alternate = deployment.topology.site(failed.site).target_fleet[1]
                 return {
-                    "recovery": {"kind": "target-process", "site": failed.site, "failed_id": failed.instance_id, "alternate_id": alternate.instance_id, "new_flow_succeeded": True, "new_flows": legacy_e2e_test.new_flow_evidence(), "recovery_duration_ms": 10},
+                    "recovery": {"kind": "target-process", "site": failed.site, "failed_id": failed.instance_id, "alternate_id": alternate.instance_id, "new_flow_succeeded": True, "new_flows": legacy_e2e_test.new_flow_evidence(source_target_id=alternate.instance_id), "recovery_duration_ms": 10},
                     "health_transitions": [{"kind": "target-process", "member_id": failed.instance_id, "states": ["healthy", "unhealthy", "healthy"]}],
                     "transport": legacy_e2e_test.failure_transport_evidence(
                         failed.instance_id, "target-process"
@@ -2576,7 +2576,7 @@ class SymmetricTopologyTest(unittest.TestCase):
                 self.calls.append("target-instance")
                 alternate = deployment.topology.site(failed.site).target_fleet[1]
                 return deployment, {
-                    "recovery": {"kind": "target-instance", "site": failed.site, "failed_id": failed.instance_id, "alternate_id": alternate.instance_id, "replacement_id": "i-ff23456789abcdef", "replacement_ready": True, "old_process_generation_sha256": "7" * 64, "replacement_process_generation_sha256": "8" * 64, "target_group_arn": failed.target_group_arn, "registration_port": 6081, "drain_state": "draining", "drain_duration_ms": 5, "new_flow_succeeded": True, "new_flows": legacy_e2e_test.new_flow_evidence(), "recovery_duration_ms": 20},
+                    "recovery": {"kind": "target-instance", "site": failed.site, "failed_id": failed.instance_id, "alternate_id": alternate.instance_id, "replacement_id": "i-ff23456789abcdef", "replacement_ready": True, "old_process_generation_sha256": "7" * 64, "replacement_process_generation_sha256": "8" * 64, "target_group_arn": failed.target_group_arn, "registration_port": 6081, "drain_state": "draining", "drain_duration_ms": 5, "new_flow_succeeded": True, "new_flows": legacy_e2e_test.new_flow_evidence(source_target_id=alternate.instance_id), "recovery_duration_ms": 20},
                     "health_transition": {"kind": "target-instance", "member_id": failed.instance_id, "states": ["healthy", "draining", "replaced"]},
                     "transport": legacy_e2e_test.failure_transport_evidence(
                         failed.instance_id, "target-instance"

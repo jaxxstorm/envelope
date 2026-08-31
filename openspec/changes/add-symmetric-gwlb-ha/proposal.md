@@ -30,6 +30,8 @@ Protected run `ha35` failed during symmetric readiness because workload SSM avai
 
 Protected run `ha36` passed symmetric readiness and reached target-instance recovery, then replacement saved-plan validation falsely classified provider-reflected `0.0.0.0/0` NAT routes in the target route tables as inner routes. The original cleanup also failed because cleanup-phase manifest validation rejected the failed replacement journal. Replacement validation must accept only exact provider reflections matching the separately planned default NAT routes and concrete NAT gateways, and cleanup phases must accept exact replacement journals for ownership-checked recovery. That recovery later removed all run resources and returned `final_residual_count` 0, but the retained schema-3 symmetric evidence is failed and the run did not satisfy acceptance.
 
+Protected run `ha37` proved those corrections: replacement planning, drain, fresh TCP/UDP alternate paths, distinct same-AZ replacement, readiness, and one-attempt zero-residual cleanup all completed. Both established tuples were packet-correlated to the replaced west/b target and, under the target group's non-rebalancing flow behavior, remained pinned after replacement; TCP acknowledged 24 of 159 markers and UDP acknowledged 23 of 159, each as one duplicate-free session, while both fresh tuples used west/a. The harness incorrectly required the original UDP tuple's final acknowledgement even though the contract requires measured established outcomes and application-retry new-flow recovery rather than same-tuple continuity. A complete terminal observation must retain exact sent, acknowledged, and lost counts as right-censored without inventing an interruption bound; malformed, incomplete, noncontiguous, or victim-reusing evidence must still fail closed. The retained schema-3 evidence is failed and the run did not satisfy acceptance.
+
 ## What Changes
 
 - Add packet-scoped GWLB turnaround: each valid ingress packet is immediately re-encapsulated and returned to GWLB with the same inner packet, VNI, protocol metadata, ordered options and flow cookie, and AWS outer tuple learned from that packet.
@@ -39,7 +41,7 @@ Protected run `ha36` passed symmetric readiness and reached target-instance reco
 - Give the protected runner bounded, ownership-checked control of coordinated Tailscale advertisement and transport-router ENI route failover and restoration during acceptance, with both prior states and an expiring owner lease persisted in the CAS-protected run manifest for runner-loss recovery.
 - **BREAKING** revise the unaccepted topology and runtime configuration version 2 in place; reject both directional-lane fields and the obsolete draft-v2 direct-forwarding fields without compatibility translation.
 - Preserve symmetric initiation, two-site GWLB traversal, multi-target readiness and drain, and bounded HA evidence without promising hitless transport continuity.
-- Define bounded HA guarantees: availability for new flows and transport recovery after bounded packet loss are in scope; hitless TCP/UDP continuity during an instance, AZ, GWLB, or Tailscale failover is not promised.
+- Define bounded HA guarantees: availability for fresh application-retry flows and bounded control-plane recovery are in scope; established TCP/UDP outcomes are measured and may remain right-censored during an instance, AZ, GWLB, or Tailscale failover rather than being reported as hitless or bounded without a trailing acknowledgement.
 
 ## Capabilities
 

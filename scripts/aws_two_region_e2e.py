@@ -2818,6 +2818,82 @@ class StreamAnalysis:
         }
 
 
+@dataclasses.dataclass(frozen=True)
+class StreamInterruption:
+    flow_id: str
+    connection_id: str
+    sent_marker_count: int
+    marker_count: int
+    mutation: MutationInterval
+    observation_complete: bool
+    right_censored: bool
+
+
+def analyze_interrupted_stream_markers(
+    markers: Sequence[StreamMarker | Mapping[str, Any]],
+    mutation: MutationInterval,
+    *,
+    protocol: str,
+    expected_marker_count: int,
+    sent_marker_count: int,
+    last_sent_monotonic_ns: int,
+) -> StreamInterruption:
+    """Validate a mutation-bound terminal interruption without inventing an end time."""
+
+    if protocol not in TRANSPORT_PROTOCOLS:
+        raise StreamAnalysisError("interrupted stream protocol is invalid")
+    if (
+        isinstance(expected_marker_count, bool)
+        or not isinstance(expected_marker_count, int)
+        or not 20 <= expected_marker_count <= 160
+        or isinstance(sent_marker_count, bool)
+        or not isinstance(sent_marker_count, int)
+        or not 2 <= sent_marker_count <= expected_marker_count
+        or isinstance(last_sent_monotonic_ns, bool)
+        or not isinstance(last_sent_monotonic_ns, int)
+        or last_sent_monotonic_ns < 0
+    ):
+        raise StreamAnalysisError("interrupted stream observation bounds are invalid")
+    parsed = tuple(StreamMarker.from_value(marker) for marker in markers)
+    if len(parsed) < 2 or len(parsed) > sent_marker_count:
+        raise StreamAnalysisError("interrupted stream marker count is invalid")
+    if len({marker.flow_id for marker in parsed}) != 1:
+        raise StreamAnalysisError("interrupted stream markers mix flow IDs")
+    if len({marker.connection_id for marker in parsed}) != 1:
+        raise StreamAnalysisError("interrupted stream markers do not use one long-lived socket")
+    if tuple(marker.sequence for marker in parsed) != tuple(range(len(parsed))):
+        raise StreamAnalysisError("interrupted stream is not one contiguous acknowledged prefix")
+    if parsed[0].sent_monotonic_ns > mutation.start_monotonic_ns:
+        raise StreamAnalysisError("interrupted stream has no marker before the mutation interval")
+    if parsed[-1].received_monotonic_ns < mutation.start_monotonic_ns:
+        raise StreamAnalysisError("interrupted stream has no acknowledgement during the mutation interval")
+    for previous, current in zip(parsed, parsed[1:]):
+        if current.sent_monotonic_ns <= previous.sent_monotonic_ns:
+            raise StreamAnalysisError("interrupted stream send timestamps are not strictly increasing")
+        if current.received_monotonic_ns <= previous.received_monotonic_ns:
+            raise StreamAnalysisError("interrupted stream receive timestamps are not strictly increasing")
+    if last_sent_monotonic_ns < parsed[-1].sent_monotonic_ns:
+        raise StreamAnalysisError("interrupted stream last-send timestamp precedes an acknowledgement")
+
+    if (
+        sent_marker_count != expected_marker_count
+        or parsed[-1].sequence >= expected_marker_count - 1
+        or last_sent_monotonic_ns <= mutation.end_monotonic_ns
+        or parsed[-1].received_monotonic_ns > mutation.end_monotonic_ns
+    ):
+        raise StreamAnalysisError("terminal stream interruption is not mutation-bound and right-censored")
+
+    return StreamInterruption(
+        flow_id=parsed[0].flow_id,
+        connection_id=parsed[0].connection_id,
+        sent_marker_count=sent_marker_count,
+        marker_count=len(parsed),
+        mutation=mutation,
+        observation_complete=True,
+        right_censored=True,
+    )
+
+
 def analyze_stream_markers(
     markers: Sequence[StreamMarker | Mapping[str, Any]],
     mutation: MutationInterval,
@@ -2843,8 +2919,8 @@ def analyze_stream_markers(
         raise StreamAnalysisError("stream is missing an unbounded trailing sequence")
     if parsed[0].sent_monotonic_ns > mutation.start_monotonic_ns:
         raise StreamAnalysisError("stream has no marker before the mutation interval")
-    if parsed[-1].received_monotonic_ns < mutation.end_monotonic_ns:
-        raise StreamAnalysisError("stream has no marker after the mutation interval")
+    if parsed[-1].sent_monotonic_ns <= mutation.end_monotonic_ns:
+        raise StreamAnalysisError("stream has no marker sent after the mutation interval")
 
     missing: list[int] = []
     windows: list[LossWindow] = []
@@ -5738,9 +5814,10 @@ def _validate_geneve_fidelity_evidence(value: Any, *, target_id: str) -> None:
         directions.add(cast(str, pair["direction"]))
 
 
-def _validate_new_flow_matrix(value: Any) -> None:
+def _validate_new_flow_matrix(value: Any) -> dict[str, Mapping[str, Any]]:
     if not isinstance(value, Mapping) or set(value) != set(TRANSPORT_PROTOCOLS):
         raise EvidenceError("failure evidence does not contain exact TCP and UDP new flows")
+    paths: dict[str, Mapping[str, Any]] = {}
     for protocol in TRANSPORT_PROTOCOLS:
         item = value.get(protocol)
         path = item.get("path") if isinstance(item, Mapping) else None
@@ -5752,10 +5829,15 @@ def _validate_new_flow_matrix(value: Any) -> None:
             or path.get("protocol") != protocol
         ):
             raise EvidenceError(f"{protocol} new-flow recovery path is not explicit")
+        paths[protocol] = cast(Mapping[str, Any], path)
+    return paths
 
 
 def _validate_failure_transport_measurement(
-    value: Any, *, allowed_failed_ids: set[str]
+    value: Any,
+    *,
+    allowed_failed_ids: set[str],
+    allow_right_censored: bool,
 ) -> dict[str, str]:
     if not isinstance(value, Mapping) or set(value) != {
         "failed_ids",
@@ -5784,6 +5866,12 @@ def _validate_failure_transport_measurement(
         "maximum_interruption_ms",
         "threshold_ms",
         "within_threshold",
+        "observation_complete",
+        "right_censored",
+        "expected_markers",
+        "last_acknowledged_sequence",
+        "mutation_overlap_observed",
+        "last_send_after_mutation",
     }
     for protocol in TRANSPORT_PROTOCOLS:
         stream = value.get(protocol)
@@ -5797,45 +5885,63 @@ def _validate_failure_transport_measurement(
             or isinstance(stream.get("threshold_ms"), bool)
             or not isinstance(stream.get("threshold_ms"), int)
             or not 1 <= stream.get("threshold_ms", 0) <= 7_200_000
-            or stream.get("within_threshold") is not True
+            or type(stream.get("observation_complete")) is not bool
+            or type(stream.get("right_censored")) is not bool
+            or stream.get("mutation_overlap_observed") is not True
+            or stream.get("last_send_after_mutation") is not True
         ):
             raise EvidenceError(f"{protocol} failure stream identity or threshold is invalid")
-        if stream.get("outcome") == "interrupted":
-            if (
-                protocol != "tcp"
-                or stream.get("analysis_available") is not False
-                or any(
-                    stream.get(field) is not None
-                    for field in (
-                        "sent_markers",
-                        "received_markers",
-                        "lost_markers",
-                        "loss_percent",
-                        "maximum_interruption_ms",
-                    )
-                )
-            ):
-                raise EvidenceError("interrupted TCP measurement retained invalid analysis claims")
-            continue
         sent = stream.get("sent_markers")
         received = stream.get("received_markers")
         lost = stream.get("lost_markers")
         loss = stream.get("loss_percent")
+        expected = stream.get("expected_markers")
+        last_acknowledged = stream.get("last_acknowledged_sequence")
+        counts_valid = (
+            not any(
+                isinstance(item, bool) or not isinstance(item, int)
+                for item in (sent, received, lost, expected, last_acknowledged)
+            )
+            and 2 <= cast(int, received) <= cast(int, sent)
+            and 20 <= cast(int, expected) <= 160
+            and cast(int, sent) == cast(int, expected)
+            and cast(int, lost) == cast(int, sent) - cast(int, received)
+            and not isinstance(loss, bool)
+            and isinstance(loss, (int, float))
+            and math.isclose(
+                float(loss),
+                cast(int, lost) * 100.0 / cast(int, sent),
+                abs_tol=1e-9,
+            )
+        )
+        if stream.get("outcome") == "interrupted":
+            if (
+                not allow_right_censored
+                or stream.get("analysis_available") is not True
+                or not counts_valid
+                or stream.get("maximum_interruption_ms") is not None
+                or stream.get("within_threshold") is not None
+                or stream.get("observation_complete") is not True
+                or stream.get("right_censored") is not True
+                or cast(int, lost) <= 0
+                or last_acknowledged != cast(int, received) - 1
+            ):
+                raise EvidenceError(
+                    f"interrupted {protocol.upper()} measurement retained invalid analysis claims"
+                )
+            continue
         interruption = stream.get("maximum_interruption_ms")
         if (
             stream.get("outcome") != "resumed"
             or stream.get("analysis_available") is not True
-            or any(isinstance(item, bool) or not isinstance(item, int) for item in (sent, received, lost))
-            or not 2 <= cast(int, received) <= cast(int, sent)
-            or cast(int, lost) != cast(int, sent) - cast(int, received)
-            or isinstance(loss, bool)
-            or not isinstance(loss, (int, float))
-            or not math.isclose(
-                float(loss), cast(int, lost) * 100.0 / cast(int, sent), abs_tol=1e-9
-            )
+            or not counts_valid
             or isinstance(interruption, bool)
             or not isinstance(interruption, int)
             or not 0 <= interruption <= cast(int, stream["threshold_ms"])
+            or stream.get("within_threshold") is not True
+            or stream.get("observation_complete") is not True
+            or stream.get("right_censored") is not False
+            or last_acknowledged != cast(int, expected) - 1
         ):
             raise EvidenceError(f"{protocol} failure stream loss or interruption is invalid")
     receivers = value.get("receivers")
@@ -6233,7 +6339,22 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
         duration = item.get("recovery_duration_ms")
         if item.get("failed_id") not in identifiers or item.get("alternate_id") not in identifiers or item["failed_id"] == item["alternate_id"] or item.get("new_flow_succeeded") is not True or isinstance(duration, bool) or not isinstance(duration, int) or not 1 <= duration <= 7_200_000:
             raise EvidenceError("symmetric recovery does not prove bounded alternate-path new-flow recovery")
-        _validate_new_flow_matrix(item.get("new_flows"))
+        new_flow_paths = _validate_new_flow_matrix(item.get("new_flows"))
+        if kind in {"target-process", "target-instance"}:
+            source_target_ids = {
+                protocol: path.get("source_target_id")
+                for protocol, path in new_flow_paths.items()
+            }
+            if (
+                any(
+                    target_id not in identifiers or target_id == item["failed_id"]
+                    for target_id in source_target_ids.values()
+                )
+                or source_target_ids["udp"] != item["alternate_id"]
+            ):
+                raise EvidenceError(
+                    "target recovery new flows do not prove exact victim exclusion"
+                )
         if kind == "target-instance":
             replacement_id = item.get("replacement_id")
             drain_duration = item.get("drain_duration_ms")
@@ -6284,14 +6405,22 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
     process_site = cast(Site, recovery_records["target-process"]["site"])
     target_ids = {member.instance_id for member in topology.site(process_site).target_fleet}
     process_failed_ids = _validate_failure_transport_measurement(
-        transport["target_process"], allowed_failed_ids=target_ids
+        transport["target_process"],
+        allowed_failed_ids=target_ids,
+        allow_right_censored=False,
     )
+    if process_failed_ids["udp"] != recovery_records["target-process"]["failed_id"]:
+        raise EvidenceError(
+            "target-process UDP stream is not bound to the recovered target"
+        )
     instance_site = cast(Site, recovery_records["target-instance"]["site"])
     instance_ids = {
         member.instance_id for member in topology.site(instance_site).target_fleet
     }
     instance_failed_ids = _validate_failure_transport_measurement(
-        transport["target_instance"], allowed_failed_ids=instance_ids
+        transport["target_instance"],
+        allowed_failed_ids=instance_ids,
+        allow_right_censored=True,
     )
     if instance_failed_ids["udp"] != recovery_records["target-instance"]["failed_id"]:
         raise EvidenceError("target-instance UDP stream is not bound to the replaced target")
@@ -6307,10 +6436,14 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
         for member in site.transport_router_fleet
     }
     graceful_failed_ids = _validate_failure_transport_measurement(
-        router_transport["graceful"], allowed_failed_ids=all_router_ids
+        router_transport["graceful"],
+        allowed_failed_ids=all_router_ids,
+        allow_right_censored=True,
     )
     abrupt_failed_ids = _validate_failure_transport_measurement(
-        router_transport["abrupt"], allowed_failed_ids=all_router_ids
+        router_transport["abrupt"],
+        allowed_failed_ids=all_router_ids,
+        allow_right_censored=True,
     )
     transport_router_value = cast(Mapping[str, Any], document["transport_router"])
     if (
@@ -13118,6 +13251,8 @@ def stream_client(args):
     connection_id = args.flow_id + ":c0001"
     markers = []
     interrupted = False
+    sent_markers = 0
+    last_sent_monotonic_ns = None
     buffer = b""
     try:
         try:
@@ -13138,6 +13273,8 @@ def stream_client(args):
             except OSError:
                 interrupted = True
                 break
+            sent_markers += 1
+            last_sent_monotonic_ns = sent
             ack_deadline = time.monotonic() + args.ack_timeout
             while time.monotonic() < ack_deadline:
                 sock.settimeout(max(0.01, ack_deadline - time.monotonic()))
@@ -13166,7 +13303,9 @@ def stream_client(args):
     finally:
         sock.close()
     emit({"connection_id": connection_id, "flow_id": args.flow_id, "markers": markers,
-          "interrupted": interrupted, "socket_count": 1, "source_port": args.source_port, "success": True})
+          "interrupted": interrupted, "last_sent_monotonic_ns": last_sent_monotonic_ns,
+          "sent_markers": sent_markers, "socket_count": 1, "source_port": args.source_port,
+          "success": True})
 
 def sized_udp_server(args):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -15577,9 +15716,9 @@ exit 1"""
         maximum_loss_ns: int,
         label: str,
         mutate_and_restore: Callable[[], Mapping[str, Any]],
-        allow_interrupted: bool = False,
+        allow_right_censored: bool = False,
         expose_interval: bool = False,
-    ) -> tuple[StreamAnalysis | None, dict[str, Any], Mapping[str, Any]]:
+    ) -> tuple[StreamAnalysis | StreamInterruption, dict[str, Any], Mapping[str, Any]]:
         if flow.protocol not in TRANSPORT_PROTOCOLS:
             raise StreamAnalysisError("continuity stream must use TCP or UDP")
         duration = max(35, min(3500, timeout_seconds + 30))
@@ -15737,33 +15876,76 @@ exit 1"""
             if pause_acquired and not control_flow_interrupted:
                 self._resume_managed_responder(flow.destination, flow.protocol)
         markers = _expand_compact_stream_markers(client)
+        client_keys = {
+            "connection_id",
+            "flow_id",
+            "interrupted",
+            "last_sent_monotonic_ns",
+            "markers",
+            "sent_markers",
+            "socket_count",
+            "source_port",
+            "success",
+        }
+        sent_marker_count = client.get("sent_markers")
+        last_sent_monotonic_ns = client.get("last_sent_monotonic_ns")
+        client_interrupted = client.get("interrupted")
         if (
-            client.get("flow_id") != flow.flow_id
+            set(client) != client_keys
+            or client.get("flow_id") != flow.flow_id
             or client.get("connection_id") != f"{flow.flow_id}:c0001"
+            or client_interrupted is not False
             or client.get("socket_count") != 1
             or client.get("source_port") != flow.source_port
+            or isinstance(sent_marker_count, bool)
+            or not isinstance(sent_marker_count, int)
+            or not 2 <= sent_marker_count <= count
+            or isinstance(last_sent_monotonic_ns, bool)
+            or not isinstance(last_sent_monotonic_ns, int)
+            or last_sent_monotonic_ns < 0
+            or sent_marker_count != count
         ):
             raise StreamAnalysisError(f"{label} did not retain one exact source socket")
-        analysis: StreamAnalysis | None
-        try:
-            analysis = analyze_stream_markers(
+        receiver_keys = {"duplicates", "flow_id", "receives", "sessions", "success"}
+        receiver_count = receiver.get("receives")
+        if (
+            set(receiver) != receiver_keys
+            or receiver.get("flow_id") != flow.flow_id
+            or receiver.get("duplicates") != 0
+            or receiver.get("sessions") != 1
+            or isinstance(receiver_count, bool)
+            or not isinstance(receiver_count, int)
+            or not len(markers) <= receiver_count <= sent_marker_count
+        ):
+            raise StreamAnalysisError(
+                f"{label} receiver observed invalid marker, duplicate, or session state"
+            )
+        mutation = MutationInterval(mutation_start, mutation_end, label)
+        if markers and markers[-1].sequence == count - 1:
+            analysis: StreamAnalysis | StreamInterruption = analyze_stream_markers(
                 markers,
-                MutationInterval(mutation_start, mutation_end, label),
+                mutation,
                 maximum_loss_ns=maximum_loss_ns,
                 expected_first_sequence=0,
                 expected_last_sequence=count - 1,
             )
-        except StreamAnalysisError:
-            if not allow_interrupted or flow.protocol != "tcp":
-                raise
-            analysis = None
-        if receiver.get("duplicates") != 0 or receiver.get("sessions") != 1:
-            raise StreamAnalysisError(f"{label} receiver observed duplicate markers or multiple sockets")
-        if allow_interrupted:
-            mutation_summary = {
-                **dict(mutation_summary),
-                "stream_client_interrupted": client.get("interrupted") is True,
-            }
+        elif allow_right_censored:
+            analysis = analyze_interrupted_stream_markers(
+                markers,
+                mutation,
+                protocol=flow.protocol,
+                expected_marker_count=count,
+                sent_marker_count=sent_marker_count,
+                last_sent_monotonic_ns=last_sent_monotonic_ns,
+            )
+        else:
+            analysis = analyze_stream_markers(
+                markers,
+                mutation,
+                maximum_loss_ns=maximum_loss_ns,
+                expected_first_sequence=0,
+                expected_last_sequence=count - 1,
+            )
         if expose_interval:
             mutation_summary = {
                 **dict(mutation_summary),
@@ -18947,27 +19129,32 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
     @staticmethod
     def _stream_failure_evidence(
         flow: FlowRecord,
-        analysis: StreamAnalysis | None,
+        analysis: StreamAnalysis | StreamInterruption,
         *,
-        interrupted: bool,
         threshold_ms: int,
     ) -> dict[str, Any]:
-        if analysis is None:
-            if flow.protocol != "tcp" or not interrupted:
-                raise StreamAnalysisError("only TCP may have a bounded interrupted stream outcome")
+        if isinstance(analysis, StreamInterruption):
+            sent = analysis.sent_marker_count
+            received = analysis.marker_count
             return {
-                "protocol": "tcp",
+                "protocol": flow.protocol,
                 "flow_id": flow.flow_id,
                 "outcome": "interrupted",
                 "one_socket": True,
-                "analysis_available": False,
-                "sent_markers": None,
-                "received_markers": None,
-                "lost_markers": None,
-                "loss_percent": None,
+                "analysis_available": True,
+                "sent_markers": sent,
+                "received_markers": received,
+                "lost_markers": sent - received,
+                "loss_percent": (sent - received) * 100.0 / sent,
                 "maximum_interruption_ms": None,
                 "threshold_ms": threshold_ms,
-                "within_threshold": True,
+                "within_threshold": None,
+                "observation_complete": analysis.observation_complete,
+                "right_censored": analysis.right_censored,
+                "expected_markers": sent,
+                "last_acknowledged_sequence": received - 1,
+                "mutation_overlap_observed": True,
+                "last_send_after_mutation": True,
             }
         sent = analysis.last_sequence - analysis.first_sequence + 1
         received = analysis.marker_count
@@ -18992,6 +19179,12 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
             "maximum_interruption_ms": maximum_interruption_ms,
             "threshold_ms": threshold_ms,
             "within_threshold": True,
+            "observation_complete": True,
+            "right_censored": False,
+            "expected_markers": sent,
+            "last_acknowledged_sequence": analysis.last_sequence,
+            "mutation_overlap_observed": True,
+            "last_send_after_mutation": True,
         }
 
     def _measure_tcp_udp_failure(
@@ -19022,6 +19215,7 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
                 maximum_loss_ns=threshold_ms * 1_000_000,
                 label=f"{label}-udp",
                 mutate_and_restore=mutate_and_restore,
+                allow_right_censored=True,
                 expose_interval=True,
             )
             udp_result.update(
@@ -19038,28 +19232,20 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
             maximum_loss_ns=threshold_ms * 1_000_000,
             label=f"{label}-tcp",
             mutate_and_restore=run_udp_during_tcp,
-            allow_interrupted=True,
+            allow_right_censored=True,
         )
         udp_analysis = udp_result.get("analysis")
-        if not isinstance(udp_analysis, StreamAnalysis):
+        if not isinstance(udp_analysis, (StreamAnalysis, StreamInterruption)):
             raise StreamAnalysisError("UDP failure measurement did not retain its stream analysis")
-        tcp_interrupted = mutation.get("stream_client_interrupted") is True
-        mutation = {
-            key: value
-            for key, value in mutation.items()
-            if key != "stream_client_interrupted"
-        }
         return mutation, {
             "tcp": self._stream_failure_evidence(
                 tcp_flow,
                 tcp_analysis,
-                interrupted=tcp_interrupted,
                 threshold_ms=threshold_ms,
             ),
             "udp": self._stream_failure_evidence(
                 udp_flow,
                 udp_analysis,
-                interrupted=False,
                 threshold_ms=threshold_ms,
             ),
             "receivers": {
@@ -19101,13 +19287,12 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
             )
             return self._process_mutation(deployment, tcp_failed, ())
 
-        tcp_analysis, tcp_receiver, tcp_mutation = self.base._run_stream_mutation(
+        tcp_analysis, tcp_receiver, _tcp_mutation = self.base._run_stream_mutation(
             tcp_flow,
             timeout_seconds=stream_timeout_seconds,
             maximum_loss_ns=7_200_000_000_000,
             label="symmetric-target-process-tcp",
             mutate_and_restore=mutate_tcp,
-            allow_interrupted=True,
         )
         udp_failed: SymmetricFleetMember | None = None
 
@@ -19129,7 +19314,10 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
             label="symmetric-target-process-udp",
             mutate_and_restore=mutate_udp,
         )
-        assert udp_analysis is not None
+        if not isinstance(udp_analysis, StreamAnalysis):
+            raise StreamAnalysisError(
+                "target-process UDP stream did not resume after restoration"
+            )
         if tcp_failed is None or udp_failed is None:
             raise ResilienceError("established transport did not identify its selected source targets")
         paths = udp_mutation.get("paths")
@@ -19175,13 +19363,11 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
                 "tcp": self._stream_failure_evidence(
                     tcp_flow,
                     tcp_analysis,
-                    interrupted=tcp_mutation.get("stream_client_interrupted") is True,
                     threshold_ms=threshold_ms,
                 ),
                 "udp": self._stream_failure_evidence(
                     udp_flow,
                     udp_analysis,
-                    interrupted=False,
                     threshold_ms=threshold_ms,
                 ),
                 "receivers": {

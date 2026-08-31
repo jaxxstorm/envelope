@@ -57,7 +57,7 @@ Every GWLBE remote-site route SHALL initially select the explicitly configured r
 - **THEN** no terminal claim is written and a successor may restore the prior routes only after the owner lease and CAS claim are reconciled
 
 ### Requirement: Bounded high availability behavior
-Each enabled site AZ SHALL have a local GWLBE and a healthy-capable Envelope target path, and each site SHALL have at least two ready transport routers. The system SHALL prove alternate-target new-flow recovery and runner-owned transport ENI route recovery and SHALL record established-flow recovery and packet loss without promising hitless continuity.
+Each enabled site AZ SHALL have a local GWLBE and a healthy-capable Envelope target path, and each site SHALL have at least two ready transport routers. The system SHALL prove alternate-target new-flow recovery and runner-owned transport ENI route recovery and SHALL record established-flow recovery and packet loss without promising hitless continuity or requiring an original five-tuple to resume. For instance, router, or route failure, a complete observation that continues sending after the mutation MAY record an exact right-censored interruption; the target-process post-restoration marker requirement remains unchanged.
 
 #### Scenario: Target failure
 - **WHEN** the selected Envelope target becomes unhealthy during protected acceptance
@@ -69,4 +69,4 @@ Each enabled site AZ SHALL have a local GWLBE and a healthy-capable Envelope tar
 
 #### Scenario: Established transport interruption
 - **WHEN** a target, process, transport router, or ENI route fails during an established TCP or UDP flow
-- **THEN** acceptance records whether TCP resumed and the observed UDP loss, and does not report a hitless-continuity guarantee
+- **THEN** acceptance records exact attempted, acknowledged, and lost marker counts, whether the observation resumed or ended right-censored, and does not report a hitless-continuity or bounded-interruption claim without a trailing acknowledgement

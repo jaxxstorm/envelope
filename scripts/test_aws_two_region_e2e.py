@@ -1069,7 +1069,9 @@ def symmetric_route_evidence() -> dict[str, Any]:
                 "failed_id": target.instance_id,
                 "alternate_id": target_alternate.instance_id,
                 "new_flow_succeeded": True,
-                "new_flows": new_flow_evidence(),
+                "new_flows": new_flow_evidence(
+                    source_target_id=target_alternate.instance_id
+                ),
                 "recovery_duration_ms": 10,
             },
             {
@@ -1086,7 +1088,9 @@ def symmetric_route_evidence() -> dict[str, Any]:
                 "drain_state": "draining",
                 "drain_duration_ms": 5,
                 "new_flow_succeeded": True,
-                "new_flows": new_flow_evidence(),
+                "new_flows": new_flow_evidence(
+                    source_target_id=target_alternate.instance_id
+                ),
                 "recovery_duration_ms": 20,
             },
             {
@@ -1178,13 +1182,19 @@ def failure_transport_evidence(failed_id: str, label: str) -> dict[str, Any]:
             "outcome": "resumed",
             "one_socket": True,
             "analysis_available": True,
-            "sent_markers": 10,
-            "received_markers": 9,
+            "sent_markers": 20,
+            "received_markers": 19,
             "lost_markers": 1,
-            "loss_percent": 10.0,
+            "loss_percent": 5.0,
             "maximum_interruption_ms": 100,
             "threshold_ms": 30_000,
             "within_threshold": True,
+            "observation_complete": True,
+            "right_censored": False,
+            "expected_markers": 20,
+            "last_acknowledged_sequence": 19,
+            "mutation_overlap_observed": True,
+            "last_send_after_mutation": True,
         }
 
     return {
@@ -3381,6 +3391,69 @@ class SymmetricRouteEvidenceTest(unittest.TestCase):
         with self.assertRaisesRegex(e2e.EvidenceError, "UDP stream"):
             e2e.validate_symmetric_evidence(document)
 
+    def test_target_instance_evidence_records_right_censored_udp_loss(self) -> None:
+        document = symmetric_route_evidence()
+        stream = document["transport"]["target_instance"]["udp"]
+        interrupted = {
+            "outcome": "interrupted",
+            "sent_markers": 159,
+            "received_markers": 23,
+            "lost_markers": 136,
+            "loss_percent": 136 * 100.0 / 159,
+            "maximum_interruption_ms": None,
+            "within_threshold": None,
+            "observation_complete": True,
+            "right_censored": True,
+            "expected_markers": 159,
+            "last_acknowledged_sequence": 22,
+            "mutation_overlap_observed": True,
+            "last_send_after_mutation": True,
+        }
+        stream.update(interrupted)
+
+        self.assertEqual(e2e.validate_symmetric_evidence(document), document)
+        stream["observation_complete"] = False
+        with self.assertRaisesRegex(e2e.EvidenceError, "interrupted UDP"):
+            e2e.validate_symmetric_evidence(document)
+
+        process_document = symmetric_route_evidence()
+        process_document["transport"]["target_process"]["udp"].update(interrupted)
+        with self.assertRaisesRegex(e2e.EvidenceError, "interrupted UDP"):
+            e2e.validate_symmetric_evidence(process_document)
+
+    def test_target_recovery_evidence_rejects_a_fresh_path_on_the_victim(self) -> None:
+        for kind in ("target-process", "target-instance"):
+            with self.subTest(kind=kind):
+                document = symmetric_route_evidence()
+                recovery = next(
+                    item
+                    for item in document["recoveries"]
+                    if item["kind"] == kind
+                )
+                recovery["new_flows"]["tcp"]["path"][
+                    "source_target_id"
+                ] = recovery["failed_id"]
+
+                with self.assertRaisesRegex(e2e.EvidenceError, "victim exclusion"):
+                    e2e.validate_symmetric_evidence(document)
+
+    def test_target_process_evidence_rejects_a_different_measured_udp_victim(self) -> None:
+        document = symmetric_route_evidence()
+        topology = e2e.parse_symmetric_topology_v2(document["topology"])
+        recovery = next(
+            item
+            for item in document["recoveries"]
+            if item["kind"] == "target-process"
+        )
+        document["transport"]["target_process"]["failed_ids"]["udp"] = next(
+            member.instance_id
+            for member in topology.west.target_fleet
+            if member.instance_id != recovery["failed_id"]
+        )
+
+        with self.assertRaisesRegex(e2e.EvidenceError, "target-process UDP stream"):
+            e2e.validate_symmetric_evidence(document)
+
     def test_schema_rejects_route_identity_state_bounds_probe_and_fidelity_tampering(self) -> None:
         def duplicate_stable_hash(value: dict[str, Any]) -> None:
             west = list(value["preflight"]["sites"]["west"]["transport_routers"].values())
@@ -3913,7 +3986,9 @@ class RouteRestorationCleanupPrecedenceTest(unittest.TestCase):
                         "failed_id": failed.instance_id,
                         "alternate_id": alternate.instance_id,
                         "new_flow_succeeded": True,
-                        "new_flows": new_flow_evidence(),
+                        "new_flows": new_flow_evidence(
+                            source_target_id=alternate.instance_id
+                        ),
                         "recovery_duration_ms": 1,
                     },
                     "health_transitions": [
@@ -3951,7 +4026,9 @@ class RouteRestorationCleanupPrecedenceTest(unittest.TestCase):
                         "drain_state": "draining",
                         "drain_duration_ms": 1,
                         "new_flow_succeeded": True,
-                        "new_flows": new_flow_evidence(),
+                        "new_flows": new_flow_evidence(
+                            source_target_id=alternate.instance_id
+                        ),
                         "recovery_duration_ms": 1,
                     },
                     "health_transition": {
@@ -5794,6 +5871,60 @@ class StreamAnalyzerTest(unittest.TestCase):
         markers = [marker(0, 40, 45), marker(1, 210, 215, connection="flow:c0002")]
         with self.assertRaisesRegex(e2e.StreamAnalysisError, "one long-lived socket"):
             e2e.analyze_stream_markers(markers, self.mutation, maximum_loss_ns=200)
+
+    def test_right_censored_interruption_retains_exact_observed_loss(self) -> None:
+        markers = [marker(0, 40, 45), marker(1, 80, 90), marker(2, 120, 130)]
+
+        interruption = e2e.analyze_interrupted_stream_markers(
+            markers,
+            self.mutation,
+            protocol="udp",
+            expected_marker_count=159,
+            sent_marker_count=159,
+            last_sent_monotonic_ns=240,
+        )
+
+        self.assertEqual(interruption.sent_marker_count, 159)
+        self.assertEqual(interruption.marker_count, 3)
+        self.assertTrue(interruption.observation_complete)
+        self.assertTrue(interruption.right_censored)
+
+        with self.assertRaisesRegex(e2e.StreamAnalysisError, "right-censored"):
+            e2e.analyze_interrupted_stream_markers(
+                markers,
+                self.mutation,
+                protocol="udp",
+                expected_marker_count=159,
+                sent_marker_count=159,
+                last_sent_monotonic_ns=200,
+            )
+        with self.assertRaisesRegex(e2e.StreamAnalysisError, "contiguous"):
+            e2e.analyze_interrupted_stream_markers(
+                [markers[0], marker(2, 120, 130)],
+                self.mutation,
+                protocol="udp",
+                expected_marker_count=159,
+                sent_marker_count=159,
+                last_sent_monotonic_ns=240,
+            )
+        with self.assertRaisesRegex(e2e.StreamAnalysisError, "acknowledgement during"):
+            e2e.analyze_interrupted_stream_markers(
+                [marker(0, 40, 45), marker(1, 70, 80)],
+                self.mutation,
+                protocol="udp",
+                expected_marker_count=159,
+                sent_marker_count=159,
+                last_sent_monotonic_ns=240,
+            )
+        with self.assertRaisesRegex(e2e.StreamAnalysisError, "right-censored"):
+            e2e.analyze_interrupted_stream_markers(
+                markers,
+                self.mutation,
+                protocol="tcp",
+                expected_marker_count=159,
+                sent_marker_count=3,
+                last_sent_monotonic_ns=150,
+            )
 
 
 def evidence_fixture() -> dict[str, Any]:
@@ -8909,6 +9040,8 @@ class ProtectedExecutionTest(unittest.TestCase):
         self.assertIn('stream.add_argument("--ready-path", required=True)', e2e.REMOTE_AGENT_SOURCE)
         self.assertIn("os.O_WRONLY | os.O_CREAT | os.O_EXCL", e2e.REMOTE_AGENT_SOURCE)
         self.assertIn("markers.append([sequence, sent, time.monotonic_ns()])", e2e.REMOTE_AGENT_SOURCE)
+        self.assertIn('"sent_markers": sent_markers', e2e.REMOTE_AGENT_SOURCE)
+        self.assertIn('"last_sent_monotonic_ns": last_sent_monotonic_ns', e2e.REMOTE_AGENT_SOURCE)
         compressed = gzip.compress(e2e.REMOTE_AGENT_SOURCE.encode("utf-8"), mtime=0)
         self.assertLess(len(base64.b64encode(compressed)), 12_000)
         compile(e2e.WIRE_INSPECTOR_SOURCE, "<wire-inspector>", "exec")
@@ -8926,7 +9059,9 @@ class ProtectedExecutionTest(unittest.TestCase):
             "connection_id": connection_id,
             "flow_id": flow_id,
             "interrupted": False,
+            "last_sent_monotonic_ns": markers[-1][1],
             "markers": markers,
+            "sent_markers": len(markers),
             "socket_count": 1,
             "source_port": 30000,
             "success": True,

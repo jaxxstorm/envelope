@@ -140,6 +140,10 @@ The protected acceptance SHALL install and checksum-verify the bounded wire insp
 - **WHEN** a selected target process or instance is made unavailable
 - **THEN** a new flow succeeds through another healthy target and evidence records bounded recovery rather than a hitless guarantee
 
+#### Scenario: Established tuple remains pinned during target replacement
+- **WHEN** a target instance is drained and replaced while an established TCP or UDP tuple continues sending through target-group flow state
+- **THEN** acceptance MAY record a right-censored interruption only after the complete send window extends beyond replacement, the acknowledged markers form one exact prefix, both fresh TCP and UDP paths exclude the victim, and evidence retains exact sent, received, and lost counts without claiming a maximum interruption duration
+
 #### Scenario: New flow while continuity is established
 - **WHEN** target recovery probes a new TCP or UDP tuple while the corresponding established continuity socket remains active on the reviewed application port
 - **THEN** the established socket retains only its exact session, the one-shot receiver owns a non-aliased listener, nested responder suspension remains active until both operations finish, every command has shutdown/reporting headroom, and each bounded retry uses a fresh source tuple
