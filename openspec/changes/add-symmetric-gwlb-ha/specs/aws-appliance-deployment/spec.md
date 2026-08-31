@@ -132,6 +132,10 @@ The protected acceptance SHALL install and checksum-verify the bounded wire insp
 - **WHEN** both site workloads initiate cold TCP, UDP, and ICMP flows concurrently
 - **THEN** each flow succeeds without CIDR-role partitioning and evidence proves both site target turnarounds and GWLBE/GWLB traversals
 
+#### Scenario: Dynamic probe tools precede workload-specific readiness
+- **WHEN** a protected workload or target is SSM-online while cloud-init is still completing
+- **THEN** each dynamic observer or inspector installer waits for cloud-init, creates only the reviewed root-owned directory, verifies its payload from a unique private temporary file, atomically installs the expected executable, and removes the temporary file on success or failure
+
 #### Scenario: Alternate target recovery
 - **WHEN** a selected target process or instance is made unavailable
 - **THEN** a new flow succeeds through another healthy target and evidence records bounded recovery rather than a hitless guarantee

@@ -13649,25 +13649,33 @@ class AwsLiveOperations:
 
     def _install_agent(self, target: SSMTarget) -> None:
         encoded = base64.b64encode(gzip.compress(REMOTE_AGENT_SOURCE.encode("utf-8"), mtime=0)).decode("ascii")
-        temporary = REMOTE_AGENT_PATH + ".tmp"
+        temporary = REMOTE_AGENT_PATH + ".tmp.XXXXXX"
         command = (
             "set -euo pipefail; umask 077; "
-            f"printf %s {shlex.quote(encoded)} | base64 -d | gzip -d > {shlex.quote(temporary)}; "
-            f"printf '%s  %s\\n' {shlex.quote(self.agent_sha256)} {shlex.quote(temporary)} | sha256sum -c - >/dev/null; "
-            f"install -m 0700 {shlex.quote(temporary)} {shlex.quote(REMOTE_AGENT_PATH)}; rm -f {shlex.quote(temporary)}"
+            "timeout 120 cloud-init status --wait >/dev/null; "
+            "install -d -o root -g root -m 0755 /opt/envelope; "
+            f"temporary=$(mktemp {shlex.quote(temporary)}); trap 'rm -f \"$temporary\"' EXIT; "
+            f"printf %s {shlex.quote(encoded)} | base64 -d | gzip -d > \"$temporary\"; "
+            f"printf '%s  %s\\n' {shlex.quote(self.agent_sha256)} \"$temporary\" | sha256sum -c - >/dev/null; "
+            f"install -m 0700 \"$temporary\" {shlex.quote(REMOTE_AGENT_PATH)}; "
+            "rm -f \"$temporary\"; trap - EXIT"
         )
-        self._execute(target, command, timeout_seconds=60, comment="Envelope E2E install bounded agent")
+        self._execute(target, command, timeout_seconds=150, comment="Envelope E2E install bounded agent")
 
     def _install_wire_inspector(self, target: RemoteTarget) -> None:
         encoded = base64.b64encode(gzip.compress(WIRE_INSPECTOR_SOURCE.encode("utf-8"), mtime=0)).decode("ascii")
-        temporary = WIRE_INSPECTOR_PATH + ".tmp"
+        temporary = WIRE_INSPECTOR_PATH + ".tmp.XXXXXX"
         command = (
-            "set -euo pipefail; umask 077; install -d -o root -g root -m 0755 /opt/envelope; "
-            f"printf %s {shlex.quote(encoded)} | base64 -d | gzip -d > {shlex.quote(temporary)}; "
-            f"printf '%s  %s\\n' {shlex.quote(self.wire_inspector_sha256)} {shlex.quote(temporary)} | sha256sum -c - >/dev/null; "
-            f"install -m 0700 {shlex.quote(temporary)} {shlex.quote(WIRE_INSPECTOR_PATH)}; rm -f {shlex.quote(temporary)}"
+            "set -euo pipefail; umask 077; "
+            "timeout 120 cloud-init status --wait >/dev/null; "
+            "install -d -o root -g root -m 0755 /opt/envelope; "
+            f"temporary=$(mktemp {shlex.quote(temporary)}); trap 'rm -f \"$temporary\"' EXIT; "
+            f"printf %s {shlex.quote(encoded)} | base64 -d | gzip -d > \"$temporary\"; "
+            f"printf '%s  %s\\n' {shlex.quote(self.wire_inspector_sha256)} \"$temporary\" | sha256sum -c - >/dev/null; "
+            f"install -m 0700 \"$temporary\" {shlex.quote(WIRE_INSPECTOR_PATH)}; "
+            "rm -f \"$temporary\"; trap - EXIT"
         )
-        self._execute(target, command, timeout_seconds=60, comment="Envelope E2E install bounded wire inspector")
+        self._execute(target, command, timeout_seconds=150, comment="Envelope E2E install bounded wire inspector")
 
     def _target_health(self, target: ApplianceTarget) -> dict[str, Any]:
         response = self.aws.json(

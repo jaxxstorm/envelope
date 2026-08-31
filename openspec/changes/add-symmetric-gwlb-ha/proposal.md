@@ -26,6 +26,8 @@ Protected run `ha33` proved compact continuity output and passed target-process 
 
 Protected run `ha34` proved that correction and reached target-instance alternate-path recovery, then both one-shot TCP receivers failed because the established continuity receiver still owned the shared listener. The generic readiness check observed the wrong listener, the first client reached its exact agent/SSM deadline, and the retry reused a source port that the killed command had not released. Established TCP must release only its listener after accept, established UDP must connect to its exact peer for tuple-specific demultiplexing, nested probes must preserve one managed-responder pause lease, command deadlines must leave bounded shutdown/reporting headroom, and retries must use fresh reserved source tuples. Cleanup again proved zero residuals, but the run did not satisfy acceptance.
 
+Protected run `ha35` failed during symmetric readiness because workload SSM availability preceded workload cloud-init completion. The dynamic observer installer attempted to create its fixed temporary file before `/opt/envelope` existed, so the run never exercised the `ha34` correction. Dynamic probe-tool installation must wait for cloud-init, create the reviewed directory idempotently, use a unique private temporary path with unconditional removal, verify the expected digest, and only then install the executable. Cleanup completed in one attempt with zero residuals, but the run did not satisfy acceptance.
+
 ## What Changes
 
 - Add packet-scoped GWLB turnaround: each valid ingress packet is immediately re-encapsulated and returned to GWLB with the same inner packet, VNI, protocol metadata, ordered options and flow cookie, and AWS outer tuple learned from that packet.

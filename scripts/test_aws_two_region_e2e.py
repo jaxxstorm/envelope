@@ -5335,10 +5335,13 @@ class CaptureControllerTest(unittest.TestCase):
         self.assertEqual(command.comment, "Envelope E2E install bounded wire inspector")
         rendered = command.commands[0]
         directory_install = "install -d -o root -g root -m 0755 /opt/envelope"
-        temporary_write = "> /opt/envelope/e2e-wire-inspector.tmp"
+        temporary_create = "temporary=$(mktemp /opt/envelope/e2e-wire-inspector.tmp.XXXXXX)"
+        temporary_write = '> "$temporary"'
         self.assertIn(directory_install, rendered)
+        self.assertIn(temporary_create, rendered)
         self.assertIn(temporary_write, rendered)
-        self.assertLess(rendered.index(directory_install), rendered.index(temporary_write))
+        self.assertLess(rendered.index(directory_install), rendered.index(temporary_create))
+        self.assertLess(rendered.index(temporary_create), rendered.index(temporary_write))
         subprocess.run(["bash", "-n", "-c", rendered], check=True, capture_output=True, text=True)
 
     def test_appliance_readiness_command_has_balanced_shell_syntax(self) -> None:
@@ -7318,6 +7321,35 @@ class ProbeLifecycleTest(unittest.TestCase):
         operations._resume_managed_responder.assert_called_once_with(
             flow.destination, "tcp"
         )
+
+    def test_dynamic_installers_wait_for_cloud_init_and_use_unique_temps(self) -> None:
+        target = self._tcp_flow().destination
+        operations = object.__new__(e2e.AwsLiveOperations)
+        operations.agent_sha256 = "a" * 64
+        operations.wire_inspector_sha256 = "b" * 64
+        operations._execute = mock.Mock()
+
+        operations._install_agent(target)
+        operations._install_wire_inspector(target)
+
+        self.assertEqual(operations._execute.call_count, 2)
+        for call, template in zip(
+            operations._execute.call_args_list,
+            (
+                f"{e2e.REMOTE_AGENT_PATH}.tmp.XXXXXX",
+                f"{e2e.WIRE_INSPECTOR_PATH}.tmp.XXXXXX",
+            ),
+            strict=True,
+        ):
+            command = call.args[1]
+            self.assertLess(
+                command.index("cloud-init status --wait"), command.index("mktemp")
+            )
+            self.assertLess(command.index("mktemp"), command.index("base64 -d"))
+            self.assertIn(f"mktemp {template}", command)
+            self.assertIn("install -d -o root -g root -m 0755 /opt/envelope", command)
+            self.assertIn("trap 'rm -f \"$temporary\"' EXIT", command)
+            self.assertEqual(call.kwargs["timeout_seconds"], 150)
 
 
 class RunAllCoordinatorTest(unittest.TestCase):

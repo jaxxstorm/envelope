@@ -98,6 +98,8 @@ The protected profile requires two AZs per site, a target path in every enabled 
 
 Protected run `ha34` reached the target-instance alternate-path probe and showed that an established continuity receiver and a concurrent one-shot receiver cannot both retain the same generic listener identity. TCP continuity closes only its listening socket after accepting the established connection; UDP continuity connects its socket to the established peer so a new tuple can bind the same reviewed application port. Nested stream and probe operations hold one reentrant managed-responder pause, remote command deadlines retain fixed shutdown/reporting headroom, and each bounded recovery retry uses a fresh reserved source tuple so a killed or GWLB-pinned attempt cannot alias the next attempt.
 
+Protected run `ha35` showed that SSM-online is not equivalent to workload bootstrap completion: dynamic observer installation ran before the workload readiness command's cloud-init wait. Dynamic observer and wire-inspector installers now perform their own bounded cloud-init wait, create `/opt/envelope` idempotently, use unique private temporary files with traps, verify their expected SHA-256 values, and install only the verified executable. This keeps the outer protected readiness stages composable without relying on incidental bootstrap timing.
+
 This is stronger than the existing one-target profile but still depends on AWS target health, GWLB flow reassignment, VPC route propagation, and Tailscale route selection. Evidence records each selected endpoint, target, transport router and ENI, every route mutation, recovery duration, packet loss, and cleanup result.
 
 ## Risks / Trade-offs
