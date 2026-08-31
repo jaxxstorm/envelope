@@ -8779,6 +8779,36 @@ class ProtectedExecutionTest(unittest.TestCase):
         wire_compressed = gzip.compress(e2e.WIRE_INSPECTOR_SOURCE.encode("utf-8"), mtime=0)
         self.assertLess(len(base64.b64encode(wire_compressed)), 12_000)
 
+    def test_embedded_tcp_framing_retains_coalesced_trailing_bytes(self) -> None:
+        namespace: dict[str, Any] = {"__name__": "remote_agent_fixture"}
+        exec(e2e.REMOTE_AGENT_SOURCE, namespace)
+        first = {"flow_id": "fixture", "kind": "marker", "sequence": 1}
+        second = {"flow_id": "fixture", "kind": "marker", "sequence": 2}
+
+        class CoalescedSocket:
+            def __init__(self) -> None:
+                self.payload = namespace["encode"](first, True) + namespace["encode"](
+                    second, True
+                )
+
+            def settimeout(self, _seconds: float) -> None:
+                pass
+
+            def recv(self, size: int) -> bytes:
+                value, self.payload = self.payload[:size], self.payload[size:]
+                return value
+
+        connection = CoalescedSocket()
+        frame, buffered = namespace["tcp_frame"](
+            connection, time.monotonic() + 1
+        )
+        self.assertEqual(namespace["decode"](frame), first)
+        frame, buffered = namespace["tcp_frame"](
+            connection, time.monotonic() + 1, buffered
+        )
+        self.assertEqual(namespace["decode"](frame), second)
+        self.assertEqual(buffered, b"")
+
     def test_embedded_icmp_sender_preserves_every_payload_byte(self) -> None:
         namespace: dict[str, Any] = {"__name__": "remote_agent_fixture"}
         exec(e2e.REMOTE_AGENT_SOURCE, namespace)

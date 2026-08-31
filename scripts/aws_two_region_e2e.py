@@ -12903,17 +12903,21 @@ def icmp_client(args):
           "payload_sha256": digest, "reply_received": reply_source is not None,
           "reply_source_ip": reply_source, "source_ip": args.source_ip, "success": True})
 
-def tcp_frame(conn, deadline):
-    data = bytearray()
-    while b"\n" not in data:
+def tcp_frame(conn, deadline, buffered=b""):
+    data = bytearray(buffered)
+    while True:
+        newline = data.find(b"\n")
+        if newline >= 0:
+            if newline > MAX_FRAME:
+                raise RuntimeError("TCP frame too large")
+            return bytes(data[:newline]), bytes(data[newline + 1:])
+        if len(data) > MAX_FRAME:
+            raise RuntimeError("TCP frame too large")
         conn.settimeout(max(0.01, deadline - time.monotonic()))
         chunk = conn.recv(MAX_FRAME + 1 - len(data))
         if not chunk:
             raise RuntimeError("TCP frame ended early")
         data.extend(chunk)
-        if len(data) > MAX_FRAME:
-            raise RuntimeError("TCP frame too large")
-    return bytes(data.split(b"\n", 1)[0])
 
 def serve_probe(args):
     tcp = args.protocol == "tcp"
@@ -12934,7 +12938,8 @@ def serve_probe(args):
                 if tcp:
                     conn, peer = sock.accept()
                     sessions += 1
-                    request = decode(tcp_frame(conn, until))
+                    frame, _buffered = tcp_frame(conn, until)
+                    request = decode(frame)
                 else:
                     data, peer = sock.recvfrom(MAX_FRAME + 1)
                     request = decode(data)
@@ -12977,7 +12982,8 @@ def probe(args):
         started = time.monotonic_ns()
         if tcp:
             sock.sendall(encode(request, True))
-            response = decode(tcp_frame(sock, deadline))
+            frame, _buffered = tcp_frame(sock, deadline)
+            response = decode(frame)
         else:
             sock.send(encode(request))
             response = decode(sock.recv(MAX_FRAME + 1))
@@ -13003,6 +13009,7 @@ def stream_server(args):
     duplicates = 0
     sources = set()
     connection = None
+    buffer = b""
     try:
         if tcp:
             sock.settimeout(max(0.01, deadline - time.monotonic()))
@@ -13010,7 +13017,7 @@ def stream_server(args):
         while time.monotonic() < deadline:
             try:
                 if tcp:
-                    data = tcp_frame(connection, deadline)
+                    data, buffer = tcp_frame(connection, deadline, buffer)
                 else:
                     sock.settimeout(min(1.0, max(0.01, deadline - time.monotonic())))
                     data, peer = sock.recvfrom(MAX_FRAME + 1)
@@ -15519,13 +15526,13 @@ exit 1"""
         server_spec = SSMCommand(
             flow.destination,
             (server_command,),
-            timeout_seconds=duration + 10,
+            timeout_seconds=duration + 30,
             comment="Envelope E2E continuity receiver",
         )
         client_spec = SSMCommand(
             flow.source,
             (client_command,),
-            timeout_seconds=duration + 5,
+            timeout_seconds=duration + 30,
             comment="Envelope E2E one-socket continuity stream",
         )
         server_id: str | None = None
@@ -15577,15 +15584,19 @@ exit 1"""
             client_result = self.ssm.wait(
                 flow.source,
                 client_id,
-                timeout_seconds=max(20, duration + 10),
+                timeout_seconds=max(20, duration + 40),
             )
             server_result = self.ssm.wait(
                 flow.destination,
                 cast(str, server_id),
-                timeout_seconds=max(20, duration + 10),
+                timeout_seconds=max(20, duration + 40),
             )
             if not client_result.succeeded or not server_result.succeeded:
-                raise StreamAnalysisError(f"{label} continuity commands did not both complete")
+                raise StreamAnalysisError(
+                    f"{label} continuity commands did not both complete: "
+                    f"client={client_result.status}/{client_result.response_code}, "
+                    f"receiver={server_result.status}/{server_result.response_code}"
+                )
             client = self._json_from_result(client_result)
             receiver = self._json_from_result(server_result)
             self._execute(
