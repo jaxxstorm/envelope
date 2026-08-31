@@ -7237,6 +7237,89 @@ class ProtectedControlFlowPropagationTest(unittest.TestCase):
         self.assertIs(raised.exception, control)
 
 
+class ProbeLifecycleTest(unittest.TestCase):
+    def _tcp_flow(self) -> e2e.FlowRecord:
+        deployment = parsed_deployment()
+        ledger = e2e.FlowLedger("fixture-probe")
+        return ledger.allocate(
+            "tcp",
+            deployment.west.initiator,
+            deployment.east.responder,
+            destination_port=5201,
+            generation=ledger.begin_generation("fixture-probe"),
+        )
+
+    def test_managed_responder_pause_is_reentrant(self) -> None:
+        target = self._tcp_flow().destination
+        operations = object.__new__(e2e.AwsLiveOperations)
+        operations._responder_pause_depth = {}
+        operations._execute = mock.Mock()
+        operations._wait_listener = mock.Mock()
+
+        operations._pause_managed_responder(target, "tcp")
+        operations._pause_managed_responder(target, "tcp")
+        self.assertEqual(operations._execute.call_count, 1)
+        self.assertIn("systemctl stop", operations._execute.call_args.args[1])
+
+        operations._resume_managed_responder(target, "tcp")
+        self.assertEqual(operations._execute.call_count, 1)
+        operations._resume_managed_responder(target, "tcp")
+
+        self.assertEqual(operations._execute.call_count, 2)
+        self.assertIn("systemctl start", operations._execute.call_args.args[1])
+        operations._wait_listener.assert_called_once_with(
+            target, "tcp", timeout_seconds=10
+        )
+        self.assertEqual(operations._responder_pause_depth, {})
+
+    def test_one_shot_probe_commands_reserve_agent_shutdown_headroom(self) -> None:
+        flow = self._tcp_flow()
+        payload = hashlib.sha512(
+            f"{flow.flow_id}:receiver-observed-payload".encode()
+        ).hexdigest()
+        payload_sha256 = hashlib.sha256(payload.encode("ascii")).hexdigest()
+        client = {
+            "flow_id": flow.flow_id,
+            "latency_ns": 1,
+            "payload_sha256": payload_sha256,
+            "protocol": "tcp",
+            "source_ip": flow.source.private_ip,
+            "source_port": flow.source_port,
+            "success": True,
+        }
+        receiver_result = e2e.SSMResult(
+            flow.destination,
+            "fixture-server-command",
+            "Success",
+            0,
+            stdout='{"success":true}\n',
+        )
+        operations = object.__new__(e2e.AwsLiveOperations)
+        operations.ssm = SimpleNamespace(
+            send=mock.Mock(return_value="fixture-server-command"),
+            wait=mock.Mock(return_value=receiver_result),
+            cancel=mock.Mock(),
+        )
+        operations._pause_managed_responder = mock.Mock()
+        operations._resume_managed_responder = mock.Mock()
+        operations._wait_listener = mock.Mock()
+        operations._execute_json = mock.Mock(return_value=client)
+
+        result = operations._run_probe(flow, timeout_seconds=20)
+
+        server_spec = operations.ssm.send.call_args.args[0]
+        self.assertEqual(server_spec.timeout_seconds, 30)
+        self.assertIn("--timeout 20", server_spec.commands[0])
+        self.assertEqual(
+            operations._execute_json.call_args.kwargs["timeout_seconds"], 30
+        )
+        self.assertEqual(operations.ssm.wait.call_args.kwargs["timeout_seconds"], 40)
+        self.assertEqual(result["source_port"], flow.source_port)
+        operations._resume_managed_responder.assert_called_once_with(
+            flow.destination, "tcp"
+        )
+
+
 class RunAllCoordinatorTest(unittest.TestCase):
     class Contexts:
         def __init__(self) -> None:
@@ -8853,6 +8936,113 @@ class ProtectedExecutionTest(unittest.TestCase):
         )
         self.assertEqual(namespace["decode"](frame), second)
         self.assertEqual(buffered, b"")
+
+    def test_embedded_stream_server_releases_protocol_listener_identity(self) -> None:
+        marker = {
+            "connection_id": "fixture-stream:c0001",
+            "flow_id": "fixture-stream",
+            "kind": "marker",
+            "sequence": 0,
+        }
+        peer = ("192.0.2.10", 41000)
+
+        for protocol in ("tcp", "udp"):
+            with self.subTest(protocol=protocol):
+                namespace: dict[str, Any] = {"__name__": "remote_agent_fixture"}
+                exec(e2e.REMOTE_AGENT_SOURCE, namespace)
+                events: list[object] = []
+                emitted: list[dict[str, Any]] = []
+
+                class Clock:
+                    def __init__(self) -> None:
+                        self.values = iter((0.0, 0.1, 0.2, 2.0))
+
+                    def monotonic(self) -> float:
+                        return next(self.values, 2.0)
+
+                class Connection:
+                    def settimeout(self, _seconds: float) -> None:
+                        pass
+
+                    def recv(self, _size: int) -> bytes:
+                        events.append("connection-recv")
+                        return namespace["encode"](marker, True)
+
+                    def sendall(self, _payload: bytes) -> None:
+                        events.append("connection-send")
+
+                    def close(self) -> None:
+                        events.append("connection-close")
+
+                connection = Connection()
+
+                class Listener:
+                    def setsockopt(self, *_args: object) -> None:
+                        pass
+
+                    def bind(self, _address: tuple[str, int]) -> None:
+                        pass
+
+                    def listen(self, _backlog: int) -> None:
+                        events.append("listener-listen")
+
+                    def settimeout(self, _seconds: float) -> None:
+                        pass
+
+                    def accept(self) -> tuple[Connection, tuple[str, int]]:
+                        events.append("listener-accept")
+                        return connection, peer
+
+                    def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+                        events.append("udp-recvfrom")
+                        return namespace["encode"](marker), peer
+
+                    def connect(self, value: tuple[str, int]) -> None:
+                        events.append(("udp-connect", value))
+
+                    def send(self, _payload: bytes) -> None:
+                        events.append("udp-send")
+
+                    def sendto(self, _payload: bytes, _peer: tuple[str, int]) -> None:
+                        events.append("udp-sendto")
+
+                    def close(self) -> None:
+                        events.append("listener-close")
+
+                listener = Listener()
+                namespace["socket"] = SimpleNamespace(
+                    AF_INET=socket.AF_INET,
+                    SOCK_STREAM=socket.SOCK_STREAM,
+                    SOCK_DGRAM=socket.SOCK_DGRAM,
+                    SOL_SOCKET=socket.SOL_SOCKET,
+                    SO_REUSEADDR=socket.SO_REUSEADDR,
+                    timeout=socket.timeout,
+                    socket=lambda *_args: listener,
+                )
+                namespace["time"] = Clock()
+                namespace["emit"] = emitted.append
+
+                namespace["stream_server"](
+                    SimpleNamespace(
+                        bind="192.0.2.20",
+                        duration=1.0,
+                        flow_id="fixture-stream",
+                        port=5201,
+                        protocol=protocol,
+                    )
+                )
+
+                self.assertEqual(emitted[-1]["receives"], 1)
+                if protocol == "tcp":
+                    self.assertLess(
+                        events.index("listener-close"),
+                        events.index("connection-recv"),
+                    )
+                    self.assertIn("connection-send", events)
+                else:
+                    self.assertIn(("udp-connect", peer), events)
+                    self.assertIn("udp-send", events)
+                    self.assertNotIn("udp-sendto", events)
 
     def test_embedded_icmp_sender_preserves_every_payload_byte(self) -> None:
         namespace: dict[str, Any] = {"__name__": "remote_agent_fixture"}

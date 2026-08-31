@@ -96,6 +96,9 @@ TRANSPORT_ROUTER_READINESS_RESERVATION_SECONDS = 165
 ROUTE_OWNER_LEASE_MARGIN_SECONDS = 15
 STREAM_MUTATION_OVERHEAD_SECONDS = 30
 MAX_STREAM_MUTATION_RESERVATION_SECONDS = 3470
+PROBE_COMMAND_HEADROOM_SECONDS = 10
+RECOVERY_PROBE_RETRY_FIRST_SOURCE_PORT = 61_000
+RECOVERY_PROBE_RETRY_PORTS_PER_FLOW = 8
 
 
 def expected_tailnet_hostnames(config: RunConfig) -> list[str]:
@@ -1631,6 +1634,30 @@ class FlowLedger:
         return record
 
     allocate_flow = allocate
+
+
+def _recovery_probe_attempt(flow: FlowRecord, attempt: int) -> FlowRecord:
+    if attempt == 0:
+        return flow
+    if (
+        flow.protocol not in TRANSPORT_PROTOCOLS
+        or flow.source_port is None
+        or not 1 <= attempt <= RECOVERY_PROBE_RETRY_PORTS_PER_FLOW
+    ):
+        raise ResilienceError("recovery probe retry identity is invalid")
+    retry_port = (
+        RECOVERY_PROBE_RETRY_FIRST_SOURCE_PORT
+        + (flow.ordinal - 1) * RECOVERY_PROBE_RETRY_PORTS_PER_FLOW
+        + attempt
+        - 1
+    )
+    if not RECOVERY_PROBE_RETRY_FIRST_SOURCE_PORT <= retry_port <= 65_535:
+        raise ResilienceError("recovery probe retry source-port reservation is exhausted")
+    return dataclasses.replace(
+        flow,
+        flow_id=f"{flow.flow_id}-retry{attempt:02d}",
+        source_port=retry_port,
+    )
 
 
 WIRE_INSPECTOR_SOURCE = r'''#!/usr/bin/env python3
@@ -13035,15 +13062,23 @@ def stream_server(args):
     duplicates = 0
     sources = set()
     connection = None
+    stream_peer = None
     buffer = b""
     try:
         if tcp:
             sock.settimeout(max(0.01, deadline - time.monotonic()))
             connection, peer = sock.accept()
+            # The accepted flow survives after its listener closes, allowing a
+            # concurrent cold-flow receiver to bind the reviewed probe port.
+            sock.close()
         while time.monotonic() < deadline:
             try:
                 if tcp:
                     data, buffer = tcp_frame(connection, deadline, buffer)
+                elif stream_peer is not None:
+                    sock.settimeout(min(1.0, max(0.01, deadline - time.monotonic())))
+                    data = sock.recv(MAX_FRAME + 1)
+                    peer = stream_peer
                 else:
                     sock.settimeout(min(1.0, max(0.01, deadline - time.monotonic())))
                     data, peer = sock.recvfrom(MAX_FRAME + 1)
@@ -13061,11 +13096,16 @@ def stream_server(args):
                 duplicates += 1
             seen.add(sequence)
             sources.add((str(peer[0]), int(peer[1]), str(request["connection_id"])))
+            if not tcp and stream_peer is None:
+                # Connected UDP demultiplexes the established tuple while a
+                # second receiver handles a new source tuple on the same port.
+                stream_peer = (str(peer[0]), int(peer[1]))
+                sock.connect(stream_peer)
             ack = {"connection_id": request["connection_id"], "flow_id": args.flow_id, "kind": "ack", "sequence": sequence}
             if tcp:
                 connection.sendall(encode(ack, True))
             else:
-                sock.sendto(encode(ack), peer)
+                sock.send(encode(ack))
     finally:
         if connection is not None:
             connection.close()
@@ -13414,6 +13454,7 @@ class AwsLiveOperations:
         self.capture_cleanup_events: list[dict[str, Any]] = []
         self.capture_assertion_events: list[dict[str, Any]] = []
         self.capture_diagnostic_events: list[dict[str, Any]] = []
+        self._responder_pause_depth: dict[tuple[str, ProtocolName], int] = {}
         self.agent_sha256 = hashlib.sha256(REMOTE_AGENT_SOURCE.encode("utf-8")).hexdigest()
         self.wire_inspector_sha256 = hashlib.sha256(WIRE_INSPECTOR_SOURCE.encode("utf-8")).hexdigest()
 
@@ -14181,6 +14222,15 @@ exit 1"""
         return f"envelope-e2e-agent-{protocol}.service"
 
     def _pause_managed_responder(self, target: SSMTarget, protocol: ProtocolName) -> None:
+        pauses = getattr(self, "_responder_pause_depth", None)
+        if pauses is None:
+            pauses = {}
+            self._responder_pause_depth = pauses
+        key = (target.instance_id, protocol)
+        depth = pauses.get(key, 0)
+        if depth > 0:
+            pauses[key] = depth + 1
+            return
         unit = self._responder_unit(protocol)
         self._execute(
             target,
@@ -14188,10 +14238,20 @@ exit 1"""
             timeout_seconds=20,
             comment="Envelope E2E pause managed receiver",
         )
+        pauses[key] = 1
 
     def _resume_managed_responder(self, target: SSMTarget, protocol: ProtocolName) -> None:
         if protocol == "icmp":
             return
+        pauses = getattr(self, "_responder_pause_depth", {})
+        key = (target.instance_id, protocol)
+        depth = pauses.get(key, 0)
+        if depth <= 0:
+            raise ProbeError("managed responder resume has no matching pause")
+        if depth > 1:
+            pauses[key] = depth - 1
+            return
+        del pauses[key]
         unit = self._responder_unit(protocol)
         selector = "-ltn" if protocol == "tcp" else "-lun"
         self._execute(
@@ -14580,6 +14640,10 @@ exit 1"""
     ) -> dict[str, Any]:
         payload = hashlib.sha512(f"{flow.flow_id}:receiver-observed-payload".encode()).hexdigest()
         payload_sha256 = hashlib.sha256(payload.encode("ascii")).hexdigest()
+        server_probe_timeout = min(45, timeout_seconds)
+        server_execution_timeout = min(
+            60, server_probe_timeout + PROBE_COMMAND_HEADROOM_SECONDS
+        )
         server_command = " ".join(
             [
                 "set -euo pipefail; exec",
@@ -14596,7 +14660,7 @@ exit 1"""
                 "--payload-sha256",
                 payload_sha256,
                 "--timeout",
-                str(min(45, timeout_seconds)),
+                str(server_probe_timeout),
                 "--settle",
                 "2",
             ]
@@ -14604,19 +14668,23 @@ exit 1"""
         server_spec = SSMCommand(
             flow.destination,
             (server_command,),
-            timeout_seconds=min(60, timeout_seconds),
+            timeout_seconds=server_execution_timeout,
             comment="Envelope E2E receiver-observed probe",
         )
         server_id: str | None = None
-        pause_attempted = False
+        pause_acquired = False
         control_flow_interrupted = False
         try:
-            pause_attempted = True
             self._pause_managed_responder(flow.destination, flow.protocol)
+            pause_acquired = True
             server_id = self.ssm.send(server_spec, timeout_seconds=10)
             self._wait_listener(flow.destination, flow.protocol, timeout_seconds=min(20, timeout_seconds))
             if before_client is not None:
                 before_client()
+            client_probe_timeout = min(30, timeout_seconds)
+            client_execution_timeout = min(
+                45, client_probe_timeout + PROBE_COMMAND_HEADROOM_SECONDS
+            )
             client_command = " ".join(
                 [
                     "set -euo pipefail; exec",
@@ -14637,19 +14705,20 @@ exit 1"""
                     "--payload",
                     payload,
                     "--timeout",
-                    str(min(30, timeout_seconds)),
+                    str(client_probe_timeout),
                 ]
             )
             client = self._execute_json(
                 flow.source,
                 client_command,
-                timeout_seconds=min(45, timeout_seconds),
+                timeout_seconds=client_execution_timeout,
                 comment="Envelope E2E unique cold probe",
             )
             server_result = self.ssm.wait(
                 flow.destination,
                 cast(str, server_id),
-                timeout_seconds=min(60, timeout_seconds),
+                timeout_seconds=server_execution_timeout
+                + PROBE_COMMAND_HEADROOM_SECONDS,
             )
             if not server_result.succeeded:
                 raise _attach_ssm_output(
@@ -14666,11 +14735,16 @@ exit 1"""
             if server_id is not None:
                 try:
                     self.ssm.cancel(flow.destination, server_id, timeout_seconds=5)
+                    self.ssm.wait(
+                        flow.destination,
+                        server_id,
+                        timeout_seconds=5,
+                    )
                 except E2EError:
                     pass
             raise
         finally:
-            if pause_attempted and not control_flow_interrupted:
+            if pause_acquired and not control_flow_interrupted:
                 self._resume_managed_responder(flow.destination, flow.protocol)
         if (
             client.get("flow_id") != flow.flow_id
@@ -14843,10 +14917,10 @@ exit 1"""
             comment="Envelope E2E sized UDP receiver",
         )
         server_id: str | None = None
-        pause_attempted = False
+        pause_acquired = False
         try:
-            pause_attempted = True
             self._pause_managed_responder(flow.destination, "udp")
+            pause_acquired = True
             server_id = self.ssm.send(server_spec, timeout_seconds=10)
             self._wait_listener(flow.destination, "udp", timeout_seconds=min(15, timeout_seconds))
             client_parts = [
@@ -14891,7 +14965,7 @@ exit 1"""
                     pass
             raise
         finally:
-            if pause_attempted:
+            if pause_acquired:
                 self._resume_managed_responder(flow.destination, "udp")
         if client.get("payload_sha256") != payload_sha256 or client.get("payload_bytes") != payload_bytes:
             raise TransportError(f"sized UDP client {flow.flow_id} changed its exact payload")
@@ -15110,10 +15184,10 @@ exit 1"""
         capture_done = False
         raw_capture_deleted = False
         capture_path = f"/run/envelope-e2e-capture/{flow.flow_id}-syn.pcap"
-        pause_attempted = False
+        pause_acquired = False
         try:
-            pause_attempted = True
             self._pause_managed_responder(flow.destination, "tcp")
+            pause_acquired = True
             server_id = self.ssm.send(
                 SSMCommand(
                     flow.destination,
@@ -15228,7 +15302,7 @@ exit 1"""
                         "error_count": 0 if raw_capture_deleted else 1,
                     }
                 )
-                if pause_attempted:
+                if pause_acquired:
                     self._resume_managed_responder(flow.destination, "tcp")
         connected = client.get("start", {}).get("connected") if isinstance(client.get("start"), Mapping) else None
         received = client.get("end", {}).get("sum_received") if isinstance(client.get("end"), Mapping) else None
@@ -15562,11 +15636,11 @@ exit 1"""
         )
         server_id: str | None = None
         client_id: str | None = None
-        pause_attempted = False
+        pause_acquired = False
         control_flow_interrupted = False
         try:
-            pause_attempted = True
             self._pause_managed_responder(flow.destination, flow.protocol)
+            pause_acquired = True
             server_id = self.ssm.send(server_spec, timeout_seconds=10)
             self._wait_listener(flow.destination, flow.protocol, timeout_seconds=15)
             self._execute(
@@ -15652,7 +15726,7 @@ exit 1"""
                 pass
             raise
         finally:
-            if pause_attempted and not control_flow_interrupted:
+            if pause_acquired and not control_flow_interrupted:
                 self._resume_managed_responder(flow.destination, flow.protocol)
         markers = _expand_compact_stream_markers(client)
         if (
@@ -17427,11 +17501,16 @@ print(json.dumps({"peer_id":match["peer_id"],"success":True},sort_keys=True))'''
     ) -> dict[str, Any]:
         deadline = self.base.monotonic() + timeout_seconds
         last_error: BaseException | None = None
-        while self.base.monotonic() < deadline:
+        attempt = 0
+        while (
+            self.base.monotonic() < deadline
+            and attempt <= RECOVERY_PROBE_RETRY_PORTS_PER_FLOW
+        ):
+            candidate = _recovery_probe_attempt(flow, attempt)
             try:
                 return self._run_probe_with_path(
                     deployment,
-                    flow,
+                    candidate,
                     timeout_seconds=max(10, min(20, int(deadline - self.base.monotonic()))),
                     exclude_targets=exclude_targets,
                 )
@@ -17439,6 +17518,7 @@ print(json.dumps({"peer_id":match["peer_id"],"success":True},sort_keys=True))'''
                 raise
             except (E2EError, OSError) as error:
                 last_error = error
+                attempt += 1
                 if self.base.monotonic() < deadline:
                     self.base.sleep(min(2.0, max(0.0, deadline - self.base.monotonic())))
         raise ResilienceError(

@@ -136,6 +136,10 @@ The protected acceptance SHALL install and checksum-verify the bounded wire insp
 - **WHEN** a selected target process or instance is made unavailable
 - **THEN** a new flow succeeds through another healthy target and evidence records bounded recovery rather than a hitless guarantee
 
+#### Scenario: New flow while continuity is established
+- **WHEN** target recovery probes a new TCP or UDP tuple while the corresponding established continuity socket remains active on the reviewed application port
+- **THEN** the established socket retains only its exact session, the one-shot receiver owns a non-aliased listener, nested responder suspension remains active until both operations finish, every command has shutdown/reporting headroom, and each bounded retry uses a fresh source tuple
+
 #### Scenario: Alternate transport-router recovery
 - **WHEN** a selected Tailscale transport router is made unavailable
 - **THEN** new flows recover after the applicable Tailnet selection or runner-owned GWLBE ENI route replacement and evidence identifies both the router and control-plane transition

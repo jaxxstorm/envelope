@@ -2120,6 +2120,53 @@ class SymmetricTopologyTest(unittest.TestCase):
                 deployment, flow, timeout_seconds=20
             )
 
+    def test_recovery_probe_retries_use_fresh_reserved_source_tuples(self) -> None:
+        deployment = e2e.parse_symmetric_protected_deployment_output(
+            symmetric_protected_output()
+        )
+        ledger = e2e.FlowLedger("symmetric-fixture")
+        flow = ledger.allocate(
+            "tcp",
+            deployment.workloads.target("west", "initiator"),
+            deployment.workloads.target("east", "responder"),
+            destination_port=5201,
+            purpose="target-instance-new-tcp",
+            generation=ledger.begin_generation("target-instance-new-tcp"),
+        )
+        clock = legacy_e2e_test.FakeClock()
+        attempts: list[e2e.FlowRecord] = []
+        operations = object.__new__(e2e.AwsSymmetricLiveOperations)
+        operations.base = SimpleNamespace(monotonic=clock, sleep=clock.sleep)
+
+        def probe(_deployment, candidate, **_kwargs):
+            attempts.append(candidate)
+            if len(attempts) < 3:
+                raise e2e.ProbeError("injected unavailable path")
+            return {"protocol": candidate.protocol}
+
+        operations._run_probe_with_path = probe
+
+        result = operations._wait_probe_path(
+            deployment,
+            flow,
+            timeout_seconds=20,
+            exclude_targets={deployment.topology.west.target_fleet[0].instance_id},
+        )
+
+        self.assertEqual(result, {"protocol": "tcp"})
+        self.assertEqual(
+            [candidate.source_port for candidate in attempts],
+            [
+                flow.source_port,
+                e2e.RECOVERY_PROBE_RETRY_FIRST_SOURCE_PORT,
+                e2e.RECOVERY_PROBE_RETRY_FIRST_SOURCE_PORT + 1,
+            ],
+        )
+        self.assertEqual(
+            [candidate.flow_id for candidate in attempts],
+            [flow.flow_id, f"{flow.flow_id}-retry01", f"{flow.flow_id}-retry02"],
+        )
+
     def test_instance_replacement_uses_udp_target_when_stream_targets_differ(self) -> None:
         deployment = e2e.parse_symmetric_protected_deployment_output(
             symmetric_protected_output()
