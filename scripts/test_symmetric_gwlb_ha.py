@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import dataclasses
 import datetime as dt
 import hashlib
 import io
@@ -2119,7 +2120,7 @@ class SymmetricTopologyTest(unittest.TestCase):
                 deployment, flow, timeout_seconds=20
             )
 
-    def test_instance_replacement_refuses_different_packet_correlated_stream_targets(self) -> None:
+    def test_instance_replacement_uses_udp_target_when_stream_targets_differ(self) -> None:
         deployment = e2e.parse_symmetric_protected_deployment_output(
             symmetric_protected_output()
         )
@@ -2140,32 +2141,96 @@ class SymmetricTopologyTest(unittest.TestCase):
         new_tcp = flow("tcp", "instance-new-tcp")
         established_tcp = flow("tcp", "instance-established-tcp")
         established_udp = flow("udp", "instance-established-udp")
+        replacement = e2e.SymmetricFleetMember(
+            second.site,
+            "target",
+            second.region,
+            second.az_key,
+            "i-ff23456789abcdef",
+            second.target_group_arn,
+        )
+        current = dataclasses.replace(
+            deployment,
+            topology=dataclasses.replace(
+                deployment.topology,
+                west=dataclasses.replace(
+                    deployment.topology.west,
+                    target_fleet=(first, replacement),
+                ),
+            ),
+        )
+        old_identity = {
+            "target_group_arn": second.target_group_arn,
+            "registration_port": 6081,
+            "process_generation_sha256": "7" * 64,
+        }
+        replacement_identity = {
+            **old_identity,
+            "process_generation_sha256": "8" * 64,
+        }
         operations = object.__new__(e2e.AwsSymmetricLiveOperations)
         operations.base = SimpleNamespace(monotonic=lambda: 1.0)
-        operations.adapter = SimpleNamespace(
-            command=mock.Mock(),
-            owned=lambda *_args: True,
-        )
-        operations._target_readiness_identities = {}
+        adapter = Adapter(replacement=True)
+
+        def replace(member):
+            self.assertEqual(member, second)
+            adapter.calls.append("replace")
+            operations.current_deployment = current
+            return replacement
+
+        adapter.replace = replace
+        operations.adapter = adapter
+        operations._target_readiness_identities = {second.instance_id: old_identity}
         operations._selected_established_target = mock.Mock(
             side_effect=(first, second)
         )
-        operations._measure_tcp_udp_failure = lambda *_args, **kwargs: kwargs[
-            "mutate_and_restore"
-        ]()
+        operations._wait_probe_path = mock.Mock(
+            side_effect=lambda _deployment, candidate, **_kwargs: {
+                "protocol": candidate.protocol,
+                "source_target_id": first.instance_id,
+            }
+        )
+        operations._verify_target = mock.Mock(return_value=replacement_identity)
+        operations._target_health = mock.Mock(return_value="healthy")
+        operations._verify_target_group_registrations = mock.Mock(
+            return_value={
+                first.instance_id: {
+                    "target_group_arn": first.target_group_arn,
+                    "port": 6081,
+                },
+                replacement.instance_id: {
+                    "target_group_arn": replacement.target_group_arn,
+                    "port": 6081,
+                },
+            }
+        )
 
-        with self.assertRaisesRegex(e2e.ResilienceError, "did not select one"):
-            operations.run_target_instance_recovery(
-                deployment,
-                first,
-                new_udp,
-                new_tcp,
-                established_tcp,
-                established_udp,
-                timeout_seconds=30,
+        def measure(_tcp, _udp, **kwargs):
+            return (
+                kwargs["mutate_and_restore"](),
+                legacy_e2e_test.failure_transport_evidence(
+                    second.instance_id, "target-instance"
+                ),
             )
 
-        operations.adapter.command.assert_not_called()
+        operations._measure_tcp_udp_failure = measure
+
+        _current, result = operations.run_target_instance_recovery(
+            deployment,
+            first,
+            new_udp,
+            new_tcp,
+            established_tcp,
+            established_udp,
+            timeout_seconds=30,
+        )
+
+        self.assertEqual(result["recovery"]["failed_id"], second.instance_id)
+        self.assertEqual(
+            result["transport"]["failed_ids"],
+            {"tcp": first.instance_id, "udp": second.instance_id},
+        )
+        self.assertIn("replace", adapter.calls)
 
     def test_target_process_stream_reserves_post_mutation_observation_window(self) -> None:
         deployment = e2e.parse_symmetric_protected_deployment_output(

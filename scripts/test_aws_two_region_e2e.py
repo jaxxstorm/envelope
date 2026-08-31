@@ -3361,6 +3361,26 @@ class SymmetricRouteEvidenceTest(unittest.TestCase):
         )
         self.assertEqual(e2e.verify_live_evidence(document), document)
 
+    def test_target_instance_evidence_allows_distinct_tcp_control_target(self) -> None:
+        document = symmetric_route_evidence()
+        topology = e2e.parse_symmetric_topology_v2(document["topology"])
+        failed_id = next(
+            recovery["failed_id"]
+            for recovery in document["recoveries"]
+            if recovery["kind"] == "target-instance"
+        )
+        control_id = next(
+            member.instance_id
+            for member in topology.west.target_fleet
+            if member.instance_id != failed_id
+        )
+        document["transport"]["target_instance"]["failed_ids"]["tcp"] = control_id
+
+        self.assertEqual(e2e.validate_symmetric_evidence(document), document)
+        document["transport"]["target_instance"]["failed_ids"]["udp"] = control_id
+        with self.assertRaisesRegex(e2e.EvidenceError, "UDP stream"):
+            e2e.validate_symmetric_evidence(document)
+
     def test_schema_rejects_route_identity_state_bounds_probe_and_fidelity_tampering(self) -> None:
         def duplicate_stable_hash(value: dict[str, Any]) -> None:
             west = list(value["preflight"]["sites"]["west"]["transport_routers"].values())

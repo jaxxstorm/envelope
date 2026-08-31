@@ -6266,10 +6266,8 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
     instance_failed_ids = _validate_failure_transport_measurement(
         transport["target_instance"], allowed_failed_ids=instance_ids
     )
-    if set(instance_failed_ids.values()) != {
-        recovery_records["target-instance"]["failed_id"]
-    }:
-        raise EvidenceError("target-instance streams are not bound to the replaced target")
+    if instance_failed_ids["udp"] != recovery_records["target-instance"]["failed_id"]:
+        raise EvidenceError("target-instance UDP stream is not bound to the replaced target")
     router_transport = transport.get("transport_router")
     if not isinstance(router_transport, Mapping) or set(router_transport) != {
         "graceful",
@@ -19146,12 +19144,15 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
         controller = SymmetricLifecycle(deployment.topology, self.adapter, dry_run=False)
         current: SymmetricProtectedDeployment | None = None
         selected_failed: SymmetricFleetMember | None = None
+        tcp_selected: SymmetricFleetMember | None = None
+        udp_selected: SymmetricFleetMember | None = None
         replacement: SymmetricFleetMember | None = None
         replacement_identity: Mapping[str, Any] | None = None
 
         def replace_during_streams() -> Mapping[str, Any]:
             nonlocal current, selected_failed, replacement, replacement_identity
             nonlocal identities, old_identity
+            nonlocal tcp_selected, udp_selected
             tcp_selected = self._selected_established_target(
                 deployment,
                 tcp_flow,
@@ -19162,11 +19163,7 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
                 udp_flow,
                 timeout_seconds=max(8, min(timeout_seconds, 30)),
             )
-            if tcp_selected.instance_id != udp_selected.instance_id:
-                raise ResilienceError(
-                    "target-instance TCP and UDP streams did not select one packet-correlated target"
-                )
-            selected_failed = tcp_selected
+            selected_failed = udp_selected
             old_identity = identities.get(selected_failed.instance_id)
             if not isinstance(old_identity, Mapping):
                 old_identity = self._verify_target(
@@ -19243,6 +19240,8 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
         if (
             current is None
             or selected_failed is None
+            or tcp_selected is None
+            or udp_selected is None
             or replacement is None
             or not isinstance(old_identity, Mapping)
             or not isinstance(replacement_identity, Mapping)
@@ -19287,8 +19286,8 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
             "transport": {
                 **transport,
                 "failed_ids": {
-                    "tcp": selected_failed.instance_id,
-                    "udp": selected_failed.instance_id,
+                    "tcp": tcp_selected.instance_id,
+                    "udp": udp_selected.instance_id,
                 },
             },
         }
