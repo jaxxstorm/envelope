@@ -34,6 +34,8 @@ Protected run `ha37` proved those corrections: replacement planning, drain, fres
 
 Protected run `ha38` proved that outcome correction and reached transport-router recovery, then timed out in its baseline ownership wait. Read-only SSM history showed repeated observation commands returning status 2 immediately. The pinned Tailscale status schema omits `Expired` when false, while the observer required an explicit false value for itself and each expected owner. The observer must decode only an omitted `Expired` field as false and continue rejecting explicit true or malformed values. Cleanup completed in one attempt with zero residuals, but the retained schema-3 evidence is failed and the run did not satisfy acceptance.
 
+Protected run `ha39` proved that ownership-observer correction and reached the first durable transport-router failover write. The `run-all` lifecycle proxy omitted the route transaction API even though its concrete delegate implemented the required CAS-protected load, create, update, and finalize operations; the direct-live cleanup proxy had the same latent defect. Both narrow proxies must explicitly forward the complete protocol without fallback or relaxed ownership checks. The failure occurred before transaction creation or either control-plane mutation, and cleanup completed in one attempt with zero residuals, but the retained schema-3 evidence is failed and the run did not satisfy acceptance.
+
 ## What Changes
 
 - Add packet-scoped GWLB turnaround: each valid ingress packet is immediately re-encapsulated and returned to GWLB with the same inner packet, VNI, protocol metadata, ordered options and flow cookie, and AWS outer tuple learned from that packet.

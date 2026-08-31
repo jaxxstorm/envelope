@@ -1846,7 +1846,7 @@ class GWLBERouteFailoverTest(unittest.TestCase):
         *,
         authorize: Any = None,
         environment: Mapping[str, str] | None = None,
-        durability: DurableRouteTransactions | None = None,
+        durability: e2e.RouteTransactionDurability | None = None,
     ) -> tuple[e2e.GWLBERouteFailover, FakeClock, list[str], pathlib.Path]:
         clock = FakeClock()
         ready: list[str] = []
@@ -2109,6 +2109,36 @@ class GWLBERouteFailoverTest(unittest.TestCase):
         self.assertTrue(
             all("lease_expires_at" in value for value in durability.writes)
         )
+
+    def test_lifecycle_proxies_delegate_complete_route_transaction_protocol(self) -> None:
+        for proxy_name in ("run-all", "bounded-cleanup"):
+            with self.subTest(proxy=proxy_name), tempfile.TemporaryDirectory() as temporary:
+                aws = RouteTableAWS(self.topology)
+                durability = DurableRouteTransactions()
+                proxy: e2e.RouteTransactionDurability
+                if proxy_name == "run-all":
+                    proxy = e2e._RunAllLifecycleProxy(
+                        durability, lambda: {"complete": True}
+                    )
+                else:
+                    proxy = e2e._BoundedCleanupLifecycleProxy(durability)
+                self.assertIsNone(proxy.load_route_transaction())
+                transaction, _clock, _ready, _evidence_path = self.failover(
+                    temporary, aws, durability=proxy
+                )
+
+                result = transaction.replace(
+                    self.current,
+                    self.alternate,
+                    probe=self.successful_probe,
+                    timeout_seconds=10,
+                    restoration_timeout_seconds=10,
+                )
+
+                self.assertTrue(result["restored"])
+                self.assert_original_routes(aws)
+                self.assertIsNone(durability.value)
+                self.assertEqual(len(durability.finalized), 1)
 
     def test_ambiguous_advertisement_completion_restores_and_fences_late_forward(self) -> None:
         aws = RouteTableAWS(self.topology)

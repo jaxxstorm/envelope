@@ -9577,7 +9577,7 @@ def new_live_evidence(run_id: str, budgets: TimeoutBudgets) -> dict[str, Any]:
     }
 
 
-class ProtectedLifecycleAPI(Protocol):
+class ProtectedLifecycleAPI(RouteTransactionDurability, Protocol):
     def claim(
         self,
         raw_deployment: Mapping[str, Any],
@@ -20236,6 +20236,32 @@ class _RunAllLifecycleProxy:
             deployment, timeout_seconds=timeout_seconds
         )
 
+    def load_route_transaction(self) -> tuple[dict[str, Any], str] | None:
+        return self.delegate.load_route_transaction()
+
+    def create_route_transaction(self, value: Mapping[str, Any]) -> str:
+        return self.delegate.create_route_transaction(value)
+
+    def update_route_transaction(
+        self, value: Mapping[str, Any], *, expected_revision: str
+    ) -> str:
+        return self.delegate.update_route_transaction(
+            value, expected_revision=expected_revision
+        )
+
+    def finalize_route_transaction(
+        self,
+        transaction_id: str,
+        summary: Mapping[str, Any],
+        *,
+        expected_revision: str,
+    ) -> str:
+        return self.delegate.finalize_route_transaction(
+            transaction_id,
+            summary,
+            expected_revision=expected_revision,
+        )
+
     def replace_target_instance(self, member: SymmetricFleetMember) -> Mapping[str, Any]:
         return self.delegate.replace_target_instance(member)
 
@@ -20293,6 +20319,32 @@ class _BoundedCleanupLifecycleProxy:
     ) -> Mapping[str, Any]:
         return self.delegate.reconcile_gwlbe_route_replacement(
             deployment, timeout_seconds=timeout_seconds
+        )
+
+    def load_route_transaction(self) -> tuple[dict[str, Any], str] | None:
+        return self.delegate.load_route_transaction()
+
+    def create_route_transaction(self, value: Mapping[str, Any]) -> str:
+        return self.delegate.create_route_transaction(value)
+
+    def update_route_transaction(
+        self, value: Mapping[str, Any], *, expected_revision: str
+    ) -> str:
+        return self.delegate.update_route_transaction(
+            value, expected_revision=expected_revision
+        )
+
+    def finalize_route_transaction(
+        self,
+        transaction_id: str,
+        summary: Mapping[str, Any],
+        *,
+        expected_revision: str,
+    ) -> str:
+        return self.delegate.finalize_route_transaction(
+            transaction_id,
+            summary,
+            expected_revision=expected_revision,
         )
 
     def replace_target_instance(self, member: SymmetricFleetMember) -> Mapping[str, Any]:
