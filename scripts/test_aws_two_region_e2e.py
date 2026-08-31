@@ -8773,11 +8773,36 @@ class ProtectedExecutionTest(unittest.TestCase):
         compile(e2e.REMOTE_AGENT_SOURCE, "<remote-agent>", "exec")
         self.assertIn('stream.add_argument("--ready-path", required=True)', e2e.REMOTE_AGENT_SOURCE)
         self.assertIn("os.O_WRONLY | os.O_CREAT | os.O_EXCL", e2e.REMOTE_AGENT_SOURCE)
+        self.assertIn("markers.append([sequence, sent, time.monotonic_ns()])", e2e.REMOTE_AGENT_SOURCE)
         compressed = gzip.compress(e2e.REMOTE_AGENT_SOURCE.encode("utf-8"), mtime=0)
         self.assertLess(len(base64.b64encode(compressed)), 12_000)
         compile(e2e.WIRE_INSPECTOR_SOURCE, "<wire-inspector>", "exec")
         wire_compressed = gzip.compress(e2e.WIRE_INSPECTOR_SOURCE.encode("utf-8"), mtime=0)
         self.assertLess(len(base64.b64encode(wire_compressed)), 12_000)
+
+    def test_compact_stream_markers_fit_ssm_output_and_expand_strictly(self) -> None:
+        flow_id = "fixture-tcp-0001"
+        connection_id = f"{flow_id}:c0001"
+        markers = [
+            [sequence, 10**18 + sequence * 2, 10**18 + sequence * 2 + 1]
+            for sequence in range(160)
+        ]
+        result = {
+            "connection_id": connection_id,
+            "flow_id": flow_id,
+            "interrupted": False,
+            "markers": markers,
+            "socket_count": 1,
+            "source_port": 30000,
+            "success": True,
+        }
+
+        self.assertLess(len(json.dumps(result, separators=(",", ":"))), 12_000)
+        expanded = e2e._expand_compact_stream_markers(result)
+        self.assertEqual([marker.sequence for marker in expanded], list(range(160)))
+        self.assertTrue(all(marker.flow_id == flow_id for marker in expanded))
+        with self.assertRaisesRegex(e2e.StreamAnalysisError, "wrong shape"):
+            e2e._expand_compact_stream_markers({**result, "markers": [[0, 1]]})
 
     def test_embedded_tcp_framing_retains_coalesced_trailing_bytes(self) -> None:
         namespace: dict[str, Any] = {"__name__": "remote_agent_fixture"}

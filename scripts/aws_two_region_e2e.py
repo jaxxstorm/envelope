@@ -2712,6 +2712,34 @@ class StreamMarker:
             raise StreamAnalysisError("stream marker was received before it was sent")
 
 
+def _expand_compact_stream_markers(value: Mapping[str, Any]) -> tuple[StreamMarker, ...]:
+    flow_id = value.get("flow_id")
+    connection_id = value.get("connection_id")
+    markers = value.get("markers")
+    if (
+        not isinstance(flow_id, str)
+        or not isinstance(connection_id, str)
+        or not isinstance(markers, list)
+    ):
+        raise StreamAnalysisError("compact stream result has an invalid identity or marker list")
+    expanded: list[StreamMarker] = []
+    for marker in markers:
+        if not isinstance(marker, list) or len(marker) != 3:
+            raise StreamAnalysisError("compact stream marker has the wrong shape")
+        expanded.append(
+            StreamMarker.from_value(
+                {
+                    "flow_id": flow_id,
+                    "connection_id": connection_id,
+                    "sequence": marker[0],
+                    "sent_monotonic_ns": marker[1],
+                    "received_monotonic_ns": marker[2],
+                }
+            )
+        )
+    return tuple(expanded)
+
+
 @dataclasses.dataclass(frozen=True)
 class LossWindow:
     first_missing_sequence: int
@@ -13086,8 +13114,7 @@ def stream_client(args):
                 except (socket.timeout, OSError, RuntimeError):
                     break
                 if response == {"connection_id": connection_id, "flow_id": args.flow_id, "kind": "ack", "sequence": sequence}:
-                    markers.append({"connection_id": connection_id, "flow_id": args.flow_id,
-                                    "received_monotonic_ns": time.monotonic_ns(), "sent_monotonic_ns": sent, "sequence": sequence})
+                    markers.append([sequence, sent, time.monotonic_ns()])
                     if sequence == 0:
                         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
                         if hasattr(os, "O_NOFOLLOW"):
@@ -15629,15 +15656,18 @@ exit 1"""
         finally:
             if pause_attempted and not control_flow_interrupted:
                 self._resume_managed_responder(flow.destination, flow.protocol)
-        markers_value = client.get("markers")
-        if not isinstance(markers_value, list) or client.get("socket_count") != 1 or client.get(
-            "source_port"
-        ) != flow.source_port:
+        markers = _expand_compact_stream_markers(client)
+        if (
+            client.get("flow_id") != flow.flow_id
+            or client.get("connection_id") != f"{flow.flow_id}:c0001"
+            or client.get("socket_count") != 1
+            or client.get("source_port") != flow.source_port
+        ):
             raise StreamAnalysisError(f"{label} did not retain one exact source socket")
         analysis: StreamAnalysis | None
         try:
             analysis = analyze_stream_markers(
-                cast(Sequence[Mapping[str, Any]], markers_value),
+                markers,
                 MutationInterval(mutation_start, mutation_end, label),
                 maximum_loss_ns=maximum_loss_ns,
                 expected_first_sequence=0,

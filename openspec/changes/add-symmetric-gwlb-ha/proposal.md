@@ -20,6 +20,8 @@ Protected run `ha30` proved the exact target-health transition, alternate-flow r
 
 Protected run `ha31` proved the framing correction because all four continuity SSM commands completed and both protocols resumed. TCP recorded 158 markers; UDP recorded 39 trailing markers after bounded loss, but its final marker preceded the restoration-end clock by 2.49 seconds. Target-process stream sizing had reserved only the generic 30-second overhead despite bounded control and restoration occurring inside the measured mutation. The caller must reserve a second fixed 30-second mutation margin so strict analysis can retain a real post-mutation sample rather than weakening the interval boundary.
 
+Protected run `ha32` proved the extended post-mutation window, then failed because an otherwise successful TCP continuity client exceeded SSM's inline stdout limit. Repeating flow and connection identities in every marker caused AWS to append `--output truncated--`, and the runner correctly rejected the result as invalid JSON. Remote continuity output must encode shared identities once and use compact timestamp tuples bounded below the inline result limit; the runner must reconstruct the full marker objects and preserve all strict identity, ordering, timestamp, and truncation checks.
+
 ## What Changes
 
 - Add packet-scoped GWLB turnaround: each valid ingress packet is immediately re-encapsulated and returned to GWLB with the same inner packet, VNI, protocol metadata, ordered options and flow cookie, and AWS outer tuple learned from that packet.
