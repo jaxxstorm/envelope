@@ -2216,7 +2216,11 @@ class SymmetricTopologyTest(unittest.TestCase):
             "process_generation_sha256": "8" * 64,
         }
         operations = object.__new__(e2e.AwsSymmetricLiveOperations)
-        operations.base = SimpleNamespace(monotonic=lambda: 1.0)
+        install_wire_inspector = mock.Mock()
+        operations.base = SimpleNamespace(
+            monotonic=lambda: 1.0,
+            _install_wire_inspector=install_wire_inspector,
+        )
         adapter = Adapter(replacement=True)
 
         def replace(member):
@@ -2277,6 +2281,7 @@ class SymmetricTopologyTest(unittest.TestCase):
             result["transport"]["failed_ids"],
             {"tcp": first.instance_id, "udp": second.instance_id},
         )
+        install_wire_inspector.assert_called_once_with(operations._remote(replacement))
         self.assertIn("replace", adapter.calls)
 
     def test_target_process_stream_reserves_post_mutation_observation_window(self) -> None:

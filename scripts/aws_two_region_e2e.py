@@ -21686,6 +21686,7 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
             replacement_identity = self._verify_target(
                 current, replacement, timeout_seconds=max(30, min(timeout_seconds, 120))
             )
+            self.base._install_wire_inspector(self._remote(replacement))
             if self._target_health(replacement) != "healthy":
                 raise ResilienceError(
                     "target replacement did not produce a distinct healthy same-AZ target"
