@@ -26,7 +26,7 @@ import time
 import unittest
 from unittest import mock
 from types import SimpleNamespace
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -1262,6 +1262,18 @@ def ready_lifecycle_manifest(deployment: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def transport_node_hashes(
+    topology: e2e.SymmetricTopologyV2,
+) -> dict[str, str]:
+    return {
+        member.instance_id: hashlib.sha256(
+            f"node-{site}-{member.az_key}".encode("utf-8")
+        ).hexdigest()
+        for site in e2e.SITES
+        for member in topology.site(site).transport_router_fleet
+    }
+
+
 class DurableManifestStore:
     def __init__(self, manifest: Mapping[str, Any]) -> None:
         self.value = copy.deepcopy(manifest)
@@ -1298,7 +1310,14 @@ class DurableRouteTransactions:
         self.revision = '"route-etag-0"'
         self.writes: list[dict[str, Any]] = []
         self.finalized: list[dict[str, Any]] = []
+        self.node_bindings: list[dict[str, str]] = []
         self.fail_next_update = False
+
+    def bind_transport_node_identities(
+        self, node_ids_by_instance: Mapping[str, str]
+    ) -> Mapping[str, Any]:
+        self.node_bindings.append(dict(node_ids_by_instance))
+        return {"bound": True}
 
     def load_route_transaction(self) -> tuple[dict[str, Any], str] | None:
         if self.value is None:
@@ -1344,6 +1363,43 @@ class DurableRouteTransactions:
             self.writes.append(copy.deepcopy(self.value))
         self.revision = f'"route-etag-{len(self.writes) + len(self.finalized)}"'
         return self.revision
+
+
+class ValidatingDurableRouteTransactions(DurableRouteTransactions):
+    def __init__(
+        self,
+        topology: e2e.SymmetricTopologyV2,
+        vpc_ids: Mapping[str, str],
+        value: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(value)
+        self.topology = topology
+        self.vpc_ids = vpc_ids
+        self.node_ids_by_instance = {
+            member.instance_id: f"node-{member.site}-{member.az_key}"
+            for site in e2e.SITES
+            for member in topology.site(site).transport_router_fleet
+        }
+
+    def _validate(self, value: Mapping[str, Any]) -> None:
+        e2e.GWLBERouteFailover.validate_durable_binding(
+            value,
+            self.topology,
+            self.vpc_ids,
+            node_ids_by_instance=self.node_ids_by_instance,
+        )
+
+    def create_route_transaction(self, value: Mapping[str, Any]) -> str:
+        self._validate(value)
+        return super().create_route_transaction(value)
+
+    def update_route_transaction(
+        self, value: Mapping[str, Any], *, expected_revision: str
+    ) -> str:
+        self._validate(value)
+        return super().update_route_transaction(
+            value, expected_revision=expected_revision
+        )
 
 
 class DeploymentParsingTest(unittest.TestCase):
@@ -1820,6 +1876,29 @@ class GWLBERouteFailoverTest(unittest.TestCase):
             "east": "vpc-1123456789abcdef0",
         }
 
+    def test_route_runner_identity_requires_one_stable_boot_identity(self) -> None:
+        with (
+            mock.patch.object(e2e, "_ROUTE_BOOT_ID_CACHE", None),
+            mock.patch.object(pathlib.Path, "read_text", side_effect=OSError("absent")),
+            mock.patch.object(e2e.sys, "platform", "unsupported"),
+        ):
+            with self.assertRaisesRegex(e2e.LifecycleError, "boot identity"):
+                e2e._route_runner_identity()
+
+        with (
+            mock.patch.object(e2e, "_ROUTE_BOOT_ID_CACHE", None),
+            mock.patch.object(pathlib.Path, "read_text", side_effect=OSError("absent")),
+            mock.patch.object(e2e.sys, "platform", "darwin"),
+            mock.patch.object(
+                e2e.subprocess,
+                "run",
+                return_value=SimpleNamespace(stdout="{ sec = 123456, usec = 0 }\n"),
+            ),
+        ):
+            identity = e2e._route_runner_identity()
+
+        self.assertRegex(identity["boot_id"], e2e._ROUTE_BOOT_ID_RE)
+
     @staticmethod
     def authority(
         current: e2e.SymmetricFleetMember,
@@ -1856,7 +1935,8 @@ class GWLBERouteFailoverTest(unittest.TestCase):
             self.vpc_ids,
             aws,
             authorize=authorize or self.authority,
-            durability=durability or DurableRouteTransactions(),
+            durability=durability
+            or ValidatingDurableRouteTransactions(self.topology, self.vpc_ids),
             verify_ready=lambda member: ready.append(member.instance_id),
             advertisement_control=FakeAdvertisementControl(self.topology, clock),
             evidence_path=evidence_path,
@@ -1873,10 +1953,25 @@ class GWLBERouteFailoverTest(unittest.TestCase):
         return transaction, clock, ready, evidence_path
 
     def successful_probe(self, _remaining: float) -> Mapping[str, Any]:
+        evidence = symmetric_route_evidence()
+        west_traversal = next(
+            item
+            for item in evidence["traversals"]
+            if item["source_site"] == "west"
+        )
+        paths = {
+            item["protocol"]: copy.deepcopy(item)
+            for item in west_traversal["probes"]
+            if item["source_role"] == "responder"
+            and item["protocol"] in e2e.TRANSPORT_PROTOCOLS
+        }
         return {
-            "source_transport_router_id": self.alternate.instance_id,
-            "source_transport_eni_id": self.alternate.network_interface_id,
+            **paths["udp"],
             "succeeded": True,
+            "new_flows": {
+                protocol: {"succeeded": True, "path": path}
+                for protocol, path in paths.items()
+            },
         }
 
     def assert_original_routes(self, aws: RouteTableAWS) -> None:
@@ -1927,7 +2022,7 @@ class GWLBERouteFailoverTest(unittest.TestCase):
                 prefix_counts={"west": 2, "east": 2},
                 observer_counts={"west": 2, "east": 2},
                 hard_timeout_seconds=5400,
-                cleanup_timeout_seconds=1200,
+                cleanup_timeout_seconds=2400,
             )
 
         bounded = e2e.SymmetricRouteFailover(
@@ -1940,10 +2035,30 @@ class GWLBERouteFailoverTest(unittest.TestCase):
             bounded,
             prefix_counts={"west": 2, "east": 2},
             observer_counts={"west": 2, "east": 2},
-            hard_timeout_seconds=5400,
-            cleanup_timeout_seconds=1200,
+            hard_timeout_seconds=6000,
+            cleanup_timeout_seconds=2400,
         )
-        self.assertLessEqual(summary["total_transaction_seconds"], 5400)
+        self.assertEqual(bounded.restoration_reservation_seconds(2), 1555)
+        self.assertEqual(bounded.reconciliation_reservation_seconds(2), 1415)
+        self.assertEqual(
+            summary["transaction_seconds_by_site"],
+            {"west": 2765, "east": 2765},
+        )
+        self.assertEqual(summary["total_transaction_seconds"], 5530)
+        self.assertEqual(
+            summary["combined_cleanup_seconds_by_site"],
+            {"west": 2315, "east": 2315},
+        )
+        self.assertEqual(summary["resource_cleanup_seconds"], 900)
+
+        with self.assertRaisesRegex(e2e.DeploymentError, "resource cleanup"):
+            e2e._validate_route_failover_run_budget(
+                bounded,
+                prefix_counts={"west": 2, "east": 2},
+                observer_counts={"west": 2, "east": 2},
+                hard_timeout_seconds=6000,
+                cleanup_timeout_seconds=2314,
+            )
 
     def pending_journal(
         self,
@@ -1973,6 +2088,41 @@ class GWLBERouteFailoverTest(unittest.TestCase):
                     for prefix in self.topology.west.remote_site_cidrs
                 ],
             }
+
+        node_ids = {
+            member.instance_id: f"node-{member.site}-{member.az_key}"
+            for site in e2e.SITES
+            for member in self.topology.site(site).transport_router_fleet
+        }
+
+        def ownership_observation(owners: Mapping[str, str]) -> dict[str, Any]:
+            return {
+                "quiet_window_seconds": self.topology.route_failover.quiet_window_seconds,
+                "observers": [
+                    {
+                        "observer_instance_id": observer.instance_id,
+                        "owners": [
+                            {
+                                "prefix": prefix,
+                                "owner_instance_id": owner,
+                                "owner_node_id_sha256": hashlib.sha256(
+                                    node_ids[owner].encode("utf-8")
+                                ).hexdigest(),
+                            }
+                            for prefix, owner in sorted(owners.items())
+                        ],
+                        "command": None,
+                    }
+                    for observer in self.topology.east.transport_router_fleet
+                ],
+            }
+
+        baseline_owners = {
+            member.advertised_prefix: member.instance_id
+            for member in self.topology.west.transport_router_fleet
+        }
+        transferred_owners = dict(baseline_owners)
+        transferred_owners[self.current.advertised_prefix] = self.alternate.instance_id
 
         identity = e2e._route_runner_identity()
         identity["pid"] = 99_999_999
@@ -2021,16 +2171,49 @@ class GWLBERouteFailoverTest(unittest.TestCase):
                 },
                 "node_id_sha256": hashlib.sha256(b"node-west-b").hexdigest(),
             },
-            "interfaces": [],
+            "interfaces": [
+                {
+                    "instance_id": self.current.instance_id,
+                    "network_interface_id": self.current.network_interface_id,
+                },
+                {
+                    "instance_id": self.alternate.instance_id,
+                    "network_interface_id": self.alternate.network_interface_id,
+                },
+            ],
             "before": snapshot(self.current.network_interface_id),
             "advertisements": {
                 "forward_generation": "33333333-4444-4555-8666-777777777777",
                 "restore_generation": "44444444-5555-4666-8777-888888888888",
                 "failure_mode": "abrupt",
-                "alternate_expansion": None,
-                "current_withdrawal": None,
+                "alternate_expansion": {
+                    "advertisements": {
+                        "generation": "33333333-4444-4555-8666-777777777777",
+                        "routes": sorted(
+                            {
+                                self.current.advertised_prefix,
+                                self.alternate.advertised_prefix,
+                            }
+                        ),
+                        "service": "running",
+                        "mode": "normal",
+                    },
+                    "command": None,
+                },
+                "current_withdrawal": {
+                    "advertisements": {
+                        "generation": "33333333-4444-4555-8666-777777777777",
+                        "routes": [],
+                        "service": "stopped",
+                        "mode": "abrupt",
+                    },
+                    "command": None,
+                },
             },
-            "ownership": {"before": {}, "transferred": {}},
+            "ownership": {
+                "before": ownership_observation(baseline_owners),
+                "transferred": ownership_observation(transferred_owners),
+            },
             "mutation": {
                 "attempted_prefixes": list(self.topology.west.remote_site_cidrs),
                 "completed_prefixes": list(self.topology.west.remote_site_cidrs),
@@ -2046,6 +2229,60 @@ class GWLBERouteFailoverTest(unittest.TestCase):
             },
             "failure": None,
         }
+
+    def cleanup_marker(
+        self, journal: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        owner = e2e._route_runner_identity()
+        owner["pid"] = 99_999_999
+        owner["host_sha256"] = "f" * 64
+        return {
+            "schema": e2e.ROUTE_RECOVERY_MARKER_SCHEMA,
+            "kind": e2e.ROUTE_RECOVERY_MARKER_KIND,
+            "run_id": self.topology.run_id,
+            "claim_id": journal["claim_id"],
+            "transaction_id": journal["transaction_id"],
+            "owner": owner,
+            "lease_expires_at": "2026-08-20T12:01:00Z",
+            "restored_at": "2026-08-20T12:02:00Z",
+            "restoration_status": "reconciled-after-crash",
+            "status": "cleanup-pending",
+        }
+
+    def active_route_adapter(
+        self,
+    ) -> tuple[
+        Mapping[str, Any],
+        e2e.SymmetricProtectedDeployment,
+        DurableManifestStore,
+        e2e.ProtectedLifecycleAdapter,
+        Mapping[str, Any],
+    ]:
+        raw = route_failover_output()
+        deployment = e2e.parse_symmetric_protected_deployment_output(raw)
+        store = DurableManifestStore(ready_lifecycle_manifest(raw))
+        adapter = object.__new__(e2e.ProtectedLifecycleAdapter)
+        adapter.store = store
+        adapter.config = SimpleNamespace(
+            run_id=self.topology.run_id,
+            sites=lifecycle_sites(),
+        )
+        adapter.manifest = None
+        adapter._ownership_state = "unclaimed"
+        adapter._claim_etag = None
+        adapter._claim_original_manifest = None
+        adapter._claim_original_etag = None
+        adapter._last_persistence_resolution = "none"
+        adapter._route_only_recovery = False
+        claim = adapter.claim(raw, deployment)
+        adapter.bind_transport_node_identities(
+            {
+                member.instance_id: f"node-{site}-{member.az_key}"
+                for site in e2e.SITES
+                for member in self.topology.site(site).transport_router_fleet
+            }
+        )
+        return raw, deployment, store, adapter, claim
 
     def test_authorized_replacement_records_before_after_and_verified_restoration(self) -> None:
         aws = RouteTableAWS(self.topology)
@@ -2109,6 +2346,15 @@ class GWLBERouteFailoverTest(unittest.TestCase):
         self.assertTrue(
             all("lease_expires_at" in value for value in durability.writes)
         )
+        for persisted in durability.writes:
+            e2e.GWLBERouteFailover.validate_durable_binding(
+                persisted,
+                self.topology,
+                self.vpc_ids,
+                node_ids_by_instance=(
+                    transaction.advertisement_control.node_ids_by_instance
+                ),
+            )
 
     def test_lifecycle_proxies_delegate_complete_route_transaction_protocol(self) -> None:
         for proxy_name in ("run-all", "bounded-cleanup"):
@@ -2122,6 +2368,11 @@ class GWLBERouteFailoverTest(unittest.TestCase):
                     )
                 else:
                     proxy = e2e._BoundedCleanupLifecycleProxy(durability)
+                self.assertTrue(
+                    proxy.bind_transport_node_identities(
+                        {"i-0123456789abcdef0": "node-fixture"}
+                    )["bound"]
+                )
                 self.assertIsNone(proxy.load_route_transaction())
                 transaction, _clock, _ready, _evidence_path = self.failover(
                     temporary, aws, durability=proxy
@@ -2139,6 +2390,7 @@ class GWLBERouteFailoverTest(unittest.TestCase):
                 self.assert_original_routes(aws)
                 self.assertIsNone(durability.value)
                 self.assertEqual(len(durability.finalized), 1)
+                self.assertEqual(len(durability.node_bindings), 1)
 
     def test_ambiguous_advertisement_completion_restores_and_fences_late_forward(self) -> None:
         aws = RouteTableAWS(self.topology)
@@ -2421,6 +2673,68 @@ class GWLBERouteFailoverTest(unittest.TestCase):
             "restored-after-failure",
             "reconciled-after-crash",
         )
+
+        templates: dict[str, dict[str, Any]] = {}
+
+        def collect(transaction: e2e.GWLBERouteFailover) -> None:
+            durability = transaction.durability
+            self.assertIsInstance(durability, DurableRouteTransactions)
+            for value in durability.writes:
+                templates.setdefault(value["status"], copy.deepcopy(value))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            transaction, _clock, _ready, _path = self.failover(
+                temporary, RouteTableAWS(self.topology)
+            )
+            transaction.replace(
+                self.current,
+                self.alternate,
+                probe=self.successful_probe,
+                timeout_seconds=10,
+                restoration_timeout_seconds=10,
+            )
+            collect(transaction)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            aws = RouteTableAWS(self.topology)
+            aws.fail_forward_call = 1
+            transaction, _clock, _ready, _path = self.failover(temporary, aws)
+            with self.assertRaises(e2e.AmbiguousRouteMutationError):
+                transaction.replace(
+                    self.current,
+                    self.alternate,
+                    probe=self.successful_probe,
+                    timeout_seconds=10,
+                    restoration_timeout_seconds=10,
+                )
+            collect(transaction)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            transaction, _clock, _ready, _path = self.failover(
+                temporary, RouteTableAWS(self.topology)
+            )
+            transaction.advertisement_control.fail_before_apply = 3
+            with self.assertRaises(e2e.RouteRestorationError):
+                transaction.replace(
+                    self.current,
+                    self.alternate,
+                    probe=self.successful_probe,
+                    timeout_seconds=10,
+                    restoration_timeout_seconds=10,
+                )
+            collect(transaction)
+
+        templates["recovery-claimed"] = copy.deepcopy(
+            templates["ownership-transferred"]
+        )
+        templates["recovery-claimed"]["status"] = "recovery-claimed"
+        templates["reconciled-after-crash"] = copy.deepcopy(templates["restored"])
+        templates["reconciled-after-crash"]["status"] = "reconciled-after-crash"
+        templates["reconciled-after-crash"]["reconciled_at"] = templates[
+            "reconciled-after-crash"
+        ]["finished_at"]
+        self.assertEqual(set(templates).intersection(statuses), set(statuses))
+
         for status in statuses:
             with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
                 aws = RouteTableAWS(self.topology)
@@ -2434,10 +2748,11 @@ class GWLBERouteFailoverTest(unittest.TestCase):
                         prefix: self.alternate.network_interface_id
                         for prefix in self.topology.west.remote_site_cidrs
                     }
-                journal = self.pending_journal(aws, owner=e2e._route_runner_identity())
-                journal["status"] = status
+                journal = copy.deepcopy(templates[status])
                 journal["lease_expires_at"] = "2099-08-20T12:01:00Z"
-                durability = DurableRouteTransactions(journal)
+                durability = ValidatingDurableRouteTransactions(
+                    self.topology, self.vpc_ids, journal
+                )
                 transaction, _clock, _ready, _path = self.failover(
                     temporary, aws, durability=durability
                 )
@@ -2780,6 +3095,7 @@ class GWLBERouteFailoverTest(unittest.TestCase):
             "claim_id": claim_id,
             "output_sha256": deployment.output_sha256,
             "started_at": "2026-08-20T12:00:00Z",
+            "transport_node_id_sha256": transport_node_hashes(self.topology),
             "route_transaction": abandoned,
         }
         aws = RouteTableAWS(self.topology)
@@ -2804,7 +3120,14 @@ class GWLBERouteFailoverTest(unittest.TestCase):
             adapter._claim_original_manifest = None
             adapter._claim_original_etag = None
             adapter._last_persistence_resolution = "none"
-            claim = adapter.claim(raw, deployment)
+            store.value["saved_plan"]["applied"] = False
+            with self.assertRaisesRegex(
+                e2e.DeploymentError, "one successful reviewed apply"
+            ):
+                adapter.claim(raw, deployment, require_route_recovery=True)
+            self.assertEqual(store.writes, [])
+            store.value["saved_plan"]["applied"] = True
+            claim = adapter.claim(raw, deployment, require_route_recovery=True)
             self.assertTrue(claim["route_recovery_required"])
             with self.assertRaisesRegex(
                 e2e.ClaimPersistenceError, "passing acceptance"
@@ -2840,6 +3163,651 @@ class GWLBERouteFailoverTest(unittest.TestCase):
         self.assertEqual(persisted["restoration"]["status"], "verified")
         self.assertEqual(store.value["phase"], "e2e_failed")
         self.assertNotIn("route_transaction", store.value["e2e"])
+        self.assertEqual(
+            store.value["e2e"]["route_recovery"]["status"],
+            "cleanup-claimed",
+        )
+
+    def test_recovery_rejects_every_static_transaction_mismatch_before_cas(self) -> None:
+        raw = route_failover_output()
+        deployment = e2e.parse_symmetric_protected_deployment_output(raw)
+
+        def output_hash(manifest, _journal):
+            manifest["e2e"]["output_sha256"] = "b" * 64
+
+        def route_table(_manifest, journal):
+            journal["route_table_id"] = "rtb-f123456789abcdef0"
+
+        def prefixes(_manifest, journal):
+            journal["prefixes"][0] = "10.99.0.0/24"
+
+        def router_eni(_manifest, journal):
+            journal["current"]["network_interface_id"] = "eni-f123456789abcdef0"
+
+        def topology_site(_manifest, journal):
+            journal["site"] = "east"
+
+        def generations(_manifest, journal):
+            journal["advertisements"]["restore_generation"] = journal[
+                "advertisements"
+            ]["forward_generation"]
+
+        def predecessor_generation(_manifest, journal):
+            journal["current"]["state_before"]["advertisements"][
+                "generation"
+            ] = journal["advertisements"]["forward_generation"]
+
+        def vpc(_manifest, journal):
+            journal["before"]["vpc_id"] = "vpc-f123456789abcdef0"
+
+        def uuid_version_one(_manifest, journal):
+            journal["transaction_id"] = (
+                "22222222-3333-1444-8555-666666666666"
+            )
+
+        def simultaneous_marker(manifest, journal):
+            manifest["e2e"]["route_recovery"] = self.cleanup_marker(journal)
+
+        def node_hash(_manifest, journal):
+            journal["current"]["node_id_sha256"] = "a" * 64
+
+        def ownership_progress(_manifest, journal):
+            journal["ownership"].pop("transferred")
+
+        def mutation_progress(_manifest, journal):
+            journal["mutation"]["attempted_prefixes"].reverse()
+
+        def restoration_progress(_manifest, journal):
+            journal["restoration"]["routes"] = {"status": "unknown"}
+
+        def restoration_extra_field(_manifest, journal):
+            journal["restoration"]["advertisements"]["unexpected"] = {
+                "forged": True
+            }
+
+        def restoration_missing_field(_manifest, journal):
+            journal["restoration"]["ownership"].pop("status")
+
+        def restoration_status_contradiction(_manifest, journal):
+            journal["restoration"]["status"] = "verified"
+
+        def ownership_observation_extra_field(_manifest, journal):
+            journal["ownership"]["before"]["unexpected"] = {"forged": True}
+
+        def status_progress_contradiction(_manifest, journal):
+            journal["status"] = "authorized"
+
+        def probe_extra_field(_manifest, journal):
+            journal["status"] = "probe-passed"
+            journal["probe"] = {
+                **self.successful_probe(1),
+                "unexpected": {"forged": True},
+            }
+
+        def ambiguous_settlement_target(_manifest, journal):
+            prefix = journal["prefixes"][0]
+            journal["status"] = "ambiguous-forward-call"
+            journal["mutation"] = {
+                "attempted_prefixes": [prefix],
+                "completed_prefixes": [],
+                "ambiguous_calls": [
+                    {
+                        "prefix": prefix,
+                        "category": "TimeoutError",
+                        "message": "ambiguous",
+                        "settled_target": "eni-f123456789abcdef0",
+                    }
+                ],
+            }
+            journal["after"] = None
+
+        def failure_transition(_manifest, journal):
+            journal["failure_transition"] = {"forged": True}
+
+        mutations = {
+            "output-hash": output_hash,
+            "route-table": route_table,
+            "prefixes": prefixes,
+            "router-eni": router_eni,
+            "topology-site": topology_site,
+            "generations": generations,
+            "predecessor-generation": predecessor_generation,
+            "vpc": vpc,
+            "uuid-version-one": uuid_version_one,
+            "simultaneous-marker": simultaneous_marker,
+            "node-hash": node_hash,
+            "ownership-progress": ownership_progress,
+            "mutation-progress": mutation_progress,
+            "restoration-progress": restoration_progress,
+            "restoration-extra-field": restoration_extra_field,
+            "restoration-missing-field": restoration_missing_field,
+            "restoration-status-contradiction": restoration_status_contradiction,
+            "ownership-observation-extra-field": ownership_observation_extra_field,
+            "status-progress-contradiction": status_progress_contradiction,
+            "probe-extra-field": probe_extra_field,
+            "ambiguous-settlement-target": ambiguous_settlement_target,
+            "failure-transition": failure_transition,
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                manifest = ready_lifecycle_manifest(raw)
+                journal = self.pending_journal(RouteTableAWS(self.topology))
+                journal["owner"]["host_sha256"] = "f" * 64
+                manifest["phase"] = "e2e_running"
+                manifest["e2e"] = {
+                    "claim_id": journal["claim_id"],
+                    "output_sha256": deployment.output_sha256,
+                    "started_at": "2026-08-20T12:00:00Z",
+                    "transport_node_id_sha256": transport_node_hashes(
+                        self.topology
+                    ),
+                    "route_transaction": journal,
+                }
+                mutate(manifest, journal)
+                store = DurableManifestStore(manifest)
+
+                class NoRemoteCalls:
+                    calls: list[Any] = []
+
+                    def json(self, *args, **kwargs):
+                        self.calls.append((args, kwargs))
+                        raise AssertionError("malformed transaction reached AWS")
+
+                aws = NoRemoteCalls()
+                adapter = object.__new__(e2e.ProtectedLifecycleAdapter)
+                adapter.store = store
+                adapter.config = SimpleNamespace(
+                    run_id=self.topology.run_id,
+                    sites=lifecycle_sites(),
+                )
+                adapter.aws = aws
+                adapter.manifest = None
+                adapter._ownership_state = "unclaimed"
+                adapter._claim_etag = None
+                adapter._claim_original_manifest = None
+                adapter._claim_original_etag = None
+                adapter._last_persistence_resolution = "none"
+
+                with self.assertRaises(e2e.E2EError):
+                    adapter.claim(raw, deployment, require_route_recovery=True)
+
+                self.assertEqual(store.writes, [])
+                self.assertEqual(aws.calls, [])
+
+    def test_transport_node_hashes_are_bound_in_a_separate_pretransaction_cas(self) -> None:
+        raw = route_failover_output()
+        deployment = e2e.parse_symmetric_protected_deployment_output(raw)
+        store = DurableManifestStore(ready_lifecycle_manifest(raw))
+        adapter = object.__new__(e2e.ProtectedLifecycleAdapter)
+        adapter.store = store
+        adapter.config = SimpleNamespace(
+            run_id=self.topology.run_id,
+            sites=lifecycle_sites(),
+        )
+        adapter.manifest = None
+        adapter._ownership_state = "unclaimed"
+        adapter._claim_etag = None
+        adapter._claim_original_manifest = None
+        adapter._claim_original_etag = None
+        adapter._last_persistence_resolution = "none"
+        adapter._route_only_recovery = False
+
+        claim = adapter.claim(raw, deployment)
+        node_ids = {
+            member.instance_id: f"node-{site}-{member.az_key}"
+            for site in e2e.SITES
+            for member in self.topology.site(site).transport_router_fleet
+        }
+        binding = adapter.bind_transport_node_identities(node_ids)
+        journal = self.pending_journal(
+            RouteTableAWS(self.topology), claim_id=claim["claim_id"]
+        )
+        adapter.create_route_transaction(journal)
+
+        self.assertTrue(binding["bound"])
+        self.assertEqual(len(store.writes), 3)
+        self.assertNotIn("route_transaction", store.writes[1][0]["e2e"])
+        self.assertEqual(
+            store.writes[1][0]["e2e"]["transport_node_id_sha256"],
+            transport_node_hashes(self.topology),
+        )
+        self.assertEqual(
+            store.writes[2][0]["e2e"]["route_transaction"]["transaction_id"],
+            journal["transaction_id"],
+        )
+
+    def test_transaction_creation_rejects_an_invalid_envelope_before_cas(self) -> None:
+        mutations = {
+            "schema": lambda journal: journal.update(schema=999),
+            "kind": lambda journal: journal.update(kind="forged-route-transaction"),
+            "transaction": lambda journal: journal.update(transaction_id="not-a-uuid"),
+            "lease": lambda journal: journal.update(lease_expires_at="not-a-timestamp"),
+            "boot": lambda journal: journal["owner"].update(boot_id=""),
+            "extra": lambda journal: journal.update(unexpected={"forged": True}),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                _raw, _deployment, store, adapter, claim = (
+                    self.active_route_adapter()
+                )
+                journal = self.pending_journal(
+                    RouteTableAWS(self.topology), claim_id=claim["claim_id"]
+                )
+                mutate(journal)
+                writes_before = len(store.writes)
+
+                with self.assertRaises(e2e.AmbiguousOwnershipError):
+                    adapter.create_route_transaction(journal)
+
+                self.assertEqual(len(store.writes), writes_before)
+                self.assertNotIn("route_transaction", store.value["e2e"])
+
+    def test_transaction_update_preserves_authority_and_forward_progress(self) -> None:
+        _raw, _deployment, store, adapter, claim = self.active_route_adapter()
+        journal = self.pending_journal(
+            RouteTableAWS(self.topology), claim_id=claim["claim_id"]
+        )
+        revision = adapter.create_route_transaction(journal)
+        writes_before = len(store.writes)
+
+        regressed = copy.deepcopy(journal)
+        regressed["status"] = "authorized"
+        regressed["advertisements"]["alternate_expansion"] = None
+        regressed["advertisements"]["current_withdrawal"] = None
+        regressed["ownership"]["transferred"] = None
+        regressed["mutation"] = {
+            "attempted_prefixes": [],
+            "completed_prefixes": [],
+            "ambiguous_calls": [],
+        }
+        regressed["after"] = None
+        e2e.GWLBERouteFailover.validate_durable_binding(
+            regressed,
+            self.topology,
+            self.vpc_ids,
+            node_hashes_by_instance=transport_node_hashes(self.topology),
+        )
+        with self.assertRaisesRegex(e2e.ClaimPersistenceError, "regressed"):
+            adapter.update_route_transaction(regressed, expected_revision=revision)
+
+        new_owner = copy.deepcopy(journal)
+        new_owner["owner"]["host_sha256"] = "f" * 64
+        e2e.GWLBERouteFailover.validate_durable_binding(
+            new_owner,
+            self.topology,
+            self.vpc_ids,
+            node_hashes_by_instance=transport_node_hashes(self.topology),
+        )
+        with self.assertRaisesRegex(
+            e2e.ClaimPersistenceError, "immutable durable authority"
+        ):
+            adapter.update_route_transaction(new_owner, expected_revision=revision)
+
+        switched_site = copy.deepcopy(journal)
+        switched_site["site"] = "east"
+        with self.assertRaisesRegex(
+            e2e.ClaimPersistenceError, "immutable durable authority"
+        ):
+            adapter._validate_route_transaction_successor(journal, switched_site)
+
+        self.assertEqual(len(store.writes), writes_before)
+        self.assertEqual(store.value["e2e"]["route_transaction"], journal)
+
+    def test_transaction_retry_fences_restoration_before_resetting_progress(self) -> None:
+        existing = self.pending_journal(RouteTableAWS(self.topology))
+        route = symmetric_route_evidence()["transport_router"]["abrupt"][
+            "route_replacement"
+        ]
+        existing["status"] = "restoring"
+        existing["restoration"] = copy.deepcopy(route["restoration"])
+        existing["restoration"]["status"] = "running"
+        existing["restoration"]["routes"]["status"] = "running"
+        existing["restoration"]["routes"]["snapshot"] = None
+        command = {
+            "site": "west",
+            "role": "transport-router",
+            "command_id": "fixture-restoration-command",
+            "status": "Success",
+            "response_code": 0,
+        }
+        existing["restoration"]["advertisements"]["current"][
+            "command"
+        ] = copy.deepcopy(command)
+        existing["restoration"]["advertisements"]["verification"]["current"][
+            "command"
+        ] = copy.deepcopy(command)
+        reset = copy.deepcopy(existing)
+        reset["restoration"] = {
+            "status": "running",
+            "advertisements": {
+                "status": "running",
+                "current": None,
+                "alternate": None,
+                "verification": None,
+                "failures": [],
+            },
+            "ownership": {"status": "not-started", "observation": None},
+            "routes": {
+                "status": "not-started",
+                "attempted_prefixes": [],
+                "api_failures": [],
+                "settled_prefixes": [],
+                "quiet_window_seconds": self.topology.route_failover.quiet_window_seconds,
+                "snapshot": None,
+            },
+        }
+        for journal in (existing, reset):
+            e2e.GWLBERouteFailover.validate_durable_binding(
+                journal,
+                self.topology,
+                self.vpc_ids,
+                node_hashes_by_instance=transport_node_hashes(self.topology),
+            )
+
+        e2e.ProtectedLifecycleAdapter._validate_route_transaction_successor(
+            existing, copy.deepcopy(existing)
+        )
+
+        with self.assertRaisesRegex(
+            e2e.ClaimPersistenceError, "restoration progress"
+        ):
+            e2e.ProtectedLifecycleAdapter._validate_route_transaction_successor(
+                existing, reset
+            )
+
+        claimed = copy.deepcopy(existing)
+        claimed["status"] = "recovery-claimed"
+        e2e.ProtectedLifecycleAdapter._validate_route_transaction_successor(
+            existing, claimed
+        )
+        e2e.ProtectedLifecycleAdapter._validate_route_transaction_successor(
+            claimed, reset
+        )
+
+    def test_transaction_finalization_requires_the_exact_terminal_summary(self) -> None:
+        raw = route_failover_output()
+        deployment = e2e.parse_symmetric_protected_deployment_output(raw)
+        journal = self.pending_journal(RouteTableAWS(self.topology))
+        route = symmetric_route_evidence()["transport_router"]["abrupt"][
+            "route_replacement"
+        ]
+        journal["probe"] = copy.deepcopy(self.successful_probe(1))
+        journal["restoration"] = copy.deepcopy(route["restoration"])
+        journal["failure"] = {
+            "category": "RuntimeError",
+            "message": "fixture forward failure",
+        }
+        journal["status"] = "restored-after-failure"
+        journal["finished_at"] = "2026-08-20T12:03:00Z"
+        e2e.GWLBERouteFailover.validate_durable_binding(
+            journal,
+            self.topology,
+            self.vpc_ids,
+            node_hashes_by_instance=transport_node_hashes(self.topology),
+        )
+        manifest = ready_lifecycle_manifest(raw)
+        manifest["phase"] = "e2e_running"
+        manifest["e2e"] = {
+            "claim_id": journal["claim_id"],
+            "output_sha256": deployment.output_sha256,
+            "started_at": "2026-08-20T12:00:00Z",
+            "transport_node_id_sha256": transport_node_hashes(self.topology),
+            "route_transaction": journal,
+        }
+        store = DurableManifestStore(manifest)
+        adapter = object.__new__(e2e.ProtectedLifecycleAdapter)
+        adapter.store = store
+        adapter.config = SimpleNamespace(
+            run_id=self.topology.run_id,
+            sites=lifecycle_sites(),
+        )
+        adapter.manifest = copy.deepcopy(manifest)
+        adapter._ownership_state = "running-owned"
+        adapter._claim_etag = store.remote_etag
+        adapter._claim_original_manifest = None
+        adapter._claim_original_etag = None
+        adapter._last_persistence_resolution = "none"
+        adapter._route_only_recovery = False
+        exact_summary = {
+            "transaction_id": journal["transaction_id"],
+            "status": journal["status"],
+            "finished_at": journal["finished_at"],
+            "restored": True,
+        }
+
+        with self.assertRaisesRegex(
+            e2e.ClaimPersistenceError, "cannot finalize"
+        ):
+            adapter.finalize_route_transaction(
+                journal["transaction_id"],
+                {**exact_summary, "status": "restored"},
+                expected_revision=store.remote_etag,
+            )
+
+        self.assertEqual(store.writes, [])
+        adapter.finalize_route_transaction(
+            journal["transaction_id"],
+            exact_summary,
+            expected_revision=store.remote_etag,
+        )
+        marker = store.value["e2e"]["route_recovery"]
+        self.assertEqual(marker["restoration_status"], "restored-after-failure")
+        self.assertEqual(marker["restored_at"], journal["finished_at"])
+
+    def test_route_only_recovery_resumes_cleanup_after_transaction_finalization(self) -> None:
+        raw = route_failover_output()
+        deployment = e2e.parse_symmetric_protected_deployment_output(raw)
+        journal = self.pending_journal(RouteTableAWS(self.topology))
+        for phase in ("e2e_running", "e2e_failed", "cleanup_incomplete"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary:
+                run_dir = pathlib.Path(temporary)
+                manifest = ready_lifecycle_manifest(raw)
+                manifest["phase"] = phase
+                manifest["e2e"] = {
+                    "claim_id": journal["claim_id"],
+                    "output_sha256": deployment.output_sha256,
+                    "started_at": "2026-08-20T12:00:00Z",
+                    "transport_node_id_sha256": transport_node_hashes(
+                        self.topology
+                    ),
+                    "route_recovery": self.cleanup_marker(journal),
+                }
+                if phase != "e2e_running":
+                    manifest["e2e"].update(
+                        {
+                            "finished_at": "2026-08-20T12:03:00Z",
+                            "passed": False,
+                        }
+                    )
+                if phase == "cleanup_incomplete":
+                    manifest["cleanup_claim_id"] = (
+                        "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+                    )
+                    manifest["cleanup_claimed_at"] = "2026-08-20T12:04:00Z"
+                store = DurableManifestStore(manifest)
+                adapter = object.__new__(e2e.ProtectedLifecycleAdapter)
+                adapter.store = store
+                adapter.config = SimpleNamespace(
+                    run_id=self.topology.run_id,
+                    config_identity="c" * 64,
+                    sites=lifecycle_sites(),
+                )
+                adapter.aws = SimpleNamespace()
+                adapter.runner = SimpleNamespace()
+                adapter.run_dir = run_dir
+                adapter.terraform_dir = ROOT / "example" / "terraform"
+                adapter.manifest = None
+                adapter._ownership_state = "unclaimed"
+                adapter._claim_etag = None
+                adapter._claim_original_manifest = None
+                adapter._claim_original_etag = None
+                adapter._last_persistence_resolution = "none"
+                adapter._route_only_recovery = False
+
+                def protected(*_args, **kwargs):
+                    result = {"final_residual_count": 0}
+                    self.assertEqual(
+                        kwargs.get("timeout_seconds"),
+                        e2e.PROTECTED_RESOURCE_CLEANUP_SECONDS,
+                    )
+                    checkpoint = kwargs.get("before_manifest_delete")
+                    self.assertTrue(callable(checkpoint))
+                    store.value["phase"] = "cleanup_started"
+                    store.value["cleanup_claim_id"] = e2e.local_cleanup_claim_id(
+                        run_dir
+                    )
+                    store.value["cleanup_claimed_at"] = (
+                        dt.datetime.now(dt.timezone.utc)
+                        .replace(microsecond=0)
+                        .isoformat()
+                        .replace("+00:00", "Z")
+                    )
+                    checkpoint(result)
+                    return result
+
+                claim = adapter.claim(
+                    raw, deployment, require_route_recovery=True
+                )
+                with mock.patch.object(
+                    e2e, "build_tailscale", return_value=SimpleNamespace()
+                ), mock.patch.object(
+                    e2e, "protected_cleanup", side_effect=protected
+                ):
+                    result = adapter.cleanup()
+
+                receipt_path = run_dir / "route-recovery-cleanup-result.json"
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                self.assertTrue(claim["route_recovery_required"])
+                self.assertEqual(claim["manifest_phase"], phase)
+                self.assertEqual(
+                    claim["route_transaction_id"], journal["transaction_id"]
+                )
+                self.assertTrue(result["route_recovery_before_cleanup"]["restored"])
+                self.assertEqual(
+                    receipt["cleanup"], "backend-finalization-pending"
+                )
+                self.assertEqual(stat.S_IMODE(receipt_path.stat().st_mode), 0o600)
+
+    def test_route_marker_cannot_take_over_a_fresh_foreign_cleanup_claim(self) -> None:
+        raw = route_failover_output()
+        deployment = e2e.parse_symmetric_protected_deployment_output(raw)
+        journal = self.pending_journal(RouteTableAWS(self.topology))
+        manifest = ready_lifecycle_manifest(raw)
+        manifest["phase"] = "cleanup_incomplete"
+        manifest["e2e"] = {
+            "claim_id": journal["claim_id"],
+            "output_sha256": deployment.output_sha256,
+            "started_at": "2026-08-20T12:00:00Z",
+            "finished_at": "2026-08-20T12:03:00Z",
+            "passed": False,
+            "transport_node_id_sha256": transport_node_hashes(self.topology),
+            "route_recovery": self.cleanup_marker(journal),
+        }
+        manifest["cleanup_claim_id"] = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        manifest["cleanup_claimed_at"] = (
+            dt.datetime.now(dt.timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        store = DurableManifestStore(manifest)
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = pathlib.Path(temporary)
+            adapter = object.__new__(e2e.ProtectedLifecycleAdapter)
+            adapter.store = store
+            adapter.config = SimpleNamespace(
+                run_id=self.topology.run_id,
+                config_identity="c" * 64,
+                sites=lifecycle_sites(),
+            )
+            adapter.aws = SimpleNamespace()
+            adapter.runner = SimpleNamespace()
+            adapter.run_dir = run_dir
+            adapter.terraform_dir = ROOT / "example" / "terraform"
+            adapter.manifest = None
+            adapter._ownership_state = "unclaimed"
+            adapter._claim_etag = None
+            adapter._claim_original_manifest = None
+            adapter._claim_original_etag = None
+            adapter._last_persistence_resolution = "none"
+            adapter._route_only_recovery = False
+
+            with self.assertRaises(e2e.ConcurrentRunError):
+                adapter.claim(raw, deployment, require_route_recovery=True)
+
+        self.assertEqual(store.writes, [])
+        self.assertEqual(store.value, manifest)
+
+    def test_route_receipt_requires_the_same_durable_cleanup_owner(self) -> None:
+        raw = route_failover_output()
+        deployment = e2e.parse_symmetric_protected_deployment_output(raw)
+        journal = self.pending_journal(RouteTableAWS(self.topology))
+        manifest = ready_lifecycle_manifest(raw)
+        manifest["phase"] = "e2e_failed"
+        manifest["e2e"] = {
+            "claim_id": journal["claim_id"],
+            "output_sha256": deployment.output_sha256,
+            "started_at": "2026-08-20T12:00:00Z",
+            "finished_at": "2026-08-20T12:03:00Z",
+            "passed": False,
+            "transport_node_id_sha256": transport_node_hashes(self.topology),
+            "route_recovery": self.cleanup_marker(journal),
+        }
+        store = DurableManifestStore(manifest)
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = pathlib.Path(temporary)
+            adapter = object.__new__(e2e.ProtectedLifecycleAdapter)
+            adapter.store = store
+            adapter.config = SimpleNamespace(
+                run_id=self.topology.run_id,
+                config_identity="c" * 64,
+                sites=lifecycle_sites(),
+            )
+            adapter.aws = SimpleNamespace()
+            adapter.runner = SimpleNamespace()
+            adapter.run_dir = run_dir
+            adapter.terraform_dir = ROOT / "example" / "terraform"
+            adapter.manifest = None
+            adapter._ownership_state = "unclaimed"
+            adapter._claim_etag = None
+            adapter._claim_original_manifest = None
+            adapter._claim_original_etag = None
+            adapter._last_persistence_resolution = "none"
+            adapter._route_only_recovery = False
+            adapter.claim(raw, deployment, require_route_recovery=True)
+
+            def protected(*_args, **kwargs):
+                store.value["phase"] = "cleanup_started"
+                store.value["cleanup_claim_id"] = e2e.local_cleanup_claim_id(
+                    run_dir
+                )
+                store.value["cleanup_claimed_at"] = (
+                    dt.datetime.now(dt.timezone.utc)
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                )
+                store.value["e2e"]["route_recovery"]["owner"][
+                    "host_sha256"
+                ] = "d" * 64
+                kwargs["before_manifest_delete"](
+                    {"final_residual_count": 0}
+                )
+                return {"final_residual_count": 0}
+
+            with mock.patch.object(
+                e2e, "build_tailscale", return_value=SimpleNamespace()
+            ), mock.patch.object(
+                e2e, "protected_cleanup", side_effect=protected
+            ):
+                with self.assertRaisesRegex(
+                    e2e.AmbiguousOwnershipError, "lost durable ownership"
+                ):
+                    adapter.cleanup()
+
+            self.assertFalse(
+                (run_dir / "route-recovery-cleanup-result.json").exists()
+            )
 
     def test_restart_rejects_unexpired_cross_host_lease_without_cas_write(self) -> None:
         raw = route_failover_output()
@@ -2853,6 +3821,7 @@ class GWLBERouteFailoverTest(unittest.TestCase):
             "claim_id": journal["claim_id"],
             "output_sha256": deployment.output_sha256,
             "started_at": "2026-08-20T12:00:00Z",
+            "transport_node_id_sha256": transport_node_hashes(self.topology),
             "route_transaction": journal,
         }
         store = DurableManifestStore(manifest)
@@ -2883,6 +3852,7 @@ class GWLBERouteFailoverTest(unittest.TestCase):
             "claim_id": journal["claim_id"],
             "output_sha256": deployment.output_sha256,
             "started_at": "2026-08-20T12:00:00Z",
+            "transport_node_id_sha256": transport_node_hashes(self.topology),
             "route_transaction": journal,
         }
         store = DurableManifestStore(manifest)
@@ -2909,6 +3879,48 @@ class GWLBERouteFailoverTest(unittest.TestCase):
 
         self.assertEqual(adapter._ownership_state, "competing")
 
+    def test_expired_lease_adoption_distinguishes_an_uncommitted_cas(self) -> None:
+        raw = route_failover_output()
+        deployment = e2e.parse_symmetric_protected_deployment_output(raw)
+        manifest = ready_lifecycle_manifest(raw)
+        journal = self.pending_journal(RouteTableAWS(self.topology))
+        journal["owner"]["host_sha256"] = "e" * 64
+        manifest["phase"] = "e2e_running"
+        manifest["e2e"] = {
+            "claim_id": journal["claim_id"],
+            "output_sha256": deployment.output_sha256,
+            "started_at": "2026-08-20T12:00:00Z",
+            "transport_node_id_sha256": transport_node_hashes(self.topology),
+            "route_transaction": journal,
+        }
+        store = DurableManifestStore(manifest)
+
+        def not_committed(_target, _value, _if_match):
+            raise e2e.LifecycleError("injected uncommitted route claim")
+
+        store.write_hook = not_committed
+        adapter = object.__new__(e2e.ProtectedLifecycleAdapter)
+        adapter.store = store
+        adapter.config = SimpleNamespace(
+            run_id=self.topology.run_id, sites=lifecycle_sites()
+        )
+        adapter.manifest = None
+        adapter._ownership_state = "unclaimed"
+        adapter._claim_etag = None
+        adapter._claim_original_manifest = None
+        adapter._claim_original_etag = None
+        adapter._last_persistence_resolution = "none"
+
+        with self.assertRaisesRegex(
+            e2e.ClaimPersistenceError, "route-recovery claim was not committed"
+        ):
+            adapter.claim(raw, deployment, require_route_recovery=True)
+
+        self.assertEqual(store.value, manifest)
+        self.assertEqual(store.writes, [])
+        self.assertEqual(adapter._ownership_state, "unclaimed")
+        self.assertEqual(adapter._last_persistence_resolution, "claim-not-committed")
+
     def test_recovery_claim_acquisition_rethrows_protected_control_flow(self) -> None:
         raw = route_failover_output()
         deployment = e2e.parse_symmetric_protected_deployment_output(raw)
@@ -2925,6 +3937,9 @@ class GWLBERouteFailoverTest(unittest.TestCase):
                     "claim_id": journal["claim_id"],
                     "output_sha256": deployment.output_sha256,
                     "started_at": "2026-08-20T12:00:00Z",
+                    "transport_node_id_sha256": transport_node_hashes(
+                        self.topology
+                    ),
                     "route_transaction": journal,
                 }
                 store = DurableManifestStore(manifest)
@@ -2967,6 +3982,147 @@ class GWLBERouteFailoverTest(unittest.TestCase):
                 transaction.reconcile(restoration_timeout_seconds=10)
         self.assertEqual(aws.mutation_calls, [])
 
+    def test_direct_reconcile_rejects_malformed_progress_before_any_write(self) -> None:
+        def reversed_attempts(journal):
+            journal["mutation"]["attempted_prefixes"].reverse()
+
+        def restoration_extra_field(journal):
+            journal["restoration"]["advertisements"]["unexpected"] = {
+                "forged": True
+            }
+
+        def ownership_extra_field(journal):
+            journal["ownership"]["before"]["unexpected"] = {"forged": True}
+
+        def status_progress_contradiction(journal):
+            journal["status"] = "authorized"
+
+        def probe_extra_field(journal):
+            journal["status"] = "probe-passed"
+            journal["probe"] = {
+                **self.successful_probe(1),
+                "unexpected": {"forged": True},
+            }
+
+        def invalid_settlement_target(journal):
+            prefix = journal["prefixes"][0]
+            journal["status"] = "ambiguous-forward-call"
+            journal["mutation"] = {
+                "attempted_prefixes": [prefix],
+                "completed_prefixes": [],
+                "ambiguous_calls": [
+                    {
+                        "prefix": prefix,
+                        "category": "TimeoutError",
+                        "message": "ambiguous",
+                        "settled_target": "eni-f123456789abcdef0",
+                    }
+                ],
+            }
+            journal["after"] = None
+
+        mutations = {
+            "reversed-attempts": reversed_attempts,
+            "restoration-extra-field": restoration_extra_field,
+            "ownership-extra-field": ownership_extra_field,
+            "status-progress-contradiction": status_progress_contradiction,
+            "probe-extra-field": probe_extra_field,
+            "invalid-settlement-target": invalid_settlement_target,
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                aws = RouteTableAWS(self.topology)
+                journal = self.pending_journal(
+                    aws, owner=e2e._route_runner_identity()
+                )
+                mutate(journal)
+                durability = DurableRouteTransactions(journal)
+                transaction, _clock, _ready, evidence_path = self.failover(
+                    temporary, aws, durability=durability
+                )
+
+                with self.assertRaisesRegex(
+                    e2e.AmbiguousOwnershipError, "progress"
+                ):
+                    transaction.reconcile(restoration_timeout_seconds=10)
+
+                self.assertFalse(evidence_path.exists())
+                self.assertEqual(durability.writes, [])
+                self.assertEqual(aws.mutation_calls, [])
+
+    def test_durable_validator_accepts_exact_production_probe_shape(self) -> None:
+        evidence = symmetric_route_evidence()
+        west_traversal = next(
+            item
+            for item in evidence["traversals"]
+            if item["source_site"] == "west"
+        )
+        paths = {
+            item["protocol"]: copy.deepcopy(item)
+            for item in west_traversal["probes"]
+            if item["source_role"] == "responder"
+            and item["protocol"] in e2e.TRANSPORT_PROTOCOLS
+        }
+        probe = {
+            **paths["udp"],
+            "succeeded": True,
+            "new_flows": {
+                protocol: {"succeeded": True, "path": path}
+                for protocol, path in paths.items()
+            },
+        }
+        journal = self.pending_journal(
+            RouteTableAWS(self.topology), owner=e2e._route_runner_identity()
+        )
+        journal["status"] = "probe-passed"
+        journal["probe"] = probe
+
+        e2e.GWLBERouteFailover.validate_durable_binding(
+            journal,
+            self.topology,
+            self.vpc_ids,
+            node_ids_by_instance={
+                member.instance_id: f"node-{member.site}-{member.az_key}"
+                for site in e2e.SITES
+                for member in self.topology.site(site).transport_router_fleet
+            },
+        )
+
+    def test_durable_validator_rejects_compact_test_only_probe_shape(self) -> None:
+        journal = self.pending_journal(RouteTableAWS(self.topology))
+        journal["status"] = "probe-passed"
+        journal["probe"] = {
+            "source_transport_router_id": self.alternate.instance_id,
+            "source_transport_eni_id": self.alternate.network_interface_id,
+            "succeeded": True,
+        }
+
+        with self.assertRaisesRegex(
+            e2e.AmbiguousOwnershipError, "progress"
+        ):
+            e2e.GWLBERouteFailover.validate_durable_binding(
+                journal,
+                self.topology,
+                self.vpc_ids,
+                node_hashes_by_instance=transport_node_hashes(self.topology),
+            )
+
+    def test_durable_validator_accepts_shared_restoration_predecessor(self) -> None:
+        journal = self.pending_journal(RouteTableAWS(self.topology))
+        shared_generation = journal["current"]["state_before"]["advertisements"][
+            "generation"
+        ]
+        journal["alternate"]["state_before"]["advertisements"][
+            "generation"
+        ] = shared_generation
+
+        e2e.GWLBERouteFailover.validate_durable_binding(
+            journal,
+            self.topology,
+            self.vpc_ids,
+            node_hashes_by_instance=transport_node_hashes(self.topology),
+        )
+
     def test_local_journal_without_manifest_transaction_is_not_authority(self) -> None:
         aws = RouteTableAWS(self.topology)
         with tempfile.TemporaryDirectory() as temporary:
@@ -2995,7 +4151,7 @@ class GWLBERouteFailoverTest(unittest.TestCase):
                     )
                 self.assertEqual(aws.mutation_calls, [])
 
-    def test_route_journal_and_embedded_probe_redact_credentials(self) -> None:
+    def test_unknown_probe_fields_fail_without_blocking_restoration(self) -> None:
         aws = RouteTableAWS(self.topology)
         with tempfile.TemporaryDirectory() as temporary:
             transaction, _clock, _ready, path = self.failover(temporary, aws)
@@ -3006,18 +4162,20 @@ class GWLBERouteFailoverTest(unittest.TestCase):
                     "token": "tskey-fixture-sensitive-value",
                 }
 
-            result = transaction.replace(
-                self.current,
-                self.alternate,
-                probe=probe,
-                timeout_seconds=10,
-                restoration_timeout_seconds=10,
-            )
+            with self.assertRaisesRegex(e2e.EvidenceError, "durable shape"):
+                transaction.replace(
+                    self.current,
+                    self.alternate,
+                    probe=probe,
+                    timeout_seconds=10,
+                    restoration_timeout_seconds=10,
+                )
             journal = json.loads(path.read_text(encoding="utf-8"))
 
-        self.assertEqual(result["probe"]["token"], "[REDACTED]")
-        self.assertEqual(journal["probe"]["token"], "[REDACTED]")
-        self.assertEqual(e2e.scan_evidence(result), [])
+        self.assert_original_routes(aws)
+        self.assertIsNone(journal["probe"])
+        self.assertEqual(journal["status"], "restored-after-failure")
+        self.assertEqual(journal["failure"]["category"], "EvidenceError")
         self.assertEqual(e2e.scan_evidence(journal), [])
 
 
@@ -3047,7 +4205,7 @@ class RouteMutationAuthorityTest(unittest.TestCase):
         self.assertIn("systemctl stop tailscaled.service", commands[1])
         self.assertFalse(any("aws " in command or "replace-route" in command for command in commands))
 
-    def test_transport_observations_are_fresh_but_mutating_retries_are_deduplicated(self) -> None:
+    def test_transport_control_uses_supported_ssm_arguments_and_host_fencing(self) -> None:
         topology = route_failover_topology()
         member = topology.west.transport_router_fleet[0]
 
@@ -3078,10 +4236,11 @@ class RouteMutationAuthorityTest(unittest.TestCase):
                 comment="fixture transport control",
             )
 
-        tokens = [call["client_token"] for call in operations.base.calls]
-        self.assertEqual(tokens[:4], [None, None, None, None])
-        self.assertIsNotNone(tokens[4])
-        self.assertEqual(tokens[4], tokens[5])
+        self.assertTrue(all("client_token" not in call for call in operations.base.calls))
+        self.assertEqual(
+            [call["command"] for call in operations.base.calls[-2:]],
+            [mutate, mutate],
+        )
 
     def test_ownership_observers_require_running_online_nonexpired_stable_peers(self) -> None:
         topology = route_failover_topology()
@@ -3349,8 +4508,12 @@ class RouteMutationAuthorityTest(unittest.TestCase):
             generation=ledger.begin_generation("abrupt-transport-tcp"),
         )
 
+        probe_timeouts: list[int] = []
+
         def path(_deployment, flow, *, timeout_seconds, exclude_targets=None):
-            del timeout_seconds, exclude_targets
+            del exclude_targets
+            probe_timeouts.append(timeout_seconds)
+            clock.sleep(3)
             if flow.purpose.startswith("graceful-transport"):
                 return {
                     "protocol": flow.protocol,
@@ -3450,6 +4613,7 @@ class RouteMutationAuthorityTest(unittest.TestCase):
             [call.kwargs["failure_mode"] for call in replace.call_args_list],
             ["graceful", "abrupt"],
         )
+        self.assertEqual(probe_timeouts, [10, 7, 10, 7])
         self.assertFalse(any("aws " in command for _member, command in commands))
 
 
@@ -4354,6 +5518,7 @@ class SSMRunnerTest(unittest.TestCase):
         parameters = json.loads(send_args[send_args.index("--parameters") + 1])
         self.assertEqual(parameters["executionTimeout"], ["2"])
         self.assertEqual(parameters["commands"], list(self.command.commands))
+        self.assertNotIn("--client-token", send_args)
         self.assertEqual(self.command.timeout_seconds, 2)
         self.assertEqual(aws.timeouts[0], 0.5)
 
@@ -4363,20 +5528,6 @@ class SSMRunnerTest(unittest.TestCase):
         self.assertEqual(maximum_args[maximum_args.index("--timeout-seconds") + 1], "3600")
         maximum_parameters = json.loads(maximum_args[maximum_args.index("--parameters") + 1])
         self.assertEqual(maximum_parameters["executionTimeout"], ["3600"])
-
-        fenced = e2e.SSMCommand(
-            self.target,
-            ("true",),
-            client_token="env-1234567890abcdef",
-        )
-        runner.send(fenced, timeout_seconds=0.5)
-        fenced_args = aws.calls[2][0]
-        self.assertEqual(
-            fenced_args[fenced_args.index("--client-token") + 1],
-            fenced.client_token,
-        )
-        with self.assertRaisesRegex(e2e.SSMError, "client_token"):
-            e2e.SSMCommand(self.target, ("true",), client_token="unsafe token")
 
     def test_wait_timeout_requests_bounded_cancellation(self) -> None:
         aws = ScriptedAWS(
@@ -7584,25 +8735,68 @@ class ProbeLifecycleTest(unittest.TestCase):
 
 class RunAllCoordinatorTest(unittest.TestCase):
     class Contexts:
+        class Deadline:
+            def __init__(
+                self,
+                owner: "RunAllCoordinatorTest.Contexts",
+                active_seconds: int,
+                cleanup_seconds: int,
+            ) -> None:
+                self.owner = owner
+                self.active_seconds = active_seconds
+                self.cleanup_seconds = cleanup_seconds
+                self.cleanup_started = False
+
+            def __enter__(self) -> "RunAllCoordinatorTest.Contexts.Deadline":
+                self.owner.active_timeouts.append(self.active_seconds)
+                self.owner.events.append("active-enter")
+                return self
+
+            def start_cleanup(self) -> None:
+                if self.cleanup_started:
+                    return
+                self.cleanup_started = True
+                self.owner.cleanup_timeouts.append(self.cleanup_seconds)
+                self.owner.events.extend(["active-exit", "cleanup-enter"])
+
+            def __exit__(self, *_error: Any) -> None:
+                self.owner.events.append(
+                    "cleanup-exit" if self.cleanup_started else "active-exit"
+                )
+                if self.owner.deadline_exit_error is not None:
+                    raise self.owner.deadline_exit_error
+
         def __init__(self) -> None:
             self.locks: list[pathlib.Path] = []
             self.active_timeouts: list[int] = []
             self.cleanup_timeouts: list[int] = []
+            self.events: list[str] = []
+            self.lock_active = False
+            self.deadline_exit_error: BaseException | None = None
 
         @contextlib.contextmanager
         def lock(self, path: pathlib.Path) -> Any:
             self.locks.append(path)
-            yield
+            self.lock_active = True
+            try:
+                yield
+            finally:
+                self.lock_active = False
 
-        @contextlib.contextmanager
-        def timeout(self, seconds: int) -> Any:
-            self.active_timeouts.append(seconds)
-            yield
+        def lifecycle_timeout(
+            self, active_seconds: int, cleanup_seconds: int
+        ) -> "RunAllCoordinatorTest.Contexts.Deadline":
+            return self.Deadline(self, active_seconds, cleanup_seconds)
 
-        @contextlib.contextmanager
-        def cleanup_timeout(self, seconds: int) -> Any:
-            self.cleanup_timeouts.append(seconds)
-            yield
+    @staticmethod
+    def prepare_route_recovery_files(
+        run_dir: pathlib.Path, raw: Mapping[str, Any]
+    ) -> None:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "config.json").write_text("{}\n", encoding="utf-8")
+        (run_dir / "deployment.json").write_text(
+            json.dumps(raw) + "\n", encoding="utf-8"
+        )
 
     def test_lifecycle_proxies_expose_the_live_durable_manifest(self) -> None:
         initial = {"phase": "ready", "tailnet": {"device_ids": {"node-a": "device-a"}}}
@@ -7619,7 +8813,12 @@ class RunAllCoordinatorTest(unittest.TestCase):
         self.assertIs(bounded.manifest, claimed)
 
     def run_coordinator(
-        self, temporary: str, failure: str | None = None
+        self,
+        temporary: str,
+        failure: str | None = None,
+        *,
+        contexts: "RunAllCoordinatorTest.Contexts | None" = None,
+        output: Callable[[e2e.RunAllResult], None] | None = None,
     ) -> tuple[e2e.RunAllResult, FakeRunAllOperations, "RunAllCoordinatorTest.Contexts"]:
         root = pathlib.Path(temporary).resolve()
         run_dir = root / "fixture-run"
@@ -7629,7 +8828,7 @@ class RunAllCoordinatorTest(unittest.TestCase):
             artifact_manifest=(root / "artifacts" / "manifest.json").resolve(),
         )
         operations = FakeRunAllOperations(root, failure)
-        contexts = self.Contexts()
+        contexts = contexts or self.Contexts()
         result = e2e.RunAllCoordinator(
             config=config,
             run_dir=run_dir,
@@ -7639,14 +8838,14 @@ class RunAllCoordinatorTest(unittest.TestCase):
             hard_timeout_seconds=1200,
             readiness_timeout_seconds=300,
             lock_factory=contexts.lock,
-            timeout_factory=contexts.timeout,
-            cleanup_timeout_factory=contexts.cleanup_timeout,
-        ).run()
+            lifecycle_timeout_factory=contexts.lifecycle_timeout,
+        ).run(output=output)
         return result, operations, contexts
 
     def test_nested_cleanup_timer_rearms_the_paused_active_timer(self) -> None:
         alarms: list[int] = []
         current_alarm = 0
+        now = 0.0
         handlers: dict[int, Any] = {
             e2e.signal.SIGALRM: "original-alarm-handler",
             e2e.signal.SIGTERM: "original-term-handler",
@@ -7668,15 +8867,173 @@ class RunAllCoordinatorTest(unittest.TestCase):
             mock.patch.object(e2e.signal, "alarm", side_effect=alarm),
             mock.patch.object(e2e.signal, "getsignal", side_effect=lambda signum: handlers[signum]),
             mock.patch.object(e2e.signal, "signal", side_effect=install),
+            mock.patch.object(e2e.time, "monotonic", side_effect=lambda: now),
             e2e.run_all_hard_timeout(120),
         ):
             self.assertEqual(current_alarm, 120)
             with e2e.cleanup_hard_timeout(30):
                 self.assertEqual(current_alarm, 30)
-            self.assertEqual(current_alarm, 120)
+                now = 7.0
+            self.assertEqual(current_alarm, 113)
 
         self.assertEqual(current_alarm, 0)
-        self.assertEqual(alarms, [0, 120, 0, 30, 0, 120, 0])
+        self.assertEqual(alarms, [0, 120, 0, 30, 0, 113, 0])
+
+    def test_lifecycle_deadline_switches_to_cleanup_without_a_signal_handler_gap(self) -> None:
+        alarms: list[int] = []
+        current_alarm = 0
+        handlers: dict[int, Any] = {
+            e2e.signal.SIGALRM: "original-alarm-handler",
+            e2e.signal.SIGTERM: "original-term-handler",
+        }
+
+        def alarm(seconds: int) -> int:
+            nonlocal current_alarm
+            previous = current_alarm
+            current_alarm = seconds
+            alarms.append(seconds)
+            return previous
+
+        def install(signum: int, handler: Any) -> Any:
+            previous = handlers[signum]
+            handlers[signum] = handler
+            return previous
+
+        with (
+            mock.patch.object(e2e.signal, "alarm", side_effect=alarm),
+            mock.patch.object(
+                e2e.signal,
+                "getsignal",
+                side_effect=lambda signum: handlers[signum],
+            ),
+            mock.patch.object(e2e.signal, "signal", side_effect=install),
+            mock.patch.object(e2e.time, "monotonic", return_value=0.0),
+        ):
+            with e2e.run_all_lifecycle_timeout(120, 30) as deadline:
+                active_term_handler = handlers[e2e.signal.SIGTERM]
+                self.assertNotEqual(active_term_handler, "original-term-handler")
+                self.assertEqual(current_alarm, 120)
+
+                deadline.start_cleanup()
+
+                self.assertIs(handlers[e2e.signal.SIGTERM], active_term_handler)
+                self.assertEqual(current_alarm, 30)
+
+        self.assertEqual(handlers[e2e.signal.SIGTERM], "original-term-handler")
+        self.assertEqual(handlers[e2e.signal.SIGALRM], "original-alarm-handler")
+        self.assertEqual(alarms, [0, 120, 0, 30, 0])
+
+    def test_signal_during_phase_switch_cannot_skip_cleanup(self) -> None:
+        for signal_name in ("alarm", "term"):
+            with self.subTest(signal=signal_name):
+                cleanup_calls: list[str] = []
+                deadline = e2e.run_all_lifecycle_timeout(120, 30)
+
+                class Lifecycle:
+                    def cleanup(self):
+                        cleanup_calls.append("cleanup")
+                        return {"complete": True}
+
+                bounded = e2e._BoundedCleanupLifecycleProxy(
+                    Lifecycle(),
+                    timeout_factory=lambda _seconds: contextlib.nullcontext(),
+                    before_cleanup=deadline.start_cleanup,
+                )
+
+                def run() -> None:
+                    with deadline:
+                        original_arm = deadline._arm
+                        injected = False
+
+                        def arm(seconds: int) -> None:
+                            nonlocal injected
+                            if seconds == 30 and not injected:
+                                injected = True
+                                if signal_name == "alarm":
+                                    deadline._expired(e2e.signal.SIGALRM, None)
+                                else:
+                                    deadline._interrupted(e2e.signal.SIGTERM, None)
+                            original_arm(seconds)
+
+                        deadline._arm = arm
+                        bounded.cleanup()
+
+                if signal_name == "term":
+                    with self.assertRaises(e2e.ProtectedTermination):
+                        run()
+                else:
+                    run()
+
+                self.assertEqual(cleanup_calls, ["cleanup"])
+                self.assertTrue(bounded.cleanup_attempted)
+                if signal_name == "alarm":
+                    self.assertIsInstance(
+                        bounded.deferred_active_error,
+                        e2e.ProtectedHardTimeout,
+                    )
+
+    def test_control_before_signal_mask_remains_retryable(self) -> None:
+        for control in (
+            e2e.ProtectedHardTimeout("injected pre-mask alarm"),
+            e2e.ProtectedTermination("injected pre-mask termination"),
+        ):
+            with self.subTest(control=type(control).__name__):
+                entries = 0
+                cleanup_calls: list[str] = []
+
+                @contextlib.contextmanager
+                def blocked():
+                    nonlocal entries
+                    entries += 1
+                    if entries == 1:
+                        raise control
+                    yield
+
+                bounded = e2e._BoundedCleanupLifecycleProxy(
+                    SimpleNamespace(
+                        cleanup=lambda: cleanup_calls.append("cleanup")
+                        or {"complete": True}
+                    ),
+                    timeout_factory=lambda _seconds: contextlib.nullcontext(),
+                )
+                with mock.patch.object(
+                    e2e,
+                    "_blocked_protected_signals",
+                    side_effect=blocked,
+                ):
+                    bounded.cleanup()
+
+                self.assertEqual(entries, 2)
+                self.assertEqual(cleanup_calls, ["cleanup"])
+                self.assertTrue(bounded.cleanup_attempted)
+                self.assertIs(bounded.deferred_active_error, control)
+
+    def test_run_all_retries_control_before_cleanup_mask(self) -> None:
+        for control in (
+            e2e.ProtectedHardTimeout("injected run-all pre-mask alarm"),
+            e2e.ProtectedTermination("injected run-all pre-mask termination"),
+        ):
+            with self.subTest(control=type(control).__name__):
+                entries = 0
+
+                @contextlib.contextmanager
+                def blocked():
+                    nonlocal entries
+                    entries += 1
+                    if entries == 1:
+                        raise control
+                    yield
+
+                with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+                    e2e,
+                    "_blocked_protected_signals",
+                    side_effect=blocked,
+                ):
+                    result, operations, _contexts = self.run_coordinator(temporary)
+
+                self.assertEqual(result.exit_code, e2e.EXIT_ACCEPTANCE_FAILED)
+                self.assertEqual(operations.cleanup_calls, 1)
+                self.assertEqual(entries, 2)
 
     def test_protected_timeout_reaches_the_outer_coordinator_and_runs_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -7703,6 +9060,10 @@ class RunAllCoordinatorTest(unittest.TestCase):
             self.assertEqual(contexts.locks, [pathlib.Path(temporary).resolve() / "fixture-run"])
             self.assertEqual(contexts.active_timeouts, [1200])
             self.assertEqual(contexts.cleanup_timeouts, [e2e.DEFAULT_TIMEOUTS.cleanup])
+            self.assertEqual(
+                contexts.events,
+                ["active-enter", "active-exit", "cleanup-enter", "cleanup-exit"],
+            )
             self.assertNotIn("whole_timeout_seconds", result.record)
             self.assertEqual([record["name"] for record in result.record["stages"]], list(e2e.RUN_ALL_STAGES))
             self.assertTrue(all(record["status"] == "passed" for record in result.record["stages"]))
@@ -7725,6 +9086,88 @@ class RunAllCoordinatorTest(unittest.TestCase):
             )
             self.assertEqual(json.loads(result.record_path.read_text()), result.record)
             self.assertEqual(stat.S_IMODE(result.record_path.stat().st_mode), 0o600)
+
+    def test_output_waits_for_cleanup_deadline_and_lock_release(self) -> None:
+        contexts = self.Contexts()
+        output_calls: list[int] = []
+
+        def output(result: e2e.RunAllResult) -> None:
+            self.assertFalse(contexts.lock_active)
+            self.assertEqual(contexts.events[-1], "cleanup-exit")
+            output_calls.append(result.exit_code)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            result, operations, _contexts = self.run_coordinator(
+                temporary,
+                contexts=contexts,
+                output=output,
+            )
+
+        self.assertEqual(result.exit_code, e2e.EXIT_OK)
+        self.assertEqual(operations.cleanup_calls, 1)
+        self.assertEqual(output_calls, [e2e.EXIT_OK])
+        self.assertEqual(
+            contexts.events,
+            ["active-enter", "active-exit", "cleanup-enter", "cleanup-exit"],
+        )
+
+    def test_output_timeout_after_cleanup_is_classified_as_cleanup_failure(self) -> None:
+        def output(_result: e2e.RunAllResult) -> None:
+            raise e2e.ProtectedHardTimeout("injected protected output timeout")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            result, operations, contexts = self.run_coordinator(
+                temporary,
+                output=output,
+            )
+
+        self.assertEqual(result.exit_code, e2e.EXIT_CLEANUP_FAILED)
+        self.assertEqual(operations.cleanup_calls, 1)
+        self.assertEqual(result.record["failure"]["stage"], e2e.RUN_ALL_STAGES[-1])
+        self.assertEqual(result.record["failure"]["category"], "ProtectedHardTimeout")
+        self.assertEqual(contexts.events[-1], "cleanup-exit")
+
+    def test_cleanup_deadline_context_exit_failure_is_exit_three(self) -> None:
+        contexts = self.Contexts()
+        contexts.deadline_exit_error = e2e.ProtectedHardTimeout(
+            "injected cleanup deadline exit failure"
+        )
+        output_calls: list[int] = []
+
+        with tempfile.TemporaryDirectory() as temporary:
+            result, operations, _contexts = self.run_coordinator(
+                temporary,
+                contexts=contexts,
+                output=lambda value: output_calls.append(value.exit_code),
+            )
+
+        self.assertEqual(result.exit_code, e2e.EXIT_CLEANUP_FAILED)
+        self.assertEqual(operations.cleanup_calls, 1)
+        self.assertEqual(result.record["failure"]["category"], "ProtectedHardTimeout")
+        self.assertEqual(result.record["cleanup"]["status"], "failed")
+        self.assertEqual(output_calls, [e2e.EXIT_CLEANUP_FAILED])
+
+    def test_outer_teardown_cannot_revoke_committed_terminal_output(self) -> None:
+        output_calls: list[int] = []
+
+        @contextlib.contextmanager
+        def outer_timeout(_seconds: int, **_kwargs: Any):
+            yield
+            raise e2e.ProtectedHardTimeout("injected outer teardown timeout")
+
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            e2e,
+            "hard_timeout",
+            side_effect=outer_timeout,
+        ):
+            result, operations, _contexts = self.run_coordinator(
+                temporary,
+                output=lambda value: output_calls.append(value.exit_code),
+            )
+
+        self.assertEqual(result.exit_code, e2e.EXIT_OK)
+        self.assertEqual(operations.cleanup_calls, 1)
+        self.assertEqual(output_calls, [e2e.EXIT_OK])
 
     def test_each_stage_failure_has_deterministic_exit_and_cleanup_authority(self) -> None:
         cases = {
@@ -7859,6 +9302,35 @@ class RunAllCoordinatorTest(unittest.TestCase):
         self.assertEqual(result.exit_code, e2e.EXIT_OK)
         self.assertEqual(operations.cleanup_calls, 1)
         self.assertEqual(result.record["cleanup"]["status"], "passed")
+
+    def test_cleanup_checkpoint_protected_timeout_is_not_swallowed(self) -> None:
+        persisted = e2e._write_private_json
+        injected = False
+
+        def checkpoint(path, value):
+            nonlocal injected
+            cleanup = value.get("cleanup")
+            if (
+                not injected
+                and isinstance(cleanup, Mapping)
+                and cleanup.get("status") == "running"
+            ):
+                injected = True
+                raise e2e.ProtectedHardTimeout(
+                    "injected cleanup checkpoint hard timeout"
+                )
+            persisted(path, value)
+
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            e2e, "_write_private_json", side_effect=checkpoint
+        ):
+            result, operations, _contexts = self.run_coordinator(temporary)
+
+        self.assertTrue(injected)
+        self.assertEqual(result.exit_code, e2e.EXIT_CLEANUP_FAILED)
+        self.assertEqual(operations.cleanup_calls, 0)
+        self.assertEqual(result.record["failure"]["category"], "ProtectedHardTimeout")
+        self.assertEqual(result.record["cleanup"]["status"], "failed")
 
     def test_nonblocking_or_inexact_inner_metadata_does_not_revoke_cleanup_authority(self) -> None:
         for failure in ("e2e-persistence", "e2e-concurrent-inexact"):
@@ -8063,15 +9535,712 @@ class RunAllCoordinatorTest(unittest.TestCase):
     def test_run_all_cli_defaults_preserve_run_live_as_separate_entry_point(self) -> None:
         args = e2e.build_parser().parse_args(["run-all", "--config", "config.json"])
         self.assertEqual(args.subcommand, "run-all")
-        self.assertEqual(args.hard_timeout_seconds, 5400)
+        self.assertEqual(args.hard_timeout_seconds, 10800)
         self.assertEqual(args.readiness_timeout_seconds, 900)
+        self.assertEqual(e2e.DEFAULT_TIMEOUTS.cleanup, 2400)
+        self.assertEqual(e2e.PROTECTED_RESOURCE_CLEANUP_SECONDS, 900)
+        self.assertEqual(e2e.MAX_PROTECTED_LIFECYCLE_SECONDS, 13200)
         live = e2e.build_parser().parse_args(
             ["run-live", "--config", "config.json", "--deployment", "deployment.json"]
         )
         self.assertEqual(live.subcommand, "run-live")
+        recovery = e2e.build_parser().parse_args(
+            [
+                "recover-route-cleanup",
+                "--config",
+                "config.json",
+                "--deployment",
+                "deployment.json",
+            ]
+        )
+        self.assertEqual(recovery.subcommand, "recover-route-cleanup")
+
+    def test_route_recovery_cleanup_uses_only_abandoned_claim_and_cleanup(self) -> None:
+        raw = route_failover_output()
+        calls: list[object] = []
+
+        class VersionRunner:
+            def run(self, args, **_kwargs):
+                calls.append(list(args))
+                return json.dumps({"terraform_version": e2e.TERRAFORM_CORE_VERSION})
+
+        class Lifecycle:
+            def claim(self, claimed_raw, deployment, *, require_route_recovery=False):
+                calls.append(
+                    ("claim", claimed_raw, deployment.topology.run_id, require_route_recovery)
+                )
+                return {
+                    "route_recovery_required": True,
+                    "claim_id": "11111111-2222-4333-8444-555555555555",
+                    "route_transaction_id": "22222222-3333-4444-8555-666666666666",
+                }
+
+            def cleanup(self):
+                calls.append("cleanup")
+                return {
+                    "final_residual_count": 0,
+                    "route_recovery_before_cleanup": {"restored": True},
+                }
+
+        @contextlib.contextmanager
+        def cleanup_envelope(seconds):
+            calls.append(("cleanup-envelope-enter", seconds))
+            yield
+            calls.append("cleanup-envelope-exit")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            run_root = root / "runs"
+            run_dir = run_root / "fixture-live"
+            self.prepare_route_recovery_files(run_dir, raw)
+            config = SimpleNamespace(
+                run_id="fixture-live",
+                config_identity="c" * 64,
+                oauth_environment_names=(),
+                backend={"bucket": "fixture-backend", "region": "us-west-2"},
+                manifest_key="runs/fixture-live/manifest.json",
+                sites={
+                    "west": {"region": "us-west-2"},
+                    "east": {"region": "us-east-1"},
+                },
+            )
+            args = e2e.build_parser().parse_args(
+                [
+                    "recover-route-cleanup",
+                    "--config",
+                    str(run_dir / "config.json"),
+                    "--deployment",
+                    str(run_dir / "deployment.json"),
+                    "--run-root",
+                    str(run_root),
+                ]
+            )
+            with (
+                mock.patch.object(e2e.RunConfig, "load", return_value=config),
+                mock.patch.object(e2e, "validate_protected_execution"),
+                mock.patch.object(e2e, "_load_json", return_value=raw),
+                mock.patch.object(e2e, "SubprocessRunner", return_value=VersionRunner()),
+                mock.patch.object(e2e, "AwsCLI", return_value=SimpleNamespace()),
+                mock.patch.object(
+                    e2e, "ProtectedLifecycleAdapter", return_value=Lifecycle()
+                ),
+                mock.patch.object(
+                    e2e,
+                    "lifecycle_lock",
+                    side_effect=lambda _path: contextlib.nullcontext(),
+                ),
+                mock.patch.object(
+                    e2e, "delete_exact_object_versions", return_value=[]
+                ),
+                mock.patch.object(
+                    e2e, "cleanup_hard_timeout", side_effect=cleanup_envelope
+                ),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                exit_code = e2e._route_recovery_cleanup_cli(args)
+
+            retained = json.loads(
+                (run_dir / "route-recovery-cleanup-result.json").read_text()
+            )
+            retained_mode = stat.S_IMODE(
+                (run_dir / "route-recovery-cleanup-result.json").stat().st_mode
+            )
+
+        self.assertEqual(exit_code, e2e.EXIT_OK)
+        self.assertEqual(
+            calls[0], ("cleanup-envelope-enter", e2e.DEFAULT_TIMEOUTS.cleanup)
+        )
+        self.assertEqual(calls[1], ["terraform", "version", "-json"])
+        self.assertEqual(calls[2][0], "claim")
+        self.assertIs(calls[2][1], raw)
+        self.assertTrue(calls[2][3])
+        self.assertEqual(calls[3:], ["cleanup", "cleanup-envelope-exit"])
+        self.assertEqual(retained["final_residual_count"], 0)
+        self.assertEqual(retained["cleanup"], "complete")
+        self.assertEqual(retained_mode, 0o600)
+        self.assertEqual(json.loads(stdout.getvalue()), retained)
+
+    def test_route_recovery_cleanup_failures_return_cleanup_exit_code(self) -> None:
+        raw = route_failover_output()
+
+        class VersionRunner:
+            @staticmethod
+            def run(_args, **_kwargs):
+                return json.dumps({"terraform_version": e2e.TERRAFORM_CORE_VERSION})
+
+        class Lifecycle:
+            def __init__(self, cleanup):
+                self.cleanup_result = cleanup
+
+            @staticmethod
+            def claim(_raw, _deployment, *, require_route_recovery=False):
+                if not require_route_recovery:
+                    raise AssertionError("route-only claim was not required")
+                return {
+                    "route_recovery_required": True,
+                    "claim_id": "11111111-2222-4333-8444-555555555555",
+                    "route_transaction_id": "22222222-3333-4444-8555-666666666666",
+                }
+
+            def cleanup(self):
+                if isinstance(self.cleanup_result, BaseException):
+                    raise self.cleanup_result
+                return self.cleanup_result
+
+        cases = {
+            "cleanup-error": RuntimeError("fixture cleanup failed"),
+            "restoration-unverified": {
+                "final_residual_count": 0,
+                "route_recovery_before_cleanup": {"restored": False},
+            },
+            "residual": {
+                "final_residual_count": 1,
+                "route_recovery_before_cleanup": {"restored": True},
+            },
+            "missing-final-residual": {
+                "route_recovery_before_cleanup": {"restored": True},
+            },
+            "legacy-residual-only": {
+                "residual_count": 0,
+                "route_recovery_before_cleanup": {"restored": True},
+            },
+            "boolean-residual": {
+                "final_residual_count": False,
+                "route_recovery_before_cleanup": {"restored": True},
+            },
+            "float-residual": {
+                "final_residual_count": 0.0,
+                "route_recovery_before_cleanup": {"restored": True},
+            },
+            "string-residual": {
+                "final_residual_count": "0",
+                "route_recovery_before_cleanup": {"restored": True},
+            },
+            "keyboard-interrupt": KeyboardInterrupt("fixture cleanup interrupt"),
+            "system-exit": SystemExit("fixture cleanup exit"),
+        }
+        for name, cleanup in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary).resolve()
+                run_root = root / "runs"
+                run_dir = run_root / "fixture-live"
+                self.prepare_route_recovery_files(run_dir, raw)
+                config = SimpleNamespace(
+                    run_id="fixture-live",
+                    config_identity="c" * 64,
+                    oauth_environment_names=(),
+                    backend={
+                        "bucket": "fixture-backend",
+                        "region": "us-west-2",
+                    },
+                    manifest_key="runs/fixture-live/manifest.json",
+                    sites={
+                        "west": {"region": "us-west-2"},
+                        "east": {"region": "us-east-1"},
+                    },
+                )
+                args = e2e.build_parser().parse_args(
+                    [
+                        "recover-route-cleanup",
+                        "--config",
+                        str(run_dir / "config.json"),
+                        "--deployment",
+                        str(run_dir / "deployment.json"),
+                        "--run-root",
+                        str(run_root),
+                    ]
+                )
+                with (
+                    mock.patch.object(e2e.RunConfig, "load", return_value=config),
+                    mock.patch.object(e2e, "validate_protected_execution"),
+                    mock.patch.object(e2e, "_load_json", return_value=raw),
+                    mock.patch.object(
+                        e2e, "SubprocessRunner", return_value=VersionRunner()
+                    ),
+                    mock.patch.object(e2e, "AwsCLI", return_value=SimpleNamespace()),
+                    mock.patch.object(
+                        e2e,
+                        "ProtectedLifecycleAdapter",
+                        return_value=Lifecycle(cleanup),
+                    ),
+                    mock.patch.object(
+                        e2e,
+                        "lifecycle_lock",
+                        side_effect=lambda _path: contextlib.nullcontext(),
+                    ),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    exit_code = e2e._route_recovery_cleanup_cli(args)
+
+                self.assertEqual(exit_code, e2e.EXIT_CLEANUP_FAILED)
+                self.assertFalse(
+                    (run_dir / "route-recovery-cleanup-result.json").exists()
+                )
+
+    def test_route_recovery_post_claim_failures_run_cleanup_and_return_three(self) -> None:
+        raw = route_failover_output()
+
+        class VersionRunner:
+            @staticmethod
+            def run(_args, **_kwargs):
+                return json.dumps(
+                    {"terraform_version": e2e.TERRAFORM_CORE_VERSION}
+                )
+
+        valid_claim = {
+            "route_recovery_required": True,
+            "claim_id": "11111111-2222-4333-8444-555555555555",
+            "route_transaction_id": "22222222-3333-4444-8555-666666666666",
+        }
+        for stage in ("invalid-claim-summary", "backend-delete", "result-write"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary).resolve()
+                run_root = root / "runs"
+                run_dir = run_root / "fixture-live"
+                self.prepare_route_recovery_files(run_dir, raw)
+                cleanup_calls: list[str] = []
+
+                class Lifecycle:
+                    @staticmethod
+                    def claim(_raw, _deployment, *, require_route_recovery=False):
+                        if not require_route_recovery:
+                            raise AssertionError("route-only claim was not required")
+                        if stage == "invalid-claim-summary":
+                            return {
+                                **valid_claim,
+                                "route_recovery_required": False,
+                            }
+                        return valid_claim
+
+                    @staticmethod
+                    def cleanup():
+                        cleanup_calls.append("cleanup")
+                        return {
+                            "final_residual_count": 0,
+                            "route_recovery_before_cleanup": {"restored": True},
+                        }
+
+                config = SimpleNamespace(
+                    run_id="fixture-live",
+                    config_identity="c" * 64,
+                    oauth_environment_names=(),
+                    backend={
+                        "bucket": "fixture-backend",
+                        "region": "us-west-2",
+                    },
+                    manifest_key="runs/fixture-live/manifest.json",
+                    sites={
+                        "west": {"region": "us-west-2"},
+                        "east": {"region": "us-east-1"},
+                    },
+                )
+                args = e2e.build_parser().parse_args(
+                    [
+                        "recover-route-cleanup",
+                        "--config",
+                        str(run_dir / "config.json"),
+                        "--deployment",
+                        str(run_dir / "deployment.json"),
+                        "--run-root",
+                        str(run_root),
+                    ]
+                )
+                delete = (
+                    mock.patch.object(
+                        e2e,
+                        "delete_exact_object_versions",
+                        side_effect=RuntimeError("fixture backend deletion failed"),
+                    )
+                    if stage == "backend-delete"
+                    else mock.patch.object(
+                        e2e, "delete_exact_object_versions", return_value=[]
+                    )
+                )
+                write = (
+                    mock.patch.object(
+                        e2e,
+                        "_write_private_json",
+                        side_effect=OSError("fixture result persistence failed"),
+                    )
+                    if stage == "result-write"
+                    else contextlib.nullcontext()
+                )
+                with (
+                    mock.patch.object(e2e.RunConfig, "load", return_value=config),
+                    mock.patch.object(e2e, "validate_protected_execution"),
+                    mock.patch.object(e2e, "_load_json", return_value=raw),
+                    mock.patch.object(
+                        e2e, "SubprocessRunner", return_value=VersionRunner()
+                    ),
+                    mock.patch.object(e2e, "AwsCLI", return_value=SimpleNamespace()),
+                    mock.patch.object(
+                        e2e, "ProtectedLifecycleAdapter", return_value=Lifecycle()
+                    ),
+                    mock.patch.object(
+                        e2e,
+                        "lifecycle_lock",
+                        side_effect=lambda _path: contextlib.nullcontext(),
+                    ),
+                    delete,
+                    write,
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    exit_code = e2e._route_recovery_cleanup_cli(args)
+
+                self.assertEqual(exit_code, e2e.EXIT_CLEANUP_FAILED)
+                self.assertEqual(cleanup_calls, ["cleanup"])
+                self.assertFalse(
+                    (run_dir / "route-recovery-cleanup-result.json").exists()
+                )
+
+    def test_route_recovery_classifies_lock_exit_and_stdout_after_claim(self) -> None:
+        raw = route_failover_output()
+
+        class VersionRunner:
+            @staticmethod
+            def run(_args, **_kwargs):
+                return json.dumps(
+                    {"terraform_version": e2e.TERRAFORM_CORE_VERSION}
+                )
+
+        class Lifecycle:
+            @staticmethod
+            def claim(_raw, _deployment, *, require_route_recovery=False):
+                return {
+                    "route_recovery_required": require_route_recovery,
+                    "claim_id": "11111111-2222-4333-8444-555555555555",
+                    "route_transaction_id": "22222222-3333-4444-8555-666666666666",
+                }
+
+            @staticmethod
+            def cleanup():
+                return {
+                    "final_residual_count": 0,
+                    "route_recovery_before_cleanup": {"restored": True},
+                }
+
+        failures = (
+            ("lock", KeyboardInterrupt("lock exit interrupt")),
+            ("lock", SystemExit("lock exit system exit")),
+            ("lock", OSError("lock exit failure")),
+            ("stdout", KeyboardInterrupt("stdout interrupt")),
+            ("stdout", SystemExit("stdout system exit")),
+            ("stdout", OSError("stdout failure")),
+        )
+        for boundary, failure in failures:
+            with self.subTest(
+                boundary=boundary, category=type(failure).__name__
+            ), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary).resolve()
+                run_root = root / "runs"
+                run_dir = run_root / "fixture-live"
+                self.prepare_route_recovery_files(run_dir, raw)
+                config = SimpleNamespace(
+                    run_id="fixture-live",
+                    config_identity="c" * 64,
+                    oauth_environment_names=(),
+                    backend={
+                        "bucket": "fixture-backend",
+                        "region": "us-west-2",
+                    },
+                    manifest_key="runs/fixture-live/manifest.json",
+                    sites={
+                        "west": {"region": "us-west-2"},
+                        "east": {"region": "us-east-1"},
+                    },
+                )
+                args = e2e.build_parser().parse_args(
+                    [
+                        "recover-route-cleanup",
+                        "--config",
+                        str(run_dir / "config.json"),
+                        "--deployment",
+                        str(run_dir / "deployment.json"),
+                        "--run-root",
+                        str(run_root),
+                    ]
+                )
+
+                @contextlib.contextmanager
+                def lock(_path):
+                    yield
+                    if boundary == "lock":
+                        raise failure
+
+                output = (
+                    mock.patch(
+                        "builtins.print", side_effect=failure
+                    )
+                    if boundary == "stdout"
+                    else contextlib.nullcontext()
+                )
+                with (
+                    mock.patch.object(e2e.RunConfig, "load", return_value=config),
+                    mock.patch.object(e2e, "validate_protected_execution"),
+                    mock.patch.object(
+                        e2e, "SubprocessRunner", return_value=VersionRunner()
+                    ),
+                    mock.patch.object(e2e, "AwsCLI", return_value=SimpleNamespace()),
+                    mock.patch.object(
+                        e2e, "ProtectedLifecycleAdapter", return_value=Lifecycle()
+                    ),
+                    mock.patch.object(e2e, "lifecycle_lock", side_effect=lock),
+                    mock.patch.object(
+                        e2e, "delete_exact_object_versions", return_value=[]
+                    ),
+                    output,
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    exit_code = e2e._route_recovery_cleanup_cli(args)
+
+                self.assertEqual(exit_code, e2e.EXIT_CLEANUP_FAILED)
+                if boundary == "lock":
+                    self.assertFalse(
+                        (run_dir / "route-recovery-cleanup-result.json").exists()
+                    )
+
+    def test_route_recovery_pending_receipt_resumes_only_backend_finalization(self) -> None:
+        raw = route_failover_output()
+
+        class VersionRunner:
+            @staticmethod
+            def run(_args, **_kwargs):
+                raise AssertionError(
+                    "receipt-only backend finalization invoked Terraform"
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            run_root = root / "runs"
+            run_dir = run_root / "fixture-live"
+            self.prepare_route_recovery_files(run_dir, raw)
+            config = SimpleNamespace(
+                run_id="fixture-live",
+                config_identity="c" * 64,
+                oauth_environment_names=(),
+                backend={
+                    "bucket": "fixture-backend",
+                    "region": "us-west-2",
+                },
+                manifest_key="runs/fixture-live/manifest.json",
+                sites={
+                    "west": {"region": "us-west-2"},
+                    "east": {"region": "us-east-1"},
+                },
+            )
+            receipt_path = run_dir / "route-recovery-cleanup-result.json"
+            e2e._write_private_json(
+                receipt_path,
+                e2e._new_route_recovery_receipt(
+                    config,
+                    raw,
+                    claim_id="11111111-2222-4333-8444-555555555555",
+                    transaction_id="22222222-3333-4444-8555-666666666666",
+                    cleanup_result={"final_residual_count": 0},
+                    cleanup="backend-finalization-pending",
+                ),
+            )
+            args = e2e.build_parser().parse_args(
+                [
+                    "recover-route-cleanup",
+                    "--config",
+                    str(run_dir / "config.json"),
+                    "--deployment",
+                    str(run_dir / "deployment.json"),
+                    "--run-root",
+                    str(run_root),
+                ]
+            )
+            with (
+                mock.patch.object(e2e.RunConfig, "load", return_value=config),
+                mock.patch.object(e2e, "validate_protected_execution"),
+                mock.patch.object(
+                    e2e, "SubprocessRunner", return_value=VersionRunner()
+                ),
+                mock.patch.object(e2e, "AwsCLI", return_value=SimpleNamespace()),
+                mock.patch.object(
+                    e2e,
+                    "ProtectedLifecycleAdapter",
+                    side_effect=AssertionError("acceptance lifecycle was reconstructed"),
+                ),
+                mock.patch.object(
+                    e2e,
+                    "lifecycle_lock",
+                    side_effect=lambda _path: contextlib.nullcontext(),
+                ),
+                mock.patch.object(
+                    e2e, "delete_exact_object_versions", return_value=[]
+                ) as delete,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                exit_code = e2e._route_recovery_cleanup_cli(args)
+
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt_mode = stat.S_IMODE(receipt_path.stat().st_mode)
+
+        self.assertEqual(exit_code, e2e.EXIT_OK)
+        self.assertEqual(receipt["cleanup"], "complete")
+        self.assertEqual(receipt_mode, 0o600)
+        delete.assert_called_once_with(
+            mock.ANY,
+            bucket="fixture-backend",
+            key="runs/fixture-live/manifest.json",
+            region="us-west-2",
+            dry_run=False,
+        )
+
+    def test_private_json_requires_parent_directory_fsync(self) -> None:
+        real_fsync = os.fsync
+        fsync_kinds: list[str] = []
+
+        def fsync(descriptor):
+            kind = "directory" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file"
+            fsync_kinds.append(kind)
+            if kind == "directory":
+                raise OSError("fixture directory fsync failed")
+            return real_fsync(descriptor)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "receipt.json"
+            with mock.patch.object(e2e.os, "fsync", side_effect=fsync):
+                with self.assertRaisesRegex(OSError, "directory fsync"):
+                    e2e._write_private_json(path, {"safe": True})
+            mode = stat.S_IMODE(path.stat().st_mode)
+
+        self.assertEqual(fsync_kinds, ["file", "directory"])
+        self.assertEqual(mode, 0o600)
+
+    def test_route_recovery_rejects_symlinked_run_directory_before_tools(self) -> None:
+        config = SimpleNamespace(run_id="fixture-live")
+        for destination in ("sibling", "outside"):
+            with self.subTest(destination=destination), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary).resolve()
+                run_root = root / "runs"
+                run_root.mkdir()
+                target = (
+                    run_root / "another-run"
+                    if destination == "sibling"
+                    else root / "outside-run"
+                )
+                target.mkdir()
+                alias = run_root / "fixture-live"
+                alias.symlink_to(target, target_is_directory=True)
+                args = e2e.build_parser().parse_args(
+                    [
+                        "recover-route-cleanup",
+                        "--config",
+                        str(alias / "config.json"),
+                        "--deployment",
+                        str(alias / "deployment.json"),
+                        "--run-root",
+                        str(run_root),
+                    ]
+                )
+                with (
+                    mock.patch.object(e2e.RunConfig, "load", return_value=config),
+                    mock.patch.object(e2e, "validate_protected_execution"),
+                    mock.patch.object(
+                        e2e,
+                        "SubprocessRunner",
+                        side_effect=AssertionError("Terraform tool was constructed"),
+                    ),
+                ):
+                    with self.assertRaisesRegex(e2e.E2EError, "symlinked path component"):
+                        e2e._route_recovery_cleanup_cli(args)
+
+    def test_route_recovery_rejects_all_path_and_lock_symlinks_before_tools(self) -> None:
+        raw = route_failover_output()
+        config = SimpleNamespace(
+            run_id="fixture-live",
+            sites={
+                "west": {"region": "us-west-2"},
+                "east": {"region": "us-east-1"},
+            },
+        )
+        for kind in (
+            "run-root",
+            "config",
+            "deployment",
+            "receipt",
+            "lifecycle-lock",
+        ):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary).resolve()
+                real_run_root = root / "runs"
+                run_dir = real_run_root / "fixture-live"
+                self.prepare_route_recovery_files(run_dir, raw)
+                selected_run_root = real_run_root
+                if kind == "run-root":
+                    selected_run_root = root / "runs-alias"
+                    selected_run_root.symlink_to(
+                        real_run_root, target_is_directory=True
+                    )
+                elif kind == "config":
+                    (run_dir / "config.json").unlink()
+                    target = run_dir / "config-target.json"
+                    target.write_text("{}\n", encoding="utf-8")
+                    (run_dir / "config.json").symlink_to(target)
+                elif kind == "deployment":
+                    (run_dir / "deployment.json").unlink()
+                    target = run_dir / "deployment-target.json"
+                    target.write_text(json.dumps(raw) + "\n", encoding="utf-8")
+                    (run_dir / "deployment.json").symlink_to(target)
+                elif kind == "receipt":
+                    target = run_dir / "receipt-target.json"
+                    target.write_text("{}\n", encoding="utf-8")
+                    (run_dir / "route-recovery-cleanup-result.json").symlink_to(
+                        target
+                    )
+                else:
+                    target = run_dir / "lock-target"
+                    target.write_text("unchanged\n", encoding="utf-8")
+                    (run_dir / "lifecycle.lock").symlink_to(target)
+                args = e2e.build_parser().parse_args(
+                    [
+                        "recover-route-cleanup",
+                        "--config",
+                        str(selected_run_root / "fixture-live" / "config.json"),
+                        "--deployment",
+                        str(
+                            selected_run_root
+                            / "fixture-live"
+                            / "deployment.json"
+                        ),
+                        "--run-root",
+                        str(selected_run_root),
+                    ]
+                )
+                with (
+                    mock.patch.object(e2e.RunConfig, "load", return_value=config),
+                    mock.patch.object(e2e, "validate_protected_execution"),
+                    mock.patch.object(
+                        e2e,
+                        "SubprocessRunner",
+                        side_effect=AssertionError("Terraform tool was constructed"),
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        (e2e.E2EError, e2e.LifecycleError),
+                        "symlink|must not be a symlink",
+                    ):
+                        e2e._route_recovery_cleanup_cli(args)
+                if kind == "lifecycle-lock":
+                    self.assertEqual(target.read_text(encoding="utf-8"), "unchanged\n")
 
     def test_run_live_malformed_deployment_still_cleans_up_and_writes_schema_three(self) -> None:
         cleanup_calls: list[str] = []
+
+        class Deadline:
+            cleanup_started = False
+
+            def __enter__(self):
+                return self
+
+            def start_cleanup(self):
+                self.cleanup_started = True
+
+            def __exit__(self, *_error):
+                return None
 
         class Lifecycle:
             def cleanup(self):
@@ -8101,7 +10270,7 @@ class RunAllCoordinatorTest(unittest.TestCase):
                     "--run-root",
                     str(run_root),
                     "--hard-timeout-seconds",
-                    "1200",
+                    "2400",
                 ]
             )
             with (
@@ -8115,8 +10284,8 @@ class RunAllCoordinatorTest(unittest.TestCase):
                 mock.patch.object(e2e, "lifecycle_lock", side_effect=lambda _path: contextlib.nullcontext()),
                 mock.patch.object(
                     e2e,
-                    "hard_timeout",
-                    side_effect=lambda _seconds, **_kwargs: contextlib.nullcontext(),
+                    "live_lifecycle_timeout",
+                    return_value=Deadline(),
                 ),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
@@ -8132,7 +10301,26 @@ class RunAllCoordinatorTest(unittest.TestCase):
 
     def test_run_live_control_flow_uses_the_separate_cleanup_reservation(self) -> None:
         cleanup_calls: list[str] = []
+        timeout_events: list[str] = []
         control = e2e.ProtectedTermination("injected direct-live termination")
+
+        class Deadline:
+            cleanup_started = False
+
+            def __enter__(self):
+                timeout_events.append("active-enter")
+                return self
+
+            def start_cleanup(self):
+                if self.cleanup_started:
+                    return
+                self.cleanup_started = True
+                timeout_events.extend(["active-exit", "cleanup-enter"])
+
+            def __exit__(self, *_error):
+                timeout_events.append(
+                    "cleanup-exit" if self.cleanup_started else "active-exit"
+                )
 
         class Lifecycle:
             def cleanup(self):
@@ -8168,7 +10356,7 @@ class RunAllCoordinatorTest(unittest.TestCase):
                     "--run-root",
                     str(root / "runs"),
                     "--hard-timeout-seconds",
-                    "1200",
+                    "2400",
                 ]
             )
             with (
@@ -8185,19 +10373,379 @@ class RunAllCoordinatorTest(unittest.TestCase):
                 ),
                 mock.patch.object(
                     e2e,
-                    "hard_timeout",
-                    side_effect=lambda _seconds, **_kwargs: contextlib.nullcontext(),
+                    "live_lifecycle_timeout",
+                    return_value=Deadline(),
+                ),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                exit_code = e2e._live_cli(args)
+
+        self.assertEqual(exit_code, e2e.EXIT_ACCEPTANCE_FAILED)
+        self.assertEqual(cleanup_calls, ["cleanup"])
+        self.assertEqual(
+            timeout_events,
+            ["active-enter", "active-exit", "cleanup-enter", "cleanup-exit"],
+        )
+
+    def test_run_live_cleanup_control_flow_is_exit_three(self) -> None:
+        cleanup_calls: list[str] = []
+        active_control = e2e.ProtectedTermination("injected direct-live termination")
+        cleanup_control = e2e.ProtectedHardTimeout("injected direct-live cleanup timeout")
+
+        class Deadline:
+            cleanup_started = False
+
+            def __enter__(self):
+                return self
+
+            def start_cleanup(self):
+                self.cleanup_started = True
+
+            def __exit__(self, *_error):
+                return None
+
+        class Lifecycle:
+            def cleanup(self):
+                cleanup_calls.append("cleanup")
+                raise cleanup_control
+
+        class Runner:
+            @staticmethod
+            def run():
+                raise active_control
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            config = SimpleNamespace(
+                run_id="fixture-live",
+                expires_at=(dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=3))
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                oauth_environment_names=(),
+                sites={
+                    "west": {"region": "us-west-2"},
+                    "east": {"region": "us-east-1"},
+                },
+            )
+            args = e2e.build_parser().parse_args(
+                [
+                    "run-live",
+                    "--config",
+                    str(root / "config.json"),
+                    "--deployment",
+                    str(root / "deployment.json"),
+                    "--run-root",
+                    str(root / "runs"),
+                    "--hard-timeout-seconds",
+                    "2400",
+                ]
+            )
+            with (
+                mock.patch.object(e2e.RunConfig, "load", return_value=config),
+                mock.patch.object(e2e, "validate_protected_execution"),
+                mock.patch.object(e2e, "SubprocessRunner", return_value=SimpleNamespace()),
+                mock.patch.object(e2e, "AwsCLI", return_value=SimpleNamespace()),
+                mock.patch.object(e2e, "ProtectedLifecycleAdapter", return_value=Lifecycle()),
+                mock.patch.object(e2e, "AwsSymmetricLiveOperations", return_value=SimpleNamespace()),
+                mock.patch.object(e2e, "SymmetricTwoRegionE2ERunner", return_value=Runner()),
+                mock.patch.object(e2e, "_load_json", return_value={}),
+                mock.patch.object(
+                    e2e, "lifecycle_lock", side_effect=lambda _path: contextlib.nullcontext()
                 ),
                 mock.patch.object(
                     e2e,
-                    "cleanup_hard_timeout",
-                    side_effect=lambda _seconds: contextlib.nullcontext(),
+                    "live_lifecycle_timeout",
+                    return_value=Deadline(),
                 ),
+                contextlib.redirect_stderr(io.StringIO()),
             ):
-                with self.assertRaises(e2e.ProtectedTermination) as raised:
-                    e2e._live_cli(args)
+                exit_code = e2e._live_cli(args)
 
-        self.assertIs(raised.exception, control)
+        self.assertEqual(exit_code, e2e.EXIT_CLEANUP_FAILED)
+        self.assertEqual(cleanup_calls, ["cleanup"])
+
+    def test_run_live_protected_error_after_cleanup_is_exit_three(self) -> None:
+        cleanup_calls: list[str] = []
+        post_cleanup_control = e2e.ProtectedHardTimeout(
+            "injected post-cleanup evidence timeout"
+        )
+
+        class Deadline:
+            cleanup_started = False
+
+            def __enter__(self):
+                return self
+
+            def start_cleanup(self):
+                self.cleanup_started = True
+
+            def __exit__(self, *_error):
+                return None
+
+        class Lifecycle:
+            def cleanup(self):
+                cleanup_calls.append("cleanup")
+                return {"final_residual_count": 0}
+
+        class Runner:
+            def __init__(self, bounded_lifecycle):
+                self.bounded_lifecycle = bounded_lifecycle
+
+            def run(self):
+                self.bounded_lifecycle.cleanup()
+                raise post_cleanup_control
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            config = SimpleNamespace(
+                run_id="fixture-live",
+                expires_at=(dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=3))
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                oauth_environment_names=(),
+                sites={
+                    "west": {"region": "us-west-2"},
+                    "east": {"region": "us-east-1"},
+                },
+            )
+            args = e2e.build_parser().parse_args(
+                [
+                    "run-live",
+                    "--config",
+                    str(root / "config.json"),
+                    "--deployment",
+                    str(root / "deployment.json"),
+                    "--run-root",
+                    str(root / "runs"),
+                    "--hard-timeout-seconds",
+                    "2400",
+                ]
+            )
+            with (
+                mock.patch.object(e2e.RunConfig, "load", return_value=config),
+                mock.patch.object(e2e, "validate_protected_execution"),
+                mock.patch.object(e2e, "SubprocessRunner", return_value=SimpleNamespace()),
+                mock.patch.object(e2e, "AwsCLI", return_value=SimpleNamespace()),
+                mock.patch.object(e2e, "ProtectedLifecycleAdapter", return_value=Lifecycle()),
+                mock.patch.object(e2e, "AwsSymmetricLiveOperations", return_value=SimpleNamespace()),
+                mock.patch.object(
+                    e2e,
+                    "SymmetricTwoRegionE2ERunner",
+                    side_effect=lambda **kwargs: Runner(kwargs["lifecycle"]),
+                ),
+                mock.patch.object(e2e, "_load_json", return_value={}),
+                mock.patch.object(
+                    e2e, "lifecycle_lock", side_effect=lambda _path: contextlib.nullcontext()
+                ),
+                mock.patch.object(
+                    e2e,
+                    "live_lifecycle_timeout",
+                    return_value=Deadline(),
+                ),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                exit_code = e2e._live_cli(args)
+
+        self.assertEqual(exit_code, e2e.EXIT_CLEANUP_FAILED)
+        self.assertEqual(cleanup_calls, ["cleanup"])
+
+    def test_run_live_cleanup_deadline_exit_failure_is_exit_three(self) -> None:
+        cleanup_calls: list[str] = []
+        active_control = e2e.ProtectedTermination("injected direct-live termination")
+
+        class Deadline:
+            cleanup_started = False
+
+            def __enter__(self):
+                return self
+
+            def start_cleanup(self):
+                self.cleanup_started = True
+
+            def __exit__(self, *_error):
+                if self.cleanup_started:
+                    raise e2e.ProtectedHardTimeout(
+                        "injected direct-live deadline exit failure"
+                    )
+                return None
+
+        class Lifecycle:
+            def cleanup(self):
+                cleanup_calls.append("cleanup")
+                return {"final_residual_count": 0}
+
+        class Runner:
+            @staticmethod
+            def run():
+                raise active_control
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            config = SimpleNamespace(
+                run_id="fixture-live",
+                expires_at=(dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=3))
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                oauth_environment_names=(),
+                sites={
+                    "west": {"region": "us-west-2"},
+                    "east": {"region": "us-east-1"},
+                },
+            )
+            args = e2e.build_parser().parse_args(
+                [
+                    "run-live",
+                    "--config",
+                    str(root / "config.json"),
+                    "--deployment",
+                    str(root / "deployment.json"),
+                    "--run-root",
+                    str(root / "runs"),
+                    "--hard-timeout-seconds",
+                    "2400",
+                ]
+            )
+            with (
+                mock.patch.object(e2e.RunConfig, "load", return_value=config),
+                mock.patch.object(e2e, "validate_protected_execution"),
+                mock.patch.object(e2e, "SubprocessRunner", return_value=SimpleNamespace()),
+                mock.patch.object(e2e, "AwsCLI", return_value=SimpleNamespace()),
+                mock.patch.object(e2e, "ProtectedLifecycleAdapter", return_value=Lifecycle()),
+                mock.patch.object(e2e, "AwsSymmetricLiveOperations", return_value=SimpleNamespace()),
+                mock.patch.object(e2e, "SymmetricTwoRegionE2ERunner", return_value=Runner()),
+                mock.patch.object(e2e, "_load_json", return_value={}),
+                mock.patch.object(
+                    e2e, "lifecycle_lock", side_effect=lambda _path: contextlib.nullcontext()
+                ),
+                mock.patch.object(
+                    e2e,
+                    "live_lifecycle_timeout",
+                    return_value=Deadline(),
+                ),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                exit_code = e2e._live_cli(args)
+
+        self.assertEqual(exit_code, e2e.EXIT_CLEANUP_FAILED)
+        self.assertEqual(cleanup_calls, ["cleanup"])
+
+    def test_run_live_output_failure_quarantines_passing_evidence(self) -> None:
+        cleanup_calls: list[str] = []
+
+        class Deadline:
+            cleanup_started = False
+
+            def __enter__(self):
+                return self
+
+            def start_cleanup(self):
+                self.cleanup_started = True
+
+            def __exit__(self, *_error):
+                return None
+
+        class Lifecycle:
+            def cleanup(self):
+                cleanup_calls.append("cleanup")
+                return {"final_residual_count": 0}
+
+        class Runner:
+            def __init__(self, bounded_lifecycle, evidence_path):
+                self.bounded_lifecycle = bounded_lifecycle
+                self.evidence_path = evidence_path
+
+            def run(self):
+                self.bounded_lifecycle.cleanup()
+                self.evidence_path.parent.mkdir(parents=True, exist_ok=True)
+                evidence = {"status": "passed"}
+                self.evidence_path.write_text(json.dumps(evidence) + "\n")
+                return e2e.LiveRunResult(
+                    e2e.EXIT_OK,
+                    self.evidence_path,
+                    evidence,
+                )
+
+        def terminal_output(*_args, **kwargs):
+            if kwargs.get("file") is sys.stderr:
+                return None
+            raise OSError("injected terminal output failure")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            run_root = root / "runs"
+            evidence_path = (
+                run_root
+                / "fixture-live"
+                / "aws-two-region-e2e-evidence.json"
+            )
+            config = SimpleNamespace(
+                run_id="fixture-live",
+                expires_at=(dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=3))
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                oauth_environment_names=(),
+                sites={
+                    "west": {"region": "us-west-2"},
+                    "east": {"region": "us-east-1"},
+                },
+            )
+            args = e2e.build_parser().parse_args(
+                [
+                    "run-live",
+                    "--config",
+                    str(root / "config.json"),
+                    "--deployment",
+                    str(root / "deployment.json"),
+                    "--run-root",
+                    str(run_root),
+                    "--hard-timeout-seconds",
+                    "2400",
+                ]
+            )
+            with (
+                mock.patch.object(e2e.RunConfig, "load", return_value=config),
+                mock.patch.object(e2e, "validate_protected_execution"),
+                mock.patch.object(e2e, "SubprocessRunner", return_value=SimpleNamespace()),
+                mock.patch.object(e2e, "AwsCLI", return_value=SimpleNamespace()),
+                mock.patch.object(e2e, "ProtectedLifecycleAdapter", return_value=Lifecycle()),
+                mock.patch.object(e2e, "AwsSymmetricLiveOperations", return_value=SimpleNamespace()),
+                mock.patch.object(
+                    e2e,
+                    "SymmetricTwoRegionE2ERunner",
+                    side_effect=lambda **kwargs: Runner(
+                        kwargs["lifecycle"],
+                        kwargs["evidence_path"],
+                    ),
+                ),
+                mock.patch.object(e2e, "_load_json", return_value={}),
+                mock.patch.object(
+                    e2e, "lifecycle_lock", side_effect=lambda _path: contextlib.nullcontext()
+                ),
+                mock.patch.object(
+                    e2e,
+                    "live_lifecycle_timeout",
+                    return_value=Deadline(),
+                ),
+                mock.patch.object(
+                    e2e,
+                    "_rewrite_symmetric_cleanup_failure",
+                    side_effect=e2e.EvidenceError("injected evidence rewrite failure"),
+                ),
+                mock.patch("builtins.print", side_effect=terminal_output),
+            ):
+                exit_code = e2e._live_cli(args)
+
+            quarantine = evidence_path.with_name(
+                f".{evidence_path.name}.invalidated"
+            )
+            self.assertFalse(evidence_path.exists())
+            self.assertTrue(quarantine.is_file())
+
+        self.assertEqual(exit_code, e2e.EXIT_CLEANUP_FAILED)
         self.assertEqual(cleanup_calls, ["cleanup"])
 
     def test_authorized_run_all_bootstrap_failures_write_only_a_minimal_private_record(self) -> None:
@@ -8210,7 +10758,7 @@ class RunAllCoordinatorTest(unittest.TestCase):
         def config(
             run_id: str = approved,
             *,
-            ttl_seconds: int = 10_000,
+            ttl_seconds: int = 20_000,
             recovery_timeout_seconds: int = 300,
         ) -> Any:
             return SimpleNamespace(
@@ -8246,9 +10794,9 @@ class RunAllCoordinatorTest(unittest.TestCase):
             "run-id-match": (config("another-run"), []),
             "ttl": (config(ttl_seconds=60), []),
             "timeout-arguments": (config(), ["--hard-timeout-seconds", "0"]),
-            "readiness-timeout": (config(), ["--readiness-timeout-seconds", "6000"]),
+            "readiness-timeout": (config(), ["--readiness-timeout-seconds", "10801"]),
             "route-failover-budget": (
-                config(recovery_timeout_seconds=600),
+                config(recovery_timeout_seconds=2000),
                 [],
             ),
             "evidence-path": (config(), ["--evidence", "OUTSIDE"]),
@@ -8435,6 +10983,16 @@ class ProtectedExecutionTest(unittest.TestCase):
         e2e.validate_protected_execution(
             "fixture-live", {"ENVELOPE_E2E_APPROVED_RUN_ID": "fixture-live", "GITHUB_EVENT_NAME": "workflow_dispatch"}
         )
+
+    def test_route_only_claim_rejects_ready_manifest_without_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            raw, store, adapter = self.protected_adapter(temporary)
+            deployment = e2e.parse_protected_deployment_output(raw)
+
+            with self.assertRaisesRegex(e2e.ClaimPersistenceError, "active abandoned"):
+                adapter.claim(raw, deployment, require_route_recovery=True)
+
+        self.assertEqual(store.writes, [])
 
     def test_manifest_requires_exactly_four_explicit_transport_nodes_and_no_targets(self) -> None:
         expected = fixture_live_tailnet_hostnames()

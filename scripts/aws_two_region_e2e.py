@@ -33,19 +33,22 @@ import time
 import uuid
 import urllib.parse
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Any, Literal, Protocol, TypeAlias, cast
+from typing import Any, Literal, NoReturn, Protocol, TypeAlias, cast
 
 from aws_appliance import (
     AwsCLI,
     ConcurrentLifecycleError,
     LifecycleError,
     ManifestStore,
+    RESIDUAL_CLEANUP_TIMEOUT_SECONDS,
     RunConfig,
     SubprocessRunner,
     build_tailscale,
     cleanup as protected_cleanup,
     collect_diagnostics as collect_appliance_diagnostics,
+    delete_exact_object_versions,
     lifecycle_lock,
+    local_cleanup_claim_id,
     prepare as protected_prepare,
     run_preflight,
     run_directory,
@@ -85,7 +88,8 @@ EXIT_OK = 0
 EXIT_ACCEPTANCE_FAILED = 1
 EXIT_CONTRACT_ERROR = 2
 EXIT_CLEANUP_FAILED = 3
-RUN_ALL_HARD_TIMEOUT_SECONDS = 5400
+RUN_ALL_HARD_TIMEOUT_SECONDS = 10800
+MAX_PROTECTED_LIFECYCLE_SECONDS = 13200
 GWLBE_STABILIZATION_SECONDS = 300
 TERRAFORM_CORE_VERSION = "1.10.5"
 TRANSPORT_UNDERLAY_INTERFACE = "ens5"
@@ -94,11 +98,15 @@ TRANSPORT_CONTROL_COMMAND_TIMEOUT_SECONDS = 30
 TRANSPORT_CONTROL_RESERVATION_SECONDS = 45
 TRANSPORT_ROUTER_READINESS_RESERVATION_SECONDS = 165
 ROUTE_OWNER_LEASE_MARGIN_SECONDS = 15
+ROUTE_MANIFEST_API_TIMEOUT_SECONDS = 10
+ROUTE_RECOVERY_FIXED_RESERVATION_SECONDS = 190
+PROTECTED_RESOURCE_CLEANUP_SECONDS = RESIDUAL_CLEANUP_TIMEOUT_SECONDS
 STREAM_MUTATION_OVERHEAD_SECONDS = 30
 MAX_STREAM_MUTATION_RESERVATION_SECONDS = 3470
 PROBE_COMMAND_HEADROOM_SECONDS = 10
 RECOVERY_PROBE_RETRY_FIRST_SOURCE_PORT = 61_000
 RECOVERY_PROBE_RETRY_PORTS_PER_FLOW = 8
+_ROUTE_BOOT_ID_CACHE: str | None = None
 
 
 def expected_tailnet_hostnames(config: RunConfig) -> list[str]:
@@ -112,16 +120,48 @@ def expected_tailnet_hostnames(config: RunConfig) -> list[str]:
 
 
 def _route_runner_identity() -> dict[str, Any]:
+    global _ROUTE_BOOT_ID_CACHE
+
     host_sha256 = hashlib.sha256(socket.gethostname().encode("utf-8")).hexdigest()
-    boot_id = "unavailable"
-    boot_id_path = pathlib.Path("/proc/sys/kernel/random/boot_id")
-    try:
-        candidate = boot_id_path.read_text(encoding="utf-8").strip()
-    except OSError:
-        candidate = ""
-    if re.fullmatch(r"[0-9a-fA-F-]{16,64}", candidate):
-        boot_id = candidate.lower()
-    return {"pid": os.getpid(), "host_sha256": host_sha256, "boot_id": boot_id}
+    if _ROUTE_BOOT_ID_CACHE is None:
+        boot_id_path = pathlib.Path("/proc/sys/kernel/random/boot_id")
+        try:
+            candidate = boot_id_path.read_text(encoding="utf-8").strip().lower()
+        except OSError:
+            candidate = ""
+        if _ROUTE_BOOT_ID_RE.fullmatch(candidate) is None and sys.platform == "darwin":
+            try:
+                completed = subprocess.run(
+                    ["/usr/sbin/sysctl", "-n", "kern.boottime"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+            except (OSError, subprocess.SubprocessError):
+                completed = None
+            match = (
+                re.search(r"\bsec\s*=\s*([0-9]+)", completed.stdout)
+                if completed is not None
+                else None
+            )
+            if match is not None:
+                candidate = str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_OID,
+                        f"{socket.gethostname()}:{match.group(1)}",
+                    )
+                )
+        if _ROUTE_BOOT_ID_RE.fullmatch(candidate) is None:
+            raise LifecycleError(
+                "stable route-runner boot identity is unavailable"
+            )
+        _ROUTE_BOOT_ID_CACHE = candidate
+    return {
+        "pid": os.getpid(),
+        "host_sha256": host_sha256,
+        "boot_id": _ROUTE_BOOT_ID_CACHE,
+    }
 
 
 def _route_process_alive(pid: int) -> bool:
@@ -166,6 +206,14 @@ _REGION_RE = re.compile(r"[a-z]{2}(?:-[a-z]+)+-[0-9]+")
 _RUN_ID_RE = re.compile(r"[a-z][a-z0-9-]{1,62}[a-z0-9]")
 _LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
 _PROCESS_RE = re.compile(r"[a-z][a-z0-9-]{0,47}")
+_UUID4_PATTERN = (
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+)
+_UUID4_RE = re.compile(_UUID4_PATTERN)
+_ROUTE_BOOT_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
 _METRIC_NAME_RE = re.compile(r"[A-Za-z_:][A-Za-z0-9_:]*")
 _LABEL_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _ROUTE_TARGET_FIELDS = {
@@ -182,6 +230,19 @@ _ROUTE_TARGET_FIELDS = {
     "VpcEndpointId",
     "VpcPeeringConnectionId",
 }
+
+
+def _route_owner_is_valid(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value) == {"pid", "host_sha256", "boot_id"}
+        and not isinstance(value.get("pid"), bool)
+        and isinstance(value.get("pid"), int)
+        and cast(int, value["pid"]) > 0
+        and re.fullmatch(r"[0-9a-f]{64}", str(value.get("host_sha256", "")))
+        is not None
+        and _ROUTE_BOOT_ID_RE.fullmatch(str(value.get("boot_id", ""))) is not None
+    )
 
 
 class E2EError(LifecycleError):
@@ -352,18 +413,32 @@ class TimeoutBudgets:
     tailscale_withdrawal: int = 180
     flow_log_capture: int = 420
     evidence: int = 30
-    cleanup: int = 1200
-    hard_timeout: int = 5400
+    cleanup: int = 2400
+    hard_timeout: int = 10800
     probe_response: int = 30
     continuity_loss: int = 90
 
     def __post_init__(self) -> None:
         for field in dataclasses.fields(self):
             value = getattr(self, field.name)
-            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 7200:
-                raise E2EError(f"timeout budget {field.name} must be an integer between 1 and 7200")
-        if self.hard_timeout + self.cleanup > 7200:
-            raise E2EError("hard_timeout plus protected cleanup must fit within 7200 seconds")
+            maximum = (
+                MAX_PROTECTED_LIFECYCLE_SECONDS - self.cleanup
+                if field.name == "hard_timeout"
+                else 7200
+            )
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 1 <= value <= maximum
+            ):
+                raise E2EError(
+                    f"timeout budget {field.name} must be an integer between 1 and {maximum}"
+                )
+        if self.hard_timeout + self.cleanup > MAX_PROTECTED_LIFECYCLE_SECONDS:
+            raise E2EError(
+                "hard_timeout plus protected cleanup must fit within "
+                f"{MAX_PROTECTED_LIFECYCLE_SECONDS} seconds"
+            )
         minimum = (
             self.consume_deployment
             + 2 * self.drift_check
@@ -1184,7 +1259,6 @@ class SSMCommand:
     commands: tuple[str, ...] = dataclasses.field(repr=False)
     timeout_seconds: int = 60
     comment: str = "Envelope two-region E2E"
-    client_token: str | None = None
 
     def __post_init__(self) -> None:
         commands = tuple(self.commands)
@@ -1202,11 +1276,6 @@ class SSMCommand:
             raise SSMError("SSM command comment must be 1-100 printable characters")
         if redact_runtime_text(self.comment) != self.comment:
             raise SSMError("SSM command comment must not contain credentials")
-        if self.client_token is not None and (
-            not isinstance(self.client_token, str)
-            or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", self.client_token) is None
-        ):
-            raise SSMError("SSM command client_token must be a safe 1-64 character identity")
         object.__setattr__(self, "commands", commands)
 
 
@@ -1326,8 +1395,6 @@ class SSMRunner:
             "--comment",
             command.comment,
         ]
-        if command.client_token is not None:
-            args.extend(("--client-token", command.client_token))
         args.extend(("--parameters", parameters))
         try:
             response = self.aws.json(
@@ -3294,13 +3361,23 @@ class SymmetricRouteFailover:
     def restoration_reservation_seconds(self, prefix_count: int) -> int:
         if isinstance(prefix_count, bool) or not isinstance(prefix_count, int) or prefix_count < 1:
             raise DeploymentError("route restoration requires at least one exact prefix")
+        # A successful path finalizes once; an API-failure path checkpoints once
+        # more per prefix. Each ambiguous CAS can require one bounded reread.
+        checkpoint_count = max(21 + 2 * prefix_count, 20 + 3 * prefix_count)
         return (
-            2 * TRANSPORT_CONTROL_RESERVATION_SECONDS
-            + 2 * TRANSPORT_CONTROL_RESERVATION_SECONDS
+            5 * TRANSPORT_CONTROL_RESERVATION_SECONDS
             + self.restoration_timeout_seconds
             + 2 * TRANSPORT_ROUTER_READINESS_RESERVATION_SECONDS
             + prefix_count * self.restoration_timeout_seconds
             + self.restoration_timeout_seconds
+            + checkpoint_count * 2 * ROUTE_MANIFEST_API_TIMEOUT_SECONDS
+        )
+
+    def reconciliation_reservation_seconds(self, prefix_count: int) -> int:
+        return (
+            self.restoration_reservation_seconds(prefix_count)
+            - 2 * TRANSPORT_ROUTER_READINESS_RESERVATION_SECONDS
+            + ROUTE_RECOVERY_FIXED_RESERVATION_SECONDS
         )
 
     def transaction_reservation_seconds(self, prefix_count: int) -> int:
@@ -3309,6 +3386,7 @@ class SymmetricRouteFailover:
             + 2 * TRANSPORT_CONTROL_RESERVATION_SECONDS
             + self.recovery_timeout_seconds
             + 20
+            + 2 * ROUTE_MANIFEST_API_TIMEOUT_SECONDS
             + self.mutation_timeout_seconds
             + self.recovery_timeout_seconds
             + self.restoration_reservation_seconds(prefix_count)
@@ -3352,6 +3430,8 @@ def _validate_route_failover_run_budget(
         raise DeploymentError("route failover budget inputs must cover both sites")
     transaction_reservations: dict[Site, int] = {}
     restoration_reservations: dict[Site, int] = {}
+    reconciliation_reservations: dict[Site, int] = {}
+    combined_cleanup_reservations: dict[Site, int] = {}
     for site in SITES:
         prefix_count = prefix_counts[site]
         observer_count = observer_counts[site]
@@ -3379,9 +3459,16 @@ def _validate_route_failover_run_budget(
         restoration_reservations[site] = (
             route_failover.restoration_reservation_seconds(prefix_count)
         )
-    if max(restoration_reservations.values()) > cleanup_timeout_seconds:
+        reconciliation_reservations[site] = (
+            route_failover.reconciliation_reservation_seconds(prefix_count)
+        )
+        combined_cleanup_reservations[site] = (
+            reconciliation_reservations[site]
+            + PROTECTED_RESOURCE_CLEANUP_SECONDS
+        )
+    if max(combined_cleanup_reservations.values()) > cleanup_timeout_seconds:
         raise DeploymentError(
-            "route restoration cannot fit the protected cleanup reservation"
+            "route reconciliation and resource cleanup cannot fit the protected cleanup reservation"
         )
     if (
         max(transaction_reservations.values())
@@ -3394,6 +3481,9 @@ def _validate_route_failover_run_budget(
     return {
         "transaction_seconds_by_site": dict(transaction_reservations),
         "restoration_seconds_by_site": dict(restoration_reservations),
+        "reconciliation_seconds_by_site": dict(reconciliation_reservations),
+        "combined_cleanup_seconds_by_site": dict(combined_cleanup_reservations),
+        "resource_cleanup_seconds": PROTECTED_RESOURCE_CLEANUP_SECONDS,
         "total_transaction_seconds": sum(transaction_reservations.values()),
         "active_run_seconds": hard_timeout_seconds,
         "cleanup_seconds": cleanup_timeout_seconds,
@@ -5543,11 +5633,7 @@ def _validate_transport_router_evidence(
             }
             or advertisements.get("failure_mode") != label
             or any(
-                re.fullmatch(
-                    r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
-                    str(advertisements.get(field, "")),
-                )
-                is None
+                _UUID4_RE.fullmatch(str(advertisements.get(field, ""))) is None
                 for field in ("forward_generation", "restore_generation")
             )
             or forward_generation == restore_generation
@@ -5575,13 +5661,11 @@ def _validate_transport_router_evidence(
             or not isinstance(alternate_before_state.get("generation"), str)
             or not alternate_before_state.get("generation")
             or current_before_state.get("generation")
-            == alternate_before_state.get("generation")
-            or current_before_state.get("generation")
             in {forward_generation, restore_generation}
             or alternate_before_state.get("generation")
             in {forward_generation, restore_generation}
         ):
-            raise EvidenceError("advertisement predecessor generations are not distinct")
+            raise EvidenceError("advertisement predecessor generations are invalid")
         validate_advertisement_record(
             current_before,
             {
@@ -7196,6 +7280,41 @@ print(json.dumps({"success":True,"payload":{"owners":{prefix:owners[0] for prefi
 ROUTE_MUTATION_ACTIONS = ("ec2:CreateRoute", "ec2:DeleteRoute", "ec2:ReplaceRoute")
 ROUTE_JOURNAL_SCHEMA = 4
 ROUTE_JOURNAL_KIND = "transport-prefix-and-gwlbe-route-failover"
+ROUTE_RECOVERY_MARKER_SCHEMA = 1
+ROUTE_RECOVERY_MARKER_KIND = "transport-prefix-and-gwlbe-route-cleanup"
+ROUTE_RECOVERY_RECEIPT_SCHEMA = 1
+ROUTE_RECOVERY_RECEIPT_KIND = "aws-two-region-route-recovery-cleanup"
+_ROUTE_JOURNAL_REQUIRED_FIELDS = {
+    "schema",
+    "kind",
+    "run_id",
+    "claim_id",
+    "transaction_id",
+    "owner",
+    "lease_expires_at",
+    "site",
+    "gwlbe_az_key",
+    "started_at",
+    "status",
+    "route_table_id",
+    "source_prefix",
+    "prefixes",
+    "current",
+    "alternate",
+    "interfaces",
+    "before",
+    "advertisements",
+    "ownership",
+    "mutation",
+    "after",
+    "probe",
+    "restoration",
+    "failure",
+}
+_ROUTE_JOURNAL_OPTIONAL_FIELDS = {
+    "finished_at",
+    "reconciled_at",
+}
 _RECOVERABLE_ROUTE_JOURNAL_STATUSES = {
     "authorized",
     "alternate-advertising",
@@ -7305,6 +7424,1151 @@ class GWLBERouteFailover:
         ):
             raise ResilienceError(f"{name} must be between 0 and 7200 seconds")
         return float(value)
+
+    @staticmethod
+    def validate_durable_binding(
+        journal: Mapping[str, Any],
+        topology: SymmetricTopologyV2,
+        vpc_ids: Mapping[Site, str],
+        *,
+        node_hashes_by_instance: Mapping[str, str] | None = None,
+        node_ids_by_instance: Mapping[str, str] | None = None,
+    ) -> tuple[
+        SymmetricFleetMember,
+        SymmetricFleetMember,
+        SymmetricFleetMember,
+        tuple[str, ...],
+    ]:
+        """Validate every immutable route-journal binding without remote calls."""
+
+        owner = journal.get("owner")
+        if (
+            not _ROUTE_JOURNAL_REQUIRED_FIELDS.issubset(journal)
+            or set(journal)
+            - (_ROUTE_JOURNAL_REQUIRED_FIELDS | _ROUTE_JOURNAL_OPTIONAL_FIELDS)
+            or journal.get("schema") != ROUTE_JOURNAL_SCHEMA
+            or journal.get("kind") != ROUTE_JOURNAL_KIND
+            or journal.get("run_id") != topology.run_id
+            or _UUID4_RE.fullmatch(str(journal.get("claim_id", ""))) is None
+            or _UUID4_RE.fullmatch(str(journal.get("transaction_id", ""))) is None
+            or not _route_owner_is_valid(owner)
+            or set(vpc_ids) != set(SITES)
+            or any(
+                not isinstance(vpc_ids.get(site), str)
+                or _VPC_ID_RE.fullmatch(cast(str, vpc_ids.get(site))) is None
+                for site in SITES
+            )
+            or node_hashes_by_instance is not None
+            and node_ids_by_instance is not None
+        ):
+            raise AmbiguousOwnershipError(
+                "durable GWLBE route journal envelope is invalid"
+            )
+        try:
+            validate_canonical_utc_timestamp(
+                journal.get("lease_expires_at"),
+                "route_transaction.lease_expires_at",
+            )
+            validate_canonical_utc_timestamp(
+                journal.get("started_at"), "route_transaction.started_at"
+            )
+            for field in ("finished_at", "reconciled_at"):
+                if field in journal:
+                    validate_canonical_utc_timestamp(
+                        journal.get(field), f"route_transaction.{field}"
+                    )
+        except LifecycleError as error:
+            raise AmbiguousOwnershipError(str(error)) from None
+        site_value = journal.get("site")
+        current_value = journal.get("current")
+        alternate_value = journal.get("alternate")
+        prefixes_value = journal.get("prefixes")
+        member_fields = {
+            "instance_id",
+            "network_interface_id",
+            "baseline_advertisements",
+            "state_before",
+            "node_id_sha256",
+        }
+        if (
+            site_value not in SITES
+            or not isinstance(current_value, Mapping)
+            or set(current_value) != member_fields
+            or not isinstance(alternate_value, Mapping)
+            or set(alternate_value) != member_fields
+            or not isinstance(prefixes_value, list)
+            or not all(isinstance(value, str) for value in prefixes_value)
+        ):
+            raise AmbiguousOwnershipError(
+                "durable GWLBE route journal allowlist is invalid"
+            )
+        site = topology.site(cast(Site, site_value))
+        current_matches = [
+            member
+            for member in site.transport_router_fleet
+            if member.instance_id == current_value.get("instance_id")
+            and member.network_interface_id
+            == current_value.get("network_interface_id")
+        ]
+        alternate_matches = [
+            member
+            for member in site.transport_router_fleet
+            if member.instance_id == alternate_value.get("instance_id")
+            and member.network_interface_id
+            == alternate_value.get("network_interface_id")
+        ]
+        table_owner_matches = [
+            member
+            for member in site.transport_router_fleet
+            if member.gwlbe_route_table_id == journal.get("route_table_id")
+            and member.az_key == journal.get("gwlbe_az_key")
+        ]
+        prefixes = tuple(cast(list[str], prefixes_value))
+        if (
+            len(current_matches) != 1
+            or len(alternate_matches) != 1
+            or len(table_owner_matches) != 1
+            or current_matches[0] == alternate_matches[0]
+        ):
+            raise AmbiguousOwnershipError(
+                "durable GWLBE route journal differs from topology"
+            )
+        current = current_matches[0]
+        alternate = alternate_matches[0]
+        table_owner = table_owner_matches[0]
+        current_state = current_value.get("state_before")
+        alternate_state = alternate_value.get("state_before")
+        current_advertisements = (
+            current_state.get("advertisements")
+            if isinstance(current_state, Mapping)
+            else None
+        )
+        alternate_advertisements = (
+            alternate_state.get("advertisements")
+            if isinstance(alternate_state, Mapping)
+            else None
+        )
+        advertisements = journal.get("advertisements")
+        forward_generation = (
+            advertisements.get("forward_generation")
+            if isinstance(advertisements, Mapping)
+            else None
+        )
+        restore_generation = (
+            advertisements.get("restore_generation")
+            if isinstance(advertisements, Mapping)
+            else None
+        )
+        expected_interfaces = [
+            {
+                "instance_id": current.instance_id,
+                "network_interface_id": current.network_interface_id,
+            },
+            {
+                "instance_id": alternate.instance_id,
+                "network_interface_id": alternate.network_interface_id,
+            },
+        ]
+        if (
+            topology.run_id != journal.get("run_id")
+            or prefixes != tuple(site.remote_site_cidrs)
+            or journal.get("source_prefix") != current.advertised_prefix
+            or current_value.get("baseline_advertisements")
+            != [current.advertised_prefix]
+            or alternate_value.get("baseline_advertisements")
+            != [alternate.advertised_prefix]
+            or topology.route_failover.initial_router_az(
+                cast(Site, site_value), cast(str, journal.get("gwlbe_az_key"))
+            )
+            != current.az_key
+            or journal.get("interfaces") != expected_interfaces
+            or not isinstance(advertisements, Mapping)
+            or set(advertisements)
+            != {
+                "forward_generation",
+                "restore_generation",
+                "failure_mode",
+                "alternate_expansion",
+                "current_withdrawal",
+            }
+            or advertisements.get("failure_mode") not in {"graceful", "abrupt"}
+            or _UUID4_RE.fullmatch(str(forward_generation or "")) is None
+            or _UUID4_RE.fullmatch(str(restore_generation or "")) is None
+            or forward_generation == restore_generation
+            or not isinstance(current_state, Mapping)
+            or set(current_state) != {"advertisements", "command"}
+            or not isinstance(alternate_state, Mapping)
+            or set(alternate_state) != {"advertisements", "command"}
+            or not isinstance(current_advertisements, Mapping)
+            or current_advertisements
+            != {
+                "generation": current_advertisements.get("generation"),
+                "routes": [current.advertised_prefix],
+                "service": "running",
+                "mode": "normal",
+            }
+            or not isinstance(alternate_advertisements, Mapping)
+            or alternate_advertisements
+            != {
+                "generation": alternate_advertisements.get("generation"),
+                "routes": [alternate.advertised_prefix],
+                "service": "running",
+                "mode": "normal",
+            }
+            or not isinstance(current_advertisements.get("generation"), str)
+            or not current_advertisements.get("generation")
+            or not isinstance(alternate_advertisements.get("generation"), str)
+            or not alternate_advertisements.get("generation")
+            or current_advertisements.get("generation")
+            in {forward_generation, restore_generation}
+            or alternate_advertisements.get("generation")
+            in {forward_generation, restore_generation}
+            or current_state.get("command") is not None
+            and not isinstance(current_state.get("command"), Mapping)
+            or alternate_state.get("command") is not None
+            and not isinstance(alternate_state.get("command"), Mapping)
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(current_value.get("node_id_sha256", ""))
+            )
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(alternate_value.get("node_id_sha256", "")),
+            )
+            is None
+            or current_value.get("node_id_sha256")
+            == alternate_value.get("node_id_sha256")
+        ):
+            raise AmbiguousOwnershipError(
+                "durable GWLBE route journal differs from topology"
+            )
+
+        def reject_progress() -> NoReturn:
+            raise AmbiguousOwnershipError(
+                "durable GWLBE route journal progress is inconsistent"
+            )
+
+        def failure_matches(value: Any) -> bool:
+            return (
+                isinstance(value, Mapping)
+                and set(value) == {"category", "message"}
+                and isinstance(value.get("category"), str)
+                and isinstance(value.get("message"), str)
+            )
+
+        def command_evidence_matches(value: Any, *, expected_site: Site) -> bool:
+            return value is None or (
+                isinstance(value, Mapping)
+                and set(value)
+                == {"site", "role", "command_id", "status", "response_code"}
+                and value.get("site") == expected_site
+                and value.get("role") == "transport-router"
+                and isinstance(value.get("command_id"), str)
+                and 0 < len(cast(str, value.get("command_id"))) <= 128
+                and value.get("status") == "Success"
+                and value.get("response_code") == 0
+                and not isinstance(value.get("response_code"), bool)
+            )
+
+        if (
+            not command_evidence_matches(
+                current_state.get("command"), expected_site=cast(Site, site_value)
+            )
+            or not command_evidence_matches(
+                alternate_state.get("command"),
+                expected_site=cast(Site, site_value),
+            )
+        ):
+            reject_progress()
+
+        def advertisement_record_matches(
+            value: Any, expected_states: Sequence[Mapping[str, Any]]
+        ) -> bool:
+            return (
+                isinstance(value, Mapping)
+                and set(value) == {"advertisements", "command"}
+                and any(
+                    value.get("advertisements") == expected
+                    for expected in expected_states
+                )
+                and command_evidence_matches(
+                    value.get("command"), expected_site=cast(Site, site_value)
+                )
+            )
+
+        def optional_advertisement_record_matches(
+            value: Any, expected: Mapping[str, Any]
+        ) -> bool:
+            return value is None or advertisement_record_matches(value, (expected,))
+
+        expected_node_hashes: dict[str, str | None] = {}
+        for member in site.transport_router_fleet:
+            if node_hashes_by_instance is not None:
+                expected_node_hashes[member.instance_id] = node_hashes_by_instance.get(
+                    member.instance_id
+                )
+            elif node_ids_by_instance is not None:
+                node_id = node_ids_by_instance.get(member.instance_id)
+                expected_node_hashes[member.instance_id] = (
+                    hashlib.sha256(node_id.encode("utf-8")).hexdigest()
+                    if isinstance(node_id, str)
+                    else None
+                )
+            elif member == current:
+                expected_node_hashes[member.instance_id] = cast(
+                    str, current_value.get("node_id_sha256")
+                )
+            elif member == alternate:
+                expected_node_hashes[member.instance_id] = cast(
+                    str, alternate_value.get("node_id_sha256")
+                )
+            else:
+                expected_node_hashes[member.instance_id] = None
+
+        def ownership_observation_matches(
+            value: Any, expected_owners: Mapping[str, str]
+        ) -> bool:
+            observers = value.get("observers") if isinstance(value, Mapping) else None
+            expected_observers = topology.site(
+                _opposite(cast(Site, site_value))
+            ).transport_router_fleet
+            if (
+                not isinstance(value, Mapping)
+                or set(value) != {"quiet_window_seconds", "observers"}
+                or isinstance(value.get("quiet_window_seconds"), bool)
+                or value.get("quiet_window_seconds")
+                != topology.route_failover.quiet_window_seconds
+                or not isinstance(observers, list)
+                or len(observers) != len(expected_observers)
+            ):
+                return False
+            by_observer: dict[str, Mapping[str, Any]] = {}
+            for observation in observers:
+                if (
+                    not isinstance(observation, Mapping)
+                    or set(observation)
+                    != {"observer_instance_id", "owners", "command"}
+                    or not isinstance(observation.get("observer_instance_id"), str)
+                    or observation["observer_instance_id"] in by_observer
+                    or not command_evidence_matches(
+                        observation.get("command"),
+                        expected_site=_opposite(cast(Site, site_value)),
+                    )
+                ):
+                    return False
+                by_observer[observation["observer_instance_id"]] = observation
+            if set(by_observer) != {
+                member.instance_id for member in expected_observers
+            }:
+                return False
+            for observation in by_observer.values():
+                owners = observation.get("owners")
+                if not isinstance(owners, list) or len(owners) != len(expected_owners):
+                    return False
+                by_prefix: dict[str, Mapping[str, Any]] = {}
+                for owner in owners:
+                    prefix = owner.get("prefix") if isinstance(owner, Mapping) else None
+                    if (
+                        not isinstance(owner, Mapping)
+                        or set(owner)
+                        != {
+                            "prefix",
+                            "owner_instance_id",
+                            "owner_node_id_sha256",
+                        }
+                        or not isinstance(prefix, str)
+                        or prefix in by_prefix
+                    ):
+                        return False
+                    by_prefix[prefix] = owner
+                if set(by_prefix) != set(expected_owners):
+                    return False
+                for prefix, owner in by_prefix.items():
+                    owner_id = expected_owners[prefix]
+                    if (
+                        owner.get("owner_instance_id") != owner_id
+                        or owner.get("owner_node_id_sha256")
+                        != expected_node_hashes.get(owner_id)
+                    ):
+                        return False
+            return True
+
+        assert table_owner.gwlbe_route_table_id is not None
+        assert current.network_interface_id is not None
+        assert alternate.network_interface_id is not None
+
+        def route_snapshot_matches(
+            value: Any, snapshot_prefixes: tuple[str, ...], target_eni: str
+        ) -> bool:
+            try:
+                _validate_route_snapshot_evidence(
+                    value,
+                    run_id=topology.run_id,
+                    member=table_owner,
+                    route_table_id=table_owner.gwlbe_route_table_id,
+                    prefixes=snapshot_prefixes,
+                    target_eni=target_eni,
+                )
+            except EvidenceError:
+                return False
+            return (
+                isinstance(value, Mapping)
+                and value.get("vpc_id") == vpc_ids.get(cast(Site, site_value))
+            )
+
+        path_keys = {
+            "protocol",
+            "source_role",
+            "destination_role",
+            "source_az_key",
+            "destination_az_key",
+            "source_gwlbe_id",
+            "destination_gwlbe_id",
+            "source_target_id",
+            "destination_target_id",
+            "source_transport_router_id",
+            "source_transport_eni_id",
+            "destination_transport_router_id",
+            "geneve_return_proof",
+            "source_preserved",
+        }
+        all_routers = {
+            member.instance_id: member
+            for candidate_site in SITES
+            for member in topology.site(candidate_site).transport_router_fleet
+        }
+        all_targets = {
+            member.instance_id: member
+            for candidate_site in SITES
+            for member in topology.site(candidate_site).target_fleet
+        }
+
+        def geneve_proof_matches(value: Any, target_id: str) -> bool:
+            if not isinstance(value, Mapping) or set(value) != {
+                "target_id",
+                "metrics",
+                "fidelity",
+            }:
+                return False
+            metrics = value.get("metrics")
+            failure_metrics = {
+                "geneve_options_validation_errors_delta",
+                "gwlb_profile_rejections_total_delta",
+                "gwlb_receive_drops_total_delta",
+                "gwlb_inner_validation_failures_total_delta",
+                "gwlb_return_build_failures_total_delta",
+                "gwlb_send_failures_total_delta",
+                "drops_delta",
+            }
+            metric_keys = {
+                "geneve_rx_packets_delta",
+                "geneve_tx_packets_delta",
+                "gwlb_target_ready",
+                "components_ready",
+                *failure_metrics,
+            }
+            if (
+                value.get("target_id") != target_id
+                or not isinstance(metrics, Mapping)
+                or set(metrics) != metric_keys
+                or any(
+                    isinstance(metrics.get(name), bool)
+                    or not isinstance(metrics.get(name), (int, float))
+                    or not math.isfinite(cast(float, metrics.get(name)))
+                    for name in metric_keys - {"components_ready"}
+                )
+                or metrics.get("geneve_rx_packets_delta", 0) <= 0
+                or metrics.get("geneve_tx_packets_delta", 0) <= 0
+                or any(metrics.get(name) != 0 for name in failure_metrics)
+                or metrics.get("gwlb_target_ready") != 1
+                or metrics.get("components_ready")
+                != {"receiver": 1, "validation": 1, "sender": 1}
+            ):
+                return False
+            try:
+                _validate_geneve_fidelity_evidence(
+                    value.get("fidelity"), target_id=target_id
+                )
+            except EvidenceError:
+                return False
+            return True
+
+        def full_probe_path_matches(value: Any, protocol: str) -> bool:
+            if not isinstance(value, Mapping) or set(value) != path_keys:
+                return False
+            source_router = all_routers.get(
+                cast(str, value.get("source_transport_router_id"))
+            )
+            destination_router = all_routers.get(
+                cast(str, value.get("destination_transport_router_id"))
+            )
+            source_target = all_targets.get(
+                cast(str, value.get("source_target_id"))
+            )
+            destination_target = all_targets.get(
+                cast(str, value.get("destination_target_id"))
+            )
+            if (
+                value.get("protocol") != protocol
+                or value.get("source_role") not in WORKLOAD_ROLES
+                or value.get("destination_role")
+                != _opposite_workload_role(
+                    cast(WorkloadRole, value.get("source_role"))
+                )
+                or source_router is None
+                or destination_router is None
+                or source_target is None
+                or destination_target is None
+                or source_router.site != source_target.site
+                or destination_router.site != destination_target.site
+                or source_router.site == destination_router.site
+                or value.get("source_transport_eni_id")
+                != source_router.network_interface_id
+                or value.get("source_az_key")
+                not in {
+                    member.az_key
+                    for member in topology.site(source_router.site).transport_router_fleet
+                }
+                or value.get("destination_az_key")
+                not in {
+                    member.az_key
+                    for member in topology.site(
+                        destination_router.site
+                    ).transport_router_fleet
+                }
+                or _VPCE_ID_RE.fullmatch(str(value.get("source_gwlbe_id", "")))
+                is None
+                or _VPCE_ID_RE.fullmatch(
+                    str(value.get("destination_gwlbe_id", ""))
+                )
+                is None
+                or value.get("source_preserved") is not True
+            ):
+                return False
+            proof = value.get("geneve_return_proof")
+            return (
+                isinstance(proof, Mapping)
+                and set(proof) == {"source", "destination"}
+                and geneve_proof_matches(
+                    proof.get("source"), source_target.instance_id
+                )
+                and geneve_proof_matches(
+                    proof.get("destination"), destination_target.instance_id
+                )
+            )
+
+        def probe_matches(value: Any) -> bool:
+            failure_mode = advertisements.get("failure_mode")
+            if (
+                not isinstance(value, Mapping)
+                or set(value) != path_keys | {"succeeded", "new_flows"}
+            ):
+                return False
+            new_flows = value.get("new_flows")
+            if (
+                value.get("succeeded") is not True
+                or not isinstance(new_flows, Mapping)
+                or set(new_flows) != set(TRANSPORT_PROTOCOLS)
+            ):
+                return False
+            paths: dict[str, Mapping[str, Any]] = {}
+            for protocol in TRANSPORT_PROTOCOLS:
+                flow = new_flows.get(protocol)
+                path = flow.get("path") if isinstance(flow, Mapping) else None
+                if (
+                    not isinstance(flow, Mapping)
+                    or set(flow) != {"succeeded", "path"}
+                    or flow.get("succeeded") is not True
+                    or not full_probe_path_matches(path, protocol)
+                ):
+                    return False
+                paths[protocol] = cast(Mapping[str, Any], path)
+            if any(value.get(key) != paths["udp"].get(key) for key in path_keys):
+                return False
+            if failure_mode == "graceful":
+                return all(
+                    path.get("destination_transport_router_id")
+                    == alternate.instance_id
+                    for path in paths.values()
+                )
+            return all(
+                path.get("source_transport_router_id") == alternate.instance_id
+                and path.get("source_transport_eni_id")
+                == alternate.network_interface_id
+                for path in paths.values()
+            )
+
+        alternate_expansion = advertisements.get("alternate_expansion")
+        current_withdrawal = advertisements.get("current_withdrawal")
+        ownership = journal.get("ownership")
+        transferred_ownership = (
+            ownership.get("transferred")
+            if isinstance(ownership, Mapping)
+            else None
+        )
+        mutation = journal.get("mutation")
+        attempted = (
+            mutation.get("attempted_prefixes")
+            if isinstance(mutation, Mapping)
+            else None
+        )
+        completed = (
+            mutation.get("completed_prefixes")
+            if isinstance(mutation, Mapping)
+            else None
+        )
+        ambiguous_calls = (
+            mutation.get("ambiguous_calls")
+            if isinstance(mutation, Mapping)
+            else None
+        )
+        restoration = journal.get("restoration")
+        failure = journal.get("failure")
+        after = journal.get("after")
+        probe = journal.get("probe")
+        alternate_expansion_state = {
+            "generation": forward_generation,
+            "routes": sorted(
+                {
+                    cast(str, current.advertised_prefix),
+                    cast(str, alternate.advertised_prefix),
+                }
+            ),
+            "service": "running",
+            "mode": "normal",
+        }
+        current_withdrawal_state = {
+            "generation": forward_generation,
+            "routes": [],
+            "service": "stopped",
+            "mode": advertisements.get("failure_mode"),
+        }
+        if (
+            not optional_advertisement_record_matches(
+                alternate_expansion, alternate_expansion_state
+            )
+            or not optional_advertisement_record_matches(
+                current_withdrawal, current_withdrawal_state
+            )
+            or current_withdrawal is not None
+            and alternate_expansion is None
+        ):
+            reject_progress()
+
+        baseline_owners = {
+            cast(str, member.advertised_prefix): member.instance_id
+            for member in site.transport_router_fleet
+        }
+        transferred_owners = dict(baseline_owners)
+        transferred_owners[cast(str, current.advertised_prefix)] = (
+            alternate.instance_id
+        )
+        if (
+            not isinstance(ownership, Mapping)
+            or set(ownership) != {"before", "transferred"}
+            or not ownership_observation_matches(
+                ownership.get("before"), baseline_owners
+            )
+            or transferred_ownership is not None
+            and not ownership_observation_matches(
+                transferred_ownership, transferred_owners
+            )
+            or transferred_ownership is not None
+            and current_withdrawal is None
+        ):
+            reject_progress()
+
+        if (
+            not isinstance(mutation, Mapping)
+            or set(mutation)
+            != {"attempted_prefixes", "completed_prefixes", "ambiguous_calls"}
+            or not isinstance(attempted, list)
+            or attempted != list(prefixes[: len(attempted)])
+            or not isinstance(completed, list)
+            or completed != list(prefixes[: len(completed)])
+            or len(attempted) - len(completed) not in {0, 1}
+            or attempted
+            and transferred_ownership is None
+            or not isinstance(ambiguous_calls, list)
+            or len(ambiguous_calls) > 1
+        ):
+            reject_progress()
+
+        def ambiguous_call_matches(value: Any) -> bool:
+            if (
+                not isinstance(value, Mapping)
+                or not isinstance(value.get("category"), str)
+                or not isinstance(value.get("message"), str)
+                or value.get("prefix") not in attempted
+            ):
+                return False
+            base_keys = {"prefix", "category", "message", "settled_target"}
+            settled_target = value.get("settled_target")
+            if settled_target is None:
+                if set(value) == base_keys:
+                    return True
+                return (
+                    set(value) == base_keys | {"settlement_failure"}
+                    and failure_matches(value.get("settlement_failure"))
+                )
+            if (
+                set(value) != base_keys | {"observation"}
+                or settled_target
+                not in {
+                    current.network_interface_id,
+                    alternate.network_interface_id,
+                }
+            ):
+                return False
+            return route_snapshot_matches(
+                value.get("observation"),
+                (cast(str, value.get("prefix")),),
+                cast(str, settled_target),
+            )
+
+        if ambiguous_calls:
+            ambiguous_call = ambiguous_calls[0]
+            if (
+                not ambiguous_call_matches(ambiguous_call)
+                or len(attempted) != len(completed) + 1
+                or attempted[-1] != ambiguous_call.get("prefix")
+            ):
+                reject_progress()
+
+        if (
+            after is not None
+            and (
+                completed != list(prefixes)
+                or ambiguous_calls
+                or not route_snapshot_matches(
+                    after, prefixes, alternate.network_interface_id
+                )
+            )
+            or probe is not None
+            and (after is None or not probe_matches(probe))
+        ):
+            reject_progress()
+        if failure is not None and not failure_matches(failure):
+            reject_progress()
+
+        initial_restoration = {
+            "status": "not-started",
+            "advertisements": {"status": "not-started"},
+            "ownership": {"status": "not-started"},
+            "routes": {"status": "not-started"},
+        }
+        restoration_is_initial = restoration == initial_restoration
+
+        current_restore_state = {
+            "generation": restore_generation,
+            "routes": [current.advertised_prefix],
+            "service": "running",
+            "mode": "normal",
+        }
+        alternate_restore_state = {
+            "generation": restore_generation,
+            "routes": [alternate.advertised_prefix],
+            "service": "running",
+            "mode": "normal",
+        }
+
+        def advertisement_failure_matches(value: Any) -> bool:
+            if failure_matches(value):
+                return True
+            return (
+                isinstance(value, Mapping)
+                and set(value) == {"member", "category", "message"}
+                and value.get("member") in {"current", "alternate"}
+                and isinstance(value.get("category"), str)
+                and isinstance(value.get("message"), str)
+            )
+
+        def restoration_advertisements_match(value: Any) -> bool:
+            if not isinstance(value, Mapping) or set(value) != {
+                "status",
+                "current",
+                "alternate",
+                "verification",
+                "failures",
+            }:
+                return False
+            status = value.get("status")
+            failures = value.get("failures")
+            verification = value.get("verification")
+            if (
+                status not in {"running", "verified", "failed"}
+                or not isinstance(failures, list)
+                or any(
+                    not advertisement_failure_matches(item) for item in failures
+                )
+                or value.get("current") is not None
+                and not advertisement_record_matches(
+                    value.get("current"), (current_restore_state,)
+                )
+                or value.get("alternate") is not None
+                and not advertisement_record_matches(
+                    value.get("alternate"), (alternate_restore_state,)
+                )
+                or value.get("alternate") is not None
+                and value.get("current") is None
+            ):
+                return False
+            if status == "running":
+                return verification is None
+            if not isinstance(verification, Mapping) or not set(verification).issubset(
+                {"current", "alternate"}
+            ):
+                return False
+            verification_states = {
+                "current": (
+                    cast(Mapping[str, Any], current_advertisements),
+                    current_withdrawal_state,
+                    current_restore_state,
+                ),
+                "alternate": (
+                    cast(Mapping[str, Any], alternate_advertisements),
+                    alternate_expansion_state,
+                    alternate_restore_state,
+                ),
+            }
+            if any(
+                not advertisement_record_matches(
+                    verification[label], verification_states[label]
+                )
+                for label in verification
+            ):
+                return False
+            if status == "verified":
+                return (
+                    value.get("current") is not None
+                    and value.get("alternate") is not None
+                    and set(verification) == {"current", "alternate"}
+                    and advertisement_record_matches(
+                        verification["current"], (current_restore_state,)
+                    )
+                    and advertisement_record_matches(
+                        verification["alternate"], (alternate_restore_state,)
+                    )
+                    and not failures
+                )
+            return bool(failures)
+
+        def restoration_ownership_matches(value: Any) -> bool:
+            if not isinstance(value, Mapping):
+                return False
+            status = value.get("status")
+            allowed_keys = {"status", "observation"}
+            has_failure = "failure" in value
+            if frozenset(value) not in {
+                frozenset(allowed_keys),
+                frozenset(allowed_keys | {"failure"}),
+            }:
+                return False
+            observation = value.get("observation")
+            if observation is not None and not ownership_observation_matches(
+                observation, baseline_owners
+            ):
+                return False
+            if has_failure and not failure_matches(value.get("failure")):
+                return False
+            if status == "not-started":
+                return observation is None and not has_failure
+            if status == "running":
+                return True
+            if status == "verified":
+                return observation is not None and not has_failure
+            if status == "failed":
+                return has_failure
+            return False
+
+        def ordered_subset(values: list[Any], expected: tuple[str, ...]) -> bool:
+            return (
+                all(isinstance(value, str) for value in values)
+                and len(values) == len(set(values))
+                and values == [item for item in expected if item in values]
+            )
+
+        def route_api_failures_match(
+            values: Any, route_attempted: list[Any]
+        ) -> bool:
+            if not isinstance(values, list):
+                return False
+            prefixes_seen: set[str] = set()
+            for item in values:
+                if (
+                    not isinstance(item, Mapping)
+                    or set(item) != {"prefix", "category", "message"}
+                    or not isinstance(item.get("prefix"), str)
+                    or item.get("prefix") not in route_attempted
+                    or item["prefix"] in prefixes_seen
+                    or not isinstance(item.get("category"), str)
+                    or not isinstance(item.get("message"), str)
+                ):
+                    return False
+                prefixes_seen.add(item["prefix"])
+            return True
+
+        def restoration_routes_match(value: Any) -> bool:
+            if not isinstance(value, Mapping):
+                return False
+            base_keys = {
+                "status",
+                "attempted_prefixes",
+                "api_failures",
+                "settled_prefixes",
+                "quiet_window_seconds",
+                "snapshot",
+            }
+            if frozenset(value) not in {
+                frozenset(base_keys),
+                frozenset(base_keys | {"failure"}),
+            }:
+                return False
+            status = value.get("status")
+            route_attempted = value.get("attempted_prefixes")
+            settled = value.get("settled_prefixes")
+            api_failures = value.get("api_failures")
+            snapshot = value.get("snapshot")
+            has_failure = "failure" in value
+            if (
+                not isinstance(route_attempted, list)
+                or route_attempted
+                != list(prefixes[: len(route_attempted)])
+                or not isinstance(settled, list)
+                or not ordered_subset(settled, prefixes)
+                or any(prefix not in route_attempted for prefix in settled)
+                or not route_api_failures_match(api_failures, route_attempted)
+                or isinstance(value.get("quiet_window_seconds"), bool)
+                or value.get("quiet_window_seconds")
+                != topology.route_failover.quiet_window_seconds
+                or has_failure
+                and not failure_matches(value.get("failure"))
+                or snapshot is not None
+                and not route_snapshot_matches(
+                    snapshot, prefixes, current.network_interface_id
+                )
+            ):
+                return False
+            if status == "not-started":
+                return (
+                    not route_attempted
+                    and not settled
+                    and not api_failures
+                    and snapshot is None
+                    and not has_failure
+                )
+            if status == "running":
+                return bool(route_attempted) and snapshot is None and not has_failure
+            if status == "verified":
+                return (
+                    route_attempted == list(prefixes)
+                    and settled == list(prefixes)
+                    and not api_failures
+                    and snapshot is not None
+                    and not has_failure
+                )
+            if status == "failed":
+                if has_failure and not route_attempted:
+                    return (
+                        not settled
+                        and not api_failures
+                        and snapshot is None
+                    )
+                if has_failure:
+                    return route_attempted == list(prefixes) and snapshot is None
+                return (
+                    route_attempted == list(prefixes)
+                    and snapshot is not None
+                    and (bool(api_failures) or settled != list(prefixes))
+                )
+            return False
+
+        restoration_is_active = False
+        if (
+            isinstance(restoration, Mapping)
+            and set(restoration)
+            == {"status", "advertisements", "ownership", "routes"}
+            and restoration_advertisements_match(
+                restoration.get("advertisements")
+            )
+            and restoration_ownership_matches(restoration.get("ownership"))
+            and restoration_routes_match(restoration.get("routes"))
+        ):
+            restoration_status = restoration.get("status")
+            advertisement_status = cast(
+                Mapping[str, Any], restoration["advertisements"]
+            ).get("status")
+            ownership_status = cast(
+                Mapping[str, Any], restoration["ownership"]
+            ).get("status")
+            route_status = cast(Mapping[str, Any], restoration["routes"]).get(
+                "status"
+            )
+            component_statuses = {
+                advertisement_status,
+                ownership_status,
+                route_status,
+            }
+            restoration_is_active = not (
+                advertisement_status == "running"
+                and (
+                    ownership_status != "not-started"
+                    or route_status != "not-started"
+                )
+                or ownership_status == "not-started"
+                and route_status != "not-started"
+                or ownership_status == "running"
+                and (
+                    advertisement_status not in {"verified", "failed"}
+                    or route_status != "not-started"
+                )
+                or ownership_status in {"verified", "failed"}
+                and advertisement_status not in {"verified", "failed"}
+                or route_status == "running"
+                and (
+                    advertisement_status != "verified"
+                    or ownership_status != "verified"
+                )
+                or restoration_status == "running"
+                and route_status not in {"not-started", "running"}
+                or restoration_status == "verified"
+                and component_statuses != {"verified"}
+                or restoration_status == "failed"
+                and (
+                    not component_statuses.issubset({"verified", "failed"})
+                    or "failed" not in component_statuses
+                )
+                or restoration_status not in {"running", "verified", "failed"}
+            )
+
+        if not restoration_is_initial and not restoration_is_active:
+            reject_progress()
+
+        if alternate_expansion is None:
+            forward_status = "authorized"
+        elif current_withdrawal is None:
+            forward_status = "alternate-advertising"
+        elif transferred_ownership is None:
+            forward_status = "ownership-converging"
+        elif ambiguous_calls:
+            forward_status = "ambiguous-forward-call"
+        elif after is None:
+            forward_status = "ownership-transferred"
+        elif probe is None:
+            forward_status = "alternate-active"
+        else:
+            forward_status = "probe-passed"
+
+        status = journal.get("status")
+        if restoration_is_initial:
+            if "finished_at" in journal or "reconciled_at" in journal:
+                reject_progress()
+            if status == "failed-before-restoration":
+                if failure is None:
+                    reject_progress()
+            elif status != "recovery-claimed" and (
+                status != forward_status or failure is not None
+            ):
+                reject_progress()
+        else:
+            restoration_status = cast(Mapping[str, Any], restoration).get("status")
+            if restoration_status == "running":
+                expected_statuses = {"restoring"}
+            elif restoration_status == "failed":
+                expected_statuses = {"restoration-failed"}
+            else:
+                expected_statuses = {
+                    "restored",
+                    "restored-after-failure",
+                    "reconciled-after-crash",
+                }
+            if status != "recovery-claimed" and status not in expected_statuses:
+                reject_progress()
+            if restoration_status == "verified":
+                if "finished_at" not in journal:
+                    reject_progress()
+                if (
+                    "reconciled_at" in journal
+                    and journal.get("reconciled_at") != journal.get("finished_at")
+                ):
+                    reject_progress()
+            elif "finished_at" in journal or "reconciled_at" in journal:
+                reject_progress()
+            if status == "restored" and (
+                failure is not None or "reconciled_at" in journal
+            ):
+                reject_progress()
+            if status == "restored-after-failure" and (
+                failure is None or "reconciled_at" in journal
+            ):
+                reject_progress()
+            if status == "reconciled-after-crash" and (
+                "reconciled_at" not in journal
+                or journal.get("reconciled_at") != journal.get("finished_at")
+            ):
+                reject_progress()
+        if node_ids_by_instance is not None and (
+            current_value.get("node_id_sha256")
+            != hashlib.sha256(
+                node_ids_by_instance.get(current.instance_id, "").encode("utf-8")
+            ).hexdigest()
+            or alternate_value.get("node_id_sha256")
+            != hashlib.sha256(
+                node_ids_by_instance.get(alternate.instance_id, "").encode("utf-8")
+            ).hexdigest()
+        ):
+            raise AmbiguousOwnershipError(
+                "durable GWLBE route journal differs from Tailnet identities"
+            )
+        all_router_ids = {
+            member.instance_id
+            for candidate_site in SITES
+            for member in topology.site(candidate_site).transport_router_fleet
+        }
+        if node_hashes_by_instance is not None and (
+            set(node_hashes_by_instance) != all_router_ids
+            or len(set(node_hashes_by_instance.values())) != len(all_router_ids)
+            or any(
+                re.fullmatch(r"[0-9a-f]{64}", str(value)) is None
+                for value in node_hashes_by_instance.values()
+            )
+            or current_value.get("node_id_sha256")
+            != node_hashes_by_instance.get(current.instance_id)
+            or alternate_value.get("node_id_sha256")
+            != node_hashes_by_instance.get(alternate.instance_id)
+        ):
+            raise AmbiguousOwnershipError(
+                "durable GWLBE route journal differs from its retained Tailnet binding"
+            )
+        assert current.network_interface_id is not None
+        assert table_owner.gwlbe_route_table_id is not None
+        try:
+            _validate_route_snapshot_evidence(
+                journal.get("before"),
+                run_id=topology.run_id,
+                member=table_owner,
+                route_table_id=table_owner.gwlbe_route_table_id,
+                prefixes=prefixes,
+                target_eni=current.network_interface_id,
+            )
+            if isinstance(after, Mapping):
+                assert alternate.network_interface_id is not None
+                _validate_route_snapshot_evidence(
+                    after,
+                    run_id=topology.run_id,
+                    member=table_owner,
+                    route_table_id=table_owner.gwlbe_route_table_id,
+                    prefixes=prefixes,
+                    target_eni=alternate.network_interface_id,
+                )
+        except EvidenceError as error:
+            raise AmbiguousOwnershipError(str(error)) from None
+        before = cast(Mapping[str, Any], journal["before"])
+        if before.get("vpc_id") != vpc_ids.get(cast(Site, site_value)):
+            raise AmbiguousOwnershipError(
+                "durable GWLBE route journal differs from its protected VPC"
+            )
+        return current, alternate, table_owner, prefixes
 
     def _aws_json(
         self,
@@ -7658,59 +8922,22 @@ class GWLBERouteFailover:
         findings = scan_evidence(value)
         if findings:
             raise AmbiguousOwnershipError("durable GWLBE route journal contains unsafe values")
-        required = {
-            "schema",
-            "kind",
-            "run_id",
-            "claim_id",
-            "transaction_id",
-            "owner",
-            "lease_expires_at",
-            "site",
-            "gwlbe_az_key",
-            "started_at",
-            "status",
-            "route_table_id",
-            "source_prefix",
-            "prefixes",
-            "current",
-            "alternate",
-            "interfaces",
-            "before",
-            "advertisements",
-            "ownership",
-            "mutation",
-            "after",
-            "probe",
-            "restoration",
-            "failure",
-        }
-        allowed = required | {"failure_transition", "finished_at", "reconciled_at"}
         if (
             not isinstance(value, dict)
-            or not required.issubset(value)
-            or set(value) - allowed
+            or not _ROUTE_JOURNAL_REQUIRED_FIELDS.issubset(value)
+            or set(value)
+            - (_ROUTE_JOURNAL_REQUIRED_FIELDS | _ROUTE_JOURNAL_OPTIONAL_FIELDS)
             or value.get("schema") != ROUTE_JOURNAL_SCHEMA
             or value.get("kind") != ROUTE_JOURNAL_KIND
             or value.get("run_id") != self.topology.run_id
             or not isinstance(value.get("transaction_id"), str)
-            or re.fullmatch(
-                r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
-                cast(str, value.get("transaction_id")),
-            )
+            or _UUID4_RE.fullmatch(cast(str, value.get("transaction_id")))
             is None
         ):
             raise AmbiguousOwnershipError("durable GWLBE route journal identity is ambiguous")
         owner = value.get("owner")
         if (
-            not isinstance(owner, Mapping)
-            or set(owner) != {"pid", "host_sha256", "boot_id"}
-            or isinstance(owner.get("pid"), bool)
-            or not isinstance(owner.get("pid"), int)
-            or owner["pid"] <= 0
-            or not isinstance(owner.get("host_sha256"), str)
-            or re.fullmatch(r"[0-9a-f]{64}", cast(str, owner["host_sha256"])) is None
-            or not isinstance(owner.get("boot_id"), str)
+            not _route_owner_is_valid(owner)
             or not isinstance(value.get("lease_expires_at"), str)
         ):
             raise AmbiguousOwnershipError("durable GWLBE route journal owner is invalid")
@@ -7720,7 +8947,6 @@ class GWLBERouteFailover:
             )
         except LifecycleError as error:
             raise AmbiguousOwnershipError(str(error)) from None
-        _write_private_json(self.evidence_path, value)
         return value
 
     def _finalize_durable(self, journal: Mapping[str, Any]) -> None:
@@ -8111,89 +9337,13 @@ class GWLBERouteFailover:
             return {"required": False, "restored": True}
         if journal.get("status") not in _RECOVERABLE_ROUTE_JOURNAL_STATUSES:
             return {"required": False, "restored": journal.get("status") in {"restored", "restored-after-failure", "reconciled-after-crash"}}
+        current, alternate, table_owner, prefixes = self.validate_durable_binding(
+            journal,
+            self.topology,
+            self.vpc_ids,
+            node_ids_by_instance=self.advertisement_control.node_ids_by_instance,
+        )
         self._journal_owned_by_current_runner(journal)
-        self._persist(journal)
-        site_value = journal.get("site")
-        if site_value not in SITES:
-            raise AmbiguousOwnershipError("durable GWLBE route journal site is invalid")
-        site = self.topology.site(cast(Site, site_value))
-        current_value = journal.get("current")
-        alternate_value = journal.get("alternate")
-        prefixes_value = journal.get("prefixes")
-        if (
-            not isinstance(current_value, Mapping)
-            or set(current_value)
-            != {
-                "instance_id",
-                "network_interface_id",
-                "baseline_advertisements",
-                "state_before",
-                "node_id_sha256",
-            }
-            or not isinstance(alternate_value, Mapping)
-            or set(alternate_value)
-            != {
-                "instance_id",
-                "network_interface_id",
-                "baseline_advertisements",
-                "state_before",
-                "node_id_sha256",
-            }
-            or not isinstance(prefixes_value, list)
-            or not all(isinstance(value, str) for value in prefixes_value)
-        ):
-            raise AmbiguousOwnershipError("durable GWLBE route journal allowlist is invalid")
-        current_matches = [
-            member
-            for member in site.transport_router_fleet
-            if member.instance_id == current_value.get("instance_id")
-            and member.network_interface_id == current_value.get("network_interface_id")
-        ]
-        table_owner_matches = [
-            member
-            for member in site.transport_router_fleet
-            if member.gwlbe_route_table_id == journal.get("route_table_id")
-            and member.az_key == journal.get("gwlbe_az_key")
-        ]
-        alternate_matches = [
-            member
-            for member in site.transport_router_fleet
-            if member.instance_id == alternate_value.get("instance_id")
-            and member.network_interface_id == alternate_value.get("network_interface_id")
-        ]
-        prefixes = tuple(cast(list[str], prefixes_value))
-        if (
-            len(current_matches) != 1
-            or len(table_owner_matches) != 1
-            or len(alternate_matches) != 1
-            or alternate_matches[0] == current_matches[0]
-            or prefixes != tuple(site.remote_site_cidrs)
-            or journal.get("source_prefix")
-            != current_matches[0].advertised_prefix
-            or current_value.get("baseline_advertisements")
-            != [current_matches[0].advertised_prefix]
-            or alternate_value.get("baseline_advertisements")
-            != [alternate_matches[0].advertised_prefix]
-            or current_value.get("node_id_sha256")
-            != hashlib.sha256(
-                self.advertisement_control.node_ids_by_instance[
-                    current_matches[0].instance_id
-                ].encode("utf-8")
-            ).hexdigest()
-            or alternate_value.get("node_id_sha256")
-            != hashlib.sha256(
-                self.advertisement_control.node_ids_by_instance[
-                    alternate_matches[0].instance_id
-                ].encode("utf-8")
-            ).hexdigest()
-            or self.topology.route_failover.initial_router_az(
-                cast(Site, site_value), cast(str, journal.get("gwlbe_az_key"))
-            )
-            != current_matches[0].az_key
-        ):
-            raise AmbiguousOwnershipError("durable GWLBE route journal differs from topology")
-        current, alternate = current_matches[0], alternate_matches[0]
-        table_owner = table_owner_matches[0]
         authority = self.authorize(current, alternate, prefixes, table_owner)
         claim_id = authority.get("claim_id") if isinstance(authority, Mapping) else None
         if (
@@ -8203,6 +9353,7 @@ class GWLBERouteFailover:
             or authority.get("claim_id") != journal.get("claim_id")
         ):
             raise AmbiguousOwnershipError("durable GWLBE route cleanup authority is ambiguous")
+        journal["status"] = "recovery-claimed"
         self._persist(journal)
         deadline = self.monotonic() + restoration_timeout
         self._network_interface_evidence(current, alternate, deadline=deadline)
@@ -8243,7 +9394,6 @@ class GWLBERouteFailover:
         timeout_seconds: float,
         restoration_timeout_seconds: float,
         failure_mode: Literal["graceful", "abrupt"] = "abrupt",
-        before_replace: Callable[[], Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Replace every exact remote prefix, then always restore the prior ENI."""
 
@@ -8304,11 +9454,7 @@ class GWLBERouteFailover:
             or authority.get("current_network_interface_id") != current.network_interface_id
             or authority.get("alternate_network_interface_id") != alternate.network_interface_id
             or not isinstance(claim_id, str)
-            or re.fullmatch(
-                r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
-                claim_id,
-            )
-            is None
+            or _UUID4_RE.fullmatch(claim_id) is None
         ):
             raise ResilienceError("durable GWLBE route replacement authority was not exact")
 
@@ -8460,16 +9606,6 @@ class GWLBERouteFailover:
             )
             journal["status"] = "alternate-advertising"
             self._persist(journal)
-            if before_replace is not None:
-                self._persist(journal)
-                remaining = deadline - self.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("transport-router failure transition has no time remaining")
-                failure_transition = dict(before_replace())
-                if self.monotonic() >= deadline:
-                    raise TimeoutError("transport-router failure transition exceeded its bounded deadline")
-                journal["failure_transition"] = sanitize_evidence_value(failure_transition)
-                self._persist(journal)
             self._persist(journal)
             remaining = deadline - self.monotonic()
             if remaining <= 0:
@@ -8582,7 +9718,12 @@ class GWLBERouteFailover:
             remaining = deadline - self.monotonic()
             if remaining <= 0:
                 raise TimeoutError("GWLBE alternate probe has no time remaining")
-            raw_probe = dict(probe(remaining))
+            with hard_timeout(
+                max(1, int(math.ceil(remaining))),
+                operation="GWLBE alternate probe",
+                _timeout_error=TimeoutError,
+            ):
+                raw_probe = dict(probe(remaining))
             if self.monotonic() > deadline:
                 raise TimeoutError("GWLBE alternate new-flow probe exceeded its deadline")
             probe_value = sanitize_evidence_value(raw_probe)
@@ -8591,6 +9732,21 @@ class GWLBERouteFailover:
             probe_value = dict(probe_value)
             journal["probe"] = probe_value
             journal["status"] = "probe-passed"
+            try:
+                self.validate_durable_binding(
+                    journal,
+                    self.topology,
+                    self.vpc_ids,
+                    node_ids_by_instance=(
+                        self.advertisement_control.node_ids_by_instance
+                    ),
+                )
+            except AmbiguousOwnershipError:
+                journal["probe"] = None
+                journal["status"] = "alternate-active"
+                raise EvidenceError(
+                    "GWLBE alternate probe has an invalid durable shape"
+                ) from None
             self._persist(journal)
             result = {"after": after, "probe": probe_value}
         except PROTECTED_CONTROL_FLOW as error:
@@ -8605,7 +9761,7 @@ class GWLBERouteFailover:
             except PROTECTED_CONTROL_FLOW as persistence_control_flow:
                 control_flow_error = persistence_control_flow
                 raise
-            except BaseException:
+            except Exception:
                 pass
         finally:
             if control_flow_error is None:
@@ -9586,6 +10742,10 @@ class ProtectedLifecycleAPI(RouteTransactionDurability, Protocol):
 
     def verify_no_drift(self, stage: Literal["before", "after"]) -> Mapping[str, Any]: ...
 
+    def bind_transport_node_identities(
+        self, node_ids_by_instance: Mapping[str, str]
+    ) -> Mapping[str, Any]: ...
+
     def authorize_gwlbe_route_replacement(
         self,
         current: SymmetricFleetMember,
@@ -9869,6 +11029,19 @@ class SymmetricTwoRegionE2ERunner:
         cleanup_result: Mapping[str, Any] = {}
         deferred_finish: Mapping[str, Any] | None = None
         current_phase = Phase.CONSUME_DEPLOYMENT.value
+
+        def cleanup_lifecycle() -> Mapping[str, Any]:
+            for transition_attempt in range(2):
+                try:
+                    return self.lifecycle.cleanup()
+                except PROTECTED_CONTROL_FLOW:
+                    if (
+                        transition_attempt > 0
+                        or getattr(self.lifecycle, "cleanup_attempted", True)
+                    ):
+                        raise
+            raise AssertionError("unreachable cleanup transition retry")
+
         try:
             deployment = parse_symmetric_protected_deployment_output(
                 self.raw_deployment,
@@ -10129,9 +11302,22 @@ class SymmetricTwoRegionE2ERunner:
             finished = True
             acceptance_completed = True
             current_phase = Phase.CLEANUP.value
+            try:
+                cleanup_result = cleanup_lifecycle()
+            except BaseException:
+                cleanup_attempted = bool(
+                    getattr(self.lifecycle, "cleanup_attempted", True)
+                )
+                raise
             cleanup_attempted = True
-            cleanup_result = self.lifecycle.cleanup()
             cleanup_status = "passed"
+            deferred_active_error = getattr(
+                self.lifecycle,
+                "deferred_active_error",
+                None,
+            )
+            if isinstance(deferred_active_error, BaseException):
+                raise deferred_active_error
             residual_audit = self._residual_audit(cleanup_result)
             current_phase = Phase.EVIDENCE.value
             evidence = {
@@ -10180,17 +11366,25 @@ class SymmetricTwoRegionE2ERunner:
             normalized = validate_symmetric_evidence(evidence)
             write_evidence(self.evidence_path, normalized)
             return LiveRunResult(EXIT_OK, self.evidence_path, normalized)
-        except PROTECTED_CONTROL_FLOW:
-            raise
         except BaseException as error:
             acceptance_failure_phase = current_phase
             active_limit_exhausted = isinstance(error, (TimeoutError, InterruptedError, KeyboardInterrupt))
             cleanup_error: BaseException | None = None
             acceptance_error: BaseException | None = error
-            if cleanup_attempted and current_phase == Phase.CLEANUP.value:
-                cleanup_error = error
-                acceptance_error = None if acceptance_completed else error
-                cleanup_status = "failed"
+            if cleanup_attempted:
+                deferred_active_error = getattr(
+                    self.lifecycle,
+                    "deferred_active_error",
+                    None,
+                )
+                if error is deferred_active_error:
+                    acceptance_error = error
+                    acceptance_failure_phase = Phase.EVIDENCE.value
+                    cleanup_status = "passed"
+                else:
+                    cleanup_error = error
+                    acceptance_error = None if acceptance_completed else error
+                    cleanup_status = "failed"
 
             ownership_resolution = _ownership_resolution(acceptance_error or cleanup_error)
             cleanup_blocked = ownership_resolution in {"competing-claim", "ambiguous-ownership"}
@@ -10206,8 +11400,6 @@ class SymmetricTwoRegionE2ERunner:
             ):
                 try:
                     diagnostics = self.operations.collect_diagnostics(deployment)
-                except PROTECTED_CONTROL_FLOW:
-                    raise
                 except BaseException as diagnostic_error:
                     active_limit_exhausted = active_limit_exhausted or isinstance(
                         diagnostic_error, (TimeoutError, InterruptedError, KeyboardInterrupt)
@@ -10240,8 +11432,6 @@ class SymmetricTwoRegionE2ERunner:
                         deferred_finish = dict(finish_result)
                     else:
                         finished = True
-                except PROTECTED_CONTROL_FLOW:
-                    raise
                 except BaseException as candidate:
                     finish_error = candidate
                     active_limit_exhausted = active_limit_exhausted or isinstance(
@@ -10254,11 +11444,14 @@ class SymmetricTwoRegionE2ERunner:
 
             cleanup_authorized = not cleanup_blocked
             if cleanup_authorized and not cleanup_attempted:
-                cleanup_attempted = True
                 try:
-                    cleanup_result = self.lifecycle.cleanup()
+                    cleanup_result = cleanup_lifecycle()
+                    cleanup_attempted = True
                     cleanup_status = "passed"
                 except BaseException as candidate:
+                    cleanup_attempted = bool(
+                        getattr(self.lifecycle, "cleanup_attempted", True)
+                    )
                     cleanup_status = "failed"
                     cleanup_error = candidate
                     cleanup_resolution = _ownership_resolution(candidate)
@@ -10271,8 +11464,6 @@ class SymmetricTwoRegionE2ERunner:
                     if cleanup_status == "passed"
                     else {"passed": False, "owned_resources_remaining": None}
                 )
-            except PROTECTED_CONTROL_FLOW:
-                raise
             except BaseException as audit_error:
                 cleanup_status = "failed"
                 cleanup_error = cleanup_error or audit_error
@@ -11721,12 +12912,169 @@ class ProtectedLifecycleAdapter:
         self._claim_original_manifest: dict[str, Any] | None = None
         self._claim_original_etag: str | None = None
         self._last_persistence_resolution = "none"
+        self._route_only_recovery = False
 
     @staticmethod
     def _manifest_claim_id(manifest: Mapping[str, Any] | None) -> str | None:
         e2e = manifest.get("e2e") if isinstance(manifest, Mapping) else None
         claim_id = e2e.get("claim_id") if isinstance(e2e, Mapping) else None
         return claim_id if isinstance(claim_id, str) and claim_id else None
+
+    @staticmethod
+    def _manifest_output_sha256(manifest: Mapping[str, Any]) -> Any:
+        e2e_value = manifest.get("e2e")
+        replacement = (
+            e2e_value.get("replacement")
+            if isinstance(e2e_value, Mapping)
+            else None
+        )
+        if isinstance(replacement, Mapping) and "finished_at" in replacement:
+            return replacement.get("new_output_sha256")
+        return (
+            e2e_value.get("output_sha256")
+            if isinstance(e2e_value, Mapping)
+            else None
+        )
+
+    @staticmethod
+    def _retained_transport_node_hashes(
+        manifest: Mapping[str, Any], topology: SymmetricTopologyV2
+    ) -> Mapping[str, str]:
+        e2e_value = manifest.get("e2e")
+        node_hashes = (
+            e2e_value.get("transport_node_id_sha256")
+            if isinstance(e2e_value, Mapping)
+            else None
+        )
+        expected_instances = {
+            member.instance_id
+            for site in SITES
+            for member in topology.site(site).transport_router_fleet
+        }
+        if (
+            not isinstance(node_hashes, Mapping)
+            or set(node_hashes) != expected_instances
+            or len(set(node_hashes.values())) != len(expected_instances)
+            or any(
+                re.fullmatch(r"[0-9a-f]{64}", str(value)) is None
+                for value in node_hashes.values()
+            )
+        ):
+            raise LifecycleError(
+                "durable E2E claim has no exact transport-node identity binding"
+            )
+        return cast(Mapping[str, str], node_hashes)
+
+    @staticmethod
+    def _validated_route_owner_lease(
+        value: Mapping[str, Any], *, field: str
+    ) -> tuple[Mapping[str, Any], dt.datetime]:
+        owner = value.get("owner")
+        if not _route_owner_is_valid(owner):
+            raise LifecycleError(f"{field} owner is invalid")
+        lease_value = validate_canonical_utc_timestamp(
+            value.get("lease_expires_at"), f"{field}.lease_expires_at"
+        )
+        return cast(Mapping[str, Any], owner), dt.datetime.fromisoformat(
+            lease_value.removesuffix("Z") + "+00:00"
+        )
+
+    def _validate_route_recovery_marker(
+        self, manifest: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        e2e_value = manifest.get("e2e")
+        marker = (
+            e2e_value.get("route_recovery")
+            if isinstance(e2e_value, Mapping)
+            else None
+        )
+        allowed_phases = {
+            "e2e_running",
+            "e2e_failed",
+            "cleanup_started",
+            "destroy_started",
+            "cleanup_incomplete",
+        }
+        if (
+            not isinstance(marker, Mapping)
+            or set(marker)
+            != {
+                "schema",
+                "kind",
+                "run_id",
+                "claim_id",
+                "transaction_id",
+                "owner",
+                "lease_expires_at",
+                "restored_at",
+                "restoration_status",
+                "status",
+            }
+            or marker.get("schema") != ROUTE_RECOVERY_MARKER_SCHEMA
+            or marker.get("kind") != ROUTE_RECOVERY_MARKER_KIND
+            or marker.get("run_id") != self.config.run_id
+            or marker.get("claim_id") != self._manifest_claim_id(manifest)
+            or _UUID4_RE.fullmatch(str(marker.get("transaction_id", "")))
+            is None
+            or marker.get("restoration_status")
+            not in {"restored-after-failure", "reconciled-after-crash"}
+            or marker.get("status")
+            not in {"cleanup-pending", "cleanup-claimed"}
+            or manifest.get("phase") not in allowed_phases
+            or scan_evidence(marker)
+        ):
+            raise LifecycleError("durable route-recovery cleanup marker is invalid")
+        validate_canonical_utc_timestamp(
+            marker.get("restored_at"), "e2e.route_recovery.restored_at"
+        )
+        self._validated_route_owner_lease(
+            marker, field="e2e.route_recovery"
+        )
+        return marker
+
+    def _validate_abandoned_route_transaction(
+        self,
+        manifest: Mapping[str, Any],
+        deployment: SymmetricProtectedDeployment,
+        journal: Mapping[str, Any],
+    ) -> tuple[Mapping[str, Any], dt.datetime]:
+        if (
+            not _ROUTE_JOURNAL_REQUIRED_FIELDS.issubset(journal)
+            or set(journal)
+            - (_ROUTE_JOURNAL_REQUIRED_FIELDS | _ROUTE_JOURNAL_OPTIONAL_FIELDS)
+            or journal.get("schema") != ROUTE_JOURNAL_SCHEMA
+            or journal.get("kind") != ROUTE_JOURNAL_KIND
+            or journal.get("run_id") != self.config.run_id
+            or journal.get("claim_id") != self._manifest_claim_id(manifest)
+            or journal.get("status") not in _RECOVERABLE_ROUTE_JOURNAL_STATUSES
+            or _UUID4_RE.fullmatch(str(journal.get("transaction_id", "")))
+            is None
+            or scan_evidence(journal)
+        ):
+            raise LifecycleError("durable GWLBE route journal identity is ambiguous")
+        validate_canonical_utc_timestamp(
+            journal.get("started_at"), "e2e.route_transaction.started_at"
+        )
+        for field in ("finished_at", "reconciled_at"):
+            if field in journal:
+                validate_canonical_utc_timestamp(
+                    journal.get(field), f"e2e.route_transaction.{field}"
+                )
+        if self._manifest_output_sha256(manifest) != deployment.output_sha256:
+            raise DeploymentError(
+                "durable E2E output identity differs from the retained deployment"
+            )
+        GWLBERouteFailover.validate_durable_binding(
+            journal,
+            deployment.topology,
+            deployment.vpc_ids,
+            node_hashes_by_instance=self._retained_transport_node_hashes(
+                manifest, deployment.topology
+            ),
+        )
+        return self._validated_route_owner_lease(
+            journal, field="e2e.route_transaction"
+        )
 
     @staticmethod
     def _propagate_after_owned_recovery(error: BaseException) -> None:
@@ -11796,6 +13144,10 @@ class ProtectedLifecycleAdapter:
         base = copy.deepcopy(value)
         e2e_value = base.get("e2e")
         if isinstance(e2e_value, dict):
+            if "route_transaction" in e2e_value and "route_recovery" in e2e_value:
+                raise LifecycleError(
+                    "durable manifest cannot retain both route transaction and cleanup marker"
+                )
             e2e_value.pop("route_transaction", None)
         validate_manifest(base, self.config)
         return value
@@ -11814,7 +13166,7 @@ class ProtectedLifecycleAdapter:
                 str(self.store.path),
             ],
             region=self.config.backend["region"],
-            timeout_seconds=10,
+            timeout_seconds=ROUTE_MANIFEST_API_TIMEOUT_SECONDS,
         )
         etag = response.get("ETag")
         self.store.remote_etag = str(etag) if isinstance(etag, str) and etag else None
@@ -11858,7 +13210,7 @@ class ProtectedLifecycleAdapter:
                 if_match,
             ],
             region=self.config.backend["region"],
-            timeout_seconds=10,
+            timeout_seconds=ROUTE_MANIFEST_API_TIMEOUT_SECONDS,
         )
         etag = response.get("ETag")
         self.store.remote_etag = str(etag) if isinstance(etag, str) and etag else None
@@ -11961,11 +13313,29 @@ class ProtectedLifecycleAdapter:
             or original.get("phase") != "e2e_running"
             or not isinstance(original.get("e2e"), Mapping)
             or original["e2e"].get("route_transaction") is not None
+            or original["e2e"].get("route_recovery") is not None
             or value.get("claim_id") != self._manifest_claim_id(original)
             or value.get("run_id") != self.config.run_id
             or scan_evidence(value)
         ):
             raise ClaimPersistenceError("route transaction creation is not durably authorized")
+        raw_deployment = original.get("deployment")
+        if not isinstance(raw_deployment, Mapping):
+            raise ClaimPersistenceError(
+                "route transaction creation has no durable deployment"
+            )
+        deployment = parse_symmetric_protected_deployment_output(
+            raw_deployment,
+            site_regions={site: self.config.sites[site]["region"] for site in SITES},
+        )
+        GWLBERouteFailover.validate_durable_binding(
+            value,
+            deployment.topology,
+            deployment.vpc_ids,
+            node_hashes_by_instance=self._retained_transport_node_hashes(
+                original, deployment.topology
+            ),
+        )
         revision = getattr(self, "_claim_etag", None)
         if not isinstance(revision, str) or not revision:
             self._raise_ambiguous()
@@ -11974,6 +13344,264 @@ class ProtectedLifecycleAdapter:
         return self._write_route_transaction_manifest(
             original, candidate, expected_revision=revision
         )
+
+    @staticmethod
+    def _validate_route_transaction_successor(
+        existing: Mapping[str, Any], candidate: Mapping[str, Any]
+    ) -> None:
+        immutable_fields = {
+            "schema",
+            "kind",
+            "run_id",
+            "claim_id",
+            "transaction_id",
+            "owner",
+            "site",
+            "gwlbe_az_key",
+            "started_at",
+            "route_table_id",
+            "source_prefix",
+            "prefixes",
+            "current",
+            "alternate",
+            "interfaces",
+            "before",
+        }
+        if any(existing.get(field) != candidate.get(field) for field in immutable_fields):
+            raise ClaimPersistenceError(
+                "route transaction update changed immutable durable authority"
+            )
+        existing_advertisements = existing.get("advertisements")
+        candidate_advertisements = candidate.get("advertisements")
+        if (
+            not isinstance(existing_advertisements, Mapping)
+            or not isinstance(candidate_advertisements, Mapping)
+            or any(
+                existing_advertisements.get(field)
+                != candidate_advertisements.get(field)
+                for field in (
+                    "forward_generation",
+                    "restore_generation",
+                    "failure_mode",
+                )
+            )
+        ):
+            raise ClaimPersistenceError(
+                "route transaction update changed fenced advertisement authority"
+            )
+
+        allowed_statuses: dict[str, set[str]] = {
+            "authorized": {"authorized", "alternate-advertising", "failed-before-restoration"},
+            "alternate-advertising": {
+                "alternate-advertising",
+                "ownership-converging",
+                "failed-before-restoration",
+            },
+            "ownership-converging": {
+                "ownership-converging",
+                "ownership-transferred",
+                "failed-before-restoration",
+            },
+            "ownership-transferred": {
+                "ownership-transferred",
+                "ambiguous-forward-call",
+                "alternate-active",
+                "failed-before-restoration",
+            },
+            "ambiguous-forward-call": {
+                "ambiguous-forward-call",
+                "failed-before-restoration",
+            },
+            "alternate-active": {
+                "alternate-active",
+                "probe-passed",
+                "failed-before-restoration",
+            },
+            "probe-passed": {"probe-passed", "failed-before-restoration"},
+            "failed-before-restoration": {"failed-before-restoration"},
+            "recovery-claimed": {"recovery-claimed"},
+            "restoring": {
+                "restoring",
+                "restoration-failed",
+                "restored",
+                "restored-after-failure",
+                "reconciled-after-crash",
+            },
+            "restoration-failed": {"restoration-failed"},
+            "restored": {"restored"},
+            "restored-after-failure": {"restored-after-failure"},
+            "reconciled-after-crash": {"reconciled-after-crash"},
+        }
+        existing_status = existing.get("status")
+        candidate_status = candidate.get("status")
+        allowed = {
+            *allowed_statuses.get(cast(str, existing_status), set()),
+            "recovery-claimed",
+        }
+        if candidate_status == "restoring":
+            allowed = {*allowed, "restoring"}
+        if candidate_status not in allowed:
+            raise ClaimPersistenceError(
+                "route transaction update regressed durable progress"
+            )
+
+        existing_restoration = existing.get("restoration")
+        candidate_restoration = candidate.get("restoration")
+        initial_restoration = {
+            "status": "not-started",
+            "advertisements": {"status": "not-started"},
+            "ownership": {"status": "not-started"},
+            "routes": {"status": "not-started"},
+        }
+        restoration_status_successors = {
+            "not-started": {"not-started", "running", "failed"},
+            "running": {"running", "verified", "failed"},
+            "verified": {"verified"},
+            "failed": {"failed"},
+        }
+
+        def restoration_progress_extends(
+            prior: Any, successor: Any, *, field: str | None = None
+        ) -> bool:
+            if prior is None:
+                return True
+            if isinstance(prior, Mapping):
+                return isinstance(successor, Mapping) and all(
+                    key in successor
+                    and restoration_progress_extends(
+                        value, successor[key], field=key
+                    )
+                    for key, value in prior.items()
+                )
+            if isinstance(prior, list):
+                return (
+                    isinstance(successor, list)
+                    and successor[: len(prior)] == prior
+                )
+            if field == "status" and isinstance(prior, str):
+                allowed_statuses = restoration_status_successors.get(prior)
+                return (
+                    successor == prior
+                    if allowed_statuses is None
+                    else successor in allowed_statuses
+                )
+            return successor == prior
+
+        if candidate_status == "recovery-claimed":
+            restoration_valid = candidate_restoration == existing_restoration
+        elif existing_status == "restoring":
+            restoration_valid = restoration_progress_extends(
+                existing_restoration, candidate_restoration
+            )
+        elif candidate_status == "restoring":
+            restoration_valid = (
+                existing_status == "recovery-claimed"
+                or existing_restoration == initial_restoration
+            )
+        else:
+            restoration_valid = (
+                existing_restoration == initial_restoration
+                and candidate_restoration == initial_restoration
+                or existing_restoration != initial_restoration
+                and candidate_restoration == existing_restoration
+            )
+        if not restoration_valid:
+            raise ClaimPersistenceError(
+                "route transaction update regressed durable restoration progress"
+            )
+
+        for field in ("alternate_expansion", "current_withdrawal"):
+            prior = existing_advertisements.get(field)
+            if prior is not None and candidate_advertisements.get(field) != prior:
+                raise ClaimPersistenceError(
+                    "route transaction update replaced acknowledged advertisement progress"
+                )
+        existing_ownership = existing.get("ownership")
+        candidate_ownership = candidate.get("ownership")
+        if (
+            not isinstance(existing_ownership, Mapping)
+            or not isinstance(candidate_ownership, Mapping)
+            or existing_ownership.get("before") != candidate_ownership.get("before")
+            or existing_ownership.get("transferred") is not None
+            and existing_ownership.get("transferred")
+            != candidate_ownership.get("transferred")
+        ):
+            raise ClaimPersistenceError(
+                "route transaction update replaced acknowledged ownership progress"
+            )
+
+        existing_mutation = existing.get("mutation")
+        candidate_mutation = candidate.get("mutation")
+        if not isinstance(existing_mutation, Mapping) or not isinstance(
+            candidate_mutation, Mapping
+        ):
+            raise ClaimPersistenceError("route transaction mutation progress is invalid")
+        for field in ("attempted_prefixes", "completed_prefixes"):
+            prior = existing_mutation.get(field)
+            successor = candidate_mutation.get(field)
+            if (
+                not isinstance(prior, list)
+                or not isinstance(successor, list)
+                or successor[: len(prior)] != prior
+            ):
+                raise ClaimPersistenceError(
+                    "route transaction update removed acknowledged route progress"
+                )
+        prior_ambiguous = existing_mutation.get("ambiguous_calls")
+        successor_ambiguous = candidate_mutation.get("ambiguous_calls")
+        if not isinstance(prior_ambiguous, list) or not isinstance(
+            successor_ambiguous, list
+        ):
+            raise ClaimPersistenceError("route transaction settlement progress is invalid")
+        if prior_ambiguous:
+            if not successor_ambiguous:
+                raise ClaimPersistenceError(
+                    "route transaction update removed an ambiguous route call"
+                )
+            prior_call = cast(Mapping[str, Any], prior_ambiguous[0])
+            successor_call = cast(Mapping[str, Any], successor_ambiguous[0])
+            if any(
+                successor_call.get(field) != value
+                for field, value in prior_call.items()
+                if not (field == "settled_target" and value is None)
+            ):
+                raise ClaimPersistenceError(
+                    "route transaction update replaced ambiguous settlement evidence"
+                )
+        for field in ("after", "probe", "failure"):
+            prior = existing.get(field)
+            if prior is not None and candidate.get(field) != prior:
+                raise ClaimPersistenceError(
+                    f"route transaction update replaced acknowledged {field} evidence"
+                )
+        if candidate_status != "restoring" and any(
+            field in existing and candidate.get(field) != existing.get(field)
+            for field in ("finished_at", "reconciled_at")
+        ):
+            raise ClaimPersistenceError(
+                "route transaction update replaced terminal timestamps"
+            )
+        try:
+            existing_lease = dt.datetime.fromisoformat(
+                validate_canonical_utc_timestamp(
+                    existing.get("lease_expires_at"),
+                    "existing route_transaction.lease_expires_at",
+                ).removesuffix("Z")
+                + "+00:00"
+            )
+            candidate_lease = dt.datetime.fromisoformat(
+                validate_canonical_utc_timestamp(
+                    candidate.get("lease_expires_at"),
+                    "candidate route_transaction.lease_expires_at",
+                ).removesuffix("Z")
+                + "+00:00"
+            )
+        except LifecycleError as error:
+            raise ClaimPersistenceError(str(error)) from None
+        if candidate_lease < existing_lease:
+            raise ClaimPersistenceError(
+                "route transaction update shortened its durable owner lease"
+            )
 
     def update_route_transaction(
         self, value: Mapping[str, Any], *, expected_revision: str
@@ -11992,6 +13620,24 @@ class ProtectedLifecycleAdapter:
             or scan_evidence(value)
         ):
             raise ClaimPersistenceError("route transaction update differs from durable authority")
+        raw_deployment = original.get("deployment")
+        if not isinstance(raw_deployment, Mapping):
+            raise ClaimPersistenceError(
+                "route transaction update has no durable deployment"
+            )
+        deployment = parse_symmetric_protected_deployment_output(
+            raw_deployment,
+            site_regions={site: self.config.sites[site]["region"] for site in SITES},
+        )
+        GWLBERouteFailover.validate_durable_binding(
+            value,
+            deployment.topology,
+            deployment.vpc_ids,
+            node_hashes_by_instance=self._retained_transport_node_hashes(
+                original, deployment.topology
+            ),
+        )
+        self._validate_route_transaction_successor(existing, value)
         candidate = copy.deepcopy(original)
         candidate["e2e"]["route_transaction"] = copy.deepcopy(dict(value))
         return self._write_route_transaction_manifest(
@@ -12019,6 +13665,16 @@ class ProtectedLifecycleAdapter:
         route_restoration = (
             restoration.get("routes") if isinstance(restoration, Mapping) else None
         )
+        expected_summary = (
+            {
+                "transaction_id": transaction_id,
+                "status": existing.get("status"),
+                "finished_at": existing.get("finished_at"),
+                "restored": True,
+            }
+            if isinstance(existing, Mapping)
+            else None
+        )
         if (
             not isinstance(original, dict)
             or not isinstance(existing, Mapping)
@@ -12038,13 +13694,39 @@ class ProtectedLifecycleAdapter:
             != existing.get("prefixes")
             or route_restoration.get("settled_prefixes")
             != existing.get("prefixes")
-            or summary.get("transaction_id") != transaction_id
-            or summary.get("restored") is not True
+            or existing.get("status")
+            not in {
+                "restored",
+                "restored-after-failure",
+                "reconciled-after-crash",
+            }
+            or not isinstance(existing.get("finished_at"), str)
+            or dict(summary) != expected_summary
             or scan_evidence(summary)
         ):
             raise ClaimPersistenceError("route transaction cannot finalize before durable restoration")
         candidate = copy.deepcopy(original)
         del candidate["e2e"]["route_transaction"]
+        if summary.get("status") in {
+            "restored-after-failure",
+            "reconciled-after-crash",
+        }:
+            candidate["e2e"]["route_recovery"] = {
+                "schema": ROUTE_RECOVERY_MARKER_SCHEMA,
+                "kind": ROUTE_RECOVERY_MARKER_KIND,
+                "run_id": self.config.run_id,
+                "claim_id": existing.get("claim_id"),
+                "transaction_id": transaction_id,
+                "owner": copy.deepcopy(existing.get("owner")),
+                "lease_expires_at": existing.get("lease_expires_at"),
+                "restored_at": summary.get("finished_at"),
+                "restoration_status": summary.get("status"),
+                "status": (
+                    "cleanup-claimed"
+                    if getattr(self, "_route_only_recovery", False)
+                    else "cleanup-pending"
+                ),
+            }
         return self._write_route_transaction_manifest(
             original, candidate, expected_revision=expected_revision
         )
@@ -12179,8 +13861,10 @@ class ProtectedLifecycleAdapter:
         assert claim_id is not None
         key_generation = candidate.get("tailnet", {}).get("key_generation")
         auth_key_id = str(candidate.get("tailnet", {}).get("auth_key_id", ""))
-        return {
-            "manifest_phase": "ready",
+        summary: dict[str, Any] = {
+            "manifest_phase": (
+                candidate.get("phase") if route_recovery_required else "ready"
+            ),
             "claim_id": claim_id,
             "claim_persistence": persistence,
             "saved_plan_applied_once": True,
@@ -12192,123 +13876,61 @@ class ProtectedLifecycleAdapter:
             "bootstrap_generation": key_generation,
             "bootstrap_identity_sha256": hashlib.sha256(auth_key_id.encode()).hexdigest() if auth_key_id else "absent",
         }
-
-    def claim(
-        self,
-        raw_deployment: Mapping[str, Any],
-        deployment: ProtectedDeployment | SymmetricProtectedDeployment,
-    ) -> Mapping[str, Any]:
-        manifest = self._recover_manifest()
-        if self.store.remote_etag is None:
-            self._raise_ambiguous()
-        if manifest.get("deployment") != raw_deployment:
-            raise DeploymentError("deployment output differs from the durable applied output")
-        route_recovery_required = False
-        if manifest.get("phase") == "e2e_running" and self._manifest_claim_id(manifest) is not None:
-            e2e_value = manifest.get("e2e")
-            journal = (
-                e2e_value.get("route_transaction")
-                if isinstance(e2e_value, Mapping)
+        if route_recovery_required:
+            e2e_value = candidate.get("e2e")
+            recovery = None
+            if isinstance(e2e_value, Mapping):
+                recovery = e2e_value.get("route_transaction") or e2e_value.get(
+                    "route_recovery"
+                )
+            transaction_id = (
+                recovery.get("transaction_id")
+                if isinstance(recovery, Mapping)
                 else None
             )
-            owner = journal.get("owner") if isinstance(journal, Mapping) else None
-            try:
-                lease_value = validate_canonical_utc_timestamp(
-                    journal.get("lease_expires_at") if isinstance(journal, Mapping) else None,
-                    "e2e.route_transaction.lease_expires_at",
+            if not isinstance(transaction_id, str):
+                raise ClaimPersistenceError(
+                    "route-recovery claim summary has no durable transaction identity"
                 )
-            except LifecycleError:
-                self._raise_ambiguous()
-            if (
-                not isinstance(journal, Mapping)
-                or journal.get("schema") != ROUTE_JOURNAL_SCHEMA
-                or journal.get("kind") != ROUTE_JOURNAL_KIND
-                or journal.get("run_id") != self.config.run_id
-                or journal.get("claim_id") != self._manifest_claim_id(manifest)
-                or journal.get("status") not in _RECOVERABLE_ROUTE_JOURNAL_STATUSES
-                or not isinstance(journal.get("transaction_id"), str)
-                or re.fullmatch(
-                    r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
-                    cast(str, journal.get("transaction_id")),
-                )
-                is None
-                or scan_evidence(journal)
-                or not isinstance(owner, Mapping)
-                or set(owner) != {"pid", "host_sha256", "boot_id"}
-                or isinstance(owner.get("pid"), bool)
-                or not isinstance(owner.get("pid"), int)
-                or cast(int, owner.get("pid")) <= 0
-                or not isinstance(owner.get("host_sha256"), str)
-                or re.fullmatch(r"[0-9a-f]{64}", cast(str, owner.get("host_sha256"))) is None
-                or not isinstance(owner.get("boot_id"), str)
-            ):
-                self._raise_ambiguous()
-            identity = _route_runner_identity()
-            now = dt.datetime.now(dt.timezone.utc)
-            lease_expires = dt.datetime.fromisoformat(lease_value.removesuffix("Z") + "+00:00")
-            if lease_expires > now:
-                self._raise_competing()
-            same_host = owner.get("host_sha256") == identity["host_sha256"]
-            same_boot = (
-                owner.get("boot_id") == identity["boot_id"]
-                or owner.get("boot_id") == "unavailable"
-                or identity["boot_id"] == "unavailable"
-            )
-            if same_host and same_boot and _route_process_alive(cast(int, owner["pid"])):
-                self._raise_competing()
-            route_failover = getattr(getattr(deployment, "topology", None), "route_failover", None)
-            lease_seconds = getattr(route_failover, "owner_lease_seconds", None)
-            if not isinstance(lease_seconds, int) or isinstance(lease_seconds, bool):
-                self._raise_ambiguous()
-            candidate = copy.deepcopy(manifest)
-            candidate_transaction = candidate["e2e"]["route_transaction"]
-            candidate_transaction["owner"] = identity
-            candidate_transaction["lease_expires_at"] = (
-                now + dt.timedelta(seconds=lease_seconds)
-            ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-            candidate_transaction["status"] = "recovery-claimed"
-            original_etag = cast(str, self.store.remote_etag)
-            try:
-                self._write_manifest(candidate, if_match=original_etag)
-            except BaseException as error:
-                _rethrow_protected_control_flow(error)
-                durable, etag = self._authoritative_recover()
-                if durable != candidate:
-                    if durable.get("phase") == "e2e_running":
-                        self._raise_competing()
-                    self._raise_ambiguous()
-                self._set_owned(durable, etag, terminal=False)
-                manifest = durable
-            else:
-                committed_etag = self.store.remote_etag
-                if not isinstance(committed_etag, str) or not committed_etag:
-                    durable, committed_etag = self._authoritative_recover()
-                    if durable != candidate:
-                        self._raise_ambiguous()
-                self._set_owned(candidate, committed_etag, terminal=False)
-                manifest = candidate
-            route_recovery_required = True
-        elif manifest.get("phase") != "ready":
-            self._raise_ambiguous()
+            summary["route_transaction_id"] = transaction_id
+        return summary
+
+    def _validated_claim_device_ids(
+        self,
+        manifest: Mapping[str, Any],
+        deployment: ProtectedDeployment | SymmetricProtectedDeployment,
+    ) -> Mapping[str, Any]:
         if "apply_claimed_at" in manifest:
             raise DeploymentError("ready durable manifest retains a stale active apply claim")
         saved_plan = manifest.get("saved_plan")
-        if not isinstance(saved_plan, Mapping) or saved_plan.get("apply_started") is not True or saved_plan.get(
-            "applied"
-        ) is not True:
+        if (
+            not isinstance(saved_plan, Mapping)
+            or saved_plan.get("apply_started") is not True
+            or saved_plan.get("applied") is not True
+        ):
             raise DeploymentError("durable manifest does not prove one successful reviewed apply")
         try:
-            applied_at = validate_canonical_utc_timestamp(saved_plan.get("applied_at"), "saved_plan.applied_at")
+            applied_at = validate_canonical_utc_timestamp(
+                saved_plan.get("applied_at"), "saved_plan.applied_at"
+            )
         except LifecycleError as error:
             raise LoadProfileError(f"durable {error}") from None
-        applied_after = dt.datetime.fromisoformat(applied_at.removesuffix("Z") + "+00:00")
-        approved_at = dt.datetime.fromisoformat(deployment.load_profile.approved_at.removesuffix("Z") + "+00:00")
+        applied_after = dt.datetime.fromisoformat(
+            applied_at.removesuffix("Z") + "+00:00"
+        )
+        approved_at = dt.datetime.fromisoformat(
+            deployment.load_profile.approved_at.removesuffix("Z") + "+00:00"
+        )
         if approved_at >= applied_after:
-            raise LoadProfileError("load thresholds were not approved before the protected apply")
+            raise LoadProfileError(
+                "load thresholds were not approved before the protected apply"
+            )
         tailnet = manifest.get("tailnet")
         device_ids = tailnet.get("device_ids") if isinstance(tailnet, Mapping) else None
         device_roles = tailnet.get("device_roles") if isinstance(tailnet, Mapping) else None
-        durable_hostnames = tailnet.get("expected_hostnames") if isinstance(tailnet, Mapping) else None
+        durable_hostnames = (
+            tailnet.get("expected_hostnames") if isinstance(tailnet, Mapping) else None
+        )
         expected_hostnames = set(expected_tailnet_hostnames(self.config))
         if (
             len(expected_hostnames) != 4
@@ -12316,22 +13938,221 @@ class ProtectedLifecycleAdapter:
             or set(device_ids) != expected_hostnames
             or len(set(device_ids.values())) != len(expected_hostnames)
             or not isinstance(device_roles, Mapping)
-            or device_roles != {hostname: "transport-router" for hostname in expected_hostnames}
+            or device_roles
+            != {hostname: "transport-router" for hostname in expected_hostnames}
             or not isinstance(durable_hostnames, list)
             or len(durable_hostnames) != len(expected_hostnames)
             or set(durable_hostnames) != expected_hostnames
-            or any("-target-" in hostname or "-transport-" not in hostname for hostname in expected_hostnames)
+            or any(
+                "-target-" in hostname or "-transport-" not in hostname
+                for hostname in expected_hostnames
+            )
         ):
             raise DeploymentError(
                 "durable manifest must identify exactly four role-separated transport-router Tailnet nodes"
             )
-        if any(self.config.sites[site]["region"] != deployment.appliance(site).region for site in SITES):
-            raise DeploymentError("deployment regions differ from protected run configuration")
+        if any(
+            self.config.sites[site]["region"] != deployment.appliance(site).region
+            for site in SITES
+        ):
+            raise DeploymentError(
+                "deployment regions differ from protected run configuration"
+            )
+        return cast(Mapping[str, Any], device_ids)
+
+    def claim(
+        self,
+        raw_deployment: Mapping[str, Any],
+        deployment: ProtectedDeployment | SymmetricProtectedDeployment,
+        *,
+        require_route_recovery: bool = False,
+    ) -> Mapping[str, Any]:
+        manifest = self._recover_manifest()
+        if self.store.remote_etag is None:
+            self._raise_ambiguous()
+        if manifest.get("deployment") != raw_deployment:
+            raise DeploymentError("deployment output differs from the durable applied output")
+        e2e_value = manifest.get("e2e")
+        journal = (
+            e2e_value.get("route_transaction")
+            if isinstance(e2e_value, Mapping)
+            else None
+        )
+        marker = (
+            e2e_value.get("route_recovery")
+            if isinstance(e2e_value, Mapping)
+            else None
+        )
+        if journal is not None and marker is not None:
+            self._raise_ambiguous()
+        recovering_transaction = (
+            manifest.get("phase") == "e2e_running"
+            and self._manifest_claim_id(manifest) is not None
+            and isinstance(journal, Mapping)
+        )
+        recovering_cleanup = (
+            self._manifest_claim_id(manifest) is not None
+            and isinstance(marker, Mapping)
+            and manifest.get("phase")
+            in {
+                "e2e_running",
+                "e2e_failed",
+                "cleanup_started",
+                "destroy_started",
+                "cleanup_incomplete",
+            }
+        )
+        recovering_route = recovering_transaction or recovering_cleanup
+        if manifest.get("phase") != "ready" and not recovering_route:
+            self._raise_ambiguous()
+        device_ids = self._validated_claim_device_ids(manifest, deployment)
+        route_recovery_required = False
+        if recovering_route:
+            if not isinstance(deployment, SymmetricProtectedDeployment):
+                self._raise_ambiguous()
+            try:
+                if recovering_transaction:
+                    assert isinstance(journal, Mapping)
+                    owner, lease_expires = self._validate_abandoned_route_transaction(
+                        manifest, deployment, journal
+                    )
+                    recovery_field = "route_transaction"
+                else:
+                    marker = self._validate_route_recovery_marker(manifest)
+                    if self._manifest_output_sha256(manifest) != deployment.output_sha256:
+                        raise DeploymentError(
+                            "durable E2E output identity differs from the retained deployment"
+                        )
+                    self._retained_transport_node_hashes(
+                        manifest, deployment.topology
+                    )
+                    if manifest.get("phase") in {
+                        "cleanup_started",
+                        "destroy_started",
+                        "cleanup_incomplete",
+                    }:
+                        cleanup_claim_id = local_cleanup_claim_id(self.run_dir)
+                        existing_cleanup_claim = manifest.get("cleanup_claim_id")
+                        try:
+                            cleanup_started_at = dt.datetime.fromisoformat(
+                                validate_canonical_utc_timestamp(
+                                    manifest.get("cleanup_claimed_at"),
+                                    "cleanup_claimed_at",
+                                ).removesuffix("Z")
+                                + "+00:00"
+                            )
+                        except LifecycleError:
+                            self._raise_ambiguous()
+                        if (
+                            existing_cleanup_claim != cleanup_claim_id
+                            and dt.datetime.now(dt.timezone.utc)
+                            - cleanup_started_at
+                            < dt.timedelta(minutes=30)
+                        ):
+                            self._raise_competing()
+                    owner, lease_expires = self._validated_route_owner_lease(
+                        marker, field="e2e.route_recovery"
+                    )
+                    recovery_field = "route_recovery"
+            except DeploymentError:
+                raise
+            except ConcurrentRunError:
+                raise
+            except (LifecycleError, AmbiguousOwnershipError, EvidenceError):
+                self._raise_ambiguous()
+            identity = _route_runner_identity()
+            now = dt.datetime.now(dt.timezone.utc)
+            if lease_expires > now:
+                self._raise_competing()
+            same_host = owner.get("host_sha256") == identity["host_sha256"]
+            same_boot = owner.get("boot_id") == identity["boot_id"]
+            if same_host and same_boot and _route_process_alive(cast(int, owner["pid"])):
+                self._raise_competing()
+            route_failover = deployment.topology.route_failover
+            lease_seconds = route_failover.owner_lease_seconds
+            if not isinstance(lease_seconds, int) or isinstance(lease_seconds, bool):
+                self._raise_ambiguous()
+            candidate = copy.deepcopy(manifest)
+            candidate_recovery = candidate["e2e"][recovery_field]
+            candidate_recovery["owner"] = identity
+            candidate_recovery["lease_expires_at"] = (
+                now + dt.timedelta(seconds=lease_seconds)
+            ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            candidate_recovery["status"] = (
+                "recovery-claimed"
+                if recovery_field == "route_transaction"
+                else "cleanup-claimed"
+            )
+            original_etag = cast(str, self.store.remote_etag)
+            try:
+                self._write_manifest(candidate, if_match=original_etag)
+            except BaseException as error:
+                _rethrow_protected_control_flow(error)
+                durable, etag = self._authoritative_recover()
+                if durable == manifest and etag == original_etag:
+                    self.manifest = None
+                    self._claim_etag = None
+                    self._ownership_state = "unclaimed"
+                    self._last_persistence_resolution = "claim-not-committed"
+                    self._clear_claim_original()
+                    raise ClaimPersistenceError(
+                        "route-recovery claim was not committed; prior cleanup authority remains unchanged"
+                    ) from None
+                if durable != candidate:
+                    if (
+                        self._manifest_claim_id(durable)
+                        != self._manifest_claim_id(manifest)
+                    ):
+                        self._raise_competing()
+                    durable_e2e = durable.get("e2e")
+                    durable_recovery = (
+                        durable_e2e.get(recovery_field)
+                        if isinstance(durable_e2e, Mapping)
+                        else None
+                    )
+                    original_e2e = manifest.get("e2e")
+                    original_recovery = (
+                        original_e2e.get(recovery_field)
+                        if isinstance(original_e2e, Mapping)
+                        else None
+                    )
+                    if (
+                        isinstance(durable_recovery, Mapping)
+                        and isinstance(original_recovery, Mapping)
+                        and durable_recovery.get("owner")
+                        != original_recovery.get("owner")
+                    ):
+                        self._raise_competing()
+                    self._raise_ambiguous()
+                self._set_owned(
+                    durable,
+                    etag,
+                    terminal=durable.get("phase") != "e2e_running",
+                )
+                manifest = durable
+            else:
+                committed_etag = self.store.remote_etag
+                if not isinstance(committed_etag, str) or not committed_etag:
+                    durable, committed_etag = self._authoritative_recover()
+                    if durable != candidate:
+                        self._raise_ambiguous()
+                self._set_owned(
+                    candidate,
+                    committed_etag,
+                    terminal=candidate.get("phase") != "e2e_running",
+                )
+                manifest = candidate
+            route_recovery_required = True
+            self._route_only_recovery = require_route_recovery
+        elif require_route_recovery:
+            raise ClaimPersistenceError(
+                "route-only recovery requires an active abandoned route transaction or its cleanup marker"
+            )
         if route_recovery_required:
             return self._claim_summary(
                 manifest,
                 deployment,
-                cast(Mapping[str, Any], device_ids),
+                device_ids,
                 "recovered-abandoned-route-claim",
                 route_recovery_required=True,
             )
@@ -12362,7 +14183,81 @@ class ProtectedLifecycleAdapter:
             else:
                 self._set_owned(candidate, committed_etag, terminal=False)
                 persistence = "conditional-write"
-        return self._claim_summary(candidate, deployment, cast(Mapping[str, Any], device_ids), persistence)
+        return self._claim_summary(candidate, deployment, device_ids, persistence)
+
+    def bind_transport_node_identities(
+        self, node_ids_by_instance: Mapping[str, str]
+    ) -> Mapping[str, Any]:
+        original = self.manifest
+        if (
+            getattr(self, "_ownership_state", "unclaimed") != "running-owned"
+            or not isinstance(original, dict)
+            or original.get("phase") != "e2e_running"
+            or not isinstance(original.get("e2e"), Mapping)
+            or "route_transaction" in original["e2e"]
+            or "route_recovery" in original["e2e"]
+        ):
+            raise ClaimPersistenceError(
+                "transport-node binding requires this runner's pre-transaction E2E claim"
+            )
+        raw_deployment = original.get("deployment")
+        if not isinstance(raw_deployment, Mapping):
+            raise ClaimPersistenceError(
+                "transport-node binding has no durable symmetric deployment"
+            )
+        deployment = parse_symmetric_protected_deployment_output(
+            raw_deployment,
+            site_regions={site: self.config.sites[site]["region"] for site in SITES},
+        )
+        expected_instances = {
+            member.instance_id
+            for site in SITES
+            for member in deployment.topology.site(site).transport_router_fleet
+        }
+        if (
+            set(node_ids_by_instance) != expected_instances
+            or len(set(node_ids_by_instance.values())) != len(expected_instances)
+            or any(
+                not isinstance(node_id, str)
+                or not node_id
+                or node_id.startswith(("nodekey:", "key:"))
+                for node_id in node_ids_by_instance.values()
+            )
+        ):
+            raise ClaimPersistenceError(
+                "transport-node binding does not cover the exact symmetric router fleet"
+            )
+        node_hashes = {
+            instance_id: hashlib.sha256(node_id.encode("utf-8")).hexdigest()
+            for instance_id, node_id in node_ids_by_instance.items()
+        }
+        durable, etag = self._authoritative_recover()
+        if durable != original or etag != getattr(self, "_claim_etag", None):
+            if self._manifest_claim_id(durable) != self._manifest_claim_id(original):
+                self._raise_competing()
+            self._raise_ambiguous()
+        existing = original["e2e"].get("transport_node_id_sha256")
+        if existing is not None:
+            if existing != node_hashes:
+                self._raise_ambiguous()
+            return {
+                "bound": True,
+                "persistence": "existing",
+                "transport_router_nodes": len(node_hashes),
+            }
+        candidate = copy.deepcopy(original)
+        candidate["e2e"]["transport_node_id_sha256"] = node_hashes
+        revision = self._write_route_transaction_manifest(
+            original,
+            candidate,
+            expected_revision=etag,
+        )
+        return {
+            "bound": True,
+            "persistence": "conditional-write",
+            "revision": revision,
+            "transport_router_nodes": len(node_hashes),
+        }
 
     def verify_no_drift(self, stage: Literal["before", "after"]) -> Mapping[str, Any]:
         try:
@@ -12921,9 +14816,74 @@ class ProtectedLifecycleAdapter:
                 raise RouteRestorationError(
                     "protected cleanup cannot proceed before durable route restoration"
                 )
-            self.finish(False)
-        handoff = self._handoff_active_claim_for_cleanup()
+            manifest = self.manifest
+            e2e_value = (
+                manifest.get("e2e") if isinstance(manifest, Mapping) else None
+            )
+        marker = (
+            e2e_value.get("route_recovery")
+            if isinstance(e2e_value, Mapping)
+            else None
+        )
+        if isinstance(marker, Mapping):
+            marker = self._validate_route_recovery_marker(cast(Mapping[str, Any], manifest))
+            if route_recovery is None:
+                route_recovery = {
+                    "required": False,
+                    "restored": True,
+                    "transaction_id": marker["transaction_id"],
+                }
+            if manifest.get("phase") == "e2e_running":
+                self.finish(False)
+                manifest = self.manifest
+        phase = manifest.get("phase") if isinstance(manifest, Mapping) else None
+        handoff = (
+            None
+            if phase
+            in {
+                "cleanup_started",
+                "destroy_started",
+                "cleanup_incomplete",
+            }
+            else self._handoff_active_claim_for_cleanup()
+        )
         tailscale = build_tailscale(self.config)
+        before_manifest_delete: Callable[[Mapping[str, Any]], None] | None = None
+        if getattr(self, "_route_only_recovery", False) and isinstance(marker, Mapping):
+            receipt_path = self.run_dir / "route-recovery-cleanup-result.json"
+
+            def checkpoint(cleanup_result: Mapping[str, Any]) -> None:
+                durable = self._recover_manifest()
+                durable_marker = self._validate_route_recovery_marker(durable)
+                if (
+                    durable_marker.get("owner") != marker.get("owner")
+                    or durable_marker.get("status") != "cleanup-claimed"
+                    or durable.get("cleanup_claim_id")
+                    != local_cleanup_claim_id(self.run_dir)
+                ):
+                    raise AmbiguousOwnershipError(
+                        "route-only cleanup lost durable ownership before its receipt"
+                    )
+                _write_private_json(
+                    receipt_path,
+                    _route_recovery_receipt_document(
+                        self.config,
+                        durable,
+                        durable_marker,
+                        cleanup_result,
+                        cleanup="backend-finalization-pending",
+                    ),
+                )
+
+            before_manifest_delete = checkpoint
+        cleanup_options: dict[str, Any] = {
+            "recover": True,
+            "dry_run": False,
+            "skip_destroy": False,
+            "timeout_seconds": PROTECTED_RESOURCE_CLEANUP_SECONDS,
+        }
+        if before_manifest_delete is not None:
+            cleanup_options["before_manifest_delete"] = before_manifest_delete
         result = protected_cleanup(
             self.config,
             self.aws,
@@ -12931,9 +14891,7 @@ class ProtectedLifecycleAdapter:
             self.runner,
             self.run_dir,
             self.terraform_dir,
-            recover=True,
-            dry_run=False,
-            skip_destroy=False,
+            **cleanup_options,
         )
         enriched = dict(result)
         if handoff is not None:
@@ -12958,9 +14916,21 @@ def validate_protected_execution(run_id: str, environment: Mapping[str, str]) ->
 
 
 @contextlib.contextmanager
-def hard_timeout(seconds: int, *, operation: str = "live E2E") -> Iterable[None]:
-    if isinstance(seconds, bool) or not isinstance(seconds, int) or not 1 <= seconds <= 7200:
-        raise E2EError("hard timeout must be between 1 and 7200 seconds")
+def hard_timeout(
+    seconds: int,
+    *,
+    operation: str = "live E2E",
+    _timeout_error: type[TimeoutError] = ProtectedHardTimeout,
+) -> Iterable[None]:
+    if (
+        isinstance(seconds, bool)
+        or not isinstance(seconds, int)
+        or not 1 <= seconds <= MAX_PROTECTED_LIFECYCLE_SECONDS
+    ):
+        raise E2EError(
+            "hard timeout must be between 1 and "
+            f"{MAX_PROTECTED_LIFECYCLE_SECONDS} seconds"
+        )
     if not hasattr(signal, "SIGALRM") or threading.current_thread() is not threading.main_thread():
         yield
         return
@@ -12968,16 +14938,27 @@ def hard_timeout(seconds: int, *, operation: str = "live E2E") -> Iterable[None]
     previous_handler = signal.getsignal(signal.SIGALRM)
     previous_term_handler = signal.getsignal(signal.SIGTERM)
     previous_alarm_seconds = signal.alarm(0)
+    started = time.monotonic()
+    nested_alarm_owns_deadline = (
+        previous_alarm_seconds == 0 or seconds < previous_alarm_seconds
+    )
 
     def expired(_signum: int, _frame: Any) -> None:
-        raise ProtectedHardTimeout(f"{operation} exceeded its {seconds}-second hard timeout")
+        raise _timeout_error(
+            f"{operation} exceeded its {seconds}-second hard timeout"
+        )
 
     def interrupted(_signum: int, _frame: Any) -> None:
         raise ProtectedTermination(f"{operation} received SIGTERM and entered protected cleanup")
 
-    signal.signal(signal.SIGALRM, expired)
+    signal.signal(
+        signal.SIGALRM,
+        expired if nested_alarm_owns_deadline else previous_handler,
+    )
     signal.signal(signal.SIGTERM, interrupted)
-    signal.alarm(seconds)
+    signal.alarm(
+        seconds if nested_alarm_owns_deadline else previous_alarm_seconds
+    )
     try:
         yield
     finally:
@@ -12985,7 +14966,10 @@ def hard_timeout(seconds: int, *, operation: str = "live E2E") -> Iterable[None]
         signal.signal(signal.SIGALRM, previous_handler)
         signal.signal(signal.SIGTERM, previous_term_handler)
         if previous_alarm_seconds > 0:
-            signal.alarm(previous_alarm_seconds)
+            elapsed = int(math.ceil(max(0.0, time.monotonic() - started)))
+            remaining = previous_alarm_seconds - elapsed
+            if remaining > 0:
+                signal.alarm(remaining)
 
 
 def run_all_hard_timeout(seconds: int) -> Any:
@@ -12994,6 +14978,196 @@ def run_all_hard_timeout(seconds: int) -> Any:
 
 def cleanup_hard_timeout(seconds: int) -> Any:
     return hard_timeout(seconds, operation="protected cleanup")
+
+
+@contextlib.contextmanager
+def _blocked_protected_signals() -> Iterable[None]:
+    if (
+        not hasattr(signal, "SIGALRM")
+        or not hasattr(signal, "pthread_sigmask")
+        or threading.current_thread() is not threading.main_thread()
+    ):
+        yield
+        return
+    previous_mask = signal.pthread_sigmask(
+        signal.SIG_BLOCK,
+        {signal.SIGALRM, signal.SIGTERM},
+    )
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
+class _ProtectedLifecycleDeadline:
+    """Own one signal handler while switching from acceptance to cleanup."""
+
+    def __init__(
+        self,
+        active_seconds: int,
+        cleanup_seconds: int,
+        *,
+        operation: str,
+    ) -> None:
+        for name, value in (
+            ("active", active_seconds),
+            ("cleanup", cleanup_seconds),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise E2EError(f"protected lifecycle {name} timeout must be a positive integer")
+        if active_seconds + cleanup_seconds > MAX_PROTECTED_LIFECYCLE_SECONDS:
+            raise E2EError(
+                "protected lifecycle active and cleanup timeouts must fit within "
+                f"{MAX_PROTECTED_LIFECYCLE_SECONDS} seconds"
+            )
+        self.active_seconds = active_seconds
+        self.cleanup_seconds = cleanup_seconds
+        self.operation = operation
+        self.cleanup_started = False
+        self.deferred_active_error: BaseException | None = None
+        self.termination_deferred = False
+        self._entered = False
+        self._closed = False
+        self._handoff_in_progress = False
+        self._signals_enabled = False
+        self._phase_operation = f"{operation} acceptance"
+        self._phase_seconds = active_seconds
+        self._previous_alarm_handler: Any = None
+        self._previous_term_handler: Any = None
+        self._previous_alarm_seconds = 0
+        self._started_monotonic = 0.0
+
+    def _parent_remaining(self) -> int | None:
+        if self._previous_alarm_seconds <= 0:
+            return None
+        elapsed = int(
+            math.ceil(max(0.0, time.monotonic() - self._started_monotonic))
+        )
+        return max(1, self._previous_alarm_seconds - elapsed)
+
+    def _arm(self, seconds: int) -> None:
+        parent_remaining = self._parent_remaining()
+        owns_deadline = parent_remaining is None or seconds < parent_remaining
+        signal.signal(
+            signal.SIGALRM,
+            self._expired if owns_deadline else self._previous_alarm_handler,
+        )
+        signal.alarm(seconds if owns_deadline else cast(int, parent_remaining))
+
+    def _expired(self, _signum: int, _frame: Any) -> None:
+        if self._handoff_in_progress:
+            if self.deferred_active_error is None:
+                self.deferred_active_error = ProtectedHardTimeout(
+                    f"{self.operation} acceptance deadline expired during the cleanup handoff"
+                )
+            return
+        raise ProtectedHardTimeout(
+            f"{self._phase_operation} exceeded its {self._phase_seconds}-second hard timeout"
+        )
+
+    def _interrupted(self, _signum: int, _frame: Any) -> None:
+        if self.cleanup_started or self._handoff_in_progress:
+            self.termination_deferred = True
+            return
+        raise ProtectedTermination(
+            f"{self._phase_operation} received SIGTERM and entered protected cleanup"
+        )
+
+    def __enter__(self) -> "_ProtectedLifecycleDeadline":
+        if self._entered:
+            raise E2EError("protected lifecycle deadline cannot be entered more than once")
+        self._entered = True
+        if not hasattr(signal, "SIGALRM") or threading.current_thread() is not threading.main_thread():
+            return self
+        self._signals_enabled = True
+        self._previous_alarm_handler = signal.getsignal(signal.SIGALRM)
+        self._previous_term_handler = signal.getsignal(signal.SIGTERM)
+        self._previous_alarm_seconds = signal.alarm(0)
+        self._started_monotonic = time.monotonic()
+        signal.signal(signal.SIGTERM, self._interrupted)
+        self._arm(self.active_seconds)
+        return self
+
+    def start_cleanup(self) -> None:
+        if not self._entered or self._closed:
+            raise E2EError("protected cleanup deadline requires an active lifecycle deadline")
+        if self.cleanup_started:
+            return
+        self._handoff_in_progress = True
+        previous_mask: set[signal.Signals] | None = None
+        blocked_signals = {signal.SIGALRM, signal.SIGTERM}
+        try:
+            if self._signals_enabled and hasattr(signal, "pthread_sigmask"):
+                previous_mask = signal.pthread_sigmask(
+                    signal.SIG_BLOCK,
+                    blocked_signals,
+                )
+            self.cleanup_started = True
+            self._phase_operation = f"{self.operation} cleanup"
+            self._phase_seconds = self.cleanup_seconds
+            if self._signals_enabled:
+                signal.alarm(0)
+                self._arm(self.cleanup_seconds)
+                if (
+                    hasattr(signal, "sigpending")
+                    and hasattr(signal, "sigwait")
+                    and signal.SIGALRM in signal.sigpending()
+                ):
+                    if self.deferred_active_error is None:
+                        self.deferred_active_error = ProtectedHardTimeout(
+                            f"{self.operation} acceptance deadline expired during the cleanup handoff"
+                        )
+                    signal.sigwait({signal.SIGALRM})
+        finally:
+            if previous_mask is not None:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            self._handoff_in_progress = False
+
+    def __exit__(
+        self,
+        _error_type: type[BaseException] | None,
+        _error: BaseException | None,
+        _traceback: Any,
+    ) -> bool:
+        if self._closed:
+            return False
+        self._closed = True
+        if self._signals_enabled:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, self._previous_alarm_handler)
+            signal.signal(signal.SIGTERM, self._previous_term_handler)
+            if self._previous_alarm_seconds > 0:
+                elapsed = int(
+                    math.ceil(max(0.0, time.monotonic() - self._started_monotonic))
+                )
+                remaining = self._previous_alarm_seconds - elapsed
+                if remaining > 0:
+                    signal.alarm(remaining)
+        if self.termination_deferred and _error is None:
+            raise ProtectedTermination(
+                f"{self.operation} cleanup received SIGTERM while protected cleanup completed"
+            )
+        return False
+
+
+def run_all_lifecycle_timeout(
+    active_seconds: int, cleanup_seconds: int
+) -> _ProtectedLifecycleDeadline:
+    return _ProtectedLifecycleDeadline(
+        active_seconds,
+        cleanup_seconds,
+        operation="protected run-all",
+    )
+
+
+def live_lifecycle_timeout(
+    active_seconds: int, cleanup_seconds: int
+) -> _ProtectedLifecycleDeadline:
+    return _ProtectedLifecycleDeadline(
+        active_seconds,
+        cleanup_seconds,
+        operation="live E2E",
+    )
 
 
 REMOTE_AGENT_SOURCE = r'''#!/usr/bin/env python3
@@ -13634,7 +15808,6 @@ class AwsLiveOperations:
         *,
         timeout_seconds: int,
         comment: str,
-        client_token: str | None = None,
     ) -> SSMResult:
         bounded = max(1, min(int(timeout_seconds), 3600))
         result = self.ssm.execute(
@@ -13643,7 +15816,6 @@ class AwsLiveOperations:
                 (command,),
                 timeout_seconds=bounded,
                 comment=comment,
-                client_token=client_token,
             ),
             wait_timeout_seconds=bounded + 15,
         )
@@ -16988,22 +19160,11 @@ class AwsSymmetricLiveOperations:
         timeout_seconds: int,
         comment: str,
     ) -> Mapping[str, Any]:
-        mutating = command.startswith(
-            "/usr/local/sbin/envelope-transport-advertisements apply "
-        )
         result = self.base._execute(
             self._remote(member),
             command,
             timeout_seconds=timeout_seconds,
             comment=comment,
-            client_token=(
-                "env-"
-                + hashlib.sha256(
-                    f"{member.instance_id}\0{command}".encode("utf-8")
-                ).hexdigest()[:60]
-                if mutating
-                else None
-            ),
         )
         lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         if not lines:
@@ -17100,6 +19261,61 @@ class AwsSymmetricLiveOperations:
             }
         if len({identity["node_id"] for identity in result.values()}) != len(result):
             raise ReadinessError("Tailnet transport routers do not have distinct stable node IDs")
+        current_manifest = getattr(self.lifecycle, "manifest", None)
+        current_e2e = (
+            current_manifest.get("e2e")
+            if isinstance(current_manifest, Mapping)
+            else None
+        )
+        retained_hashes = (
+            current_e2e.get("transport_node_id_sha256")
+            if isinstance(current_e2e, Mapping)
+            else None
+        )
+        binder = getattr(self.lifecycle, "bind_transport_node_identities", None)
+        if retained_hashes is not None or callable(binder):
+            raw_deployment = (
+                current_manifest.get("deployment")
+                if isinstance(current_manifest, Mapping)
+                else None
+            )
+            if not isinstance(raw_deployment, Mapping):
+                raise ReadinessError(
+                    "transport-node binding has no durable symmetric deployment"
+                )
+            deployment = parse_symmetric_protected_deployment_output(
+                raw_deployment,
+                site_regions={
+                    site: self.config.sites[site]["region"] for site in SITES
+                },
+            )
+            node_ids_by_instance = {
+                member.instance_id: cast(
+                    str,
+                    result[
+                        f"{self.config.run_id}-{site}-transport-{member.az_key}"
+                    ]["node_id"],
+                )
+                for site in SITES
+                for member in deployment.topology.site(site).transport_router_fleet
+            }
+            node_hashes = {
+                instance_id: hashlib.sha256(node_id.encode("utf-8")).hexdigest()
+                for instance_id, node_id in node_ids_by_instance.items()
+            }
+            if retained_hashes is not None and retained_hashes != node_hashes:
+                raise ReadinessError(
+                    "Tailnet transport-node identities differ from the durable E2E binding"
+                )
+            if retained_hashes is None:
+                binding = binder(node_ids_by_instance)
+                if (
+                    not isinstance(binding, Mapping)
+                    or binding.get("bound") is not True
+                ):
+                    raise ReadinessError(
+                        "transport-node identities were not durably bound before route mutation"
+                    )
         self._tailnet_status_identity_cache = {
             hostname: dict(identity) for hostname, identity in result.items()
         }
@@ -19780,15 +21996,17 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
                     ).remote_site_cidrs
                 )
             )
-            + STREAM_MUTATION_OVERHEAD_SECONDS
         )
         abrupt_reservation = (
             deployment.topology.route_failover.transaction_reservation_seconds(
                 len(deployment.topology.site(abrupt_failed.site).remote_site_cidrs)
             )
-            + STREAM_MUTATION_OVERHEAD_SECONDS
         )
-        if max(graceful_reservation, abrupt_reservation) > MAX_STREAM_MUTATION_RESERVATION_SECONDS:
+        if (
+            max(graceful_reservation, abrupt_reservation)
+            + STREAM_MUTATION_OVERHEAD_SECONDS
+            > MAX_STREAM_MUTATION_RESERVATION_SECONDS
+        ):
             raise ResilienceError(
                 "transport failover configuration cannot fit a bounded continuity stream"
             )
@@ -19797,14 +22015,19 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
 
         def graceful_exercise() -> Mapping[str, Any]:
             def probe(remaining: float) -> Mapping[str, Any]:
-                paths = {
-                    flow.protocol: self._wait_probe_path(
+                probe_deadline = self.base.monotonic() + remaining
+                paths: dict[str, Mapping[str, Any]] = {}
+                for flow in (graceful_new_tcp_flow, graceful_flow):
+                    probe_remaining = probe_deadline - self.base.monotonic()
+                    if probe_remaining <= 0:
+                        raise TimeoutError(
+                            "graceful failover probes exhausted their shared deadline"
+                        )
+                    paths[flow.protocol] = self._wait_probe_path(
                         deployment,
                         flow,
-                        timeout_seconds=max(1, int(remaining)),
+                        timeout_seconds=max(1, int(math.ceil(probe_remaining))),
                     )
-                    for flow in (graceful_new_tcp_flow, graceful_flow)
-                }
                 if any(
                     path["destination_transport_router_id"]
                     != graceful_alternate.instance_id
@@ -19848,14 +22071,19 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
         abrupt_started = self.base.monotonic()
 
         def abrupt_probe(remaining: float) -> Mapping[str, Any]:
-            paths = {
-                flow.protocol: self._wait_probe_path(
+            probe_deadline = self.base.monotonic() + remaining
+            paths: dict[str, Mapping[str, Any]] = {}
+            for flow in (abrupt_new_tcp_flow, abrupt_flow):
+                probe_remaining = probe_deadline - self.base.monotonic()
+                if probe_remaining <= 0:
+                    raise TimeoutError(
+                        "abrupt failover probes exhausted their shared deadline"
+                    )
+                paths[flow.protocol] = self._wait_probe_path(
                     deployment,
                     flow,
-                    timeout_seconds=max(1, int(remaining)),
+                    timeout_seconds=max(1, int(math.ceil(probe_remaining))),
                 )
-                for flow in (abrupt_new_tcp_flow, abrupt_flow)
-            }
             if any(
                 path.get("source_transport_router_id")
                 != abrupt_alternate.instance_id
@@ -20125,6 +22353,96 @@ class RunAllResult:
         return self.exit_code == EXIT_OK
 
 
+def _rewrite_symmetric_cleanup_failure(
+    result: LiveRunResult,
+    error: BaseException,
+) -> LiveRunResult:
+    evidence = result.evidence
+    if (
+        evidence.get("schema") != SYMMETRIC_EVIDENCE_SCHEMA
+        or evidence.get("kind") != SYMMETRIC_EVIDENCE_KIND
+        or evidence.get("status") not in {"passed", "failed"}
+    ):
+        return result
+    rewritten = copy.deepcopy(evidence)
+    prior_failure = rewritten.get("failure")
+    diagnostics = rewritten.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+        rewritten["diagnostics"] = diagnostics
+    if (
+        isinstance(prior_failure, Mapping)
+        and prior_failure.get("phase") != Phase.CLEANUP.value
+    ):
+        diagnostics["acceptance_failure_before_cleanup"] = dict(prior_failure)
+    rewritten["status"] = "failed"
+    rewritten["failure"] = {
+        "phase": Phase.CLEANUP.value,
+        "category": type(error).__name__,
+        "message": _sanitize_string(str(error)),
+    }
+    lifecycle = rewritten.get("lifecycle")
+    if not isinstance(lifecycle, dict):
+        lifecycle = {}
+        rewritten["lifecycle"] = lifecycle
+    lifecycle["cleanup"] = "failed"
+    rewritten["residual_audit"] = {
+        "passed": False,
+        "owned_resources_remaining": None,
+    }
+    normalized = validate_symmetric_evidence(rewritten)
+    write_evidence(result.evidence_path, normalized)
+    return LiveRunResult(
+        EXIT_CLEANUP_FAILED,
+        result.evidence_path,
+        normalized,
+        _sanitize_string(str(error)),
+    )
+
+
+def _rewrite_symmetric_active_failure(
+    result: LiveRunResult,
+    error: BaseException,
+) -> LiveRunResult:
+    evidence = result.evidence
+    if (
+        evidence.get("schema") != SYMMETRIC_EVIDENCE_SCHEMA
+        or evidence.get("kind") != SYMMETRIC_EVIDENCE_KIND
+        or evidence.get("status") != "passed"
+    ):
+        return result
+    rewritten = copy.deepcopy(evidence)
+    rewritten["status"] = "failed"
+    rewritten["failure"] = {
+        "phase": Phase.EVIDENCE.value,
+        "category": type(error).__name__,
+        "message": _sanitize_string(str(error)),
+    }
+    normalized = validate_symmetric_evidence(rewritten)
+    write_evidence(result.evidence_path, normalized)
+    return LiveRunResult(
+        EXIT_ACCEPTANCE_FAILED,
+        result.evidence_path,
+        normalized,
+        _sanitize_string(str(error)),
+    )
+
+
+def _quarantine_evidence(path: pathlib.Path) -> None:
+    if not path.is_file() or path.is_symlink():
+        return
+    quarantine = path.with_name(f".{path.name}.invalidated")
+    os.replace(path, quarantine)
+    directory_fd = os.open(
+        path.parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 class _RunAllE2EResultError(AcceptanceError):
     def __init__(self, result: LiveRunResult):
         super().__init__(result.error or f"full E2E returned exit code {result.exit_code}")
@@ -20191,15 +22509,148 @@ def _write_private_json(path: pathlib.Path, value: Mapping[str, Any]) -> None:
             os.fsync(stream.fileno())
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def _new_route_recovery_receipt(
+    config: RunConfig,
+    raw_deployment: Mapping[str, Any],
+    *,
+    claim_id: Any,
+    transaction_id: Any,
+    cleanup_result: Mapping[str, Any],
+    cleanup: Literal["backend-finalization-pending", "complete"],
+) -> dict[str, Any]:
+    residual_count = cleanup_result.get("final_residual_count")
+    if (
+        type(residual_count) is not int
+        or residual_count != 0
+        or _UUID4_RE.fullmatch(str(claim_id or "")) is None
+        or _UUID4_RE.fullmatch(str(transaction_id or "")) is None
+    ):
+        raise LifecycleError(
+            "route-only cleanup cannot checkpoint without restored ownership and an exact final zero audit"
+        )
+    deployment_sha256 = hashlib.sha256(
+        json.dumps(
+            raw_deployment,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    ).hexdigest()
+    return {
+        "schema": ROUTE_RECOVERY_RECEIPT_SCHEMA,
+        "kind": ROUTE_RECOVERY_RECEIPT_KIND,
+        "run_id": config.run_id,
+        "configuration_sha256": config.config_identity,
+        "deployment_sha256": deployment_sha256,
+        "claim_id": claim_id,
+        "transaction_id": transaction_id,
+        "terraform_version": TERRAFORM_CORE_VERSION,
+        "route_recovery": "restored",
+        "final_residual_count": 0,
+        "cleanup": cleanup,
+    }
+
+
+def _route_recovery_receipt_document(
+    config: RunConfig,
+    manifest: Mapping[str, Any],
+    marker: Mapping[str, Any],
+    cleanup_result: Mapping[str, Any],
+    *,
+    cleanup: Literal["backend-finalization-pending", "complete"],
+) -> dict[str, Any]:
+    raw_deployment = manifest.get("deployment")
+    if (
+        not isinstance(raw_deployment, Mapping)
+        or marker.get("status") not in {"cleanup-pending", "cleanup-claimed"}
+    ):
+        raise LifecycleError("route-only cleanup marker is not checkpointable")
+    return _new_route_recovery_receipt(
+        config,
+        raw_deployment,
+        claim_id=marker.get("claim_id"),
+        transaction_id=marker.get("transaction_id"),
+        cleanup_result=cleanup_result,
+        cleanup=cleanup,
+    )
+
+
+def _validate_route_recovery_receipt(
+    value: Any,
+    config: RunConfig,
+    raw_deployment: Mapping[str, Any],
+) -> dict[str, Any]:
+    deployment_sha256 = hashlib.sha256(
+        json.dumps(
+            raw_deployment,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    ).hexdigest()
+    expected_fields = {
+        "schema",
+        "kind",
+        "run_id",
+        "configuration_sha256",
+        "deployment_sha256",
+        "claim_id",
+        "transaction_id",
+        "terraform_version",
+        "route_recovery",
+        "final_residual_count",
+        "cleanup",
+    }
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != expected_fields
+        or value.get("schema") != ROUTE_RECOVERY_RECEIPT_SCHEMA
+        or value.get("kind") != ROUTE_RECOVERY_RECEIPT_KIND
+        or value.get("run_id") != config.run_id
+        or value.get("configuration_sha256") != config.config_identity
+        or value.get("deployment_sha256") != deployment_sha256
+        or _UUID4_RE.fullmatch(str(value.get("claim_id", ""))) is None
+        or _UUID4_RE.fullmatch(str(value.get("transaction_id", ""))) is None
+        or value.get("terraform_version") != TERRAFORM_CORE_VERSION
+        or value.get("route_recovery") != "restored"
+        or type(value.get("final_residual_count")) is not int
+        or value.get("final_residual_count") != 0
+        or value.get("cleanup")
+        not in {"backend-finalization-pending", "complete"}
+        or scan_evidence(value)
+    ):
+        raise LifecycleError("retained route-recovery cleanup receipt is invalid")
+    return dict(value)
 
 
 class _RunAllLifecycleProxy:
     def __init__(self, delegate: ProtectedLifecycleAPI, cleanup: Callable[[], Mapping[str, Any]]):
         self.delegate = delegate
         self.cleanup_once = cleanup
+
+    @property
+    def cleanup_attempted(self) -> bool:
+        owner = getattr(self.cleanup_once, "__self__", None)
+        return bool(getattr(owner, "cleanup_attempted", False))
+
+    @property
+    def deferred_active_error(self) -> BaseException | None:
+        owner = getattr(self.cleanup_once, "__self__", None)
+        value = getattr(owner, "deferred_active_error", None)
+        return value if isinstance(value, BaseException) else None
 
     @property
     def manifest(self) -> Mapping[str, Any] | None:
@@ -20214,6 +22665,11 @@ class _RunAllLifecycleProxy:
 
     def verify_no_drift(self, stage: Literal["before", "after"]) -> Mapping[str, Any]:
         return self.delegate.verify_no_drift(stage)
+
+    def bind_transport_node_identities(
+        self, node_ids_by_instance: Mapping[str, str]
+    ) -> Mapping[str, Any]:
+        return self.delegate.bind_transport_node_identities(node_ids_by_instance)
 
     def authorize_gwlbe_route_replacement(
         self,
@@ -20279,12 +22735,23 @@ class _BoundedCleanupLifecycleProxy:
         self,
         delegate: ProtectedLifecycleAPI,
         timeout_factory: Callable[[int], Any] = cleanup_hard_timeout,
+        before_cleanup: Callable[[], None] = lambda: None,
     ):
         self.delegate = delegate
         self.timeout_factory = timeout_factory
+        self.before_cleanup = before_cleanup
         self.cleanup_attempted = False
         self.cleanup_result: Mapping[str, Any] | None = None
         self.cleanup_error: BaseException | None = None
+        self._deferred_active_error: BaseException | None = None
+
+    @property
+    def deferred_active_error(self) -> BaseException | None:
+        if self._deferred_active_error is not None:
+            return self._deferred_active_error
+        deadline = getattr(self.before_cleanup, "__self__", None)
+        value = getattr(deadline, "deferred_active_error", None)
+        return value if isinstance(value, BaseException) else None
 
     @property
     def manifest(self) -> Mapping[str, Any] | None:
@@ -20299,6 +22766,11 @@ class _BoundedCleanupLifecycleProxy:
 
     def verify_no_drift(self, stage: Literal["before", "after"]) -> Mapping[str, Any]:
         return self.delegate.verify_no_drift(stage)
+
+    def bind_transport_node_identities(
+        self, node_ids_by_instance: Mapping[str, str]
+    ) -> Mapping[str, Any]:
+        return self.delegate.bind_transport_node_identities(node_ids_by_instance)
 
     def authorize_gwlbe_route_replacement(
         self,
@@ -20358,8 +22830,24 @@ class _BoundedCleanupLifecycleProxy:
             if self.cleanup_error is not None:
                 raise self.cleanup_error
             return self.cleanup_result or {"complete": True}
-        self.cleanup_attempted = True
         try:
+            transition_entered = False
+            for transition_attempt in range(2):
+                try:
+                    with _blocked_protected_signals():
+                        transition_entered = True
+                        try:
+                            self.before_cleanup()
+                        except BaseException:
+                            self.cleanup_attempted = True
+                            raise
+                        self.cleanup_attempted = True
+                    break
+                except PROTECTED_CONTROL_FLOW as error:
+                    if not transition_entered and transition_attempt == 0:
+                        self._deferred_active_error = error
+                        continue
+                    raise
             with self.timeout_factory(DEFAULT_TIMEOUTS.cleanup):
                 value = self.delegate.cleanup()
             if not isinstance(value, Mapping):
@@ -20367,6 +22855,7 @@ class _BoundedCleanupLifecycleProxy:
             self.cleanup_result = dict(value)
             return self.cleanup_result
         except BaseException as error:
+            self.cleanup_attempted = True
             self.cleanup_error = error
             raise
 
@@ -20386,8 +22875,7 @@ class RunAllCoordinator:
         readiness_timeout_seconds: int = 900,
         budgets: TimeoutBudgets = DEFAULT_TIMEOUTS,
         lock_factory: Callable[[pathlib.Path], Any] = lifecycle_lock,
-        timeout_factory: Callable[[int], Any] = run_all_hard_timeout,
-        cleanup_timeout_factory: Callable[[int], Any] = cleanup_hard_timeout,
+        lifecycle_timeout_factory: Callable[[int, int], Any] = run_all_lifecycle_timeout,
     ):
         self.config = config
         self.run_dir = run_dir.expanduser().resolve()
@@ -20396,8 +22884,13 @@ class RunAllCoordinator:
         self.diagnostics_path = self.run_dir / "diagnostics.json"
         if self.evidence_path.parent != self.run_dir:
             raise EvidenceError("run-all evidence must remain directly inside the protected run directory")
-        if not 1 <= hard_timeout_seconds <= 7200 - DEFAULT_TIMEOUTS.cleanup:
-            raise E2EError("run-all hard timeout plus cleanup reservation must be no greater than 7200 seconds")
+        if not 1 <= hard_timeout_seconds <= (
+            MAX_PROTECTED_LIFECYCLE_SECONDS - budgets.cleanup
+        ):
+            raise E2EError(
+                "run-all hard timeout plus cleanup reservation must be no greater than "
+                f"{MAX_PROTECTED_LIFECYCLE_SECONDS} seconds"
+            )
         if (
             isinstance(readiness_timeout_seconds, bool)
             or not isinstance(readiness_timeout_seconds, int)
@@ -20410,14 +22903,15 @@ class RunAllCoordinator:
         self.readiness_timeout_seconds = readiness_timeout_seconds
         self.budgets = budgets
         self.lock_factory = lock_factory
-        self.timeout_factory = timeout_factory
-        self.cleanup_timeout_factory = cleanup_timeout_factory
+        self.lifecycle_timeout_factory = lifecycle_timeout_factory
+        self._lifecycle_timeout_context: Any | None = None
         self.current_stage = RUN_ALL_STAGES[0]
         self.cleanup_authorized = False
         self.cleanup_suppressed_reason: str | None = None
         self.cleanup_attempted = False
         self.cleanup_result: Mapping[str, Any] | None = None
         self.cleanup_error: BaseException | None = None
+        self._deferred_active_error: BaseException | None = None
         self.primary_exit_code = EXIT_OK
         self.live_result: LiveRunResult | None = None
         self.stage_records = {
@@ -20433,7 +22927,7 @@ class RunAllCoordinator:
             "architecture": config.architecture,
             "artifact_manifest": str(config.artifact_manifest),
             "hard_timeout_seconds": hard_timeout_seconds,
-            "cleanup_reservation_seconds": DEFAULT_TIMEOUTS.cleanup,
+            "cleanup_reservation_seconds": budgets.cleanup,
             "evidence": str(self.evidence_path),
             "artifacts": {},
             "stages": [self.stage_records[name] for name in RUN_ALL_STAGES],
@@ -20552,14 +23046,35 @@ class RunAllCoordinator:
             )
             self.primary_exit_code = exit_code
             self._record_failure(name, error, exit_code)
+            if isinstance(error, PROTECTED_CONTROL_FLOW):
+                raise error
             try:
                 self._checkpoint()
+            except PROTECTED_CONTROL_FLOW:
+                raise
             except BaseException as checkpoint_error:
                 record["summary"]["checkpoint_error"] = _sanitize_string(str(checkpoint_error))
             raise error
         record.update({"status": "passed", "exit_code": EXIT_OK, "summary": sanitize_evidence_value(value)})
         self._checkpoint()
         return value
+
+    def _start_cleanup_timeout(self) -> None:
+        context = self._lifecycle_timeout_context
+        if context is None:
+            raise E2EError("run-all cleanup requires an active protected lifecycle deadline")
+        start_cleanup = getattr(context, "start_cleanup", None)
+        if not callable(start_cleanup):
+            raise E2EError("run-all lifecycle deadline cannot enter protected cleanup")
+        start_cleanup()
+
+    @property
+    def deferred_active_error(self) -> BaseException | None:
+        if self._deferred_active_error is not None:
+            return self._deferred_active_error
+        context = self._lifecycle_timeout_context
+        value = getattr(context, "deferred_active_error", None)
+        return value if isinstance(value, BaseException) else None
 
     def _authorize_cleanup(self) -> None:
         self.cleanup_authorized = True
@@ -20570,51 +23085,106 @@ class RunAllCoordinator:
         self.cleanup_suppressed_reason = reason
         self.document["cleanup"]["authorized"] = False
 
+    def _set_cleanup_failure(self, error: BaseException) -> None:
+        self.cleanup_attempted = True
+        if self.cleanup_error is None:
+            self.cleanup_error = error
+        selected = self.cleanup_error
+        cleanup_record = self.stage_records[RUN_ALL_STAGES[-1]]
+        cleanup_record.update(
+            {
+                "status": "failed",
+                "exit_code": EXIT_CLEANUP_FAILED,
+                "summary": {
+                    "category": type(selected).__name__,
+                    "message": _sanitize_string(str(selected)),
+                },
+            }
+        )
+        self.document["cleanup"].update(
+            {"attempted": True, "attempts": 1, "status": "failed"}
+        )
+
     def _cleanup_once(self) -> Mapping[str, Any]:
-        if not self.cleanup_authorized:
-            raise E2EError("run-all cleanup is not authorized before preparation starts")
         if self.cleanup_attempted:
             if self.cleanup_error is not None:
                 raise self.cleanup_error
             return self.cleanup_result or {"complete": True}
-        self.cleanup_attempted = True
         cleanup_record = self.stage_records[RUN_ALL_STAGES[-1]]
-        cleanup_record.update({"status": "running", "exit_code": None, "summary": {"authorized": True}})
-        self.document["cleanup"].update({"attempted": True, "attempts": 1, "status": "running"})
         try:
-            self._checkpoint()
-        except BaseException:
-            # Stage-record persistence must never prevent the authorized cleanup attempt.
-            pass
-        try:
-            with self.cleanup_timeout_factory(DEFAULT_TIMEOUTS.cleanup):
-                value = self.operations.cleanup()
+            transition_entered = False
+            for transition_attempt in range(2):
+                try:
+                    with _blocked_protected_signals():
+                        transition_entered = True
+                        try:
+                            self._start_cleanup_timeout()
+                        except BaseException:
+                            self.cleanup_attempted = True
+                            raise
+                        self.cleanup_attempted = True
+                    break
+                except PROTECTED_CONTROL_FLOW as error:
+                    if not transition_entered and transition_attempt == 0:
+                        self._deferred_active_error = error
+                        continue
+                    raise
+            if not self.cleanup_authorized:
+                raise E2EError(
+                    "run-all cleanup is not authorized before preparation starts"
+                )
+            cleanup_record.update(
+                {
+                    "status": "running",
+                    "exit_code": None,
+                    "summary": {"authorized": True},
+                }
+            )
+            self.document["cleanup"].update(
+                {"attempted": True, "attempts": 1, "status": "running"}
+            )
+            try:
+                self._checkpoint()
+            except PROTECTED_CONTROL_FLOW:
+                raise
+            except BaseException as checkpoint_error:
+                # Stage persistence must never prevent the authorized cleanup.
+                cleanup_record["summary"]["checkpoint_error"] = _sanitize_string(
+                    str(checkpoint_error)
+                )
+            value = self.operations.cleanup()
             if not isinstance(value, Mapping):
                 raise E2EError("protected cleanup returned a non-object result")
             self.cleanup_result = dict(value)
-        except BaseException as error:
-            self.cleanup_error = error
+            summary = {
+                "authorized": True,
+                "complete": True,
+                **dict(self.cleanup_result),
+            }
             cleanup_record.update(
                 {
-                    "status": "failed",
-                    "exit_code": EXIT_CLEANUP_FAILED,
-                    "summary": {"category": type(error).__name__, "message": _sanitize_string(str(error))},
+                    "status": "passed",
+                    "exit_code": EXIT_OK,
+                    "summary": sanitize_evidence_value(summary),
                 }
             )
-            self.document["cleanup"]["status"] = "failed"
+            self.document["cleanup"]["status"] = "passed"
+            self._checkpoint()
+            return summary
+        except BaseException as error:
+            self._set_cleanup_failure(error)
             try:
                 self._checkpoint()
-            except BaseException:
-                pass
-            raise error
-        summary = {"authorized": True, "complete": True, **dict(self.cleanup_result)}
-        cleanup_record.update({"status": "passed", "exit_code": EXIT_OK, "summary": sanitize_evidence_value(summary)})
-        self.document["cleanup"]["status"] = "passed"
-        try:
-            self._checkpoint()
-        except BaseException:
-            pass
-        return summary
+            except PROTECTED_CONTROL_FLOW as checkpoint_error:
+                cleanup_record["summary"]["checkpoint_error"] = _sanitize_string(
+                    str(checkpoint_error)
+                )
+                raise
+            except BaseException as checkpoint_error:
+                cleanup_record["summary"]["checkpoint_error"] = _sanitize_string(
+                    str(checkpoint_error)
+                )
+            raise
 
     def _run_locked(self) -> RunAllResult:
         primary_error: BaseException | None = None
@@ -20672,6 +23242,12 @@ class RunAllCoordinator:
             self._stage(RUN_ALL_STAGES[6], e2e)
         except BaseException as error:
             primary_error = error
+            if (
+                self.cleanup_attempted
+                and self.cleanup_error is None
+                and not isinstance(error, _RunAllE2EResultError)
+            ):
+                self._set_cleanup_failure(error)
             lifecycle_ownership_rejected = isinstance(
                 error, (ConcurrentLifecycleError, ConcurrentRunError, AmbiguousOwnershipError)
             )
@@ -20689,7 +23265,7 @@ class RunAllCoordinator:
             if self.cleanup_authorized and not self.cleanup_attempted:
                 try:
                     self._cleanup_once()
-                except BaseException:
+                except Exception:
                     pass
             elif not self.cleanup_authorized:
                 reason = self.cleanup_suppressed_reason or "preparation never started; cleanup not authorized"
@@ -20737,10 +23313,188 @@ class RunAllCoordinator:
         self._checkpoint()
         return RunAllResult(exit_code, self.record_path, self.evidence_path, sanitize_evidence_value(self.document))
 
-    def run(self) -> RunAllResult:
-        with self.lock_factory(self.run_dir):
-            with self.timeout_factory(self.active_timeout_seconds):
-                return self._run_locked()
+    def _cleanup_finalization_result(self, error: BaseException) -> RunAllResult:
+        prior_failure = self.document.get("failure")
+        if (
+            isinstance(prior_failure, Mapping)
+            and prior_failure.get("stage") != RUN_ALL_STAGES[-1]
+            and self.document.get("primary_failure") is None
+        ):
+            self.document["primary_failure"] = copy.deepcopy(prior_failure)
+        self._set_cleanup_failure(error)
+        selected = self.cleanup_error or error
+        if self.live_result is None and self.evidence_path.is_file():
+            try:
+                retained_evidence = _load_json(self.evidence_path)
+                if isinstance(retained_evidence, Mapping):
+                    self.live_result = LiveRunResult(
+                        EXIT_ACCEPTANCE_FAILED,
+                        self.evidence_path,
+                        retained_evidence,
+                    )
+            except Exception:
+                pass
+        if self.live_result is not None:
+            prior_status = self.live_result.evidence.get("status")
+            try:
+                rewritten_result = _rewrite_symmetric_cleanup_failure(
+                    self.live_result,
+                    selected,
+                )
+                self.live_result = rewritten_result
+                if (
+                    prior_status == "passed"
+                    and rewritten_result.exit_code != EXIT_CLEANUP_FAILED
+                ):
+                    _quarantine_evidence(self.evidence_path)
+            except BaseException as evidence_error:
+                self.stage_records[RUN_ALL_STAGES[-1]]["summary"][
+                    "evidence_error"
+                ] = _sanitize_string(str(evidence_error))
+                if prior_status == "passed":
+                    try:
+                        _quarantine_evidence(self.evidence_path)
+                    except OSError:
+                        pass
+        self.document["evidence"] = (
+            str(self.evidence_path)
+            if self.live_result is not None
+            and self.live_result.evidence.get("status") == "failed"
+            and self.evidence_path.is_file()
+            else None
+        )
+        self._record_failure(RUN_ALL_STAGES[-1], selected, EXIT_CLEANUP_FAILED)
+        for record in self.document["stages"]:
+            if record["status"] == "pending":
+                record.update(
+                    {
+                        "status": "skipped",
+                        "exit_code": None,
+                        "summary": {"reason": "prior stage failed closed"},
+                    }
+                )
+        self.document["exit_code"] = EXIT_CLEANUP_FAILED
+        self.document["status"] = "failed"
+        try:
+            self._checkpoint()
+        except BaseException as checkpoint_error:
+            self.stage_records[RUN_ALL_STAGES[-1]]["summary"][
+                "checkpoint_error"
+            ] = _sanitize_string(str(checkpoint_error))
+        return RunAllResult(
+            EXIT_CLEANUP_FAILED,
+            self.record_path,
+            self.evidence_path,
+            sanitize_evidence_value(self.document),
+        )
+
+    def _active_finalization_result(self, error: BaseException) -> RunAllResult:
+        stage = RUN_ALL_STAGES[6]
+        record = self.stage_records[stage]
+        record.update(
+            {
+                "status": "failed",
+                "exit_code": EXIT_ACCEPTANCE_FAILED,
+                "summary": {
+                    "category": type(error).__name__,
+                    "message": _sanitize_string(str(error)),
+                },
+            }
+        )
+        if self.live_result is not None:
+            prior_status = self.live_result.evidence.get("status")
+            try:
+                rewritten_result = _rewrite_symmetric_active_failure(
+                    self.live_result,
+                    error,
+                )
+                self.live_result = rewritten_result
+                if (
+                    prior_status == "passed"
+                    and rewritten_result.exit_code != EXIT_ACCEPTANCE_FAILED
+                ):
+                    _quarantine_evidence(self.evidence_path)
+            except BaseException as evidence_error:
+                record["summary"]["evidence_error"] = _sanitize_string(
+                    str(evidence_error)
+                )
+                if prior_status == "passed":
+                    try:
+                        _quarantine_evidence(self.evidence_path)
+                    except OSError:
+                        pass
+        self.document["evidence"] = (
+            str(self.evidence_path)
+            if self.live_result is not None
+            and self.live_result.evidence.get("status") == "failed"
+            and self.evidence_path.is_file()
+            else None
+        )
+        self._record_failure(stage, error, EXIT_ACCEPTANCE_FAILED)
+        self.document["exit_code"] = EXIT_ACCEPTANCE_FAILED
+        self.document["status"] = "failed"
+        self._checkpoint()
+        return RunAllResult(
+            EXIT_ACCEPTANCE_FAILED,
+            self.record_path,
+            self.evidence_path,
+            sanitize_evidence_value(self.document),
+        )
+
+    def run(
+        self,
+        *,
+        output: Callable[[RunAllResult], None] | None = None,
+    ) -> RunAllResult:
+        deadline = self.lifecycle_timeout_factory(
+            self.active_timeout_seconds,
+            self.budgets.cleanup,
+        )
+        self._lifecycle_timeout_context = deadline
+        result: RunAllResult | None = None
+        output_committed = False
+        try:
+            try:
+                with hard_timeout(
+                    self.active_timeout_seconds + self.budgets.cleanup,
+                    operation="complete protected run-all lifecycle",
+                ):
+                    try:
+                        with deadline:
+                            with self.lock_factory(self.run_dir):
+                                result = self._run_locked()
+                    except BaseException as error:
+                        if not self.cleanup_attempted:
+                            raise
+                        result = self._cleanup_finalization_result(error)
+                    deferred_active_error = self.deferred_active_error
+                    if (
+                        result.exit_code == EXIT_OK
+                        and deferred_active_error is not None
+                    ):
+                        result = self._active_finalization_result(
+                            deferred_active_error
+                        )
+                    if output is not None:
+                        try:
+                            output(result)
+                        except BaseException as error:
+                            if not self.cleanup_attempted:
+                                raise
+                            result = self._cleanup_finalization_result(error)
+                        else:
+                            output_committed = True
+            except BaseException as error:
+                if output_committed and result is not None:
+                    # Published terminal output is the lifecycle commit point.
+                    return result
+                if self.cleanup_attempted:
+                    return self._cleanup_finalization_result(error)
+                raise
+            assert result is not None
+            return result
+        finally:
+            self._lifecycle_timeout_context = None
 
 
 class AwsRunAllOperations:
@@ -20794,19 +23548,7 @@ class AwsRunAllOperations:
         }
 
     def preflight(self) -> Mapping[str, Any]:
-        try:
-            terraform_version_document = json.loads(self.runner.run(["terraform", "version", "-json"]))
-        except json.JSONDecodeError as error:
-            raise E2EError("selected Terraform executable returned invalid version JSON") from error
-        terraform_version = (
-            terraform_version_document.get("terraform_version")
-            if isinstance(terraform_version_document, Mapping)
-            else None
-        )
-        if terraform_version != TERRAFORM_CORE_VERSION:
-            raise E2EError(
-                f"protected run requires Terraform {TERRAFORM_CORE_VERSION}; selected version is {terraform_version!r}"
-            )
+        terraform_version = _require_terraform_core_version(self.runner)
         artifact, account_id = run_preflight(self.config, self.aws, self.tailscale())
         self._validated_preflight = (artifact, account_id)
         return {
@@ -20902,6 +23644,29 @@ def _load_json(path: pathlib.Path) -> Any:
         raise E2EError(f"cannot read JSON {path}: {error}") from error
 
 
+def _lexical_absolute_path(path: pathlib.Path) -> pathlib.Path:
+    return pathlib.Path(os.path.abspath(os.fspath(path.expanduser())))
+
+
+def _require_unsymlinked_path(path: pathlib.Path, *, label: str) -> None:
+    for candidate in (*reversed(path.parents), path):
+        if candidate.is_symlink():
+            raise E2EError(f"{label} must not contain a symlinked path component")
+
+
+def _require_terraform_core_version(runner: SubprocessRunner) -> str:
+    try:
+        document = json.loads(runner.run(["terraform", "version", "-json"]))
+    except json.JSONDecodeError as error:
+        raise E2EError("selected Terraform executable returned invalid version JSON") from error
+    version = document.get("terraform_version") if isinstance(document, Mapping) else None
+    if version != TERRAFORM_CORE_VERSION:
+        raise E2EError(
+            f"protected run requires Terraform {TERRAFORM_CORE_VERSION}; selected version is {version!r}"
+        )
+    return version
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
@@ -20949,6 +23714,17 @@ def build_parser() -> argparse.ArgumentParser:
     live_parser.add_argument("--terraform-dir", type=pathlib.Path, default=pathlib.Path("example/terraform"))
     live_parser.add_argument("--evidence", type=pathlib.Path)
     live_parser.add_argument("--hard-timeout-seconds", type=int, default=DEFAULT_TIMEOUTS.hard_timeout)
+
+    recovery_parser = subparsers.add_parser(
+        "recover-route-cleanup",
+        help="adopt an expired route transaction, restore it, and clean up without replaying acceptance",
+    )
+    recovery_parser.add_argument("--config", type=pathlib.Path, required=True)
+    recovery_parser.add_argument("--deployment", type=pathlib.Path, required=True)
+    recovery_parser.add_argument("--run-root", type=pathlib.Path, default=pathlib.Path(".run"))
+    recovery_parser.add_argument(
+        "--terraform-dir", type=pathlib.Path, default=pathlib.Path("example/terraform")
+    )
     return parser
 
 
@@ -21017,9 +23793,13 @@ def _run_all_cli(args: argparse.Namespace) -> int:
         if (
             isinstance(args.hard_timeout_seconds, bool)
             or not isinstance(args.hard_timeout_seconds, int)
-            or not 1 <= args.hard_timeout_seconds <= 7200 - DEFAULT_TIMEOUTS.cleanup
+            or not 1 <= args.hard_timeout_seconds
+            <= MAX_PROTECTED_LIFECYCLE_SECONDS - DEFAULT_TIMEOUTS.cleanup
         ):
-            raise E2EError("--hard-timeout-seconds plus cleanup reservation must be no greater than 7200")
+            raise E2EError(
+                "--hard-timeout-seconds plus cleanup reservation must be no greater than "
+                f"{MAX_PROTECTED_LIFECYCLE_SECONDS}"
+            )
         if (
             isinstance(args.readiness_timeout_seconds, bool)
             or not isinstance(args.readiness_timeout_seconds, int)
@@ -21095,28 +23875,32 @@ def _run_all_cli(args: argparse.Namespace) -> int:
         if isinstance(error, (LifecycleError, OSError)):
             raise
         raise E2EError(f"run-all bootstrap validation failed at {gate}") from None
-    result = coordinator.run()
-    print(
-        json.dumps(
-            {
-                "cleanup": result.record["cleanup"],
-                "evidence": str(result.evidence_path),
-                "exit_code": result.exit_code,
-                "record": str(result.record_path),
-                "run_id": config.run_id,
-                "stages": result.record["stages"],
-                "status": result.record["status"],
-            },
-            sort_keys=True,
+    def output(result: RunAllResult) -> None:
+        print(
+            json.dumps(
+                {
+                    "cleanup": result.record["cleanup"],
+                    "evidence": result.record.get("evidence"),
+                    "exit_code": result.exit_code,
+                    "record": str(result.record_path),
+                    "run_id": config.run_id,
+                    "stages": result.record["stages"],
+                    "status": result.record["status"],
+                },
+                sort_keys=True,
+            )
         )
-    )
+
+    result = coordinator.run(output=output)
     return result.exit_code
 
 
 def _live_cli(args: argparse.Namespace) -> int:
     config = RunConfig.load(args.config, enforce_future_expiry=False)
     validate_protected_execution(config.run_id, os.environ)
-    if not 1 <= args.hard_timeout_seconds <= 7200 - DEFAULT_TIMEOUTS.cleanup:
+    if not 1 <= args.hard_timeout_seconds <= (
+        MAX_PROTECTED_LIFECYCLE_SECONDS - DEFAULT_TIMEOUTS.cleanup
+    ):
         raise E2EError("--hard-timeout-seconds must leave the protected cleanup timeout reservation")
     expiry = dt.datetime.fromisoformat(config.expires_at.replace("Z", "+00:00"))
     total_timeout = args.hard_timeout_seconds + DEFAULT_TIMEOUTS.cleanup
@@ -21134,7 +23918,12 @@ def _live_cli(args: argparse.Namespace) -> int:
         raise EvidenceError("live evidence must remain directly inside the protected run directory")
     budgets = dataclasses.replace(DEFAULT_TIMEOUTS, hard_timeout=args.hard_timeout_seconds)
     lifecycle = ProtectedLifecycleAdapter(config, aws, subprocess_runner, run_dir, args.terraform_dir)
-    bounded_lifecycle = _BoundedCleanupLifecycleProxy(lifecycle)
+    deadline = live_lifecycle_timeout(budgets.hard_timeout, budgets.cleanup)
+    bounded_lifecycle = _BoundedCleanupLifecycleProxy(
+        lifecycle,
+        timeout_factory=lambda _seconds: contextlib.nullcontext(),
+        before_cleanup=deadline.start_cleanup,
+    )
     operations = AwsSymmetricLiveOperations(config, aws, run_dir, bounded_lifecycle)
     load_error: E2EError | None = None
     raw: Mapping[str, Any] = {}
@@ -21154,46 +23943,390 @@ def _live_cli(args: argparse.Namespace) -> int:
         evidence_path=evidence_path,
         budgets=budgets,
     )
-    with lifecycle_lock(run_dir):
+    result: LiveRunResult | None = None
+    active_error: BaseException | None = None
+    active_finalization_error: BaseException | None = None
+    cleanup_finalization_error: BaseException | None = None
+
+    def demote_cleanup_failure(error: BaseException) -> None:
+        nonlocal result
+        if result is None and evidence_path.is_file():
+            try:
+                retained_evidence = _load_json(evidence_path)
+                if isinstance(retained_evidence, Mapping):
+                    result = LiveRunResult(
+                        EXIT_ACCEPTANCE_FAILED,
+                        evidence_path,
+                        retained_evidence,
+                    )
+            except Exception:
+                pass
+        if result is not None:
+            prior_status = result.evidence.get("status")
+            try:
+                rewritten_result = _rewrite_symmetric_cleanup_failure(result, error)
+                result = rewritten_result
+                if (
+                    prior_status == "passed"
+                    and rewritten_result.exit_code != EXIT_CLEANUP_FAILED
+                ):
+                    _quarantine_evidence(evidence_path)
+            except BaseException:
+                if prior_status == "passed":
+                    try:
+                        _quarantine_evidence(evidence_path)
+                    except OSError:
+                        pass
         try:
-            with hard_timeout(
-                budgets.hard_timeout, operation="live E2E acceptance"
+            print(redact_runtime_text(str(error)), file=sys.stderr)
+        except Exception:
+            pass
+
+    output_committed = False
+    acceptance_exit = False
+    exit_code = EXIT_CLEANUP_FAILED
+    try:
+        with hard_timeout(total_timeout, operation="complete live E2E lifecycle"):
+            try:
+                with deadline:
+                    with lifecycle_lock(run_dir):
+                        try:
+                            result = runner.run()
+                        except PROTECTED_CONTROL_FLOW as error:
+                            if deadline.cleanup_started:
+                                raise
+                            active_error = error
+                            bounded_lifecycle.cleanup()
+                    if active_error is not None:
+                        raise active_error
+                    if load_error is not None:
+                        assert result is not None
+                        evidence = copy.deepcopy(result.evidence)
+                        failure = {
+                            "phase": Phase.CONSUME_DEPLOYMENT.value,
+                            "category": type(load_error).__name__,
+                            "message": _sanitize_string(str(load_error)),
+                        }
+                        diagnostics = evidence.get("diagnostics")
+                        if not isinstance(diagnostics, dict):
+                            diagnostics = {}
+                            evidence["diagnostics"] = diagnostics
+                        if result.exit_code == EXIT_CLEANUP_FAILED:
+                            diagnostics["acceptance_failure_before_cleanup"] = failure
+                        else:
+                            evidence["failure"] = failure
+                        normalized = validate_symmetric_evidence(evidence)
+                        _write_private_json(
+                            run_dir / "diagnostics.json",
+                            cast(Mapping[str, Any], normalized["diagnostics"]),
+                        )
+                        write_evidence(evidence_path, normalized)
+                        result = LiveRunResult(
+                            result.exit_code,
+                            evidence_path,
+                            normalized,
+                            failure["message"],
+                        )
+            except BaseException as error:
+                if bounded_lifecycle.cleanup_error is not None:
+                    cleanup_finalization_error = bounded_lifecycle.cleanup_error
+                elif active_error is not None and error is active_error:
+                    acceptance_exit = True
+                    try:
+                        print(redact_runtime_text(str(error)), file=sys.stderr)
+                    except Exception:
+                        pass
+                elif deadline.cleanup_started:
+                    cleanup_finalization_error = error
+                else:
+                    raise
+
+            deferred_active_error = bounded_lifecycle.deferred_active_error
+            if (
+                cleanup_finalization_error is None
+                and result is not None
+                and result.exit_code == EXIT_OK
+                and deferred_active_error is not None
             ):
-                result = runner.run()
-        except PROTECTED_CONTROL_FLOW:
-            bounded_lifecycle.cleanup()
-            raise
-    if load_error is not None:
-        evidence = copy.deepcopy(result.evidence)
-        failure = {
-            "phase": Phase.CONSUME_DEPLOYMENT.value,
-            "category": type(load_error).__name__,
-            "message": _sanitize_string(str(load_error)),
-        }
-        diagnostics = evidence.get("diagnostics")
-        if not isinstance(diagnostics, dict):
-            diagnostics = {}
-            evidence["diagnostics"] = diagnostics
-        if result.exit_code == EXIT_CLEANUP_FAILED:
-            diagnostics["acceptance_failure_before_cleanup"] = failure
-        else:
-            evidence["failure"] = failure
-        normalized = validate_symmetric_evidence(evidence)
-        _write_private_json(run_dir / "diagnostics.json", cast(Mapping[str, Any], normalized["diagnostics"]))
-        write_evidence(evidence_path, normalized)
-        result = LiveRunResult(result.exit_code, evidence_path, normalized, failure["message"])
-    print(
-        json.dumps(
-            {
-                "evidence": str(result.evidence_path),
-                "exit_code": result.exit_code,
-                "run_id": config.run_id,
-                "status": result.evidence["status"],
-            },
-            sort_keys=True,
+                active_finalization_error = deferred_active_error
+                prior_status = result.evidence.get("status")
+                try:
+                    rewritten_result = _rewrite_symmetric_active_failure(
+                        result,
+                        deferred_active_error,
+                    )
+                    result = rewritten_result
+                    if (
+                        prior_status == "passed"
+                        and rewritten_result.exit_code != EXIT_ACCEPTANCE_FAILED
+                    ):
+                        _quarantine_evidence(evidence_path)
+                except BaseException:
+                    if prior_status == "passed":
+                        try:
+                            _quarantine_evidence(evidence_path)
+                        except OSError:
+                            pass
+                if result.exit_code != EXIT_ACCEPTANCE_FAILED:
+                    result = LiveRunResult(
+                        EXIT_ACCEPTANCE_FAILED,
+                        result.evidence_path,
+                        result.evidence,
+                        _sanitize_string(str(deferred_active_error)),
+                    )
+
+            if cleanup_finalization_error is not None:
+                demote_cleanup_failure(cleanup_finalization_error)
+
+            if acceptance_exit:
+                exit_code = EXIT_ACCEPTANCE_FAILED
+            elif result is not None:
+                exit_code = (
+                    EXIT_CLEANUP_FAILED
+                    if cleanup_finalization_error is not None
+                    else result.exit_code
+                )
+                evidence_value = (
+                    str(result.evidence_path)
+                    if (
+                        cleanup_finalization_error is None
+                        and active_finalization_error is None
+                    )
+                    or result.evidence.get("status") == "failed"
+                    and evidence_path.is_file()
+                    else None
+                )
+                try:
+                    print(
+                        json.dumps(
+                            {
+                                "evidence": evidence_value,
+                                "exit_code": exit_code,
+                                "run_id": config.run_id,
+                                "status": (
+                                    "failed"
+                                    if cleanup_finalization_error is not None
+                                    or active_finalization_error is not None
+                                    else result.evidence["status"]
+                                ),
+                            },
+                            sort_keys=True,
+                        )
+                    )
+                except BaseException as output_error:
+                    if not deadline.cleanup_started:
+                        raise
+                    cleanup_finalization_error = output_error
+                    demote_cleanup_failure(output_error)
+                    exit_code = EXIT_CLEANUP_FAILED
+                else:
+                    output_committed = True
+    except BaseException as error:
+        if output_committed:
+            return exit_code
+        if deadline.cleanup_started:
+            demote_cleanup_failure(error)
+            return EXIT_CLEANUP_FAILED
+        raise
+    return exit_code
+
+
+def _route_recovery_cleanup_cli(args: argparse.Namespace) -> int:
+    cleanup_deadline = time.monotonic() + DEFAULT_TIMEOUTS.cleanup
+    with cleanup_hard_timeout(DEFAULT_TIMEOUTS.cleanup):
+        return _route_recovery_cleanup_cli_impl(
+            args, cleanup_deadline=cleanup_deadline
         )
+
+
+def _route_recovery_cleanup_cli_impl(
+    args: argparse.Namespace, *, cleanup_deadline: float
+) -> int:
+    run_root = _lexical_absolute_path(args.run_root)
+    config_path = _lexical_absolute_path(args.config)
+    deployment_path = _lexical_absolute_path(args.deployment)
+    _require_unsymlinked_path(run_root, label="route-recovery run root")
+    _require_unsymlinked_path(config_path, label="route-recovery config")
+    _require_unsymlinked_path(deployment_path, label="route-recovery deployment")
+    if not run_root.is_dir():
+        raise E2EError("route-recovery run root must be one existing directory")
+    for path, label in (
+        (config_path, "config"),
+        (deployment_path, "deployment"),
+    ):
+        if not path.is_file() or path.stat().st_uid != os.getuid():
+            raise E2EError(
+                f"route-recovery {label} must be one runner-owned regular file"
+            )
+    config = RunConfig.load(config_path, enforce_future_expiry=False)
+    validate_protected_execution(config.run_id, os.environ)
+    expected_run_dir = run_root / config.run_id
+    if (
+        expected_run_dir.parent != run_root
+        or not expected_run_dir.is_dir()
+        or expected_run_dir.stat().st_uid != os.getuid()
+    ):
+        raise E2EError(
+            "approved run directory must be one real direct child of the protected run root"
+        )
+    run_dir = expected_run_dir
+    if (
+        config_path != run_dir / "config.json"
+        or deployment_path != run_dir / "deployment.json"
+    ):
+        raise E2EError(
+            "route recovery requires the retained config and deployment inside the approved run directory"
+        )
+    loaded = _load_json(deployment_path)
+    if not isinstance(loaded, Mapping):
+        raise DeploymentError("protected deployment file must contain a JSON object")
+    raw = cast(Mapping[str, Any], loaded)
+    deployment = parse_symmetric_protected_deployment_output(
+        raw,
+        site_regions={site: config.sites[site]["region"] for site in SITES},
     )
-    return result.exit_code
+    if deployment.topology.run_id != config.run_id:
+        raise DeploymentError("symmetric topology run ID differs from the approved recovery run")
+
+    result_path = run_dir / "route-recovery-cleanup-result.json"
+    lock_path = run_dir / "lifecycle.lock"
+    for path, label in ((result_path, "receipt"), (lock_path, "lifecycle lock")):
+        if path.is_symlink():
+            raise LifecycleError(
+                f"route-recovery {label} must not be a symlink"
+            )
+        if path.exists() and (
+            not path.is_file() or path.stat().st_uid != os.getuid()
+        ):
+            raise LifecycleError(
+                f"route-recovery {label} must be one runner-owned regular file"
+            )
+    existing_receipt: dict[str, Any] | None = None
+    if result_path.exists():
+        if result_path.stat().st_mode & 0o777 != 0o600:
+            raise LifecycleError(
+                "retained route-recovery cleanup receipt must be private"
+            )
+        existing_receipt = _validate_route_recovery_receipt(
+            _load_json(result_path), config, raw
+        )
+
+    claimed = False
+    receipt_authorized = existing_receipt is not None
+    bounded_lifecycle: _BoundedCleanupLifecycleProxy | None = None
+    result: Mapping[str, Any] | None = None
+    result_needs_write = False
+    try:
+        with contextlib.nullcontext():
+            subprocess_runner = SubprocessRunner(config.oauth_environment_names)
+            aws = AwsCLI(subprocess_runner, config.oauth_environment_names)
+            with lifecycle_lock(run_dir):
+                if existing_receipt is not None:
+                    if existing_receipt["cleanup"] == "complete":
+                        result = existing_receipt
+                    else:
+                        delete_exact_object_versions(
+                            aws,
+                            bucket=config.backend["bucket"],
+                            key=config.manifest_key,
+                            region=config.backend["region"],
+                            dry_run=False,
+                        )
+                        result = {**existing_receipt, "cleanup": "complete"}
+                        result_needs_write = True
+                else:
+                    terraform_version = _require_terraform_core_version(
+                        subprocess_runner
+                    )
+                    lifecycle = ProtectedLifecycleAdapter(
+                        config, aws, subprocess_runner, run_dir, args.terraform_dir
+                    )
+                    bounded_lifecycle = _BoundedCleanupLifecycleProxy(
+                        lifecycle,
+                        timeout_factory=lambda _seconds: contextlib.nullcontext(),
+                    )
+                    claim = lifecycle.claim(
+                        raw, deployment, require_route_recovery=True
+                    )
+                    claimed = True
+                    if claim.get("route_recovery_required") is not True:
+                        raise ClaimPersistenceError(
+                            "route-only recovery did not acquire durable route-cleanup authority"
+                        )
+                    cleanup = bounded_lifecycle.cleanup()
+                    route_recovery = cleanup.get("route_recovery_before_cleanup")
+                    if (
+                        not isinstance(route_recovery, Mapping)
+                        or route_recovery.get("restored") is not True
+                    ):
+                        raise RouteRestorationError(
+                            "route-only cleanup did not prove verified route restoration"
+                        )
+                    if (
+                        type(cleanup.get("final_residual_count")) is not int
+                        or cleanup.get("final_residual_count") != 0
+                    ):
+                        raise LifecycleError(
+                            "route-only cleanup did not prove a zero-resource final residual audit"
+                        )
+                    if result_path.exists():
+                        pending = _validate_route_recovery_receipt(
+                            _load_json(result_path), config, raw
+                        )
+                        if (
+                            pending["cleanup"]
+                            != "backend-finalization-pending"
+                            or pending["claim_id"] != claim.get("claim_id")
+                            or pending["transaction_id"]
+                            != claim.get("route_transaction_id")
+                        ):
+                            raise LifecycleError(
+                                "route-only cleanup checkpoint differs from its durable claim"
+                            )
+                        result = {**pending, "cleanup": "complete"}
+                    else:
+                        result = _new_route_recovery_receipt(
+                            config,
+                            raw,
+                            claim_id=claim.get("claim_id"),
+                            transaction_id=claim.get("route_transaction_id"),
+                            cleanup_result=cleanup,
+                            cleanup="complete",
+                        )
+                    if terraform_version != result["terraform_version"]:
+                        raise LifecycleError(
+                            "route-only cleanup receipt Terraform version changed"
+                        )
+                    delete_exact_object_versions(
+                        aws,
+                        bucket=config.backend["bucket"],
+                        key=config.manifest_key,
+                        region=config.backend["region"],
+                        dry_run=False,
+                    )
+                    result_needs_write = True
+            if result is None:
+                raise LifecycleError("route-only cleanup produced no terminal result")
+            if result_needs_write:
+                _write_private_json(result_path, result)
+            print(json.dumps(result, sort_keys=True))
+            return EXIT_OK
+    except BaseException as error:
+        if claimed and bounded_lifecycle is not None:
+            remaining = int(math.floor(cleanup_deadline - time.monotonic()))
+            if not bounded_lifecycle.cleanup_attempted and remaining > 0:
+                try:
+                    with cleanup_hard_timeout(remaining):
+                        bounded_lifecycle.cleanup()
+                except BaseException as cleanup_error:
+                    error = cleanup_error
+        if claimed or receipt_authorized:
+            try:
+                print(redact_runtime_text(str(error)), file=sys.stderr)
+            except BaseException:
+                pass
+            return EXIT_CLEANUP_FAILED
+        raise
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -21249,6 +24382,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_all_cli(args)
         if args.subcommand == "run-live":
             return _live_cli(args)
+        if args.subcommand == "recover-route-cleanup":
+            return _route_recovery_cleanup_cli(args)
         raise E2EError(f"unknown subcommand: {args.subcommand}")
     except EvidenceVerificationError as error:
         print(redact_runtime_text(str(error)), file=sys.stderr)

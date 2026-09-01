@@ -2773,8 +2773,24 @@ class SymmetricTopologyTest(unittest.TestCase):
                 evidence_path=evidence_path,
             ).run()
             persisted = e2e.load_evidence(evidence_path)
+            rewritten = e2e._rewrite_symmetric_cleanup_failure(
+                result,
+                e2e.ProtectedHardTimeout("injected finalization timeout"),
+            )
+            rewritten_persisted = e2e.load_evidence(evidence_path)
         self.assertTrue(result.passed, result.error)
         self.assertEqual(persisted["schema"], 3)
+        self.assertEqual(rewritten.exit_code, e2e.EXIT_CLEANUP_FAILED)
+        self.assertEqual(rewritten.evidence["status"], "failed")
+        self.assertEqual(
+            rewritten.evidence["failure"],
+            {
+                "phase": e2e.Phase.CLEANUP.value,
+                "category": "ProtectedHardTimeout",
+                "message": "injected finalization timeout",
+            },
+        )
+        self.assertEqual(rewritten_persisted, rewritten.evidence)
         self.assertTrue(
             all(
                 identity["primary_route_ownership"]["local"] == []
@@ -3125,6 +3141,57 @@ class SymmetricTopologyTest(unittest.TestCase):
         self.assertEqual(result.exit_code, e2e.EXIT_ACCEPTANCE_FAILED)
         self.assertEqual(calls, ["claim", "cleanup"])
         self.assertEqual(result.evidence["diagnostics"]["collection"], "skipped")
+
+    def test_protected_active_timeout_is_converted_only_after_cleanup(self) -> None:
+        calls: list[str] = []
+        control = e2e.ProtectedHardTimeout("injected active hard timeout")
+
+        class Lifecycle:
+            def claim(self, raw_deployment, deployment):
+                calls.append("claim")
+                raise control
+
+            def cleanup(self):
+                calls.append("cleanup")
+                return {"final_residual_count": 0}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            result = e2e.SymmetricTwoRegionE2ERunner(
+                run_id="symmetric-fixture",
+                raw_deployment=symmetric_protected_output(),
+                site_regions={"west": "us-west-2", "east": "us-east-1"},
+                lifecycle=Lifecycle(),
+                operations=SimpleNamespace(),
+                evidence_path=pathlib.Path(temporary) / "failure.json",
+            ).run()
+
+        self.assertEqual(result.exit_code, e2e.EXIT_ACCEPTANCE_FAILED)
+        self.assertEqual(calls, ["claim", "cleanup"])
+        self.assertEqual(result.evidence["failure"]["category"], "ProtectedHardTimeout")
+        self.assertEqual(result.evidence["lifecycle"]["cleanup"], "passed")
+
+    def test_protected_cleanup_timeout_is_exit_three(self) -> None:
+        calls: list[str] = []
+
+        class Lifecycle:
+            def cleanup(self):
+                calls.append("cleanup")
+                raise e2e.ProtectedHardTimeout("injected cleanup hard timeout")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            result = e2e.SymmetricTwoRegionE2ERunner(
+                run_id="symmetric-fixture",
+                raw_deployment={},
+                site_regions={"west": "us-west-2", "east": "us-east-1"},
+                lifecycle=Lifecycle(),
+                operations=SimpleNamespace(),
+                evidence_path=pathlib.Path(temporary) / "failure.json",
+            ).run()
+
+        self.assertEqual(result.exit_code, e2e.EXIT_CLEANUP_FAILED)
+        self.assertEqual(calls, ["cleanup"])
+        self.assertEqual(result.evidence["failure"]["category"], "ProtectedHardTimeout")
+        self.assertEqual(result.evidence["failure"]["phase"], e2e.Phase.CLEANUP.value)
 
     def test_parse_failure_still_runs_run_owned_cleanup(self) -> None:
         calls: list[str] = []

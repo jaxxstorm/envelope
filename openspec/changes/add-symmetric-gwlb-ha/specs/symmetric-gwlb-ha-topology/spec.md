@@ -56,6 +56,14 @@ Every GWLBE remote-site route SHALL initially select the explicitly configured r
 - **WHEN** a protected runner is lost while its durable route transaction is active
 - **THEN** no terminal claim is written and a successor may restore the prior routes only after the owner lease and CAS claim are reconciled
 
+#### Scenario: Expired acceptance recovery
+- **WHEN** the run configuration has expired but an abandoned durable route transaction or its verified cleanup-pending handoff remains
+- **THEN** a route-only successor may bypass only the normal TTL gate, validates every immutable route binding before CAS, refuses acceptance replay or a ready manifest, and requires verified restoration, an exact integer-zero final residual audit, and backend finalization
+
+#### Scenario: Successor lost during cleanup handoff
+- **WHEN** a route-only successor exits after verified restoration or while finalizing cleanup
+- **THEN** the leased cleanup marker and private pending receipt preserve enough exact authority for a later invocation to finish cleanup without replaying acceptance
+
 ### Requirement: Bounded high availability behavior
 Each enabled site AZ SHALL have a local GWLBE and a healthy-capable Envelope target path, and each site SHALL have at least two ready transport routers. The system SHALL prove alternate-target new-flow recovery and runner-owned transport ENI route recovery and SHALL record established-flow recovery and packet loss without promising hitless continuity or requiring an original five-tuple to resume. For instance, router, or route failure, a complete observation that continues sending after the mutation MAY record an exact right-censored interruption; the target-process post-restoration marker requirement remains unchanged.
 

@@ -1841,6 +1841,25 @@ def owned_tag_list(config: appliance.RunConfig) -> list[dict[str, str]]:
 
 
 class ConfigAndPathTest(unittest.TestCase):
+    def test_lifecycle_lock_rejects_symlink_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            target = root / "outside-lock"
+            target.write_text("unchanged\n", encoding="utf-8")
+            target.chmod(0o644)
+            (run_dir / "lifecycle.lock").symlink_to(target)
+
+            with self.assertRaisesRegex(
+                appliance.LifecycleError, "private regular file|symlink"
+            ):
+                with appliance.lifecycle_lock(run_dir):
+                    self.fail("symlinked lock was acquired")
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "unchanged\n")
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
+
     def test_manifest_transition_reconciles_commit_response_loss_and_collisions(self):
         original = {"phase": "original"}
         candidate = {"phase": "candidate"}
@@ -1962,6 +1981,73 @@ class ConfigAndPathTest(unittest.TestCase):
             ambiguous["e2e"]["replacement"]["failed_at"] = "2026-08-20T12:03:00Z"
             with self.assertRaisesRegex(appliance.LifecycleError, "replacement journal"):
                 appliance.validate_manifest(ambiguous, config)
+
+    def test_manifest_accepts_only_exact_route_recovery_cleanup_markers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = make_config(root)
+            manifest = appliance.new_manifest(
+                config, artifact_identity(root), "123456789012"
+            )
+            mark_manifest_applied(manifest)
+            manifest["phase"] = "e2e_running"
+            manifest["e2e"] = {
+                "claim_id": "11111111-2222-4333-8444-555555555555",
+                "output_sha256": "d" * 64,
+                "started_at": "2026-08-20T12:00:00Z",
+                "route_recovery": {
+                    "schema": 1,
+                    "kind": "transport-prefix-and-gwlbe-route-cleanup",
+                    "run_id": config.run_id,
+                    "claim_id": "11111111-2222-4333-8444-555555555555",
+                    "transaction_id": "22222222-3333-4444-8555-666666666666",
+                    "owner": {
+                        "pid": 1234,
+                        "host_sha256": "e" * 64,
+                        "boot_id": "33333333-4444-4555-8666-777777777777",
+                    },
+                    "lease_expires_at": "2026-08-20T12:02:00Z",
+                    "restored_at": "2026-08-20T12:01:00Z",
+                    "restoration_status": "reconciled-after-crash",
+                    "status": "cleanup-pending",
+                },
+            }
+            appliance.validate_manifest(manifest, config)
+
+            terminal = copy.deepcopy(manifest)
+            terminal["phase"] = "e2e_failed"
+            terminal["e2e"].update(
+                {"finished_at": "2026-08-20T12:03:00Z", "passed": False}
+            )
+            appliance.validate_manifest(terminal, config)
+
+            incomplete = copy.deepcopy(terminal)
+            incomplete["phase"] = "cleanup_incomplete"
+            incomplete["cleanup_claimed_at"] = "2026-08-20T12:04:00Z"
+            incomplete["cleanup_claim_id"] = (
+                "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+            )
+            appliance.validate_manifest(incomplete, config)
+
+            for field, value in (
+                ("status", "complete"),
+                ("transaction_id", "not-a-transaction"),
+                ("restoration_status", "restored"),
+            ):
+                with self.subTest(field=field):
+                    invalid = copy.deepcopy(manifest)
+                    invalid["e2e"]["route_recovery"][field] = value
+                    with self.assertRaisesRegex(
+                        appliance.LifecycleError, "route-recovery marker"
+                    ):
+                        appliance.validate_manifest(invalid, config)
+
+            invalid_owner = copy.deepcopy(manifest)
+            invalid_owner["e2e"]["route_recovery"]["owner"]["boot_id"] = ""
+            with self.assertRaisesRegex(
+                appliance.LifecycleError, "route-recovery marker"
+            ):
+                appliance.validate_manifest(invalid_owner, config)
 
     def test_saved_plan_requires_the_exact_symmetric_fleet_graph(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -10027,6 +10113,147 @@ class SSMAndCleanupTest(unittest.TestCase):
             }
             manifest["phase"] = "key_rotation_create_started"
             self.assertEqual(appliance.recover_auth_key_ids(API(), manifest), ["old-key", "unrecorded-new-key"])
+
+    def test_cleanup_checkpoints_after_zero_audit_before_manifest_deletion(self):
+        class AWS:
+            @staticmethod
+            def object_exists(_bucket, _key, _region, **_kwargs):
+                return False
+
+            @staticmethod
+            def json(args, *, region=None, timeout_seconds=None):
+                if args[1] == "describe-parameters":
+                    return {"Parameters": []}
+                raise AssertionError(args)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            config = make_config(root)
+            manifest = appliance.new_manifest(
+                config, artifact_identity(root), "123456789012"
+            )
+            mark_manifest_applied(manifest)
+            manifest["phase"] = "e2e_failed"
+            manifest["e2e"] = {
+                "claim_id": "11111111-2222-4333-8444-555555555555",
+                "output_sha256": "d" * 64,
+                "started_at": "2026-08-20T12:00:00Z",
+                "finished_at": "2026-08-20T12:01:00Z",
+                "passed": False,
+            }
+
+            class Store:
+                def __init__(self):
+                    self.value = copy.deepcopy(manifest)
+                    self.remote_etag = '"fixture-etag"'
+                    self.path = run_dir / "manifest.json"
+
+                def recover(self):
+                    return copy.deepcopy(self.value)
+
+                def write(self, value, *, if_match=None):
+                    self.value = copy.deepcopy(value)
+                    self.remote_etag = '"fixture-next-etag"'
+
+            store = Store()
+            order: list[str] = []
+
+            def delete_versions(_aws, *, bucket, key, region, dry_run):
+                order.append(key)
+                return []
+
+            def checkpoint(result):
+                self.assertEqual(result["final_residual_count"], 0)
+                self.assertNotIn(config.manifest_key, order)
+                order.append("checkpoint")
+
+            with (
+                mock.patch.object(appliance, "ManifestStore", return_value=store),
+                mock.patch.object(
+                    appliance, "cleanup_tailnet_devices", return_value=[]
+                ),
+                mock.patch.object(appliance, "recover_auth_key_ids", return_value=[]),
+                mock.patch.object(appliance, "audit_run_resources", return_value=[]),
+                mock.patch.object(appliance, "delete_ssm_parameter"),
+                mock.patch.object(
+                    appliance,
+                    "delete_exact_object_versions",
+                    side_effect=delete_versions,
+                ),
+            ):
+                result = appliance.cleanup(
+                    config,
+                    AWS(),
+                    object(),
+                    object(),
+                    run_dir,
+                    root / "terraform",
+                    recover=True,
+                    dry_run=False,
+                    skip_destroy=False,
+                    before_manifest_delete=checkpoint,
+                )
+
+            self.assertEqual(result["final_residual_count"], 0)
+            self.assertEqual(
+                order,
+                [
+                    config.backend["state_key"],
+                    config.lock_key,
+                    "checkpoint",
+                    config.manifest_key,
+                ],
+            )
+
+            failed_store = Store()
+            failed_order: list[str] = []
+
+            def failed_delete_versions(
+                _aws, *, bucket, key, region, dry_run
+            ):
+                failed_order.append(key)
+                return []
+
+            def failed_checkpoint(_result):
+                failed_order.append("checkpoint")
+                raise OSError("fixture durable receipt fsync failed")
+
+            with (
+                mock.patch.object(
+                    appliance, "ManifestStore", return_value=failed_store
+                ),
+                mock.patch.object(
+                    appliance, "cleanup_tailnet_devices", return_value=[]
+                ),
+                mock.patch.object(appliance, "recover_auth_key_ids", return_value=[]),
+                mock.patch.object(appliance, "audit_run_resources", return_value=[]),
+                mock.patch.object(appliance, "delete_ssm_parameter"),
+                mock.patch.object(
+                    appliance,
+                    "delete_exact_object_versions",
+                    side_effect=failed_delete_versions,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    appliance.LifecycleError, "durable receipt fsync"
+                ):
+                    appliance.cleanup(
+                        config,
+                        AWS(),
+                        object(),
+                        object(),
+                        run_dir,
+                        root / "terraform",
+                        recover=True,
+                        dry_run=False,
+                        skip_destroy=False,
+                        before_manifest_delete=failed_checkpoint,
+                    )
+
+            self.assertNotIn(config.manifest_key, failed_order)
+            self.assertEqual(failed_store.value["phase"], "cleanup_incomplete")
 
 
 def render_template(path: pathlib.Path, values: dict[str, str]) -> str:

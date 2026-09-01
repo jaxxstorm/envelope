@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import subprocess
 import unittest
 
 
@@ -446,12 +447,51 @@ class SymmetricTerraformContractTest(unittest.TestCase):
                 "stale advertisement generation was fenced"
             ),
             self.transport_router.index(
+                "recorded advertisement predecessor differs from the live service or preferences"
+            ),
+        )
+        self.assertLess(
+            self.transport_router.index(
+                "recorded advertisement predecessor differs from the live service or preferences"
+            ),
+            self.transport_router.index(
                 "/usr/bin/tailscale set --accept-routes=true"
             ),
         )
         advertisements = heredoc(
             self.transport_router,
             "/usr/local/sbin/envelope-transport-advertisements",
+        )
+        self.assertIn("readonly requested_routes_json=$4", advertisements)
+        self.assertNotIn("readonly routes_json=$4", advertisements)
+        top_level_readonly = set(
+            re.findall(r"^readonly ([a-z_][a-z0-9_]*)=", advertisements, re.MULTILINE)
+        )
+        function_locals = {
+            token.split("=", 1)[0]
+            for declaration in re.findall(
+                r"^\s+local ([^\n]+)", advertisements, re.MULTILINE
+            )
+            for token in declaration.split()
+            if re.fullmatch(r"[a-z_][a-z0-9_]*(?:=.*)?", token)
+        }
+        self.assertEqual(top_level_readonly & function_locals, set())
+        subprocess.run(
+            [
+                "bash",
+                "-c",
+                """set -euo pipefail
+readonly requested_generation=11111111-2222-4333-8444-555555555555
+readonly requested_routes_json='["10.0.0.0/24"]'
+validate_routes() { local routes_json=$1; [[ "$routes_json" == '["10.0.0.0/24"]' ]]; }
+write_state() { local generation=$1 routes_json=$2; [[ "$generation" == "$requested_generation" && "$routes_json" == "$requested_routes_json" ]]; }
+validate_routes "$requested_routes_json"
+write_state "$requested_generation" "$requested_routes_json"
+""",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
         )
         inspect_start = advertisements.index('if [[ "$operation" == inspect ]]')
         inspect_output = advertisements.index(
@@ -468,10 +508,29 @@ class SymmetricTerraformContractTest(unittest.TestCase):
             "systemctl mask tailscaled.service"
         )
         state_write = advertisements.rindex(
-            'write_state "$generation" "$desired_routes" "$desired_service" "$desired_mode"'
+            'write_state "$requested_generation" "$desired_routes" "$desired_service" "$desired_mode"'
         )
         self.assertLess(abrupt_mask, abrupt_kill)
         self.assertLess(abrupt_kill, state_write)
+        self.assertIn(
+            '[[ "$main_pid" =~ ^[1-9][0-9]*$ ]]', advertisements
+        )
+        self.assertIn(
+            "abrupt transition did not terminate the original tailscaled process",
+            advertisements,
+        )
+        self.assertIn(
+            '[[ "$desired_service" == running && "$desired_mode" == normal ]] ||',
+            advertisements,
+        )
+        self.assertIn(
+            "an existing advertisement generation differs from live state",
+            advertisements,
+        )
+        self.assertNotIn(
+            "systemctl kill --kill-who=main --signal=SIGKILL tailscaled.service >/dev/null 2>&1 || true",
+            advertisements,
+        )
         self.assertIn('[[ "$unit_state" == masked ]]', advertisements)
         self.assertIn(
             '.generation == $initial or (.generation | test(', advertisements

@@ -25,6 +25,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -889,8 +890,28 @@ def lifecycle_lock(run_dir: pathlib.Path) -> Iterable[None]:
             finally:
                 depths[path] -= 1
             return
-        with path.open("a") as stream:
-            os.chmod(path, 0o600)
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        if not hasattr(os, "O_NOFOLLOW") and path.is_symlink():
+            raise LifecycleError("protected lifecycle lock must not be a symlink")
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except OSError as error:
+            raise LifecycleError(
+                "protected lifecycle lock must be one private regular file"
+            ) from error
+        try:
+            lock_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_nlink != 1:
+                raise LifecycleError(
+                    "protected lifecycle lock must be one private regular file"
+                )
+            os.fchmod(descriptor, 0o600)
+            stream = os.fdopen(descriptor, "a")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        with stream:
             try:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
@@ -2931,13 +2952,16 @@ def validate_manifest(manifest: dict[str, Any], config: RunConfig) -> None:
     if isinstance(e2e, dict):
         base_fields = {"claim_id", "output_sha256", "started_at"}
         terminal_fields = base_fields | {"finished_at", "passed"}
-        replacement_fields = {"replacement"}
+        extension_fields = {
+            "replacement",
+            "route_recovery",
+            "transport_node_id_sha256",
+        }
         e2e_fields = set(e2e)
-        core_fields = e2e_fields - replacement_fields
-        if core_fields not in (base_fields, terminal_fields) or e2e_fields - core_fields not in (
-            set(),
-            replacement_fields,
-        ):
+        core_fields = e2e_fields - extension_fields
+        if core_fields not in (base_fields, terminal_fields) or not (
+            e2e_fields - core_fields
+        ).issubset(extension_fields):
             raise LifecycleError("cleanup manifest E2E claim has an invalid schema")
         if (
             not isinstance(e2e.get("claim_id"), str)
@@ -2991,6 +3015,90 @@ def validate_manifest(manifest: dict[str, Any], config: RunConfig) -> None:
                 "e2e_failed",
             } and phase not in cleanup_phases:
                 raise LifecycleError("cleanup manifest active replacement journal has an invalid phase")
+        if "route_recovery" in e2e:
+            route_recovery = e2e["route_recovery"]
+            owner = (
+                route_recovery.get("owner")
+                if isinstance(route_recovery, dict)
+                else None
+            )
+            if (
+                not isinstance(route_recovery, dict)
+                or set(route_recovery)
+                != {
+                    "schema",
+                    "kind",
+                    "run_id",
+                    "claim_id",
+                    "transaction_id",
+                    "owner",
+                    "lease_expires_at",
+                    "restored_at",
+                    "restoration_status",
+                    "status",
+                }
+                or route_recovery.get("schema") != 1
+                or route_recovery.get("kind")
+                != "transport-prefix-and-gwlbe-route-cleanup"
+                or route_recovery.get("run_id") != manifest.get("run_id")
+                or route_recovery.get("claim_id") != e2e.get("claim_id")
+                or OPERATION_CLAIM_ID_RE.fullmatch(
+                    str(route_recovery.get("transaction_id", ""))
+                )
+                is None
+                or route_recovery.get("restoration_status")
+                not in {"restored-after-failure", "reconciled-after-crash"}
+                or route_recovery.get("status")
+                not in {"cleanup-pending", "cleanup-claimed"}
+                or phase
+                not in {
+                    "e2e_running",
+                    "e2e_failed",
+                    "cleanup_started",
+                    "destroy_started",
+                    "cleanup_incomplete",
+                }
+                or phase in cleanup_phases
+                and core_fields != terminal_fields
+                or not isinstance(owner, dict)
+                or set(owner) != {"pid", "host_sha256", "boot_id"}
+                or isinstance(owner.get("pid"), bool)
+                or not isinstance(owner.get("pid"), int)
+                or owner.get("pid", 0) <= 0
+                or re.fullmatch(r"[0-9a-f]{64}", str(owner.get("host_sha256", "")))
+                is None
+                or re.fullmatch(
+                    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                    str(owner.get("boot_id", "")),
+                )
+                is None
+            ):
+                raise LifecycleError(
+                    "cleanup manifest route-recovery marker is invalid"
+                )
+            validate_canonical_utc_timestamp(
+                route_recovery.get("lease_expires_at"),
+                "e2e.route_recovery.lease_expires_at",
+            )
+            validate_canonical_utc_timestamp(
+                route_recovery.get("restored_at"),
+                "e2e.route_recovery.restored_at",
+            )
+        if "transport_node_id_sha256" in e2e:
+            node_hashes = e2e["transport_node_id_sha256"]
+            if (
+                not isinstance(node_hashes, dict)
+                or len(node_hashes) != 4
+                or len(set(node_hashes.values())) != 4
+                or any(
+                    DEPLOYMENT_INSTANCE_ID_RE.fullmatch(str(instance_id)) is None
+                    or re.fullmatch(r"[0-9a-f]{64}", str(node_hash)) is None
+                    for instance_id, node_hash in node_hashes.items()
+                )
+            ):
+                raise LifecycleError(
+                    "cleanup manifest transport-node identity binding is invalid"
+                )
         if core_fields == terminal_fields:
             validate_canonical_utc_timestamp(e2e.get("finished_at"), "e2e.finished_at")
             if type(e2e.get("passed")) is not bool:
@@ -11258,8 +11366,9 @@ def _cleanup(
     recover: bool,
     dry_run: bool,
     skip_destroy: bool,
-    janitor: bool = False,
     deadline: CleanupDeadline,
+    janitor: bool = False,
+    before_manifest_delete: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     run_dir = run_dir.expanduser().resolve()
     terraform_dir = terraform_dir.expanduser().resolve()
@@ -11486,6 +11595,15 @@ def _cleanup(
             except Exception as error:
                 record_failure(f"delete backend versions for {key}", error)
             sync_signal_interrupts()
+        if not dry_run and not failures and before_manifest_delete is not None:
+            try:
+                deadline.remaining()
+                before_manifest_delete(copy.deepcopy(results))
+            except (KeyboardInterrupt, CleanupInterrupted) as error:
+                record_interrupt("checkpoint cleanup before manifest deletion", error)
+            except Exception as error:
+                record_failure("checkpoint cleanup before manifest deletion", error)
+            sync_signal_interrupts()
         if dry_run or not failures:
             try:
                 deadline.remaining()
@@ -11556,6 +11674,7 @@ def cleanup(
     dry_run: bool,
     skip_destroy: bool,
     janitor: bool = False,
+    before_manifest_delete: Callable[[dict[str, Any]], None] | None = None,
     timeout_seconds: float = RESIDUAL_CLEANUP_TIMEOUT_SECONDS,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
@@ -11574,6 +11693,7 @@ def cleanup(
             dry_run=dry_run,
             skip_destroy=skip_destroy,
             janitor=janitor,
+            before_manifest_delete=before_manifest_delete,
             deadline=deadline,
         )
 
