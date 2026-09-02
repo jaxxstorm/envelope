@@ -65,9 +65,9 @@ This is an **illustrative input shape**, not a runnable deployment configuration
 
 | Field | External meaning |
 | --- | --- |
-| `mutation_timeout_seconds` | Whole number from `1` through `7200` bounding an authorized route mutation, convergence, and alternate-path probe. |
+| `mutation_timeout_seconds` | Whole number from `1` through `7200` bounding authorized ownership transfer and GWLBE route mutation and convergence. |
 | `restoration_timeout_seconds` | Whole number from `1` through `7200` bounding unconditional restoration and verification. |
-| `recovery_timeout_seconds` | Whole number from `1` through `7200` bounding the protected recovery exercise. |
+| `recovery_timeout_seconds` | Whole number from `1` through `7200` jointly bounding the sequential TCP and UDP alternate-path proofs after route convergence. |
 | `initial_transport_router_az_by_gwlbe_az` | Object containing exactly `west` and `east`; in each site every GWLBE AZ key maps to the equal enabled transport-router AZ key. |
 
 `initial_transport_router_az_by_gwlbe_az` is required same-AZ key equality. A cross-AZ initial mapping is rejected; the map does not contain ENI IDs, infer readiness, or choose a fallback. There is no separate owner input. For each AZ, the map assigns the local workload prefix to that AZ's router and selects that router's primary ENI for every exact remote-site CIDR route in the corresponding GWLBE subnet route table. A distinct same-site ENI remains the eligible acceptance alternate.
@@ -81,6 +81,8 @@ The `symmetric_topology` output gives every transport-router fleet member exactl
 On every router, Tailscale table 52 contains exactly the opposite site's exact workload prefixes and no local-site prefix. Every opposite-site observer selects each protected remote prefix's configured stable-node `PrimaryRoutes` owner, while no same-site observer reports a protected local `PrimaryRoutes` claim. Every local prefix, whether self- or sibling-owned in the singleton advertisement map, remains on `main` and the VPC underlay. The higher-priority `iif tailscale0` local-prefix rules make every router forwarding-capable for bounded takeover and able to deliver all local prefixes during normal and takeover paths.
 
 Failed protected run `ha25` proved this route shape by showing exactly the two opposite-site workload routes and only opposite-site serving paths on every router in the illustrated two-prefix profile. It did not pass acceptance and is not live-readiness evidence for a future plan.
+
+Failed protected run `ha47` proved destination-prefix endpoint symmetry and both cross-AZ recovery paths, then exposed that the sequential full TCP and UDP proofs cannot share the preceding mutation deadline. The runner now completes ownership and GWLBE route convergence within `mutation_timeout_seconds`, then starts one fresh `recovery_timeout_seconds` deadline jointly covering those two proofs. Restoration and cleanup reached zero residuals, but the run did not pass acceptance.
 
 Terraform emits the host contract separately as `transport_router_readiness_expectations`, including each site's exact CIDRs, forwarding, policy, firewall, MSS, IPv6, no-NAT expectations, and contract hash. That output is an expectation consumed by credentialed protected readiness, not a user input and not proof that a deployed router is ready.
 

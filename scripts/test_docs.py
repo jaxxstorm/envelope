@@ -259,6 +259,28 @@ class DocsContractTest(unittest.TestCase):
                     ),
                 )
 
+    def test_pages_separate_route_mutation_and_recovery_proof_deadlines(self) -> None:
+        pages = {
+            "README.md": self.root_readme,
+            "docs/README.md": self.home,
+            "docs/aws-appliance-runbook.md": self.appliance_runbook,
+            "docs/aws-two-region-e2e-runbook.md": self.e2e_runbook,
+            "docs/terraform-example.md": self.terraform_example,
+            "docs/getting-started.md": self.getting_started,
+        }
+        for name, document in pages.items():
+            with self.subTest(page=name):
+                self.assert_contains_all(
+                    document,
+                    (
+                        "mutation_timeout_seconds",
+                        "recovery_timeout_seconds",
+                        "sequential TCP and UDP",
+                    ),
+                    case_sensitive=True,
+                )
+                self.assertRegex(document.lower(), r"route (?:mutation and )?convergence")
+
     def test_pages_define_same_az_map_as_the_only_owner_assignment(self) -> None:
         pages = {
             "README.md": self.root_readme,

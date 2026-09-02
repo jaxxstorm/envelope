@@ -113,7 +113,7 @@ The protected runner SHALL be the only component authorized to coordinate tempor
 
 #### Scenario: Authorized alternate route
 - **WHEN** a selected transport router is failed during an approved exercise
-- **THEN** the runner transfers only the failed owner's exact prefix to a ready alternate, proves the expected opposite-site stable-node ownership graph and continued absence of local Tailnet routes, replaces only the affected run-owned remote-site routes with the alternate ENI, and proves a new flow within the configured bound
+- **THEN** the runner transfers only the failed owner's exact prefix to a ready alternate, proves the expected opposite-site stable-node ownership graph and continued absence of local Tailnet routes, and replaces only the affected run-owned remote-site routes with the alternate ENI within `mutation_timeout_seconds`, then proves the sequential TCP and UDP new flows within one joint `recovery_timeout_seconds` bound
 
 #### Scenario: Ambiguous or out-of-scope route
 - **WHEN** a route table, prefix, current target, alternate ENI, or ownership tag differs from the durable run manifest

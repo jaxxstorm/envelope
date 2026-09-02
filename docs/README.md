@@ -40,6 +40,8 @@ Failed protected run `ha25` proved this live route shape: each router installed 
 
 Failed protected run `ha46` proved the separate destination-endpoint invariant: a cross-AZ receiving router must retain the destination workload prefix's AZ GWLBE rather than select its own AZ endpoint. The run cleaned up to zero residuals but did not satisfy acceptance.
 
+Failed protected run `ha47` proved that corrected path and completed both cross-AZ TCP and UDP recovery proofs, but the second proof finished about eight seconds beyond the shared mutation deadline. `mutation_timeout_seconds` now bounds ownership transfer and GWLBE route convergence; after convergence, the sequential TCP and UDP proofs jointly use a fresh `recovery_timeout_seconds` deadline. Restoration and one-attempt cleanup reached zero residuals, but the run did not satisfy acceptance.
+
 ## Availability Boundary
 
 The topology is designed for bounded new-flow recovery through alternate targets and transport routers. The operation is coordinated but not atomic. It is not hitless: established TCP can be interrupted and UDP can lose packets during process, instance, AZ, GWLB, VPC-route, or Tailscale control-plane failover. Applications must retry, and future protected acceptance must measure recovery and loss rather than promise continuity.

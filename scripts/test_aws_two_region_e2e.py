@@ -2387,6 +2387,45 @@ class GWLBERouteFailoverTest(unittest.TestCase):
                 ),
             )
 
+    def test_recovery_probe_uses_its_separate_reviewed_deadline(self) -> None:
+        aws = RouteTableAWS(self.topology)
+        with tempfile.TemporaryDirectory() as temporary:
+            transaction, clock, _ready, _evidence_path = self.failover(
+                temporary, aws
+            )
+            control = transaction.advertisement_control
+            original_apply = control.apply
+
+            def slow_apply(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                result = original_apply(*args, **kwargs)
+                clock.sleep(10)
+                return result
+
+            control.apply = slow_apply
+            observed_remaining: list[float] = []
+
+            def probe(remaining: float) -> Mapping[str, Any]:
+                observed_remaining.append(remaining)
+                clock.sleep(9)
+                return self.successful_probe(remaining)
+
+            result = transaction.replace(
+                self.current,
+                self.alternate,
+                probe=probe,
+                timeout_seconds=self.topology.route_failover.mutation_timeout_seconds,
+                restoration_timeout_seconds=(
+                    self.topology.route_failover.restoration_timeout_seconds
+                ),
+            )
+
+        self.assertTrue(result["restored"])
+        self.assertEqual(
+            observed_remaining,
+            [float(self.topology.route_failover.recovery_timeout_seconds)],
+        )
+        self.assert_original_routes(aws)
+
     def test_lifecycle_proxies_delegate_complete_route_transaction_protocol(self) -> None:
         for proxy_name in ("run-all", "bounded-cleanup"):
             with self.subTest(proxy=proxy_name), tempfile.TemporaryDirectory() as temporary:

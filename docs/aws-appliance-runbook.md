@@ -2,7 +2,7 @@
 
 ## Status
 
-The AWS appliance topology retains version `2` while replacing the rejected target-forwarding draft with packet-scoped GWLB turnaround, GWLBE subnet routing, and separate transport routers. The corrected protected profile is still under development, and no passing live acceptance run is documented. Protected runs `ha25` and `ha46` failed acceptance but supplied the live Tailnet and endpoint-symmetry evidence used to correct the transport readiness contract below. This page is a safety and architecture reference, not an executable live-run procedure.
+The AWS appliance topology retains version `2` while replacing the rejected target-forwarding draft with packet-scoped GWLB turnaround, GWLBE subnet routing, and separate transport routers. The corrected protected profile is still under development, and no passing live acceptance run is documented. Protected runs `ha25`, `ha46`, and `ha47` failed acceptance but supplied the live Tailnet, endpoint-symmetry, and deadline-separation evidence used to correct the transport contract below. This page is a safety and architecture reference, not an executable live-run procedure.
 
 Do not use an older protected configuration, saved plan, state file, workflow, evidence file, or direct Terraform command with this topology. Do not translate an old configuration by hand. A future approved run must create a fresh, run-owned version-2 deployment and own its cleanup.
 
@@ -62,11 +62,13 @@ Failed protected run `ha25` proved this shape directly: each router installed ex
 
 Failed protected run `ha46` proved the endpoint half of this shape during graceful takeover: east/a received a packet for the east/b workload, but its old uniform local routes selected GWLBE a while the workload reverse route selected GWLBE b. Both GWLBs observed SYNs, no SYN-ACK returned, cleanup reached zero residuals, and the run did not satisfy acceptance.
 
+Failed protected run `ha47` proved the corrected endpoint shape: ownership and both affected routes transferred to east/a, and both full TCP and UDP cross-AZ recovery proofs completed. The second sequential proof finished about eight seconds after the shared 120-second mutation deadline. The runner now bounds ownership transfer and GWLBE route convergence with `mutation_timeout_seconds`, then jointly bounds the sequential TCP and UDP proofs with a fresh `recovery_timeout_seconds` deadline. Restoration and one-attempt cleanup reached zero residuals; the run still did not satisfy acceptance.
+
 ## Runner-Owned ENI Failover
 
 Each GWLBE table's exact remote-site routes have one active transport-router ENI target and at least one ready same-site alternate. At baseline, the same router owns that GWLBE AZ's source workload prefix in Tailscale; route and stable-node ownership must agree.
 
-The external `symmetric_topology.route_failover` object contains exactly `mutation_timeout_seconds`, `restoration_timeout_seconds`, `recovery_timeout_seconds`, and `initial_transport_router_az_by_gwlbe_az`. All three timeouts are whole seconds from `1` through `7200`. The final object contains exactly `west` and `east` maps; each map covers every GWLBE AZ key, and every value must equal its GWLBE AZ key.
+The external `symmetric_topology.route_failover` object contains exactly `mutation_timeout_seconds`, `restoration_timeout_seconds`, `recovery_timeout_seconds`, and `initial_transport_router_az_by_gwlbe_az`. All three timeouts are whole seconds from `1` through `7200`. `mutation_timeout_seconds` bounds ownership transfer and GWLBE route convergence. After convergence, the sequential TCP and UDP proofs jointly use a fresh `recovery_timeout_seconds` deadline; unconditional restoration uses its separate bound. The final object contains exactly `west` and `east` maps; each map covers every GWLBE AZ key, and every value must equal its GWLBE AZ key.
 
 `initial_transport_router_az_by_gwlbe_az` is required same-AZ key equality; a cross-AZ initial mapping is invalid. It is the sole initial ownership input, not a readiness election. For each AZ it derives the transport-router output's singleton `advertised_prefix`, the route output's `source_workload_prefix`, and the owner primary ENI targeted by every exact remote-site route in that source prefix's GWLBE table. There is no separate owner input. Internal settlement, quiet-window, and owner-lease durations are derived by the protected lifecycle and must not be supplied as external fields.
 

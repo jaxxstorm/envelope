@@ -9967,16 +9967,20 @@ class GWLBERouteFailover:
             journal["after"] = after
             journal["status"] = "alternate-active"
             self._persist(journal)
-            remaining = deadline - self.monotonic()
+            recovery_deadline = (
+                self.monotonic()
+                + self.topology.route_failover.recovery_timeout_seconds
+            )
+            remaining = recovery_deadline - self.monotonic()
             if remaining <= 0:
-                raise TimeoutError("GWLBE alternate probe has no time remaining")
+                raise TimeoutError("GWLBE alternate recovery has no probe time remaining")
             with hard_timeout(
                 max(1, int(math.ceil(remaining))),
                 operation="GWLBE alternate probe",
                 _timeout_error=TimeoutError,
             ):
                 raw_probe = dict(probe(remaining))
-            if self.monotonic() > deadline:
+            if self.monotonic() > recovery_deadline:
                 raise TimeoutError("GWLBE alternate new-flow probe exceeded its deadline")
             probe_value = sanitize_evidence_value(raw_probe)
             if not isinstance(probe_value, Mapping):

@@ -62,6 +62,8 @@ Failed protected run `ha25` proved this route shape by showing exactly the two o
 
 Failed protected run `ha46` then proved that the local endpoint route must remain destination-prefix anchored during cross-AZ router takeover. It cleaned up with zero residuals but did not pass acceptance.
 
+Failed protected run `ha47` proved that corrected route and completed both cross-AZ TCP and UDP recovery paths, but the second full proof exceeded the shared mutation deadline by about eight seconds. Ownership transfer and GWLBE route convergence now use `mutation_timeout_seconds`; the sequential TCP and UDP proofs jointly use a fresh `recovery_timeout_seconds` deadline after convergence. Restoration and cleanup again reached zero residuals, but the run did not pass acceptance.
+
 The installed target systemd service runs as an unprivileged user with ambient `CAP_NET_RAW`; it does not need `CAP_NET_ADMIN`. The transport-router host-network unit, `envelope-transport-router-network.service`, runs as root with `CAP_NET_ADMIN` and `CAP_NET_RAW`, but configures only forwarding sysctls, its exact fail-closed firewall chains, and MSS clamping. Terraform publishes the expected host contract as the separate `transport_router_readiness_expectations` output; that output is not a live readiness result. Protected readiness separately observes Tailscale peer expiry and bounded pings, exact policy and prefix route chains, EC2 source/destination checks, ENI identity, and the complete destination-prefix GWLBE map.
 
 ## Secretless Linux Integration

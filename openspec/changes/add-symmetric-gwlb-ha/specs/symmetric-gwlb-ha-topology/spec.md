@@ -46,7 +46,7 @@ Every GWLBE remote-site route SHALL initially select the explicitly configured r
 
 #### Scenario: Selected transport router fails
 - **WHEN** acceptance makes the transport router selected by a GWLBE remote-site route unavailable
-- **THEN** the protected runner transfers the selected router's owned prefix to the alternate, observes every opposite-site observer converge on the alternate stable node while local Tailnet routes remain absent, replaces only the authorized routes with the alternate ENI, and proves a new flow within the configured bound
+- **THEN** the protected runner transfers the selected router's owned prefix to the alternate, observes every opposite-site observer converge on the alternate stable node while local Tailnet routes remain absent, and replaces only the authorized routes with the alternate ENI within `mutation_timeout_seconds`, then proves the sequential TCP and UDP new flows within one joint `recovery_timeout_seconds` bound
 
 #### Scenario: Route restoration
 - **WHEN** a failover exercise succeeds, fails, or times out after route mutation
