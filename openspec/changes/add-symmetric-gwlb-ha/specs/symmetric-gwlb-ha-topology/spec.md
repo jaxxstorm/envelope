@@ -12,7 +12,7 @@ The system SHALL route every packet between configured disjoint site CIDRs throu
 - **THEN** the packet follows the equivalent reverse sequence and reaches site A without CIDR-role partitioning or any target state learned from an earlier packet
 
 ### Requirement: GWLBE-owned post-inspection route domains
-The deployment SHALL create separate workload, transport-router, GWLBE, Envelope-target, and management route domains. Workload route tables SHALL send exact remote-site CIDRs to the same-AZ GWLBE. Transport-router route tables SHALL send exact local-site CIDRs to the same-AZ GWLBE. Each GWLBE subnet route table SHALL use VPC local delivery for local-site CIDRs and the active ENI of that GWLBE AZ's source-prefix owner for every exact remote-site CIDR. Target route tables SHALL carry only outer GWLB and management traffic and SHALL NOT route inner site traffic.
+The deployment SHALL create separate workload, transport-router, GWLBE, Envelope-target, and management route domains. Workload route tables SHALL send exact remote-site CIDRs to the same-AZ GWLBE. Every transport-router route table SHALL send each exact local-site CIDR to the GWLBE in that destination workload prefix's AZ, independent of the router AZ. Each GWLBE subnet route table SHALL use VPC local delivery for local-site CIDRs and the active ENI of that GWLBE AZ's source-prefix owner for every exact remote-site CIDR. Target route tables SHALL carry only outer GWLB and management traffic and SHALL NOT route inner site traffic.
 
 #### Scenario: Post-inspection local delivery
 - **WHEN** GWLB returns an inspected packet for a local-site CIDR to its GWLBE
@@ -23,7 +23,7 @@ The deployment SHALL create separate workload, transport-router, GWLBE, Envelope
 - **THEN** the GWLBE subnet route table selects the ready same-site transport-router ENI whose Tailnet advertisement owns the source workload prefix associated with that GWLBE
 
 #### Scenario: Route-domain bypass or loop
-- **WHEN** a workload or Tailnet-arriving local packet can bypass its GWLBE, a target can directly forward an inner packet, or a GWLBE-returned local packet can re-enter the endpoint
+- **WHEN** a workload packet can bypass its source-AZ GWLBE, a Tailnet-arriving local packet can bypass its destination-prefix-AZ GWLBE, a target can directly forward an inner packet, or a GWLBE-returned local packet can re-enter the endpoint
 - **THEN** plan validation and protected readiness fail before acceptance traffic
 
 ### Requirement: Redundant bidirectional site transport
@@ -35,7 +35,7 @@ Each site SHALL have at least two AZ-spread Tailscale transport routers whose di
 
 #### Scenario: Tailnet-arriving local packet
 - **WHEN** a transport router receives a packet from Tailscale for its local-site CIDR
-- **THEN** its higher-priority local rule selects `main`, the VPC underlay, and the local GWLBE before workload delivery without a local table-52 route
+- **THEN** its higher-priority local rule selects `main`, the VPC underlay, and the destination workload prefix's AZ GWLBE before workload delivery without a local table-52 route, even when the receiving router is cross-AZ
 
 #### Scenario: ha25 exposes only opposite-site serving paths
 - **WHEN** the failed protected run `ha25` route evidence is reconciled for its two-prefix-per-site profile

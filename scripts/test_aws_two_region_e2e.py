@@ -754,6 +754,26 @@ def symmetric_route_evidence() -> dict[str, Any]:
             "source_preserved": True,
         }
 
+    def recovery_new_flows(
+        site: e2e.Site,
+        role: e2e.WorkloadRole,
+        **path_overrides: Any,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for protocol in e2e.TRANSPORT_PROTOCOLS:
+            path = traversal_probe(site, role, protocol)
+            path.update(path_overrides)
+            if "source_target_id" in path_overrides:
+                path["geneve_return_proof"]["source"] = turnaround(
+                    path_overrides["source_target_id"]
+                )
+            if "destination_target_id" in path_overrides:
+                path["geneve_return_proof"]["destination"] = turnaround(
+                    path_overrides["destination_target_id"]
+                )
+            result[protocol] = {"succeeded": True, "path": path}
+        return result
+
     current, alternate = topology.west.transport_router_fleet
     graceful_failed, graceful_alternate = topology.east.transport_router_fleet
     assert current.gwlbe_route_table_id is not None
@@ -784,26 +804,26 @@ def symmetric_route_evidence() -> dict[str, Any]:
             ],
         }
 
+    graceful_new_flows = recovery_new_flows(
+        "west",
+        "responder",
+        destination_transport_router_id=graceful_alternate.instance_id,
+    )
     graceful_probe = {
+        **graceful_new_flows["udp"]["path"],
         "succeeded": True,
-        "protocol": "udp",
-        "source_transport_router_id": current.instance_id,
-        "source_transport_eni_id": current.network_interface_id,
-        "destination_transport_router_id": graceful_alternate.instance_id,
-        "new_flows": new_flow_evidence(
-            destination_transport_router_id=graceful_alternate.instance_id
-        ),
+        "new_flows": graceful_new_flows,
     }
+    abrupt_new_flows = recovery_new_flows(
+        "west",
+        "initiator",
+        source_transport_router_id=alternate.instance_id,
+        source_transport_eni_id=alternate.network_interface_id,
+    )
     abrupt_probe = {
+        **abrupt_new_flows["udp"]["path"],
         "succeeded": True,
-        "protocol": "udp",
-        "source_transport_router_id": alternate.instance_id,
-        "source_transport_eni_id": alternate.network_interface_id,
-        "destination_transport_router_id": graceful_alternate.instance_id,
-        "new_flows": new_flow_evidence(
-            source_transport_router_id=alternate.instance_id,
-            source_transport_eni_id=alternate.network_interface_id,
-        ),
+        "new_flows": abrupt_new_flows,
     }
     def owner_observation(
         owner_site: e2e.SymmetricSiteTopology,
@@ -1003,6 +1023,12 @@ def symmetric_route_evidence() -> dict[str, Any]:
                         ]["contract_sha256"],
                         "tailnet_node_id_sha256": node_hashes[member.instance_id],
                         "advertised_prefix": member.advertised_prefix,
+                        "local_gwlbes": {
+                            candidate.advertised_prefix: endpoints[site][
+                                candidate.az_key
+                            ]
+                            for candidate in topology.site(site).transport_router_fleet
+                        },
                         "primary_route_ownership": {
                             "observed_at": "2026-08-20T11:59:59Z",
                             "remote": [
@@ -1026,7 +1052,7 @@ def symmetric_route_evidence() -> dict[str, Any]:
             for site in e2e.SITES
         },
     }
-    return {
+    document = {
         "schema": e2e.SYMMETRIC_EVIDENCE_SCHEMA,
         "kind": e2e.SYMMETRIC_EVIDENCE_KIND,
         "run_id": topology.run_id,
@@ -1070,8 +1096,10 @@ def symmetric_route_evidence() -> dict[str, Any]:
                 "failed_id": target.instance_id,
                 "alternate_id": target_alternate.instance_id,
                 "new_flow_succeeded": True,
-                "new_flows": new_flow_evidence(
-                    source_target_id=target_alternate.instance_id
+                "new_flows": recovery_new_flows(
+                    "west",
+                    "initiator",
+                    source_target_id=target_alternate.instance_id,
                 ),
                 "recovery_duration_ms": 10,
             },
@@ -1089,8 +1117,10 @@ def symmetric_route_evidence() -> dict[str, Any]:
                 "drain_state": "draining",
                 "drain_duration_ms": 5,
                 "new_flow_succeeded": True,
-                "new_flows": new_flow_evidence(
-                    source_target_id=target_alternate.instance_id
+                "new_flows": recovery_new_flows(
+                    "west",
+                    "initiator",
+                    source_target_id=target_alternate.instance_id,
                 ),
                 "recovery_duration_ms": 20,
             },
@@ -1173,6 +1203,7 @@ def symmetric_route_evidence() -> dict[str, Any]:
         "diagnostics": {},
         "failure": None,
     }
+    return json.loads(json.dumps(document))
 
 
 def failure_transport_evidence(failed_id: str, label: str) -> dict[str, Any]:
@@ -4509,10 +4540,25 @@ class RouteMutationAuthorityTest(unittest.TestCase):
         )
 
         probe_timeouts: list[int] = []
+        expected_router_calls: list[tuple[str | None, str | None]] = []
 
-        def path(_deployment, flow, *, timeout_seconds, exclude_targets=None):
+        def path(
+            _deployment,
+            flow,
+            *,
+            timeout_seconds,
+            exclude_targets=None,
+            expected_source_transport_router_id=None,
+            expected_destination_transport_router_id=None,
+        ):
             del exclude_targets
             probe_timeouts.append(timeout_seconds)
+            expected_router_calls.append(
+                (
+                    expected_source_transport_router_id,
+                    expected_destination_transport_router_id,
+                )
+            )
             clock.sleep(3)
             if flow.purpose.startswith("graceful-transport"):
                 return {
@@ -4614,6 +4660,15 @@ class RouteMutationAuthorityTest(unittest.TestCase):
             ["graceful", "abrupt"],
         )
         self.assertEqual(probe_timeouts, [10, 7, 10, 7])
+        self.assertEqual(
+            expected_router_calls,
+            [
+                (None, graceful_alternate.instance_id),
+                (None, graceful_alternate.instance_id),
+                (alternate.instance_id, None),
+                (alternate.instance_id, None),
+            ],
+        )
         self.assertFalse(any("aws " in command for _member, command in commands))
 
 
@@ -4632,7 +4687,144 @@ class SymmetricRouteEvidenceTest(unittest.TestCase):
                 ].values()
             )
         )
+        graceful_path = validated["transport_router"]["graceful"]["new_flows"][
+            "tcp"
+        ]["path"]
+        topology = e2e.parse_symmetric_topology_v2(validated["topology"])
+        destination_router = next(
+            member
+            for site in e2e.SITES
+            for member in topology.site(site).transport_router_fleet
+            if member.instance_id
+            == graceful_path["destination_transport_router_id"]
+        )
+        self.assertNotEqual(
+            destination_router.az_key, graceful_path["destination_az_key"]
+        )
+        self.assertEqual(
+            graceful_path["destination_gwlbe_id"],
+            validated["endpoint_ids"][destination_router.site][
+                graceful_path["destination_az_key"]
+            ],
+        )
         self.assertEqual(e2e.verify_live_evidence(document), document)
+
+    def test_transport_recovery_summary_exactly_matches_serialized_abrupt_exercise(
+        self,
+    ) -> None:
+        def recovery(value: dict[str, Any]) -> dict[str, Any]:
+            return next(
+                item
+                for item in value["recoveries"]
+                if item["kind"] == "transport-router"
+            )
+
+        def swap_router_ids(value: dict[str, Any]) -> None:
+            summary = recovery(value)
+            summary["failed_id"], summary["alternate_id"] = (
+                summary["alternate_id"],
+                summary["failed_id"],
+            )
+
+        def change_new_flow(value: dict[str, Any]) -> None:
+            topology = e2e.parse_symmetric_topology_v2(value["topology"])
+            path = recovery(value)["new_flows"]["tcp"]["path"]
+            replacement = next(
+                member.instance_id
+                for member in topology.west.target_fleet
+                if member.instance_id != path["source_target_id"]
+            )
+            path["source_target_id"] = replacement
+            proof = path["geneve_return_proof"]["source"]
+            proof["target_id"] = replacement
+            proof["fidelity"]["target_id"] = replacement
+
+        def change_metric_number_type(value: dict[str, Any]) -> None:
+            metrics = recovery(value)["new_flows"]["tcp"]["path"][
+                "geneve_return_proof"
+            ]["source"]["metrics"]
+            metrics["geneve_rx_packets_delta"] = 1
+            metrics["geneve_tx_packets_delta"] = 1
+
+        mutations = {
+            "alternate": swap_router_ids,
+            "new flows": change_new_flow,
+            "JSON number type": change_metric_number_type,
+            "duration": lambda value: recovery(value).update(
+                {"recovery_duration_ms": 31}
+            ),
+        }
+        for name, mutate in mutations.items():
+            document = json.loads(json.dumps(symmetric_route_evidence()))
+            mutate(document)
+            with self.subTest(name=name), self.assertRaisesRegex(
+                e2e.EvidenceError, "summary differs"
+            ):
+                e2e.validate_symmetric_evidence(document)
+
+    def test_recovery_paths_require_complete_typed_turnaround_proof(self) -> None:
+        def source_proof(value: dict[str, Any]) -> dict[str, Any]:
+            return value["recoveries"][0]["new_flows"]["tcp"]["path"][
+                "geneve_return_proof"
+            ]["source"]
+
+        mutations = {
+            "missing metrics": lambda value: source_proof(value)["metrics"].clear(),
+            "boolean failure metric": lambda value: source_proof(value)[
+                "metrics"
+            ].update({"drops_delta": False}),
+            "numeric capture hash": lambda value: source_proof(value)[
+                "fidelity"
+            ].update({"capture_sha256": int("1" * 64)}),
+            "boolean VNI": lambda value: source_proof(value)["fidelity"]["pairs"][
+                0
+            ].update({"vni": False}),
+            "float VNI": lambda value: source_proof(value)["fidelity"]["pairs"][
+                0
+            ].update({"vni": 0.0}),
+            "array direction": lambda value: source_proof(value)["fidelity"][
+                "pairs"
+            ][0].update({"direction": []}),
+            "array router ID": lambda value: value["recoveries"][0]["new_flows"][
+                "tcp"
+            ]["path"].update({"source_transport_router_id": []}),
+            "array recovery ID": lambda value: value["recoveries"][0].update(
+                {"failed_id": []}
+            ),
+            "array stream ID": lambda value: value["transport"][
+                "target_process"
+            ]["failed_ids"].update({"tcp": []}),
+            "array exercise ID": lambda value: value["transport_router"][
+                "abrupt"
+            ].update({"failed_id": []}),
+            "huge metric": lambda value: source_proof(value)["metrics"].update(
+                {"geneve_rx_packets_delta": 10**10000}
+            ),
+        }
+        for name, mutate in mutations.items():
+            document = symmetric_route_evidence()
+            mutate(document)
+            with self.subTest(name=name), self.assertRaises(e2e.EvidenceError):
+                e2e.validate_symmetric_evidence(document)
+
+    def test_serialized_duplicate_probes_require_exact_json_types(self) -> None:
+        mutations = {
+            "exercise probe": lambda value: value["transport_router"]["abrupt"][
+                "probe"
+            ]["new_flows"]["tcp"]["path"]["geneve_return_proof"]["source"][
+                "fidelity"
+            ]["pairs"][0].update({"vni": False}),
+            "route probe": lambda value: value["transport_router"]["abrupt"][
+                "route_replacement"
+            ]["probe"]["geneve_return_proof"]["source"]["fidelity"]["pairs"][
+                0
+            ].update({"vni": False}),
+        }
+        for name, mutate in mutations.items():
+            document = json.loads(json.dumps(symmetric_route_evidence()))
+            mutate(document)
+            with self.subTest(name=name), self.assertRaises(e2e.EvidenceError):
+                e2e.validate_symmetric_evidence(document)
 
     def test_target_instance_evidence_allows_distinct_tcp_control_target(self) -> None:
         document = symmetric_route_evidence()
@@ -4696,6 +4888,11 @@ class SymmetricRouteEvidenceTest(unittest.TestCase):
                 recovery["new_flows"]["tcp"]["path"][
                     "source_target_id"
                 ] = recovery["failed_id"]
+                proof = recovery["new_flows"]["tcp"]["path"][
+                    "geneve_return_proof"
+                ]["source"]
+                proof["target_id"] = recovery["failed_id"]
+                proof["fidelity"]["target_id"] = recovery["failed_id"]
 
                 with self.assertRaisesRegex(e2e.EvidenceError, "victim exclusion"):
                     e2e.validate_symmetric_evidence(document)
@@ -4734,6 +4931,50 @@ class SymmetricRouteEvidenceTest(unittest.TestCase):
                     "online": True,
                 }
             ]
+
+        def swap_preflight_destination_gwlbe(value: dict[str, Any]) -> None:
+            topology = e2e.parse_symmetric_topology_v2(value["topology"])
+            router = topology.west.transport_router_fleet[0]
+            identity = value["preflight"]["sites"]["west"]["transport_routers"][
+                router.instance_id
+            ]
+            identity["local_gwlbes"][router.advertised_prefix] = value[
+                "endpoint_ids"
+            ]["west"]["b"]
+
+        def move_graceful_probe_to_unaffected_az(value: dict[str, Any]) -> None:
+            topology = e2e.parse_symmetric_topology_v2(value["topology"])
+            exercise = value["transport_router"]["graceful"]
+            alternate = next(
+                member
+                for member in topology.east.transport_router_fleet
+                if member.instance_id == exercise["alternate_id"]
+            )
+            endpoint = value["endpoint_ids"]["east"][alternate.az_key]
+            route_probe = exercise["route_replacement"]["probe"]
+            for probe in (exercise["probe"], route_probe):
+                probe["destination_az_key"] = alternate.az_key
+                probe["destination_gwlbe_id"] = endpoint
+                for item in probe["new_flows"].values():
+                    item["path"]["destination_az_key"] = alternate.az_key
+                    item["path"]["destination_gwlbe_id"] = endpoint
+            for item in exercise["new_flows"].values():
+                item["path"]["destination_az_key"] = alternate.az_key
+                item["path"]["destination_gwlbe_id"] = endpoint
+
+        def transfer_target_recovery_destination_owner(value: dict[str, Any]) -> None:
+            topology = e2e.parse_symmetric_topology_v2(value["topology"])
+            path = value["recoveries"][0]["new_flows"]["tcp"]["path"]
+            current = next(
+                member
+                for member in topology.east.transport_router_fleet
+                if member.instance_id == path["destination_transport_router_id"]
+            )
+            path["destination_transport_router_id"] = next(
+                member.instance_id
+                for member in topology.east.transport_router_fleet
+                if member != current
+            )
 
         mutations = {
             "route table": lambda value: value["transport_router"]["abrupt"][
@@ -4781,12 +5022,22 @@ class SymmetricRouteEvidenceTest(unittest.TestCase):
                 {"observer_instance_id": "i-ff23456789abcdef"}
             ),
             "local preflight owner": add_local_owner,
+            "preflight destination GWLBE": swap_preflight_destination_gwlbe,
+            "graceful unaffected destination AZ": move_graceful_probe_to_unaffected_az,
+            "target recovery transferred owner": transfer_target_recovery_destination_owner,
             "duplicate stable node hash": duplicate_stable_hash,
             "bound": lambda value: value["transport_router"]["abrupt"][
                 "route_replacement"
             ]["bounds"].update({"mutation_timeout_seconds": 0}),
             "GWLBE probe": lambda value: value["transport_router"]["abrupt"]["probe"].update(
                 {"source_transport_eni_id": "eni-fffffffffffffffff"}
+            ),
+            "recovery destination GWLBE": lambda value: value["transport_router"][
+                "graceful"
+            ]["new_flows"]["tcp"]["path"].update(
+                {
+                    "destination_gwlbe_id": value["endpoint_ids"]["east"]["b"]
+                }
             ),
             "control plane": lambda value: value["transport_router"]["graceful"].update(
                 {"control_plane": "gwlbe-route"}
@@ -5171,6 +5422,14 @@ class RouteRestorationCleanupPrecedenceTest(unittest.TestCase):
                                     ]["contract_sha256"],
                                     "tailnet_node_id_sha256": "8" * 64,
                                     "advertised_prefix": member.advertised_prefix,
+                                    "local_gwlbes": {
+                                        candidate.advertised_prefix: current.endpoint_ids[
+                                            site
+                                        ][candidate.az_key]
+                                        for candidate in current.topology.site(
+                                            site
+                                        ).transport_router_fleet
+                                    },
                                     "primary_route_ownership": {
                                         "observed_at": "2026-08-20T11:59:59Z",
                                         "remote": [

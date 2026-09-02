@@ -796,6 +796,24 @@ def _verify_route_table_association(
         raise ReadinessError("transport subnet VPC route-table association is not active")
 
 
+def _validated_local_gwlbes(
+    value: Any,
+    prefixes: Sequence[ipaddress.IPv4Network | ipaddress.IPv6Network],
+) -> dict[str, str]:
+    expected = {str(prefix) for prefix in prefixes}
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise ReadinessError(
+            "local GWLBE map must contain exactly one endpoint for every local-site prefix"
+        )
+    result: dict[str, str] = {}
+    for prefix in sorted(expected):
+        endpoint = value.get(prefix)
+        if not isinstance(endpoint, str) or not _GWLBE_ID_RE.fullmatch(endpoint):
+            raise ReadinessError(f"local GWLBE identity for {prefix} is invalid")
+        result[prefix] = endpoint
+    return result
+
+
 def validate_readiness(
     status: Mapping[str, Any],
     transport_state: Mapping[str, Any],
@@ -803,12 +821,11 @@ def validate_readiness(
     local_site_cidrs: Sequence[str],
     remote_site_cidrs: Sequence[str],
     expected_advertised_prefix: str,
-    local_gwlbe: str,
+    local_gwlbes: Mapping[str, str],
     expected_network_interface_id: str,
     expected_subnet_id: str,
     expected_route_table_id: str,
     expected_availability_zone: str,
-    local_gwlbe_availability_zone: str,
     underlay_interface: str,
     tailscale_interface: str,
     readiness_contract: Mapping[str, Any],
@@ -846,8 +863,6 @@ def validate_readiness(
         "RoutePeers",
     }:
         raise ReadinessError("status.Self has the wrong sanitized fixture shape")
-    if not isinstance(local_gwlbe, str) or not _GWLBE_ID_RE.fullmatch(local_gwlbe):
-        raise ReadinessError("local GWLBE identity is invalid")
     if (
         not isinstance(expected_network_interface_id, str)
         or not _ENI_ID_RE.fullmatch(expected_network_interface_id)
@@ -863,12 +878,8 @@ def validate_readiness(
     if (
         not isinstance(expected_availability_zone, str)
         or not _AZ_RE.fullmatch(expected_availability_zone)
-        or not isinstance(local_gwlbe_availability_zone, str)
-        or not _AZ_RE.fullmatch(local_gwlbe_availability_zone)
     ):
-        raise ReadinessError("transport or GWLBE availability-zone identity is invalid")
-    if local_gwlbe_availability_zone != expected_availability_zone:
-        raise ReadinessError("local GWLBE is not in the transport router availability zone")
+        raise ReadinessError("transport availability-zone identity is invalid")
     if (
         not isinstance(underlay_interface, str)
         or not isinstance(tailscale_interface, str)
@@ -945,6 +956,7 @@ def validate_readiness(
             for right in networks[index + 1 :]
         ):
             raise ReadinessError(f"{field} CIDRs overlap each other")
+    expected_local_gwlbes = _validated_local_gwlbes(local_gwlbes, local)
     expected_advertisements = _networks(
         [expected_advertised_prefix], "expected advertised prefix"
     )
@@ -1020,6 +1032,7 @@ def validate_readiness(
     parsed_routes = tuple((route, _route_network(route)) for route in _routes(vpc_route_table))
     vpc_prefix_chains: list[dict[str, str]] = []
     for prefix in local:
+        local_gwlbe = expected_local_gwlbes[str(prefix)]
         exact = [route for route, network in parsed_routes if network == prefix]
         if len(exact) != 1:
             raise ReadinessError(f"{prefix} does not have one exact VPC route")
@@ -1060,7 +1073,7 @@ def validate_readiness(
 
     return {
         "ready": True,
-        "local_gwlbe": local_gwlbe,
+        "local_gwlbes": expected_local_gwlbes,
         "availability_zone": expected_availability_zone,
         "network_interface_id": expected_network_interface_id,
         "subnet_id": expected_subnet_id,
@@ -1130,12 +1143,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--local-site-cidr", action="append", required=True)
     parser.add_argument("--remote-site-cidr", action="append", required=True)
     parser.add_argument("--advertised-prefix", required=True)
-    parser.add_argument("--local-gwlbe", required=True)
+    parser.add_argument("--local-gwlbes-file", type=pathlib.Path, required=True)
     parser.add_argument("--network-interface-id", required=True)
     parser.add_argument("--subnet-id", required=True)
     parser.add_argument("--route-table-id", required=True)
     parser.add_argument("--availability-zone", required=True)
-    parser.add_argument("--local-gwlbe-availability-zone", required=True)
     parser.add_argument("--underlay-interface", required=True)
     parser.add_argument("--tailscale-interface", required=True)
     args = parser.parse_args(argv)
@@ -1150,12 +1162,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.local_site_cidr,
             args.remote_site_cidr,
             args.advertised_prefix,
-            args.local_gwlbe,
+            load_json(args.local_gwlbes_file),
             args.network_interface_id,
             args.subnet_id,
             args.route_table_id,
             args.availability_zone,
-            args.local_gwlbe_availability_zone,
             args.underlay_interface,
             args.tailscale_interface,
             load_json(args.contract_file),

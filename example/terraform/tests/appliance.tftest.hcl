@@ -697,6 +697,22 @@ run "distinct_transport_enis_and_same_az_initial_routes" {
   command = apply
 
   override_resource {
+    target = aws_vpc_endpoint.west["a"]
+    values = { id = "vpce-0123456789abcdef0" }
+  }
+  override_resource {
+    target = aws_vpc_endpoint.west["b"]
+    values = { id = "vpce-1123456789abcdef0" }
+  }
+  override_resource {
+    target = aws_vpc_endpoint.east["a"]
+    values = { id = "vpce-2123456789abcdef0" }
+  }
+  override_resource {
+    target = aws_vpc_endpoint.east["b"]
+    values = { id = "vpce-3123456789abcdef0" }
+  }
+  override_resource {
     target = aws_instance.transport_router_west["a"]
     values = { primary_network_interface_id = "eni-0123456789abcdef0" }
   }
@@ -725,6 +741,13 @@ run "distinct_transport_enis_and_same_az_initial_routes" {
       output.route_failover.same_az_preferred.east == true
     )
     error_message = "every GWLBE remote route must resolve its explicit same-AZ initial transport ENI."
+  }
+  assert {
+    condition = (
+      alltrue([for route in values(aws_route.transport_to_local_west) : route.vpc_endpoint_id == aws_vpc_endpoint.west[one([for az_key, prefix in var.symmetric_topology.sites.west.workload_subnet_cidrs : az_key if prefix == route.destination_cidr_block])].id]) &&
+      alltrue([for route in values(aws_route.transport_to_local_east) : route.vpc_endpoint_id == aws_vpc_endpoint.east[one([for az_key, prefix in var.symmetric_topology.sites.east.workload_subnet_cidrs : az_key if prefix == route.destination_cidr_block])].id])
+    )
+    error_message = "every transport route table must select each destination workload prefix's GWLBE, including cross-AZ prefix routes."
   }
 }
 

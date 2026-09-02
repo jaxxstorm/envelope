@@ -242,6 +242,39 @@ class SymmetricTerraformContractTest(unittest.TestCase):
         self.assertGreaterEqual(self.topology.count("setproduct"), 6)
 
         for site in ("west", "east"):
+            transport_route = braced_block(
+                self.topology,
+                f'resource "aws_route" "transport_to_local_{site}"',
+            )
+            self.assertIn(
+                f"toset(keys(local.sites.{site}.workload_subnet_cidrs))",
+                transport_route,
+            )
+            self.assertIn(
+                f'"${{pair[0]}}:${{local.sites.{site}.workload_subnet_cidrs[pair[1]]}}"',
+                transport_route,
+            )
+            self.assertIn(
+                f"aws_route_table.transport_{site}[each.value.transport_az_key].id",
+                transport_route,
+            )
+            self.assertIn(
+                f"aws_vpc_endpoint.{site}[each.value.workload_az_key].id",
+                transport_route,
+            )
+            self.assertIn(
+                f"each.value.cidr == local.sites.{site}.workload_subnet_cidrs[each.value.workload_az_key]",
+                transport_route,
+            )
+            self.assertIn(
+                "transport routes must select the GWLBE in each destination workload prefix's AZ",
+                transport_route,
+            )
+            self.assertNotIn(
+                f"aws_vpc_endpoint.{site}[each.value.transport_az_key].id",
+                transport_route,
+            )
+
             route = braced_block(
                 self.topology, f'resource "aws_route" "gwlbe_to_remote_{site}"'
             )

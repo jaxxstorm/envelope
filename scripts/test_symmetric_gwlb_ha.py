@@ -36,6 +36,19 @@ def packet_return_envelope() -> dict:
     }
 
 
+def endpoint_ids_document() -> dict[str, dict[str, str]]:
+    return {
+        "west": {
+            "a": "vpce-0123456789abcdef0",
+            "b": "vpce-1123456789abcdef0",
+        },
+        "east": {
+            "a": "vpce-2123456789abcdef0",
+            "b": "vpce-3123456789abcdef0",
+        },
+    }
+
+
 def topology_document() -> dict:
     def site(name: str, region: str, prefix: str, peer: str, serial: int) -> dict:
         target_group = f"arn:aws:elasticloadbalancing:{region}:123456789012:targetgroup/{name}/0123456789abcdef"
@@ -88,6 +101,7 @@ def topology_document() -> dict:
 
 def readiness_document(topology: e2e.SymmetricTopologyV2) -> dict:
     expectations = legacy_e2e_test.terraform_transport_readiness_value(topology)
+    endpoint_ids = endpoint_ids_document()
     return {
         "tailnet_policy_valid": True,
         "transport_router_contract_sha256": {
@@ -118,6 +132,12 @@ def readiness_document(topology: e2e.SymmetricTopologyV2) -> dict:
                             f"node-{member.site}-{member.az_key}".encode("utf-8")
                         ).hexdigest(),
                         "advertised_prefix": member.advertised_prefix,
+                        "local_gwlbes": {
+                            candidate.advertised_prefix: endpoint_ids[site][
+                                candidate.az_key
+                            ]
+                            for candidate in topology.site(site).transport_router_fleet
+                        },
                         "primary_route_ownership": {
                             "observed_at": "2026-08-28T12:00:00Z",
                             "remote": [
@@ -497,18 +517,25 @@ class SymmetricTopologyTest(unittest.TestCase):
         ]
         self.assertEqual(
             e2e.validate_symmetric_preflight(
-                topology, readiness_document(topology), expectations
+                topology,
+                readiness_document(topology),
+                endpoint_ids_document(),
+                expectations,
             )["config_version"],
             2,
         )
         invalid = readiness_document(topology)
         invalid["sites"]["west"]["route_domains"]["target"] = False
         with self.assertRaisesRegex(e2e.ReadinessError, "route-domain"):
-            e2e.validate_symmetric_preflight(topology, invalid)
+            e2e.validate_symmetric_preflight(
+                topology, invalid, endpoint_ids_document()
+            )
         wrong_contract = readiness_document(topology)
         wrong_contract["transport_router_contract_sha256"]["west"] = "f" * 64
         with self.assertRaisesRegex(e2e.ReadinessError, "Terraform contract SHA"):
-            e2e.validate_symmetric_preflight(topology, wrong_contract, expectations)
+            e2e.validate_symmetric_preflight(
+                topology, wrong_contract, endpoint_ids_document(), expectations
+            )
         invalid_topology = topology_document()
         invalid_topology["sites"]["west"]["remote_site_cidrs"] = ["10.10.1.0/24"]
         with self.assertRaisesRegex(e2e.DeploymentError, "overlap|peer"):
@@ -691,7 +718,9 @@ class SymmetricTopologyTest(unittest.TestCase):
                     }
                 ]
             with self.subTest(mutation=mutation), self.assertRaises(e2e.ReadinessError):
-                e2e.validate_symmetric_preflight(topology, invalid)
+                e2e.validate_symmetric_preflight(
+                    topology, invalid, endpoint_ids_document()
+                )
 
     def test_ingress_era_symmetric_names_are_rejected_without_translation(self) -> None:
         legacy_topology = topology_document()
@@ -719,7 +748,9 @@ class SymmetricTopologyTest(unittest.TestCase):
         with self.assertRaisesRegex(
             (e2e.DeploymentError, e2e.ReadinessError), "unsupported|missing"
         ):
-            e2e.validate_symmetric_preflight(topology, legacy_readiness)
+            e2e.validate_symmetric_preflight(
+                topology, legacy_readiness, endpoint_ids_document()
+            )
 
         legacy_evidence = evidence_document()
         probe = legacy_evidence["traversals"][0]["probes"][0]
@@ -1571,7 +1602,7 @@ class SymmetricTopologyTest(unittest.TestCase):
                 mock.sentinel.flow,
             )
 
-    def test_destination_router_discovery_runs_on_source_transport_router(self) -> None:
+    def test_destination_router_discovery_accepts_a_protected_transferred_owner(self) -> None:
         deployment = e2e.parse_symmetric_protected_deployment_output(symmetric_protected_output())
         source_router = deployment.topology.west.transport_router_fleet[0]
         destination_router = deployment.topology.east.transport_router_fleet[0]
@@ -1606,6 +1637,21 @@ class SymmetricTopologyTest(unittest.TestCase):
 
         operations.base = SimpleNamespace(
             _execute_json=lambda *_args, **_kwargs: {
+                "peer_id": "node-east-b",
+                "success": True,
+            }
+        )
+        self.assertEqual(
+            operations._selected_destination_transport_router(
+                source_router,
+                deployment.topology.east,
+                "10.20.1.10",
+            ),
+            deployment.topology.east.transport_router_fleet[1].instance_id,
+        )
+
+        operations.base = SimpleNamespace(
+            _execute_json=lambda *_args, **_kwargs: {
                 "peer_id": "node-not-protected",
                 "success": True,
             }
@@ -1615,6 +1661,99 @@ class SymmetricTopologyTest(unittest.TestCase):
                 source_router,
                 deployment.topology.east,
                 "10.20.1.10",
+            )
+
+    def test_probe_path_requires_contextual_router_owners_and_workload_endpoint(self) -> None:
+        deployment = e2e.parse_symmetric_protected_deployment_output(
+            symmetric_protected_output()
+        )
+        ledger = e2e.FlowLedger("symmetric-fixture")
+        flow = ledger.allocate(
+            "tcp",
+            deployment.workloads.target("west", "initiator"),
+            deployment.workloads.target("east", "responder"),
+            destination_port=5201,
+            purpose="contextual-router-owners",
+            generation=ledger.begin_generation("contextual-router-owners"),
+        )
+        source_current, source_alternate = (
+            deployment.topology.west.transport_router_fleet
+        )
+        destination_alternate, destination_current = (
+            deployment.topology.east.transport_router_fleet
+        )
+        selected = {
+            "source": source_current,
+            "destination": destination_current,
+        }
+        operations = object.__new__(e2e.AwsSymmetricLiveOperations)
+        operations.base = SimpleNamespace(
+            _run_probe=lambda *_args, **_kwargs: {"succeeded": True},
+        )
+        operations._start_geneve_captures = lambda *_args, **_kwargs: {}
+        operations._finish_geneve_captures = lambda *_args, **_kwargs: {}
+        operations._target_snapshots = lambda *_args, **_kwargs: {}
+        operations._selected_target = lambda *_args, **kwargs: (
+            deployment.topology.site(_args[2]).target_fleet[0].instance_id,
+            {},
+        )
+        operations._selected_gwlbe_transport_router = (
+            lambda *_args, **_kwargs: selected["source"]
+        )
+        operations._selected_destination_transport_router = (
+            lambda *_args, **_kwargs: selected["destination"].instance_id
+        )
+        operations._geneve_return_proof = lambda *_args, **_kwargs: {}
+
+        with mock.patch.object(e2e, "_validate_probe_evidence"):
+            baseline = operations._run_probe_with_path(
+                deployment, flow, timeout_seconds=20
+            )
+            self.assertEqual(
+                baseline["destination_gwlbe_id"],
+                deployment.endpoint_ids["east"]["b"],
+            )
+
+            selected["destination"] = destination_alternate
+            with self.assertRaisesRegex(e2e.ProbeError, "unexpected destination"):
+                operations._run_probe_with_path(
+                    deployment, flow, timeout_seconds=20
+                )
+            transferred = operations._run_probe_with_path(
+                deployment,
+                flow,
+                timeout_seconds=20,
+                expected_destination_transport_router_id=(
+                    destination_alternate.instance_id
+                ),
+            )
+            self.assertEqual(
+                transferred["destination_gwlbe_id"],
+                deployment.endpoint_ids["east"]["b"],
+            )
+            self.assertNotEqual(
+                transferred["destination_gwlbe_id"],
+                deployment.endpoint_ids["east"][destination_alternate.az_key],
+            )
+
+            selected["source"] = source_alternate
+            with self.assertRaisesRegex(e2e.ProbeError, "source GWLBE route"):
+                operations._run_probe_with_path(
+                    deployment,
+                    flow,
+                    timeout_seconds=20,
+                    expected_destination_transport_router_id=(
+                        destination_alternate.instance_id
+                    ),
+                )
+            operations._run_probe_with_path(
+                deployment,
+                flow,
+                timeout_seconds=20,
+                expected_source_transport_router_id=source_alternate.instance_id,
+                expected_destination_transport_router_id=(
+                    destination_alternate.instance_id
+                ),
             )
 
     def test_ha25_live_transport_readiness_uses_remote_only_table52_and_status(self) -> None:
@@ -1642,7 +1781,13 @@ class SymmetricTopologyTest(unittest.TestCase):
                             "Routes": [
                                 {
                                     "DestinationCidrBlock": cidr,
-                                    "GatewayId": deployment.endpoint_ids["west"][member.az_key],
+                                    "GatewayId": deployment.endpoint_ids["west"][
+                                        member.az_key
+                                        if mutation[0] == "uniform-gwlbe"
+                                        else deployment.topology.west.transport_router_for_prefix(
+                                            cidr
+                                        ).az_key
+                                    ],
                                     "State": "active",
                                 }
                                 for cidr in deployment.topology.west.local_site_cidrs
@@ -1666,6 +1811,10 @@ class SymmetricTopologyTest(unittest.TestCase):
                     "transport_subnet_cidrs": {
                         "a": "10.10.6.0/24",
                         "b": "10.10.7.0/24",
+                    },
+                    "workload_subnet_cidrs": {
+                        "a": "10.10.1.0/24",
+                        "b": "10.10.2.0/24",
                     },
                 }
             },
@@ -1849,6 +1998,15 @@ class SymmetricTopologyTest(unittest.TestCase):
             list(deployment.topology.west.remote_site_cidrs),
         )
         self.assertEqual(identity["primary_route_ownership"]["local"], [])
+        self.assertEqual(
+            identity["local_gwlbes"],
+            {
+                candidate.advertised_prefix: deployment.endpoint_ids["west"][
+                    candidate.az_key
+                ]
+                for candidate in deployment.topology.west.transport_router_fleet
+            },
+        )
         shell_parts = shlex.split(commands[0])
         python_index = shell_parts.index("python3")
         self.assertEqual(shell_parts[python_index + 1], "-c")
@@ -1864,6 +2022,9 @@ class SymmetricTopologyTest(unittest.TestCase):
             operations._verify_transport_router(deployment, member)
         mutation[0] = "status-local"
         with self.assertRaisesRegex(e2e.ReadinessError, "local primary-route ownership"):
+            operations._verify_transport_router(deployment, member)
+        mutation[0] = "uniform-gwlbe"
+        with self.assertRaisesRegex(e2e.ReadinessError, "does not select"):
             operations._verify_transport_router(deployment, member)
 
     def test_live_transport_readiness_waits_for_exact_enabled_tailnet_routes(self) -> None:
@@ -2553,65 +2714,73 @@ class SymmetricTopologyTest(unittest.TestCase):
                     },
                 }
 
+            def path(self, deployment, flow, **overrides):
+                source_site = flow.source.site
+                destination_site = flow.destination.site
+                source = deployment.topology.site(source_site)
+                destination = deployment.topology.site(destination_site)
+                source_target = source.target_fleet[0]
+                destination_target = destination.target_fleet[0]
+                source_router = next(
+                    member
+                    for member in source.transport_router_fleet
+                    if member.az_key == flow.source.az_key
+                )
+                destination_router = next(
+                    member
+                    for member in destination.transport_router_fleet
+                    if member.az_key == flow.destination.az_key
+                )
+                value = {
+                    "protocol": flow.protocol,
+                    "source_role": flow.source.role,
+                    "destination_role": flow.destination.role,
+                    "source_az_key": flow.source.az_key,
+                    "destination_az_key": flow.destination.az_key,
+                    "source_gwlbe_id": deployment.endpoint_ids[source_site][
+                        flow.source.az_key
+                    ],
+                    "destination_gwlbe_id": deployment.endpoint_ids[
+                        destination_site
+                    ][flow.destination.az_key],
+                    "source_target_id": source_target.instance_id,
+                    "destination_target_id": destination_target.instance_id,
+                    "source_transport_router_id": source_router.instance_id,
+                    "source_transport_eni_id": source_router.network_interface_id,
+                    "destination_transport_router_id": destination_router.instance_id,
+                    "geneve_return_proof": {
+                        "source": self.turnaround(source_target.instance_id),
+                        "destination": self.turnaround(destination_target.instance_id),
+                    },
+                    "source_preserved": True,
+                }
+                value.update(overrides)
+                if "source_target_id" in overrides:
+                    value["geneve_return_proof"]["source"] = self.turnaround(
+                        overrides["source_target_id"]
+                    )
+                if "destination_target_id" in overrides:
+                    value["geneve_return_proof"]["destination"] = self.turnaround(
+                        overrides["destination_target_id"]
+                    )
+                return value
+
+            def new_flows(self, deployment, tcp_flow, udp_flow, **overrides):
+                return {
+                    flow.protocol: {
+                        "succeeded": True,
+                        "path": self.path(deployment, flow, **overrides),
+                    }
+                    for flow in (tcp_flow, udp_flow)
+                }
+
             def run_traversal(self, deployment, source_site, flows, *, timeout_seconds):
                 self.calls.append(f"traversal-{source_site}")
                 destination = e2e._opposite(source_site)
-                source_target = deployment.topology.site(source_site).target_fleet[0]
-                destination_target = deployment.topology.site(destination).target_fleet[0]
-                destination_router = next(
-                    member
-                    for member in deployment.topology.site(
-                        destination
-                    ).transport_router_fleet
-                    if member.az_key == flows[0].destination.az_key
-                )
                 return {
                     "source_site": source_site,
                     "destination_site": destination,
-                    "probes": [
-                        {
-                            "protocol": flow.protocol,
-                            "source_role": flow.source.role,
-                            "destination_role": flow.destination.role,
-                            "source_az_key": flow.source.az_key,
-                            "destination_az_key": flow.destination.az_key,
-                            "source_gwlbe_id": deployment.endpoint_ids[source_site][flow.source.az_key],
-                            "destination_gwlbe_id": deployment.endpoint_ids[
-                                destination
-                            ][flow.destination.az_key],
-                            "source_target_id": source_target.instance_id,
-                            "destination_target_id": destination_target.instance_id,
-                            "source_transport_router_id": next(
-                                member.instance_id
-                                for member in deployment.topology.site(
-                                    source_site
-                                ).transport_router_fleet
-                                if member.az_key == flow.source.az_key
-                            ),
-                            "source_transport_eni_id": next(
-                                member.network_interface_id
-                                for member in deployment.topology.site(
-                                    source_site
-                                ).transport_router_fleet
-                                if member.az_key == flow.source.az_key
-                            ),
-                            "destination_transport_router_id": next(
-                                member.instance_id
-                                for member in deployment.topology.site(
-                                    destination
-                                ).transport_router_fleet
-                                if member.az_key == flow.destination.az_key
-                            ),
-                            "geneve_return_proof": {
-                                "source": self.turnaround(source_target.instance_id),
-                                "destination": self.turnaround(
-                                    destination_target.instance_id
-                                ),
-                            },
-                            "source_preserved": True,
-                        }
-                        for flow in flows
-                    ],
+                    "probes": [self.path(deployment, flow) for flow in flows],
                 }
 
             def run_target_process_recovery(
@@ -2620,7 +2789,7 @@ class SymmetricTopologyTest(unittest.TestCase):
                 self.calls.append("target-process")
                 alternate = deployment.topology.site(failed.site).target_fleet[1]
                 return {
-                    "recovery": {"kind": "target-process", "site": failed.site, "failed_id": failed.instance_id, "alternate_id": alternate.instance_id, "new_flow_succeeded": True, "new_flows": legacy_e2e_test.new_flow_evidence(source_target_id=alternate.instance_id), "recovery_duration_ms": 10},
+                    "recovery": {"kind": "target-process", "site": failed.site, "failed_id": failed.instance_id, "alternate_id": alternate.instance_id, "new_flow_succeeded": True, "new_flows": self.new_flows(deployment, new_tcp_flow, new_flow, source_target_id=alternate.instance_id), "recovery_duration_ms": 10},
                     "health_transitions": [{"kind": "target-process", "member_id": failed.instance_id, "states": ["healthy", "unhealthy", "healthy"]}],
                     "transport": legacy_e2e_test.failure_transport_evidence(
                         failed.instance_id, "target-process"
@@ -2633,7 +2802,7 @@ class SymmetricTopologyTest(unittest.TestCase):
                 self.calls.append("target-instance")
                 alternate = deployment.topology.site(failed.site).target_fleet[1]
                 return deployment, {
-                    "recovery": {"kind": "target-instance", "site": failed.site, "failed_id": failed.instance_id, "alternate_id": alternate.instance_id, "replacement_id": "i-ff23456789abcdef", "replacement_ready": True, "old_process_generation_sha256": "7" * 64, "replacement_process_generation_sha256": "8" * 64, "target_group_arn": failed.target_group_arn, "registration_port": 6081, "drain_state": "draining", "drain_duration_ms": 5, "new_flow_succeeded": True, "new_flows": legacy_e2e_test.new_flow_evidence(source_target_id=alternate.instance_id), "recovery_duration_ms": 20},
+                    "recovery": {"kind": "target-instance", "site": failed.site, "failed_id": failed.instance_id, "alternate_id": alternate.instance_id, "replacement_id": "i-ff23456789abcdef", "replacement_ready": True, "old_process_generation_sha256": "7" * 64, "replacement_process_generation_sha256": "8" * 64, "target_group_arn": failed.target_group_arn, "registration_port": 6081, "drain_state": "draining", "drain_duration_ms": 5, "new_flow_succeeded": True, "new_flows": self.new_flows(deployment, new_tcp_flow, new_flow, source_target_id=alternate.instance_id), "recovery_duration_ms": 20},
                     "health_transition": {"kind": "target-instance", "member_id": failed.instance_id, "states": ["healthy", "draining", "replaced"]},
                     "transport": legacy_e2e_test.failure_transport_evidence(
                         failed.instance_id, "target-instance"
@@ -2699,14 +2868,17 @@ class SymmetricTopologyTest(unittest.TestCase):
                         ],
                     }
 
+                abrupt_new_flows = self.new_flows(
+                    deployment,
+                    abrupt_new_tcp_flow,
+                    abrupt_flow,
+                    source_transport_router_id=abrupt_alternate.instance_id,
+                    source_transport_eni_id=abrupt_alternate.network_interface_id,
+                )
                 abrupt_probe = {
+                    **abrupt_new_flows["udp"]["path"],
                     "succeeded": True,
-                    "source_transport_router_id": abrupt_alternate.instance_id,
-                    "source_transport_eni_id": abrupt_alternate.network_interface_id,
-                    "new_flows": legacy_e2e_test.new_flow_evidence(
-                        source_transport_router_id=abrupt_alternate.instance_id,
-                        source_transport_eni_id=abrupt_alternate.network_interface_id,
-                    ),
+                    "new_flows": abrupt_new_flows,
                 }
                 prefixes = list(
                     deployment.topology.site(abrupt_failed.site).remote_site_cidrs
@@ -2754,12 +2926,16 @@ class SymmetricTopologyTest(unittest.TestCase):
                     },
                     "restored": True,
                 }
+                graceful_new_flows = self.new_flows(
+                    deployment,
+                    graceful_new_tcp_flow,
+                    graceful_flow,
+                    destination_transport_router_id=graceful_alternate.instance_id,
+                )
                 graceful_probe = {
+                    **graceful_new_flows["udp"]["path"],
                     "succeeded": True,
-                    "destination_transport_router_id": graceful_alternate.instance_id,
-                    "new_flows": legacy_e2e_test.new_flow_evidence(
-                        destination_transport_router_id=graceful_alternate.instance_id
-                    ),
+                    "new_flows": graceful_new_flows,
                 }
                 graceful_route_replacement = (
                     legacy_e2e_test.coordinated_route_replacement_fixture(

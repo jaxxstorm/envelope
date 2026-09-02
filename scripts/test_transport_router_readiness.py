@@ -18,7 +18,9 @@ import transport_router_readiness as readiness  # noqa: E402
 
 LOCAL = ["10.10.0.0/16", "10.11.0.0/16"]
 REMOTE = ["10.20.0.0/16", "10.21.0.0/16"]
-GWLBE = "vpce-0123456789abcdef0"
+GWLBE_A = "vpce-0123456789abcdef0"
+GWLBE_B = "vpce-1123456789abcdef0"
+LOCAL_GWLBES = {LOCAL[0]: GWLBE_A, LOCAL[1]: GWLBE_B}
 ENI = "eni-0123456789abcdef0"
 SUBNET = "subnet-0123456789abcdef0"
 ROUTE_TABLE = "rtb-0123456789abcdef0"
@@ -91,7 +93,11 @@ def route_fixture() -> dict:
             }
         ],
         "Routes": [
-            {"DestinationCidrBlock": prefix, "GatewayId": GWLBE, "State": "active"}
+            {
+                "DestinationCidrBlock": prefix,
+                "GatewayId": LOCAL_GWLBES[prefix],
+                "State": "active",
+            }
             for prefix in LOCAL
         ]
     }
@@ -213,6 +219,7 @@ def validate(
     transport: dict | None = None,
     routes: dict | None = None,
     contract: dict | None = None,
+    local_gwlbes: dict[str, str] | None = None,
     expected_remote_prefix_owners: dict[str, str] | None = None,
 ) -> dict:
     return readiness.validate_readiness(
@@ -222,11 +229,10 @@ def validate(
         LOCAL,
         REMOTE,
         LOCAL[0],
-        GWLBE,
+        LOCAL_GWLBES if local_gwlbes is None else local_gwlbes,
         ENI,
         SUBNET,
         ROUTE_TABLE,
-        AZ,
         AZ,
         UNDERLAY,
         TAILSCALE,
@@ -240,7 +246,7 @@ class TransportRouterReadinessTest(unittest.TestCase):
         result = validate()
 
         self.assertTrue(result["ready"])
-        self.assertEqual(result["local_gwlbe"], GWLBE)
+        self.assertEqual(result["local_gwlbes"], LOCAL_GWLBES)
         self.assertEqual(result["local_site_cidrs"], LOCAL)
         self.assertEqual(result["advertised_prefix"], LOCAL[0])
         self.assertEqual(result["network_interface_id"], ENI)
@@ -276,7 +282,7 @@ class TransportRouterReadinessTest(unittest.TestCase):
         )
         self.assertEqual(
             [value["gwlbe"] for value in result["prefix_chains"]["local_vpc_gwlbe"]],
-            [GWLBE, GWLBE],
+            [GWLBE_A, GWLBE_B],
         )
         self.assertEqual(result["firewall_chains"]["filter_forward_policy"], "DROP")
         self.assertEqual(result["firewall_chains"]["mangle_forward_policy"], "ACCEPT")
@@ -323,8 +329,12 @@ class TransportRouterReadinessTest(unittest.TestCase):
         ]
         routes = route_fixture()
         routes["Routes"] = [
-            {"DestinationCidrBlock": prefix, "GatewayId": GWLBE, "State": "active"}
-            for prefix in local
+            {
+                "DestinationCidrBlock": prefix,
+                "GatewayId": endpoint,
+                "State": "active",
+            }
+            for prefix, endpoint in zip(local, (GWLBE_A, GWLBE_B), strict=True)
         ]
 
         result = readiness.validate_readiness(
@@ -334,11 +344,10 @@ class TransportRouterReadinessTest(unittest.TestCase):
             local,
             remote,
             local[0],
-            GWLBE,
+            dict(zip(local, (GWLBE_A, GWLBE_B), strict=True)),
             ENI,
             SUBNET,
             ROUTE_TABLE,
-            AZ,
             AZ,
             UNDERLAY,
             TAILSCALE,
@@ -861,25 +870,6 @@ class TransportRouterReadinessTest(unittest.TestCase):
         with self.assertRaisesRegex(readiness.ReadinessError, "route-table identity"):
             validate(routes=wrong_table)
 
-        with self.assertRaisesRegex(readiness.ReadinessError, "GWLBE is not"):
-            readiness.validate_readiness(
-                status_fixture(),
-                transport_fixture(),
-                route_fixture(),
-                LOCAL,
-                REMOTE,
-                LOCAL[0],
-                GWLBE,
-                ENI,
-                SUBNET,
-                ROUTE_TABLE,
-                AZ,
-                "us-west-2b",
-                UNDERLAY,
-                TAILSCALE,
-                contract_fixture(),
-            )
-
     def test_transport_subnet_must_be_associated_with_the_checked_route_table(self) -> None:
         missing = route_fixture()
         missing["Associations"] = []
@@ -901,7 +891,7 @@ class TransportRouterReadinessTest(unittest.TestCase):
         cases.append(("wrong target", wrong_target, "does not select"))
         wrong_target_field = route_fixture()
         wrong_target_field["Routes"][0].pop("GatewayId")
-        wrong_target_field["Routes"][0]["VpcEndpointId"] = GWLBE
+        wrong_target_field["Routes"][0]["VpcEndpointId"] = GWLBE_A
         cases.append(("wrong target field", wrong_target_field, "does not select"))
         mixed_target = route_fixture()
         mixed_target["Routes"][0]["InstanceId"] = "i-0123456789abcdef0"
@@ -919,6 +909,23 @@ class TransportRouterReadinessTest(unittest.TestCase):
                 with self.assertRaisesRegex(readiness.ReadinessError, message):
                     validate(routes=routes)
 
+    def test_local_gwlbe_map_and_routes_are_destination_prefix_anchored(self) -> None:
+        uniform = route_fixture()
+        for route in uniform["Routes"]:
+            route["GatewayId"] = GWLBE_A
+        with self.assertRaisesRegex(readiness.ReadinessError, "does not select"):
+            validate(routes=uniform)
+
+        for name, local_gwlbes in (
+            ("missing", {LOCAL[0]: GWLBE_A}),
+            ("extra", {**LOCAL_GWLBES, "10.12.0.0/16": GWLBE_A}),
+            ("invalid", {LOCAL[0]: GWLBE_A, LOCAL[1]: "vpce-invalid"}),
+        ):
+            with self.subTest(name=name), self.assertRaisesRegex(
+                readiness.ReadinessError, "local GWLBE"
+            ):
+                validate(local_gwlbes=local_gwlbes)
+
     def test_rejects_overlapping_site_route_domains(self) -> None:
         remote = ["10.10.128.0/17"]
         contract = readiness.build_readiness_contract(
@@ -933,11 +940,10 @@ class TransportRouterReadinessTest(unittest.TestCase):
                 LOCAL,
                 remote,
                 LOCAL[0],
-                GWLBE,
+                LOCAL_GWLBES,
                 ENI,
                 SUBNET,
                 ROUTE_TABLE,
-                AZ,
                 AZ,
                 UNDERLAY,
                 TAILSCALE,
@@ -951,10 +957,12 @@ class TransportRouterReadinessTest(unittest.TestCase):
             transport_path = directory / "transport.json"
             routes_path = directory / "routes.json"
             contract_path = directory / "contract.json"
+            gwlbes_path = directory / "gwlbes.json"
             status_path.write_text(json.dumps(status_fixture()))
             transport_path.write_text(json.dumps(transport_fixture()))
             routes_path.write_text(json.dumps(route_fixture()))
             contract_path.write_text(json.dumps(contract_fixture()))
+            gwlbes_path.write_text(json.dumps(LOCAL_GWLBES))
             result = subprocess.run(
                 [
                     sys.executable,
@@ -977,8 +985,8 @@ class TransportRouterReadinessTest(unittest.TestCase):
                     REMOTE[1],
                     "--advertised-prefix",
                     LOCAL[0],
-                    "--local-gwlbe",
-                    GWLBE,
+                    "--local-gwlbes-file",
+                    str(gwlbes_path),
                     "--network-interface-id",
                     ENI,
                     "--subnet-id",
@@ -986,8 +994,6 @@ class TransportRouterReadinessTest(unittest.TestCase):
                     "--route-table-id",
                     ROUTE_TABLE,
                     "--availability-zone",
-                    AZ,
-                    "--local-gwlbe-availability-zone",
                     AZ,
                     "--underlay-interface",
                     UNDERLAY,

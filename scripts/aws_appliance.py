@@ -6003,7 +6003,11 @@ def strip_hcl_comments(source: str) -> str:
     return "".join(result)
 
 
-def validate_terraform_source_contract(terraform_dir: pathlib.Path) -> None:
+def validate_terraform_source_contract(
+    terraform_dir: pathlib.Path,
+    *,
+    require_destination_prefix_routes: bool = True,
+) -> None:
     terraform_dir = terraform_dir.expanduser().resolve()
     prohibited = [
         path
@@ -6041,6 +6045,55 @@ def validate_terraform_source_contract(terraform_dir: pathlib.Path) -> None:
     for site in ("west", "east"):
         if len(re.findall(rf'resource\s+"aws_lb_target_group_attachment"\s+"{site}"\s*\{{', topology)) != 1:
             raise LifecycleError("reviewed Terraform source has an ambiguous regional target attachment")
+    expected_transport_routes = (
+        '''resource "aws_route" "transport_to_local_west" {
+  for_each = {
+    for pair in setproduct(toset(keys(local.sites.west.azs)), toset(keys(local.sites.west.workload_subnet_cidrs))) :
+    "${pair[0]}:${local.sites.west.workload_subnet_cidrs[pair[1]]}" => {
+      transport_az_key = pair[0]
+      workload_az_key  = pair[1]
+      cidr             = local.sites.west.workload_subnet_cidrs[pair[1]]
+    }
+  }
+  route_table_id         = aws_route_table.transport_west[each.value.transport_az_key].id
+  destination_cidr_block = each.value.cidr
+  vpc_endpoint_id        = aws_vpc_endpoint.west[each.value.workload_az_key].id
+
+  lifecycle {
+    precondition {
+      condition     = each.value.cidr == local.sites.west.workload_subnet_cidrs[each.value.workload_az_key]
+      error_message = "West transport routes must select the GWLBE in each destination workload prefix's AZ."
+    }
+  }
+}''',
+        '''resource "aws_route" "transport_to_local_east" {
+  provider = aws.east
+  for_each = {
+    for pair in setproduct(toset(keys(local.sites.east.azs)), toset(keys(local.sites.east.workload_subnet_cidrs))) :
+    "${pair[0]}:${local.sites.east.workload_subnet_cidrs[pair[1]]}" => {
+      transport_az_key = pair[0]
+      workload_az_key  = pair[1]
+      cidr             = local.sites.east.workload_subnet_cidrs[pair[1]]
+    }
+  }
+  route_table_id         = aws_route_table.transport_east[each.value.transport_az_key].id
+  destination_cidr_block = each.value.cidr
+  vpc_endpoint_id        = aws_vpc_endpoint.east[each.value.workload_az_key].id
+
+  lifecycle {
+    precondition {
+      condition     = each.value.cidr == local.sites.east.workload_subnet_cidrs[each.value.workload_az_key]
+      error_message = "East transport routes must select the GWLBE in each destination workload prefix's AZ."
+    }
+  }
+}''',
+    )
+    if require_destination_prefix_routes and any(
+        topology.count(block) != 1 for block in expected_transport_routes
+    ):
+        raise LifecycleError(
+            "reviewed Terraform source does not use exact destination-prefix transport GWLBE routes"
+        )
 
 
 def terraform_source_record(terraform_dir: pathlib.Path, identity: dict[str, str]) -> dict[str, Any]:
@@ -6053,7 +6106,10 @@ def terraform_source_record(terraform_dir: pathlib.Path, identity: dict[str, str
 
 
 def materialize_durable_terraform_source(
-    source: dict[str, Any], run_dir: pathlib.Path
+    source: dict[str, Any],
+    run_dir: pathlib.Path,
+    *,
+    require_destination_prefix_routes: bool = True,
 ) -> tuple[pathlib.Path, dict[str, str]]:
     identity = terraform_source_identity(source)
     files = source.get("files")
@@ -6086,7 +6142,10 @@ def materialize_durable_terraform_source(
         os.chmod(destination, 0o600)
     if terraform_source_digest(snapshot) != identity["sha256"]:
         raise LifecycleError("durable Terraform source bundle digest is invalid")
-    validate_terraform_source_contract(snapshot)
+    validate_terraform_source_contract(
+        snapshot,
+        require_destination_prefix_routes=require_destination_prefix_routes,
+    )
     return snapshot, identity
 
 
@@ -6095,6 +6154,8 @@ def materialize_reviewed_terraform_source(
     terraform_dir: pathlib.Path,
     run_dir: pathlib.Path,
     revision: str,
+    *,
+    require_destination_prefix_routes: bool = True,
 ) -> tuple[pathlib.Path, dict[str, str]]:
     terraform_dir = terraform_dir.expanduser().resolve()
     run_dir = run_dir.expanduser().resolve()
@@ -6147,7 +6208,10 @@ def materialize_reviewed_terraform_source(
             runner.run(["git", "-C", str(repository), "cat-file", "blob", object_id], env=git_env)
         )
         os.chmod(destination, 0o700 if mode == "100755" else 0o600)
-    validate_terraform_source_contract(snapshot)
+    validate_terraform_source_contract(
+        snapshot,
+        require_destination_prefix_routes=require_destination_prefix_routes,
+    )
     identity = {
         "revision": revision,
         "repository_path": source_prefix.as_posix(),
@@ -7653,11 +7717,39 @@ def validate_symmetric_saved_plan(
             failures.append("saved plan GWLBE endpoints are not exact same-AZ route-domain members")
 
         route_contracts = (
-            ("workload_to_remote", "workload", "remote_site_cidrs", "vpc_endpoint_id"),
-            ("transport_to_local", "transport", "local_site_cidrs", "vpc_endpoint_id"),
-            ("gwlbe_to_remote", "gwlbe", "remote_site_cidrs", "network_interface_id"),
+            (
+                "workload_to_remote",
+                "workload",
+                "remote_site_cidrs",
+                "vpc_endpoint_id",
+                "az_key",
+                "az_key",
+            ),
+            (
+                "transport_to_local",
+                "transport",
+                "local_site_cidrs",
+                "vpc_endpoint_id",
+                "transport_az_key",
+                "workload_az_key",
+            ),
+            (
+                "gwlbe_to_remote",
+                "gwlbe",
+                "remote_site_cidrs",
+                "network_interface_id",
+                "az_key",
+                "az_key",
+            ),
         )
-        for family, domain, cidr_field, target_field in route_contracts:
+        for (
+            family,
+            domain,
+            cidr_field,
+            target_field,
+            route_az_field,
+            target_az_field,
+        ) in route_contracts:
             family_expected: dict[str, tuple[str, str, str]] = {}
             for site in DEPLOYMENT_SITES:
                 route_base = f"aws_route.{family}_{site}"
@@ -7675,7 +7767,7 @@ def validate_symmetric_saved_plan(
                 expected_references = {
                     "route_table_id": {
                         f"aws_route_table.{domain}_{site}",
-                        "each.value.az_key",
+                        f"each.value.{route_az_field}",
                         "each.value",
                     },
                     "destination_cidr_block": {"each.value.cidr", "each.value"},
@@ -7685,13 +7777,30 @@ def validate_symmetric_saved_plan(
                             f"local.route_failover.initial_transport_router_az_by_gwlbe_az.{site}",
                             "local.route_failover.initial_transport_router_az_by_gwlbe_az",
                             "local.route_failover",
-                            "each.value.az_key",
+                            f"each.value.{target_az_field}",
                             "each.value",
                         }
                         if target_field == "network_interface_id"
-                        else {target_base, "each.value.az_key", "each.value"}
+                        else {
+                            target_base,
+                            f"each.value.{target_az_field}",
+                            "each.value",
+                        }
                     ),
                 }
+                expected_for_each_references = {
+                    f"local.sites.{site}.azs",
+                    f"local.sites.{site}.{cidr_field}",
+                    f"local.sites.{site}",
+                    "local.sites",
+                }
+                if family == "transport_to_local":
+                    expected_for_each_references = {
+                        f"local.sites.{site}.azs",
+                        f"local.sites.{site}.workload_subnet_cidrs",
+                        f"local.sites.{site}",
+                        "local.sites",
+                    }
                 if (
                     not isinstance(expressions, dict)
                     or set(expressions) != set(expected_references)
@@ -7704,17 +7813,16 @@ def validate_symmetric_saved_plan(
                         if isinstance(route_resource, dict)
                         else None
                     )
-                    != {
-                        f"local.sites.{site}.azs",
-                        f"local.sites.{site}.{cidr_field}",
-                        f"local.sites.{site}",
-                        "local.sites",
-                    }
+                    != expected_for_each_references
                 ):
                     detail = (
                         "reviewed same-site transport ENI selection"
                         if target_field == "network_interface_id"
-                        else "same-AZ GWLBE"
+                        else (
+                            "destination-prefix-AZ GWLBE"
+                            if family == "transport_to_local"
+                            else "source-workload-AZ GWLBE"
+                        )
                     )
                     failures.append(
                         f"saved plan {site} {family} routes do not select the exact {detail}"
@@ -7741,8 +7849,19 @@ def validate_symmetric_saved_plan(
             for address, (site, az_key, cidr) in family_expected.items():
                 resource = planned_resources.get(address)
                 values = resource.get("values") if isinstance(resource, dict) else None
+                workload_az_by_cidr = {
+                    prefix: workload_az
+                    for workload_az, prefix in config.sites[site][
+                        "workload_subnet_cidrs"
+                    ].items()
+                }
+                endpoint_az_key = (
+                    workload_az_by_cidr.get(cidr)
+                    if family == "transport_to_local"
+                    else az_key
+                )
                 expected_target = (
-                    endpoint_ids.get((site, az_key))
+                    endpoint_ids.get((site, endpoint_az_key))
                     if target_field == "vpc_endpoint_id"
                     else (
                         concrete_transport_members.get(site, {})
@@ -7767,6 +7886,7 @@ def validate_symmetric_saved_plan(
                         values.get(field) not in (None, "")
                         for field in route_target_fields - {target_field}
                     )
+                    or endpoint_az_key is None
                     or (
                         expected_target is not None
                         and values.get(target_field) != expected_target
@@ -7782,8 +7902,13 @@ def validate_symmetric_saved_plan(
                             f"saved plan GWLBE route {address} does not target its reviewed same-site transport ENI selection"
                         )
                     else:
+                        endpoint_description = (
+                            "destination workload prefix's GWLBE"
+                            if family == "transport_to_local"
+                            else "source workload AZ's GWLBE"
+                        )
                         failures.append(
-                            f"saved plan pre-inspection route {address} does not target its same-AZ GWLBE"
+                            f"saved plan pre-inspection route {address} does not target its {endpoint_description}"
                         )
 
         endpoint_output_value = after_values.get("gwlb_endpoint_ids")
@@ -11293,13 +11418,21 @@ def terraform_destroy(
     artifact = artifact_for_recovery(config, manifest, aws, run_dir)
     durable_source = manifest.get("terraform_source")
     if isinstance(durable_source, dict) and durable_source.get("files"):
-        source_dir, source_identity = materialize_durable_terraform_source(durable_source, run_dir)
+        source_dir, source_identity = materialize_durable_terraform_source(
+            durable_source,
+            run_dir,
+            require_destination_prefix_routes=False,
+        )
         if source_identity["revision"] != artifact["revision"]:
             raise LifecycleError("destroy Terraform source differs from the durable artifact revision")
     else:
         # Existing active runs created before source bundling still need a cleanup path.
         source_dir, _ = materialize_reviewed_terraform_source(
-            runner, terraform_dir, run_dir, str(artifact["revision"])
+            runner,
+            terraform_dir,
+            run_dir,
+            str(artifact["revision"]),
+            require_destination_prefix_routes=False,
         )
     store = ManifestStore(config, aws, run_dir)
     runtime_file = write_runtime_variables(config, store, manifest, artifact)

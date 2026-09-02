@@ -12,10 +12,10 @@ Envelope targets SHALL NOT run or require `tailscaled`, own `envelope0`, adverti
 - **THEN** configuration fails before TUN, route, Tailscale, or forwarding state is inspected or mutated
 
 ### Requirement: Bidirectional no-NAT transport-router readiness
-The deployment SHALL validate every Tailscale transport router separately from Envelope targets. A ready router SHALL have a Running kernel-TUN backend, enable only its singleton assigned exact local-site CIDR advertisement in normal operation, accept every exact remote-site route, remain capable of advertising every exact local-site CIDR during bounded failover, disable subnet-route SNAT, preserve source addresses, enable underlay-to-Tailscale and Tailscale-to-underlay forwarding, and prove that its subnet route table sends local-site CIDRs to the same-AZ GWLBE. The fleet's normal enabled advertisement sets SHALL be non-empty and pairwise disjoint and their union SHALL equal all exact local-site CIDRs. Table 52 and Tailnet serving paths SHALL contain only opposite-site workload prefixes; all local prefixes SHALL remain on the main/VPC underlay with no same-site protected `PrimaryRoutes` claim. A router ENI SHALL be eligible for a GWLBE's remote routes only while that router owns the GWLBE AZ's workload source prefix.
+The deployment SHALL validate every Tailscale transport router separately from Envelope targets. A ready router SHALL have a Running kernel-TUN backend, enable only its singleton assigned exact local-site CIDR advertisement in normal operation, accept every exact remote-site route, remain capable of advertising every exact local-site CIDR during bounded failover, disable subnet-route SNAT, preserve source addresses, enable underlay-to-Tailscale and Tailscale-to-underlay forwarding, and prove that its subnet route table sends each local-site CIDR to that destination workload prefix's AZ GWLBE independent of the router AZ. The fleet's normal enabled advertisement sets SHALL be non-empty and pairwise disjoint and their union SHALL equal all exact local-site CIDRs. Table 52 and Tailnet serving paths SHALL contain only opposite-site workload prefixes; all local prefixes SHALL remain on the main/VPC underlay with no same-site protected `PrimaryRoutes` claim. A router ENI SHALL be eligible for a GWLBE's remote routes only while that router owns the GWLBE AZ's workload source prefix.
 
 #### Scenario: Ready transport router
-- **WHEN** the backend, exact advertisements and accepted routes, source preservation, forwarding, firewall, MSS, ENI identity, and local GWLBE route all pass
+- **WHEN** the backend, exact advertisements and accepted routes, source preservation, forwarding, firewall, MSS, ENI identity, and destination-prefix GWLBE routes all pass
 - **THEN** the router is ready for both post-inspection remote egress and Tailnet-arriving local ingress
 
 #### Scenario: Either transit direction is invalid
@@ -23,7 +23,7 @@ The deployment SHALL validate every Tailscale transport router separately from E
 - **THEN** transport-router readiness fails before acceptance traffic or ENI-route selection
 
 #### Scenario: Tailnet packet could bypass inspection
-- **WHEN** a transport-router subnet can directly deliver a local-site CIDR instead of selecting its local GWLBE
+- **WHEN** a transport-router subnet can directly deliver a local-site CIDR or selects the receiving router's endpoint instead of the destination prefix's GWLBE
 - **THEN** readiness is unhealthy and identifies the affected prefix
 
 ### Requirement: Secretless separated-role acceptance
@@ -40,7 +40,7 @@ The system SHALL provide a required local integration with immutable Headscale a
 ## MODIFIED Requirements
 
 ### Requirement: Effective forward route to Tailscale
-Transport-router readiness SHALL prove the complete configured prefixes rather than only boundary addresses. For every remote-site destination received from a selected GWLBE ENI, effective host routing SHALL select `tailscale0` and the configured stable owner of that exact prefix. In normal operation, table 52 SHALL contain exactly one exact `tailscale0` route for each opposite-site workload prefix and no local-site prefix route. For every local-site destination received from `tailscale0`, whether its singleton advertiser is self or sibling, the higher-priority `iif tailscale0` local-prefix policy rule SHALL select `main` and the VPC underlay, and the associated VPC route table SHALL select the same-AZ GWLBE. More-specific, source-specific, policy, blackhole, unreachable, prohibit, duplicate, swapped-owner, wrong-device, or local table-52 routes that bypass either result SHALL fail readiness.
+Transport-router readiness SHALL prove the complete configured prefixes rather than only boundary addresses. For every remote-site destination received from a selected GWLBE ENI, effective host routing SHALL select `tailscale0` and the configured stable owner of that exact prefix. In normal operation, table 52 SHALL contain exactly one exact `tailscale0` route for each opposite-site workload prefix and no local-site prefix route. For every local-site destination received from `tailscale0`, whether its singleton advertiser is self or sibling, the higher-priority `iif tailscale0` local-prefix policy rule SHALL select `main` and the VPC underlay, and the associated VPC route table SHALL select the destination workload prefix's AZ GWLBE. More-specific, source-specific, policy, blackhole, unreachable, prohibit, duplicate, swapped-owner, wrong-device, wrong-endpoint, or local table-52 routes that bypass either result SHALL fail readiness.
 
 #### Scenario: Effective remote route
 - **WHEN** a post-inspection remote-site packet is delivered to a transport-router ENI
@@ -48,7 +48,7 @@ Transport-router readiness SHALL prove the complete configured prefixes rather t
 
 #### Scenario: Effective local inspection route
 - **WHEN** a Tailnet packet for a local-site CIDR is forwarded to the underlay
-- **THEN** every address in the destination prefix selects the associated same-AZ GWLBE before local delivery
+- **THEN** every address in the destination prefix selects that workload prefix's AZ GWLBE before local delivery, independent of the receiving router AZ
 
 #### Scenario: ha25 remote-only table 52
 - **WHEN** the failed protected run `ha25` route and serving-path evidence is evaluated
@@ -59,7 +59,7 @@ Transport-router readiness SHALL prove the complete configured prefixes rather t
 - **THEN** readiness fails even when the higher-priority `iif tailscale0` rule would select `main`
 
 #### Scenario: Interior route shadowing
-- **WHEN** a more-specific or source-specific route can bypass Tailscale or the local GWLBE for any interior subset
+- **WHEN** a more-specific or source-specific route can bypass Tailscale or the destination-prefix GWLBE for any interior subset
 - **THEN** full-prefix readiness fails even if boundary lookups succeed
 
 ### Requirement: Linux forwarding prerequisites

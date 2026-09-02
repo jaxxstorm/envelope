@@ -893,7 +893,18 @@ def symmetric_saved_plan_document(config: appliance.RunConfig) -> dict:
                     selected_az
                 ]["network_interface_id"]
             else:
-                resource["values"]["vpc_endpoint_id"] = f"vpce-{site}-{az_key}"
+                endpoint_az = (
+                    next(
+                        workload_az
+                        for workload_az, prefix in config.sites[site][
+                            "workload_subnet_cidrs"
+                        ].items()
+                        if prefix == cidr
+                    )
+                    if family == "transport_to_local"
+                    else az_key
+                )
+                resource["values"]["vpc_endpoint_id"] = f"vpce-{site}-{endpoint_az}"
         subnet_match = re.fullmatch(
             r'aws_subnet\.(workload|transport|gwlbe|target)_(west|east)\["([^\"]+)"\]',
             address,
@@ -1065,24 +1076,37 @@ def symmetric_saved_plan_document(config: appliance.RunConfig) -> dict:
         )
         if route_match is not None:
             family, site = route_match.groups()
-            domain, cidr_field, target_field, target_base = {
+            (
+                domain,
+                cidr_field,
+                target_field,
+                target_base,
+                route_az_field,
+                target_az_field,
+            ) = {
                 "workload_to_remote": (
                     "workload",
                     "remote_site_cidrs",
                     "vpc_endpoint_id",
                     f"aws_vpc_endpoint.{site}",
+                    "az_key",
+                    "az_key",
                 ),
                 "transport_to_local": (
                     "transport",
-                    "local_site_cidrs",
+                    "workload_subnet_cidrs",
                     "vpc_endpoint_id",
                     f"aws_vpc_endpoint.{site}",
+                    "transport_az_key",
+                    "workload_az_key",
                 ),
                 "gwlbe_to_remote": (
                     "gwlbe",
                     "remote_site_cidrs",
                     "network_interface_id",
                     f"aws_instance.transport_router_{site}",
+                    "az_key",
+                    "az_key",
                 ),
             }[family]
             resource.update(
@@ -1099,7 +1123,7 @@ def symmetric_saved_plan_document(config: appliance.RunConfig) -> dict:
                         "route_table_id": {
                             "references": [
                                 f"aws_route_table.{domain}_{site}",
-                                "each.value.az_key",
+                                f"each.value.{route_az_field}",
                                 "each.value",
                             ]
                         },
@@ -1113,11 +1137,15 @@ def symmetric_saved_plan_document(config: appliance.RunConfig) -> dict:
                                     f"local.route_failover.initial_transport_router_az_by_gwlbe_az.{site}",
                                     "local.route_failover.initial_transport_router_az_by_gwlbe_az",
                                     "local.route_failover",
-                                    "each.value.az_key",
+                                    f"each.value.{target_az_field}",
                                     "each.value",
                                 ]
                                 if family == "gwlbe_to_remote"
-                                else [target_base, "each.value.az_key", "each.value"]
+                                else [
+                                    target_base,
+                                    f"each.value.{target_az_field}",
+                                    "each.value",
+                                ]
                             )
                         },
                     },
@@ -2253,6 +2281,26 @@ class ConfigAndPathTest(unittest.TestCase):
                 )
             )
 
+            router_anchored = copy.deepcopy(document)
+            configured_transport_route = next(
+                resource
+                for resource in router_anchored["configuration"]["root_module"][
+                    "resources"
+                ]
+                if resource["address"] == "aws_route.transport_to_local_west"
+            )
+            configured_transport_route["expressions"]["vpc_endpoint_id"][
+                "references"
+            ][1] = "each.value.transport_az_key"
+            self.assertTrue(
+                any(
+                    "destination-prefix-AZ GWLBE" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        router_anchored, config
+                    )
+                )
+            )
+
     def test_saved_plan_rejects_mutated_current_output_contracts(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = make_config(pathlib.Path(temporary))
@@ -2651,9 +2699,25 @@ class ConfigAndPathTest(unittest.TestCase):
             )["values"]["vpc_endpoint_id"] = "vpce-west-b"
             self.assertTrue(
                 any(
-                    "same-AZ GWLBE" in failure
+                    "source workload AZ's GWLBE" in failure
                     for failure in appliance.validate_symmetric_saved_plan(
                         wrong_preinspection_endpoint, config
+                    )
+                )
+            )
+
+            wrong_transport_endpoint = copy.deepcopy(document)
+            next(
+                resource
+                for resource in wrong_transport_endpoint["planned_values"]["root_module"]["resources"]
+                if resource["address"]
+                == 'aws_route.transport_to_local_west["a:10.10.2.0/24"]'
+            )["values"]["vpc_endpoint_id"] = "vpce-west-a"
+            self.assertTrue(
+                any(
+                    "destination workload prefix's GWLBE" in failure
+                    for failure in appliance.validate_symmetric_saved_plan(
+                        wrong_transport_endpoint, config
                     )
                 )
             )
@@ -3996,6 +4060,22 @@ resource /* separator */ "aws_lb_target_group_attachment" "west" {{
             topology.write_text("locals { fixture = <<-EOT\n" + west_block + "\nEOT\n}\n" + original)
             with self.assertRaisesRegex(appliance.LifecycleError, "heredoc"):
                 appliance.validate_terraform_source_contract(restored)
+            topology.write_text(original)
+            topology.write_text(
+                original.replace(
+                    "workload_az_key  = pair[1]",
+                    "workload_az_key  = pair[0]",
+                    1,
+                )
+            )
+            with self.assertRaisesRegex(
+                appliance.LifecycleError, "destination-prefix transport GWLBE"
+            ):
+                appliance.validate_terraform_source_contract(restored)
+            appliance.validate_terraform_source_contract(
+                restored,
+                require_destination_prefix_routes=False,
+            )
             topology.write_text(original)
             (restored / "override.tf").write_text('resource "terraform_data" "unexpected" {}\n')
             self.assertNotEqual(appliance.terraform_source_digest(restored), baseline)

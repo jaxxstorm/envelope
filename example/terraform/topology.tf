@@ -524,22 +524,44 @@ resource "aws_route" "workload_to_remote_east" {
 }
 resource "aws_route" "transport_to_local_west" {
   for_each = {
-    for pair in setproduct(toset(keys(local.sites.west.azs)), toset(local.sites.west.local_site_cidrs)) :
-    "${pair[0]}:${pair[1]}" => { az_key = pair[0], cidr = pair[1] }
+    for pair in setproduct(toset(keys(local.sites.west.azs)), toset(keys(local.sites.west.workload_subnet_cidrs))) :
+    "${pair[0]}:${local.sites.west.workload_subnet_cidrs[pair[1]]}" => {
+      transport_az_key = pair[0]
+      workload_az_key  = pair[1]
+      cidr             = local.sites.west.workload_subnet_cidrs[pair[1]]
+    }
   }
-  route_table_id         = aws_route_table.transport_west[each.value.az_key].id
+  route_table_id         = aws_route_table.transport_west[each.value.transport_az_key].id
   destination_cidr_block = each.value.cidr
-  vpc_endpoint_id        = aws_vpc_endpoint.west[each.value.az_key].id
+  vpc_endpoint_id        = aws_vpc_endpoint.west[each.value.workload_az_key].id
+
+  lifecycle {
+    precondition {
+      condition     = each.value.cidr == local.sites.west.workload_subnet_cidrs[each.value.workload_az_key]
+      error_message = "West transport routes must select the GWLBE in each destination workload prefix's AZ."
+    }
+  }
 }
 resource "aws_route" "transport_to_local_east" {
   provider = aws.east
   for_each = {
-    for pair in setproduct(toset(keys(local.sites.east.azs)), toset(local.sites.east.local_site_cidrs)) :
-    "${pair[0]}:${pair[1]}" => { az_key = pair[0], cidr = pair[1] }
+    for pair in setproduct(toset(keys(local.sites.east.azs)), toset(keys(local.sites.east.workload_subnet_cidrs))) :
+    "${pair[0]}:${local.sites.east.workload_subnet_cidrs[pair[1]]}" => {
+      transport_az_key = pair[0]
+      workload_az_key  = pair[1]
+      cidr             = local.sites.east.workload_subnet_cidrs[pair[1]]
+    }
   }
-  route_table_id         = aws_route_table.transport_east[each.value.az_key].id
+  route_table_id         = aws_route_table.transport_east[each.value.transport_az_key].id
   destination_cidr_block = each.value.cidr
-  vpc_endpoint_id        = aws_vpc_endpoint.east[each.value.az_key].id
+  vpc_endpoint_id        = aws_vpc_endpoint.east[each.value.workload_az_key].id
+
+  lifecycle {
+    precondition {
+      condition     = each.value.cidr == local.sites.east.workload_subnet_cidrs[each.value.workload_az_key]
+      error_message = "East transport routes must select the GWLBE in each destination workload prefix's AZ."
+    }
+  }
 }
 resource "aws_route" "gwlbe_to_remote_west" {
   for_each = {

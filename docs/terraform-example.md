@@ -91,7 +91,7 @@ Terraform emits the host contract separately as `transport_router_readiness_expe
 - Each enabled AZ has separate workload, transport-router, GWLBE, GWLB, and target route domains, plus a separate management domain per site.
 - Every enabled AZ has a GWLBE and healthy-capable Envelope target path. Each site has two independent AZ-spread transport routers with distinct eligible ENIs.
 - Protected topology and evidence name each router collection `transport_router_fleet`; transport hosts run the `envelope-transport-router-network.service` unit for host sysctls, fail-closed firewall chains, and MSS clamping only. Protected readiness owns Tailnet, route, AWS, and ENI eligibility checks.
-- Workload routes send peer CIDRs to the same-AZ GWLBE. Transport-router routes send local CIDRs to the same-AZ GWLBE.
+- Workload routes send peer CIDRs to the source workload's same-AZ GWLBE. Every transport-router route table sends each local CIDR to that destination workload prefix's AZ GWLBE, independent of the receiving router AZ.
 - After inspection, each GWLBE subnet route table sends local-site CIDRs through VPC local delivery and each exact remote-site CIDR to the explicitly selected same-site transport-router primary ENI. Live readiness is a separate gate.
 - Targets carry only outer GWLB and management routes. They do not receive site CIDRs as forwarding configuration, create a TUN, join Tailscale, or forward an inner packet.
 - Each transport router advertises exactly its one assigned `advertised_prefix` at baseline. Per-site assignments are non-empty and pairwise disjoint and exactly cover local workload CIDRs; normal duplicate or overlapping ownership is invalid.

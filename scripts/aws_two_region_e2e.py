@@ -4552,10 +4552,30 @@ def parse_symmetric_protected_deployment_output(
 def validate_symmetric_preflight(
     topology: SymmetricTopologyV2,
     readiness: Any,
+    endpoint_ids: Mapping[Site, Mapping[str, str]],
     transport_router_readiness_expectations: Mapping[Site, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Fail closed unless every route domain, target, and route advertiser is ready."""
 
+    if (
+        not isinstance(endpoint_ids, Mapping)
+        or set(endpoint_ids) != set(SITES)
+        or any(
+            not isinstance(endpoint_ids[site], Mapping)
+            or set(endpoint_ids[site])
+            != {
+                member.az_key
+                for member in topology.site(site).transport_router_fleet
+            }
+            or any(
+                not isinstance(endpoint_id, str)
+                or _VPCE_ID_RE.fullmatch(endpoint_id) is None
+                for endpoint_id in endpoint_ids[site].values()
+            )
+            for site in SITES
+        )
+    ):
+        raise ReadinessError("symmetric readiness GWLBE identities are incomplete")
     document = _mapping(readiness, "symmetric readiness")
     expected_keys = {
         "sites",
@@ -4636,6 +4656,10 @@ def validate_symmetric_preflight(
         ) != {member.instance_id for member in expected.transport_router_fleet}:
             raise ReadinessError(f"{name} readiness fleet identities differ from the protected topology")
         validated_routers: dict[str, dict[str, Any]] = {}
+        expected_local_gwlbes = {
+            cast(str, candidate.advertised_prefix): endpoint_ids[name][candidate.az_key]
+            for candidate in expected.transport_router_fleet
+        }
         for member in expected.target_fleet:
             identity = targets[member.instance_id]
             if (
@@ -4672,11 +4696,13 @@ def validate_symmetric_preflight(
                     "tailnet_node_id_sha256",
                     "contract_sha256",
                     "primary_route_ownership",
+                    "local_gwlbes",
                 }
                 or identity.get("ready") is not True
                 or identity.get("node_identity_ready") is not True
                 or identity.get("network_interface_id") != member.network_interface_id
                 or identity.get("advertised_prefix") != member.advertised_prefix
+                or identity.get("local_gwlbes") != expected_local_gwlbes
                 or identity.get("contract_sha256") != contract_hashes[name]
                 or re.fullmatch(
                     r"[0-9a-f]{64}", str(identity.get("tailnet_node_id_sha256", ""))
@@ -4684,7 +4710,7 @@ def validate_symmetric_preflight(
                 is None
             ):
                 raise ReadinessError(
-                    f"{name} transport readiness is not bound to its EC2 ENI and Tailnet node"
+                    f"{name} transport readiness is not bound to its ENI, Tailnet node, and destination-prefix GWLBE routes"
                 )
             normalized_identity = dict(identity)
             normalized_identity["primary_route_ownership"] = (
@@ -5327,10 +5353,22 @@ def _validate_route_snapshot_evidence(
         raise EvidenceError("GWLBE route snapshot does not prove one exact active ENI target")
 
 
+def _exact_json_equal(left: Any, right: Any) -> bool:
+    try:
+        return json.dumps(
+            left, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ) == json.dumps(
+            right, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 def _validate_transport_router_evidence(
     value: Any,
     *,
     topology: SymmetricTopologyV2,
+    endpoint_ids: Mapping[Site, Mapping[str, str]],
     recovery: Mapping[str, Any],
     node_hashes_by_instance: Mapping[str, str],
 ) -> None:
@@ -5373,8 +5411,12 @@ def _validate_transport_router_evidence(
             "passing evidence does not bind distinct stable-node hashes to every router"
         )
     for label, exercise in (("graceful", graceful), ("abrupt", abrupt)):
-        failed = all_routers.get(cast(str, exercise.get("failed_id")))
-        alternate = all_routers.get(cast(str, exercise.get("alternate_id")))
+        failed_id = exercise.get("failed_id")
+        alternate_id = exercise.get("alternate_id")
+        failed = all_routers.get(failed_id) if isinstance(failed_id, str) else None
+        alternate = (
+            all_routers.get(alternate_id) if isinstance(alternate_id, str) else None
+        )
         duration = exercise.get("recovery_duration_ms")
         probe = exercise.get("probe")
         if (
@@ -5390,7 +5432,9 @@ def _validate_transport_router_evidence(
             or not 1 <= duration <= 7_200_000
             or not isinstance(probe, Mapping)
             or probe.get("succeeded") is not True
-            or exercise.get("new_flows") != probe.get("new_flows")
+            or not _exact_json_equal(
+                exercise.get("new_flows"), probe.get("new_flows")
+            )
         ):
             raise EvidenceError("transport-router exercise identity, bound, probe, or restoration is invalid")
         if label == "graceful" and probe.get(
@@ -5402,23 +5446,62 @@ def _validate_transport_router_evidence(
             or probe.get("source_transport_eni_id") != alternate.network_interface_id
         ):
             raise EvidenceError("abrupt transport evidence does not prove alternate GWLBE ENI selection")
-        _validate_new_flow_matrix(exercise.get("new_flows"))
-        for item in cast(Mapping[str, Any], exercise["new_flows"]).values():
-            path = cast(Mapping[str, Any], item)["path"]
+        new_flow_paths = _validate_new_flow_matrix(
+            exercise.get("new_flows"),
+            topology=topology,
+            endpoint_ids=endpoint_ids,
+        )
+        if set(probe) != set(new_flow_paths["udp"]) | {
+            "succeeded",
+            "new_flows",
+        } or not _exact_json_equal(
+            {key: probe.get(key) for key in new_flow_paths["udp"]},
+            new_flow_paths["udp"],
+        ):
+            raise EvidenceError(
+                "transport-router probe identity differs from its retained UDP path"
+            )
+        for path in new_flow_paths.values():
+            source_router = all_routers[cast(str, path["source_transport_router_id"])]
+            destination_router = all_routers[
+                cast(str, path["destination_transport_router_id"])
+            ]
             if (
                 label == "graceful"
-                and path.get("destination_transport_router_id") != alternate.instance_id
+                and (
+                    path.get("destination_transport_router_id")
+                    != alternate.instance_id
+                    or path.get("destination_az_key") != failed.az_key
+                    or source_router.az_key != path.get("source_az_key")
+                )
             ) or (
                 label == "abrupt"
                 and (
                     path.get("source_transport_router_id") != alternate.instance_id
                     or path.get("source_transport_eni_id")
                     != alternate.network_interface_id
+                    or path.get("source_az_key") != failed.az_key
+                    or destination_router.az_key
+                    != path.get("destination_az_key")
                 )
             ):
                 raise EvidenceError(
-                    "TCP/UDP new-flow paths do not bind the selected alternate router"
+                    "TCP/UDP new-flow paths do not bind the failed prefix and selected alternate router"
                 )
+
+    expected_recovery = {
+        "kind": "transport-router",
+        "site": all_routers[cast(str, abrupt["failed_id"])].site,
+        "failed_id": abrupt["failed_id"],
+        "alternate_id": abrupt["alternate_id"],
+        "new_flow_succeeded": abrupt["new_flow_succeeded"],
+        "new_flows": abrupt["new_flows"],
+        "recovery_duration_ms": abrupt["recovery_duration_ms"],
+    }
+    if not _exact_json_equal(recovery, expected_recovery):
+        raise EvidenceError(
+            "transport-router recovery summary differs from the detailed abrupt exercise"
+        )
 
     route_keys = {
         "route_table_id",
@@ -5825,6 +5908,7 @@ def _validate_transport_router_evidence(
         route_probe = route.get("probe")
         if (
             not isinstance(route_probe, Mapping)
+            or not _exact_json_equal(route_probe, exercise.get("probe"))
             or route_probe.get("succeeded") is not True
             or (
                 label == "graceful"
@@ -5859,7 +5943,8 @@ def _validate_geneve_fidelity_evidence(value: Any, *, target_id: str) -> None:
         or set(value) != expected_keys
         or value.get("observed") is not True
         or value.get("target_id") != target_id
-        or re.fullmatch(r"[0-9a-f]{64}", str(value.get("capture_sha256", ""))) is None
+        or not isinstance(value.get("capture_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", value["capture_sha256"]) is None
         or isinstance(value.get("capture_frame_count"), bool)
         or not isinstance(value.get("capture_frame_count"), int)
         or not 2 <= value.get("capture_frame_count", 0) <= 512
@@ -5891,9 +5976,16 @@ def _validate_geneve_fidelity_evidence(value: Any, *, target_id: str) -> None:
         if (
             not isinstance(pair, Mapping)
             or set(pair) != pair_keys
+            or not isinstance(pair.get("direction"), str)
             or pair.get("direction") not in {"request", "reply"}
             or pair.get("direction") in directions
-            or any(re.fullmatch(r"[0-9a-f]{64}", str(value)) is None for value in hashes)
+            or any(
+                not isinstance(hash_value, str)
+                or re.fullmatch(r"[0-9a-f]{64}", hash_value) is None
+                for hash_value in hashes
+            )
+            or isinstance(pair.get("vni"), bool)
+            or not isinstance(pair.get("vni"), int)
             or pair.get("vni") != 0
             or pair.get("outer_tuple_swapped") is not True
             or pair.get("return_source_port_preserved") is not True
@@ -5902,9 +5994,96 @@ def _validate_geneve_fidelity_evidence(value: Any, *, target_id: str) -> None:
         directions.add(cast(str, pair["direction"]))
 
 
-def _validate_new_flow_matrix(value: Any) -> dict[str, Mapping[str, Any]]:
+def _validate_geneve_return_proof(
+    value: Any,
+    *,
+    target_id: str,
+    error_message: str,
+) -> None:
+    metrics = value.get("metrics") if isinstance(value, Mapping) else None
+    failure_metrics = {
+        "geneve_options_validation_errors_delta",
+        "gwlb_profile_rejections_total_delta",
+        "gwlb_receive_drops_total_delta",
+        "gwlb_inner_validation_failures_total_delta",
+        "gwlb_return_build_failures_total_delta",
+        "gwlb_send_failures_total_delta",
+        "drops_delta",
+    }
+    packet_metrics = {"geneve_rx_packets_delta", "geneve_tx_packets_delta"}
+    scalar_metrics = packet_metrics | failure_metrics | {"gwlb_target_ready"}
+    components = metrics.get("components_ready") if isinstance(metrics, Mapping) else None
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"target_id", "metrics", "fidelity"}
+        or value.get("target_id") != target_id
+        or not isinstance(metrics, Mapping)
+        or set(metrics) != scalar_metrics | {"components_ready"}
+        or any(
+            isinstance(metrics.get(name), bool)
+            or not isinstance(metrics.get(name), (int, float))
+            or (
+                isinstance(metrics.get(name), float)
+                and not math.isfinite(metrics[name])
+            )
+            for name in scalar_metrics
+        )
+        or any(cast(float, metrics.get(name)) <= 0 for name in packet_metrics)
+        or metrics.get("geneve_rx_packets_delta")
+        != metrics.get("geneve_tx_packets_delta")
+        or any(metrics.get(name) != 0 for name in failure_metrics)
+        or metrics.get("gwlb_target_ready") != 1
+        or not isinstance(components, Mapping)
+        or set(components) != {"receiver", "validation", "sender"}
+        or any(
+            isinstance(components.get(name), bool)
+            or not isinstance(components.get(name), (int, float))
+            or (
+                isinstance(components.get(name), float)
+                and not math.isfinite(components[name])
+            )
+            or components.get(name) != 1
+            for name in ("receiver", "validation", "sender")
+        )
+    ):
+        raise EvidenceError(error_message)
+    _validate_geneve_fidelity_evidence(value.get("fidelity"), target_id=target_id)
+
+
+def _validate_new_flow_matrix(
+    value: Any,
+    *,
+    topology: SymmetricTopologyV2,
+    endpoint_ids: Mapping[Site, Mapping[str, str]],
+) -> dict[str, Mapping[str, Any]]:
     if not isinstance(value, Mapping) or set(value) != set(TRANSPORT_PROTOCOLS):
         raise EvidenceError("failure evidence does not contain exact TCP and UDP new flows")
+    path_keys = {
+        "protocol",
+        "source_role",
+        "destination_role",
+        "source_az_key",
+        "destination_az_key",
+        "source_gwlbe_id",
+        "destination_gwlbe_id",
+        "source_target_id",
+        "destination_target_id",
+        "source_transport_router_id",
+        "source_transport_eni_id",
+        "destination_transport_router_id",
+        "geneve_return_proof",
+        "source_preserved",
+    }
+    routers = {
+        member.instance_id: member
+        for site in SITES
+        for member in topology.site(site).transport_router_fleet
+    }
+    targets = {
+        member.instance_id: member
+        for site in SITES
+        for member in topology.site(site).target_fleet
+    }
     paths: dict[str, Mapping[str, Any]] = {}
     for protocol in TRANSPORT_PROTOCOLS:
         item = value.get(protocol)
@@ -5914,9 +6093,79 @@ def _validate_new_flow_matrix(value: Any) -> dict[str, Mapping[str, Any]]:
             or set(item) != {"succeeded", "path"}
             or item.get("succeeded") is not True
             or not isinstance(path, Mapping)
+            or set(path) != path_keys
             or path.get("protocol") != protocol
         ):
             raise EvidenceError(f"{protocol} new-flow recovery path is not explicit")
+        source_router_id = path.get("source_transport_router_id")
+        destination_router_id = path.get("destination_transport_router_id")
+        source_target_id = path.get("source_target_id")
+        destination_target_id = path.get("destination_target_id")
+        source_router = (
+            routers.get(source_router_id) if isinstance(source_router_id, str) else None
+        )
+        destination_router = (
+            routers.get(destination_router_id)
+            if isinstance(destination_router_id, str)
+            else None
+        )
+        source_target = (
+            targets.get(source_target_id) if isinstance(source_target_id, str) else None
+        )
+        destination_target = (
+            targets.get(destination_target_id)
+            if isinstance(destination_target_id, str)
+            else None
+        )
+        source_role = path.get("source_role")
+        source_az_key = path.get("source_az_key")
+        destination_az_key = path.get("destination_az_key")
+        if (
+            source_router is None
+            or destination_router is None
+            or source_target is None
+            or destination_target is None
+            or source_router.site != source_target.site
+            or destination_router.site != destination_target.site
+            or source_router.site == destination_router.site
+            or source_role not in WORKLOAD_ROLES
+            or path.get("destination_role")
+            != _opposite_workload_role(cast(WorkloadRole, source_role))
+            or not isinstance(source_az_key, str)
+            or source_az_key not in endpoint_ids[source_router.site]
+            or not isinstance(destination_az_key, str)
+            or destination_az_key not in endpoint_ids[destination_router.site]
+            or path.get("source_gwlbe_id")
+            != endpoint_ids[source_router.site].get(cast(str, source_az_key))
+            or path.get("destination_gwlbe_id")
+            != endpoint_ids[destination_router.site].get(
+                cast(str, destination_az_key)
+            )
+            or path.get("source_transport_eni_id")
+            != source_router.network_interface_id
+            or path.get("source_preserved") is not True
+        ):
+            raise EvidenceError(
+                f"{protocol} new-flow recovery path has invalid endpoint, target, or router identity"
+            )
+        return_proof = path.get("geneve_return_proof")
+        if not isinstance(return_proof, Mapping) or set(return_proof) != {
+            "source",
+            "destination",
+        }:
+            raise EvidenceError(f"{protocol} new-flow recovery path omits GENEVE proof")
+        for side, target in (
+            ("source", source_target),
+            ("destination", destination_target),
+        ):
+            proof = return_proof.get(side)
+            _validate_geneve_return_proof(
+                proof,
+                target_id=target.instance_id,
+                error_message=(
+                    f"{protocol} new-flow recovery path has invalid {side} target proof"
+                ),
+            )
         paths[protocol] = cast(Mapping[str, Any], path)
     return paths
 
@@ -5938,7 +6187,10 @@ def _validate_failure_transport_measurement(
     if (
         not isinstance(failed_ids, Mapping)
         or set(failed_ids) != {"tcp", "udp"}
-        or any(identifier not in allowed_failed_ids for identifier in failed_ids.values())
+        or any(
+            not isinstance(identifier, str) or identifier not in allowed_failed_ids
+            for identifier in failed_ids.values()
+        )
     ):
         raise EvidenceError("failure transport measurement is not bound to its failed members")
     stream_keys = {
@@ -6122,7 +6374,7 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
         raise EvidenceError("symmetric evidence GWLBE identities are not globally distinct")
     try:
         validated_preflight = validate_symmetric_preflight(
-            topology, document.get("preflight")
+            topology, document.get("preflight"), endpoint_ids
         )
     except (DeploymentError, ReadinessError) as error:
         raise EvidenceError(f"symmetric evidence preflight is invalid: {error}") from None
@@ -6230,11 +6482,15 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
                 for member in destination_site.transport_router_fleet
                 if member.instance_id == probe.get("destination_transport_router_id")
             )
-            if probe.get("destination_gwlbe_id") != endpoint_ids[cast(Site, destination)][
-                cast(str, probe.get("destination_az_key"))
-            ] or destination_transport_router.az_key != probe.get("destination_az_key"):
+            if probe.get("destination_gwlbe_id") != endpoint_ids[
+                cast(Site, destination)
+            ][cast(str, probe.get("destination_az_key"))]:
                 raise EvidenceError(
-                    "symmetric traversal probe lacks its configured destination prefix owner's same-AZ GWLBE"
+                    "symmetric traversal probe lacks its destination workload prefix's GWLBE"
+                )
+            if destination_transport_router.az_key != probe.get("destination_az_key"):
+                raise EvidenceError(
+                    "symmetric baseline traversal probe lacks its configured destination prefix owner"
                 )
             return_proof = probe.get("geneve_return_proof")
             if not isinstance(return_proof, Mapping) or set(return_proof) != {
@@ -6246,62 +6502,12 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
                 ("source", probe.get("source_target_id")),
                 ("destination", probe.get("destination_target_id")),
             ):
-                proof = return_proof.get(side)
-                metrics = proof.get("metrics") if isinstance(proof, Mapping) else None
-                fidelity = proof.get("fidelity") if isinstance(proof, Mapping) else None
-                if (
-                    not isinstance(proof, Mapping)
-                    or set(proof) != {
-                        "target_id",
-                        "metrics",
-                        "fidelity",
-                    }
-                    or proof.get("target_id") != target_id
-                    or not isinstance(metrics, Mapping)
-                    or set(metrics)
-                    != {
-                        "geneve_rx_packets_delta",
-                        "geneve_tx_packets_delta",
-                        "geneve_options_validation_errors_delta",
-                        "gwlb_profile_rejections_total_delta",
-                        "gwlb_receive_drops_total_delta",
-                        "gwlb_inner_validation_failures_total_delta",
-                        "gwlb_return_build_failures_total_delta",
-                        "gwlb_send_failures_total_delta",
-                        "drops_delta",
-                        "gwlb_target_ready",
-                        "components_ready",
-                    }
-                    or any(
-                        isinstance(metrics.get(name), bool)
-                        or not isinstance(metrics.get(name), (int, float))
-                        or not math.isfinite(cast(float, metrics.get(name)))
-                        or cast(float, metrics.get(name)) <= 0
-                        for name in ("geneve_rx_packets_delta", "geneve_tx_packets_delta")
-                    )
-                    or metrics.get("geneve_rx_packets_delta")
-                    != metrics.get("geneve_tx_packets_delta")
-                    or any(
-                        metrics.get(name) != 0
-                        for name in (
-                            "geneve_options_validation_errors_delta",
-                            "gwlb_profile_rejections_total_delta",
-                            "gwlb_receive_drops_total_delta",
-                            "gwlb_inner_validation_failures_total_delta",
-                            "gwlb_return_build_failures_total_delta",
-                            "gwlb_send_failures_total_delta",
-                            "drops_delta",
-                        )
-                    )
-                    or metrics.get("gwlb_target_ready") != 1
-                    or metrics.get("components_ready")
-                    != {"receiver": 1, "validation": 1, "sender": 1}
-                ):
-                    raise EvidenceError(
+                _validate_geneve_return_proof(
+                    return_proof.get(side),
+                    target_id=cast(str, target_id),
+                    error_message=(
                         "symmetric traversal probe does not prove packet-scoped target turnaround fidelity"
-                    )
-                _validate_geneve_fidelity_evidence(
-                    fidelity, target_id=cast(str, target_id)
+                    ),
                 )
             observed_flows.append(
                 (
@@ -6416,7 +6622,12 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
         if not isinstance(item, Mapping) or set(item) != expected_keys:
             raise EvidenceError("symmetric recovery has the wrong shape")
         site = item.get("site")
-        if kind not in expected_recovery_kinds or kind in seen_kinds or site not in SITES:
+        if (
+            not isinstance(kind, str)
+            or kind not in expected_recovery_kinds
+            or kind in seen_kinds
+            or site not in SITES
+        ):
             raise EvidenceError("symmetric recovery kind or site is invalid")
         fleet = (
             topology.site(cast(Site, site)).transport_router_fleet
@@ -6425,10 +6636,43 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
         )
         identifiers = {member.instance_id for member in fleet}
         duration = item.get("recovery_duration_ms")
-        if item.get("failed_id") not in identifiers or item.get("alternate_id") not in identifiers or item["failed_id"] == item["alternate_id"] or item.get("new_flow_succeeded") is not True or isinstance(duration, bool) or not isinstance(duration, int) or not 1 <= duration <= 7_200_000:
+        failed_id = item.get("failed_id")
+        alternate_id = item.get("alternate_id")
+        if (
+            not isinstance(failed_id, str)
+            or failed_id not in identifiers
+            or not isinstance(alternate_id, str)
+            or alternate_id not in identifiers
+            or failed_id == alternate_id
+            or item.get("new_flow_succeeded") is not True
+            or isinstance(duration, bool)
+            or not isinstance(duration, int)
+            or not 1 <= duration <= 7_200_000
+        ):
             raise EvidenceError("symmetric recovery does not prove bounded alternate-path new-flow recovery")
-        new_flow_paths = _validate_new_flow_matrix(item.get("new_flows"))
+        new_flow_paths = _validate_new_flow_matrix(
+            item.get("new_flows"),
+            topology=topology,
+            endpoint_ids=endpoint_ids,
+        )
         if kind in {"target-process", "target-instance"}:
+            all_routers = {
+                member.instance_id: member
+                for candidate_site in SITES
+                for member in topology.site(candidate_site).transport_router_fleet
+            }
+            if any(
+                all_routers[cast(str, path["source_transport_router_id"])].az_key
+                != path.get("source_az_key")
+                or all_routers[
+                    cast(str, path["destination_transport_router_id"])
+                ].az_key
+                != path.get("destination_az_key")
+                for path in new_flow_paths.values()
+            ):
+                raise EvidenceError(
+                    "target recovery new flows do not preserve baseline transport ownership"
+                )
             source_target_ids = {
                 protocol: path.get("source_target_id")
                 for protocol, path in new_flow_paths.items()
@@ -6479,6 +6723,7 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
     _validate_transport_router_evidence(
         document.get("transport_router"),
         topology=topology,
+        endpoint_ids=endpoint_ids,
         recovery=recovery_records["transport-router"],
         node_hashes_by_instance=node_hashes_by_instance,
     )
@@ -7878,7 +8123,10 @@ class GWLBERouteFailover:
                 or any(
                     isinstance(metrics.get(name), bool)
                     or not isinstance(metrics.get(name), (int, float))
-                    or not math.isfinite(cast(float, metrics.get(name)))
+                    or (
+                        isinstance(metrics.get(name), float)
+                        and not math.isfinite(metrics[name])
+                    )
                     for name in metric_keys - {"components_ready"}
                 )
                 or metrics.get("geneve_rx_packets_delta", 0) <= 0
@@ -11099,6 +11347,7 @@ class SymmetricTwoRegionE2ERunner:
             preflight = validate_symmetric_preflight(
                 deployment.topology,
                 self.operations.verify_readiness(deployment, timeout_seconds=self.budgets.readiness_topology),
+                deployment.endpoint_ids,
                 deployment.transport_router_readiness_expectations,
             )
             traversal_flows = {
@@ -19719,9 +19968,6 @@ class AwsSymmetricLiveOperations:
             ]: f"{self.config.run_id}-{destination.site}-transport-{member.az_key}"
             for member in destination.transport_router_fleet
         }
-        expected_owner = destination.transport_router_for_prefix(
-            destination_prefixes[0]
-        )
         script = r'''import json,sys
 prefix=sys.argv[1]; expected=json.loads(sys.argv[2])
 status=json.load(sys.stdin)
@@ -19762,9 +20008,9 @@ print(json.dumps({"peer_id":match["peer_id"],"success":True},sort_keys=True))'''
                 f"{self.config.run_id}-{destination.site}-transport-{member.az_key}"
             ]
         ]
-        if len(matches) != 1 or matches[0] != expected_owner:
+        if len(matches) != 1:
             raise ProbeError(
-                "active Tailnet primary route does not identify the configured destination prefix owner"
+                "active Tailnet primary route does not identify one protected destination prefix owner"
             )
         return matches[0].instance_id
 
@@ -19859,6 +20105,8 @@ print(json.dumps({"peer_id":match["peer_id"],"success":True},sort_keys=True))'''
         *,
         timeout_seconds: int,
         exclude_targets: set[str] | None = None,
+        expected_source_transport_router_id: str | None = None,
+        expected_destination_transport_router_id: str | None = None,
     ) -> dict[str, Any]:
         captures = self._start_geneve_captures(
             deployment, flow, timeout_seconds=timeout_seconds
@@ -19893,34 +20141,64 @@ print(json.dumps({"peer_id":match["peer_id"],"success":True},sort_keys=True))'''
         )
         if flow.source.az_key is None or flow.destination.az_key is None:
             raise ProbeError("symmetric probe omitted a protected workload AZ")
+        if expected_source_transport_router_id is None:
+            expected_source_az = deployment.topology.route_failover.initial_router_az(
+                flow.source.site, flow.source.az_key
+            )
+            expected_source_transport_router_id = next(
+                member.instance_id
+                for member in deployment.topology.site(
+                    flow.source.site
+                ).transport_router_fleet
+                if member.az_key == expected_source_az
+            )
+        if expected_destination_transport_router_id is None:
+            expected_destination_az = (
+                deployment.topology.route_failover.initial_router_az(
+                    flow.destination.site, flow.destination.az_key
+                )
+            )
+            expected_destination_transport_router_id = next(
+                member.instance_id
+                for member in deployment.topology.site(
+                    flow.destination.site
+                ).transport_router_fleet
+                if member.az_key == expected_destination_az
+            )
         source_router = self._selected_gwlbe_transport_router(
             deployment,
             flow.source.site,
             flow.source.az_key,
             flow.destination.private_ip,
         )
+        if source_router.instance_id != expected_source_transport_router_id:
+            raise ProbeError(
+                "source GWLBE route selected an unexpected transport router"
+            )
         destination_transport_router_id = self._selected_destination_transport_router(
             source_router,
             deployment.topology.site(flow.destination.site),
             flow.destination.private_ip,
         )
-        destination_transport_router = next(
-            member
-            for member in deployment.topology.site(
-                flow.destination.site
-            ).transport_router_fleet
-            if member.instance_id == destination_transport_router_id
-        )
+        if (
+            destination_transport_router_id
+            != expected_destination_transport_router_id
+        ):
+            raise ProbeError(
+                "Tailnet selected an unexpected destination-prefix transport owner"
+            )
+        source_gwlbe_id = deployment.endpoint_ids[flow.source.site][flow.source.az_key]
+        destination_gwlbe_id = deployment.endpoint_ids[flow.destination.site][
+            flow.destination.az_key
+        ]
         return {
             "protocol": flow.protocol,
             "source_role": flow.source.role,
             "destination_role": flow.destination.role,
             "source_az_key": flow.source.az_key,
             "destination_az_key": flow.destination.az_key,
-            "source_gwlbe_id": deployment.endpoint_ids[flow.source.site][flow.source.az_key],
-            "destination_gwlbe_id": deployment.endpoint_ids[flow.destination.site][
-                destination_transport_router.az_key
-            ],
+            "source_gwlbe_id": source_gwlbe_id,
+            "destination_gwlbe_id": destination_gwlbe_id,
             "source_target_id": source_id,
             "destination_target_id": destination_id,
             "source_transport_router_id": source_router.instance_id,
@@ -19944,6 +20222,8 @@ print(json.dumps({"peer_id":match["peer_id"],"success":True},sort_keys=True))'''
         *,
         timeout_seconds: int,
         exclude_targets: set[str] | None = None,
+        expected_source_transport_router_id: str | None = None,
+        expected_destination_transport_router_id: str | None = None,
     ) -> dict[str, Any]:
         deadline = self.base.monotonic() + timeout_seconds
         last_error: BaseException | None = None
@@ -19959,6 +20239,8 @@ print(json.dumps({"peer_id":match["peer_id"],"success":True},sort_keys=True))'''
                     candidate,
                     timeout_seconds=max(10, min(20, int(deadline - self.base.monotonic()))),
                     exclude_targets=exclude_targets,
+                    expected_source_transport_router_id=expected_source_transport_router_id,
+                    expected_destination_transport_router_id=expected_destination_transport_router_id,
                 )
             except PROTECTED_CONTROL_FLOW:
                 raise
@@ -20290,7 +20572,7 @@ print(json.dumps({"peer_id":match["peer_id"],"success":True},sort_keys=True))'''
             ]
             if bypasses:
                 raise ReadinessError(
-                    f"{description} has a more-specific route that bypasses its same-AZ GWLBE: "
+                    f"{description} has a more-specific route that bypasses its protected next hop: "
                     + ",".join(sorted(bypasses))
                 )
 
@@ -20744,8 +21026,27 @@ print(json.dumps({"payload":payload,"success":True},sort_keys=True,separators=("
             or len(matching) != 1
         ):
             raise ReadinessError("transport-router subnet route-table identity is not exact")
-        endpoint = deployment.endpoint_ids[member.site][member.az_key]
         availability_zone = self.config.sites[member.site]["azs"][member.az_key]
+        local_workloads = [
+            workload
+            for workload in deployment.workloads.targets
+            if workload.site == member.site
+        ]
+        if any(
+            workload.az_key is None or workload.cidr is None
+            for workload in local_workloads
+        ):
+            raise ReadinessError("local workload GWLBE identity is incomplete")
+        local_gwlbes = {
+            cast(str, workload.cidr): deployment.endpoint_ids[member.site][
+                cast(str, workload.az_key)
+            ]
+            for workload in local_workloads
+        }
+        if set(local_gwlbes) != set(expected.local_site_cidrs):
+            raise ReadinessError(
+                "local workload prefixes do not define the exact transport GWLBE map"
+            )
         table52_routes = transport_state["table52_routes"]
         if not isinstance(table52_routes, list) or not all(
             isinstance(route, Mapping) for route in table52_routes
@@ -20782,11 +21083,10 @@ print(json.dumps({"payload":payload,"success":True},sort_keys=True,separators=("
                 expected.local_site_cidrs,
                 expected.remote_site_cidrs,
                 cast(str, member.advertised_prefix),
-                endpoint,
+                local_gwlbes,
                 member.network_interface_id,
                 subnet_id,
                 cast(str, table["RouteTableId"]),
-                availability_zone,
                 availability_zone,
                 cast(str, contract["underlay_interface"]),
                 cast(str, contract["tailscale_interface"]),
@@ -20803,7 +21103,7 @@ print(json.dumps({"payload":payload,"success":True},sort_keys=True,separators=("
 
         try:
             try:
-                validate_transport_state(transport_state)
+                validated_transport_state = validate_transport_state(transport_state)
             except StandaloneTransportReadinessError as error:
                 if str(error) != (
                     "table-52 local selections must contain every sibling prefix "
@@ -20825,7 +21125,7 @@ print(json.dumps({"payload":payload,"success":True},sort_keys=True,separators=("
                         if prefix != member.advertised_prefix
                     ],
                 ]
-                validate_transport_state(standalone_state)
+                validated_transport_state = validate_transport_state(standalone_state)
         except StandaloneTransportReadinessError as error:
             raise ReadinessError(
                 f"transport-router effective readiness failed: {error}"
@@ -20858,6 +21158,7 @@ print(json.dumps({"payload":payload,"success":True},sort_keys=True,separators=("
             "node_identity_ready": True,
             "network_interface_id": member.network_interface_id,
             "advertised_prefix": member.advertised_prefix,
+            "local_gwlbes": validated_transport_state["local_gwlbes"],
             "contract_sha256": contract["contract_sha256"],
             "tailnet_node_id_sha256": hashlib.sha256(
                 expected_status_node_id.encode("utf-8")
@@ -22068,6 +22369,9 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
                         deployment,
                         flow,
                         timeout_seconds=max(1, int(math.ceil(probe_remaining))),
+                        expected_destination_transport_router_id=(
+                            graceful_alternate.instance_id
+                        ),
                     )
                 if any(
                     path["destination_transport_router_id"]
@@ -22124,6 +22428,9 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
                     deployment,
                     flow,
                     timeout_seconds=max(1, int(math.ceil(probe_remaining))),
+                    expected_source_transport_router_id=(
+                        abrupt_alternate.instance_id
+                    ),
                 )
             if any(
                 path.get("source_transport_router_id")

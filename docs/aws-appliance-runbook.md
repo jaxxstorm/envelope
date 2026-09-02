@@ -2,7 +2,7 @@
 
 ## Status
 
-The AWS appliance topology retains version `2` while replacing the rejected target-forwarding draft with packet-scoped GWLB turnaround, GWLBE subnet routing, and separate transport routers. The corrected protected profile is still under development, and no passing live acceptance run is documented. Protected run `ha25` failed acceptance but supplied the live route evidence used to correct the transport readiness contract below. This page is a safety and architecture reference, not an executable live-run procedure.
+The AWS appliance topology retains version `2` while replacing the rejected target-forwarding draft with packet-scoped GWLB turnaround, GWLBE subnet routing, and separate transport routers. The corrected protected profile is still under development, and no passing live acceptance run is documented. Protected runs `ha25` and `ha46` failed acceptance but supplied the live Tailnet and endpoint-symmetry evidence used to correct the transport readiness contract below. This page is a safety and architecture reference, not an executable live-run procedure.
 
 Do not use an older protected configuration, saved plan, state file, workflow, evidence file, or direct Terraform command with this topology. Do not translate an old configuration by hand. A future approved run must create a fresh, run-owned version-2 deployment and own its cleanup.
 
@@ -13,7 +13,7 @@ Each site must have at least two enabled availability zones and these separate r
 | Domain | Required forwarding behavior |
 | --- | --- |
 | Workload | Exact remote-site CIDRs select the same-AZ GWLBE. |
-| Transport router | Exact local-site CIDRs select the same-AZ GWLBE; accepted exact remote routes select Tailscale. |
+| Transport router | In every table, each exact local-site CIDR selects that destination workload prefix's AZ GWLBE, independent of the receiving router AZ; accepted exact remote routes select Tailscale. |
 | GWLBE subnet | After GWLB inspection, local-site CIDRs use VPC local delivery and remote-site CIDRs select one ready same-site transport-router ENI. |
 | Envelope target | Outer GWLB and management traffic only; no inner site route, TUN, Tailscale, or host transit. |
 | Management | Kept separate from packet-transit route domains. |
@@ -51,14 +51,16 @@ Transport-router readiness is independent of target health. Every eligible route
 - Stable-node identities are bound to protected instance IDs, and source-prefix owner/ENI coupling is derived from singleton advertisements, control-plane stable identities, and opposite-site observations and must agree with the primary ENI selected for that source prefix's GWLBE route table.
 - Subnet-route SNAT disabled and source addresses preserved.
 - Persistent bidirectional forwarding, supported reverse-path settings, the reviewed no-NAT firewall and MSS policy, and disabled EC2 source/destination checks.
-- An effective remote route to Tailscale and an effective local-site VPC route to the same-AZ GWLBE across each complete prefix.
+- An effective remote route to Tailscale and, across each complete local prefix, an effective VPC route to that destination workload prefix's AZ GWLBE.
 - A distinct run-owned ENI eligible only for same-site GWLBE remote routes.
 
-A transport router's root host-network setup runs as `envelope-transport-router-network.service` and uses `CAP_NET_ADMIN` and `CAP_NET_RAW`. The unit owns only forwarding and reverse-path sysctls, exact fail-closed firewall chains, and MSS clamping; its service state or local marker does not declare AWS, Tailnet, route, or ENI readiness. Terraform emits the expected host contract as the separate `transport_router_readiness_expectations` output. That output is not part of `symmetric_topology.route_failover` and is not a live readiness result. The credentialed protected readiness gate separately observes exact policy and prefix route chains, Tailscale peer expiry and bounded ping results, EC2 source/destination checks, ENI identity, and same-AZ GWLBE routes. These transport privileges are not granted to the Envelope target service.
+A transport router's root host-network setup runs as `envelope-transport-router-network.service` and uses `CAP_NET_ADMIN` and `CAP_NET_RAW`. The unit owns only forwarding and reverse-path sysctls, exact fail-closed firewall chains, and MSS clamping; its service state or local marker does not declare AWS, Tailnet, route, or ENI readiness. Terraform emits the expected host contract as the separate `transport_router_readiness_expectations` output. That output is not part of `symmetric_topology.route_failover` and is not a live readiness result. The credentialed protected readiness gate separately observes exact policy and prefix route chains, Tailscale peer expiry and bounded ping results, EC2 source/destination checks, ENI identity, and the complete destination-prefix GWLBE map. These transport privileges are not granted to the Envelope target service.
 
-The priority-100 `iif tailscale0` local-prefix rules make every router capable of delivering all local prefixes during normal and takeover paths by sending arriving local traffic through `main`, the VPC underlay, and the same-AZ GWLBE. Any local table-52 route or same-site protected local `PrimaryRoutes` claim makes the router ineligible, as does a broader, narrower, missing, duplicate, source-specific, shadowed, terminal, wrong-device, or NAT-rewritten remote route.
+The priority-100 `iif tailscale0` local-prefix rules make every router capable of delivering all local prefixes during normal and takeover paths by sending arriving local traffic through `main`, the VPC underlay, and the destination workload prefix's AZ GWLBE. Any local table-52 route or same-site protected local `PrimaryRoutes` claim makes the router ineligible, as does a broader, narrower, missing, duplicate, source-specific, shadowed, terminal, wrong-device, wrong-endpoint, or NAT-rewritten route.
 
 Failed protected run `ha25` proved this shape directly: each router installed exactly the two opposite-site workload routes in table 52 and formed only opposite-site serving paths. The finding corrects the contract; it is not a passing acceptance result.
+
+Failed protected run `ha46` proved the endpoint half of this shape during graceful takeover: east/a received a packet for the east/b workload, but its old uniform local routes selected GWLBE a while the workload reverse route selected GWLBE b. Both GWLBs observed SYNs, no SYN-ACK returned, cleanup reached zero residuals, and the run did not satisfy acceptance.
 
 ## Runner-Owned ENI Failover
 

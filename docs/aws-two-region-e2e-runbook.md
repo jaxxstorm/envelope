@@ -21,7 +21,7 @@ source workload -> source-site GWLBE -> source-site GWLB -> source-site target
 
 Each target handles only the current AWS GENEVE packet and returns it exactly once with identical inner bytes, VNI, protocol metadata, ordered options, cookie, and packet-specific AWS tuple. It does not use a TUN, Tailscale, host forwarding, or retained flow identity.
 
-The dedicated transport routers are bidirectional. A source-site router receives post-inspection remote traffic through its selected ENI and forwards it through Tailscale without NAT. A destination-site router receives Tailnet traffic for a local-site CIDR and forwards it to the underlay, where its subnet route selects the same-AZ GWLBE. After each target turnaround, the GWLBE route table selects remote ENI transit or VPC local delivery.
+The dedicated transport routers are bidirectional. A source-site router receives post-inspection remote traffic through its selected ENI and forwards it through Tailscale without NAT. A destination-site router receives Tailnet traffic for a local-site CIDR and forwards it to the underlay, where every transport table selects that destination workload prefix's AZ GWLBE, independent of the receiving router AZ. After each target turnaround, the GWLBE route table selects remote ENI transit or VPC local delivery.
 
 ## Required Profile
 
@@ -33,7 +33,7 @@ The dedicated transport routers are bidirectional. A source-site router receives
 - Tailscale table 52 and serving paths contain only opposite-site workload prefixes; every local prefix stays on the main/VPC underlay.
 - Disjoint local-site and remote-site CIDRs, with each remote list equal to the peer's local list.
 - Separate workload, transport-router, GWLBE, target, and management route domains.
-- Workload remote routes and transport-router local routes through same-AZ GWLBE endpoints.
+- Workload remote routes through source-workload-AZ GWLBE endpoints and every transport local-prefix route through the destination-workload-AZ endpoint.
 - GWLBE post-inspection local delivery and one selected same-site transport-router ENI per exact remote prefix.
 - An approved fixed-cost ceiling and short, explicit resource expiry before any future infrastructure creation.
 
@@ -55,7 +55,7 @@ Before billable resources or live traffic, protected preflight must fail closed 
 - Exact run ownership, durable cleanup authority, expiry, scoped credentials, artifact identity, and Tailnet policy.
 - Expected two-AZ target and transport-router fleets, route tables, endpoint identities, eligible ENIs, and initial route selections.
 - Target packet-receive, validation, and compliant-send readiness independent of transport readiness.
-- Both transport directions, no NAT, exact advertisements and accepted routes, source preservation, and local GWLBE routing.
+- Both transport directions, no NAT, exact advertisements and accepted routes, source preservation, and the complete destination-prefix GWLBE route map on every router.
 - Exact local policy rules and complete prefix route chains, non-expired serving peers with peer-bound bounded ping observations, and the live-MTU-derived MSS rule in both directions.
 - Every opposite-site observer selects each protected remote prefix's configured stable-node `PrimaryRoutes` owner, with stable-node identity bound to its protected transport-router instance ID.
 - On every router, Tailscale table 52 contains exactly the opposite site's exact workload prefixes and no local-site prefix; no same-site observer reports a protected local `PrimaryRoutes` claim.
@@ -100,9 +100,11 @@ Failed protected run `ha39` proved that ownership-observer correction and advanc
 
 Failed protected run `ha40` reached the first durable transport-router transaction, then the AWS CLI rejected an unsupported `ssm send-command --client-token` option before advertisement or GWLBE route mutation. The original cleanup could not finalize the active transaction; ownership-checked successor recovery then exposed Bash dynamic-scope collisions between top-level readonly `routes_json` and `generation` values and same-named function locals in the deployed helper. SSM command construction no longer emits the unsupported option, and the helper uses distinct request-level names while structural coverage rejects future readonly/local collisions. The successor CAS-adopted the expired lease, applied the original restore generation, verified advertisements, opposite-site ownership, and baseline ENI routes, then completed cleanup with `final_residual_count` 0. The retained schema-3 symmetric evidence is failed; `ha40` did not satisfy task 6.4.
 
+Failed protected run `ha46` passed readiness, traversal, and both target recoveries before graceful transport-router recovery exposed endpoint asymmetry. The east/a takeover router sent the east/b destination prefix through GWLBE a, while the east/b workload reverse route used GWLBE b. Independent captures observed the correlated SYN through both site GWLBs but no SYN-ACK. Transport routes and evidence now remain destination-prefix anchored when the receiving router is cross-AZ. Cleanup completed in one attempt with `final_residual_count` 0; the retained schema-3 evidence is failed and task 6.4 remains open.
+
 ## Evidence Expectations
 
-Protected acceptance must prove simultaneous cold initiation from both sites for TCP, UDP, and ICMP without directional CIDR partitioning. For each direction, evidence must bind the source and destination GWLBE, GWLB target, transport router, and ENI identities and prove both target turnarounds. Preflight evidence records bounded per-prefix Tailnet ownership from every opposite-site observer, maps stable node IDs to protected transport-router instance IDs, proves local Tailnet routes and claims are absent, and verifies that each source-prefix owner agrees with the GWLBE ENI selection.
+Protected acceptance must prove simultaneous cold initiation from both sites for TCP, UDP, and ICMP without directional CIDR partitioning. For each direction and recovery path, evidence must bind the source-workload-AZ and destination-workload-prefix-AZ GWLBE identities independently from the selected transport routers, then bind GWLB targets, router and ENI identities, and both target turnarounds. Preflight evidence records the complete local-prefix-to-GWLBE map on every router, bounded per-prefix Tailnet ownership from every opposite-site observer, maps stable node IDs to protected transport-router instance IDs, proves local Tailnet routes and claims are absent, and verifies that each source-prefix owner agrees with the GWLBE ENI selection.
 
 Packet-level assertions must show exactly one immediate return for each valid ingress packet with byte-identical inner data, VNI, protocol metadata, ordered options, cookie, and the current packet's AWS outer tuple. Invalid packets must produce no send. The assertion must not infer turnaround solely from an application response or aggregate counter.
 

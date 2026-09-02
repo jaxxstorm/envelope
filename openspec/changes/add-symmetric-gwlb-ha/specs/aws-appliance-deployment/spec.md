@@ -46,7 +46,7 @@ The deployment SHALL persist forwarding, reverse-path, no-NAT firewall, and TCP 
 
 #### Scenario: Required transport state after boot
 - **WHEN** transport-router cloud-init and network preflight complete
-- **THEN** effective sysctls, both forwarding directions, no-NAT state, MSS policy, Tailscale routes, and the local-site VPC route through GWLBE satisfy readiness
+- **THEN** effective sysctls, both forwarding directions, no-NAT state, MSS policy, Tailscale routes, and every local-site VPC route through its destination workload prefix's GWLBE satisfy readiness
 
 #### Scenario: Target host remains outside transit
 - **WHEN** an Envelope target boots
@@ -59,7 +59,7 @@ The deployment SHALL persist forwarding, reverse-path, no-NAT firewall, and TCP 
 ## ADDED Requirements
 
 ### Requirement: Multi-AZ symmetric site deployment
-The protected deployment SHALL keep topology and runtime configuration version 2 and create at least two enabled AZs per site, a GWLBE in every enabled workload and transport-router AZ, and at least one Envelope target in every enabled target AZ. Each workload route table SHALL send exact remote-site CIDRs to its same-AZ GWLBE; each transport-router route table SHALL send exact local-site CIDRs to its same-AZ GWLBE; and each GWLBE route table SHALL send local-site traffic through VPC local delivery and remote-site traffic to the ENI of the deterministic initial owner of that GWLBE AZ's workload prefix. Target subnets SHALL carry no inner site route.
+The protected deployment SHALL keep topology and runtime configuration version 2 and create at least two enabled AZs per site, a GWLBE in every enabled workload and transport-router AZ, and at least one Envelope target in every enabled target AZ. Each workload route table SHALL send exact remote-site CIDRs to its same-AZ GWLBE; every transport-router route table SHALL send each exact local-site CIDR to the GWLBE in that destination workload prefix's AZ, independent of the router AZ; and each GWLBE route table SHALL send local-site traffic through VPC local delivery and remote-site traffic to the ENI of the deterministic initial owner of that GWLBE AZ's workload prefix. Target subnets SHALL carry no inner site route.
 
 #### Scenario: Both sites have symmetric paths
 - **WHEN** Terraform plans a valid two-site configuration
@@ -86,7 +86,7 @@ The deployment SHALL create at least two independent Tailscale transport routers
 
 #### Scenario: Local prefix uses the underlay
 - **WHEN** a packet received on `tailscale0` targets any local prefix, whether its singleton advertiser is the receiving router or its sibling
-- **THEN** the higher-priority local rule selects `main` and the VPC underlay to the same-AZ GWLBE without a local table-52 route
+- **THEN** the higher-priority local rule selects `main` and the VPC underlay to the destination workload prefix's AZ GWLBE without a local table-52 route
 
 #### Scenario: Incomplete router contract
 - **WHEN** one transport router advertises a broader, narrower, or missing local-site prefix, lacks a remote route, enables SNAT, or cannot forward one direction
@@ -174,7 +174,7 @@ The protected acceptance SHALL install and checksum-verify the bounded wire insp
 
 ### Requirement: Tailscale control-plane readiness
 **Reason**: Envelope targets have no Tailscale responsibility; dedicated transport routers own the Tailnet control plane and both transit directions.
-**Migration**: Targets have no Tailscale responsibility; validate redundant transport-router advertisements, accepted routes, no-NAT forwarding, ENIs, and local GWLBE route readiness.
+**Migration**: Targets have no Tailscale responsibility; validate redundant transport-router advertisements, accepted routes, no-NAT forwarding, ENIs, and destination-prefix GWLBE route readiness.
 
 ### Requirement: GWLB target bootstrap readiness
 **Reason**: A target must prove packet-scoped receive and compliant return plus coordinated drain, not TUN and site-forwarding prerequisites for a single regional owner.
