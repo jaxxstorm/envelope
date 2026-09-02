@@ -102,6 +102,9 @@ ROUTE_MANIFEST_API_TIMEOUT_SECONDS = 10
 ROUTE_RECOVERY_FIXED_RESERVATION_SECONDS = 190
 PROTECTED_RESOURCE_CLEANUP_SECONDS = RESIDUAL_CLEANUP_TIMEOUT_SECONDS
 STREAM_MUTATION_OVERHEAD_SECONDS = 30
+# Covers paired stream setup plus bounded SSM stop, reporting, receiver
+# completion, and responder restoration operations.
+CONTROLLED_STREAM_COMPLETION_HEADROOM_SECONDS = 600
 MAX_STREAM_MUTATION_RESERVATION_SECONDS = 3470
 PROBE_COMMAND_HEADROOM_SECONDS = 10
 RECOVERY_PROBE_RETRY_FIRST_SOURCE_PORT = 61_000
@@ -257,8 +260,29 @@ class SSMError(E2EError):
     pass
 
 
+class SSMDispatchError(SSMError):
+    """SSM may have accepted a command whose identifier was not returned."""
+
+
+class SSMTerminationError(SSMError):
+    """An identified SSM command was not confirmed terminal."""
+
+
 class SSMTimeout(SSMError):
     pass
+
+
+def _ssm_ownership_unconfirmed(error: BaseException) -> bool:
+    return isinstance(error, (SSMDispatchError, SSMTerminationError)) or bool(
+        getattr(error, "ssm_ownership_unconfirmed", False)
+    )
+
+
+def _mark_ssm_ownership_unconfirmed(error: BaseException) -> None:
+    try:
+        setattr(error, "ssm_ownership_unconfirmed", True)
+    except (AttributeError, TypeError):
+        pass
 
 
 class ProtectedHardTimeout(TimeoutError):
@@ -1409,13 +1433,19 @@ class SSMRunner:
         except PROTECTED_CONTROL_FLOW:
             raise
         except TimeoutError as error:
-            raise SSMTimeout(f"SSM send-command exceeded its native timeout: {error}") from None
-        except BaseException as error:
-            raise SSMError(redact_runtime_text(f"SSM send-command failed: {error}")) from None
+            raise SSMDispatchError(
+                f"SSM send-command exceeded its native timeout: {error}"
+            ) from None
+        except Exception as error:
+            raise SSMDispatchError(
+                redact_runtime_text(f"SSM send-command failed: {error}")
+            ) from None
         command_value = response.get("Command")
         command_id = command_value.get("CommandId") if isinstance(command_value, Mapping) else None
         if not isinstance(command_id, str) or not command_id or len(command_id) > 128:
-            raise SSMError("SSM send-command response omitted a valid CommandId")
+            raise SSMDispatchError(
+                "SSM send-command response omitted a valid CommandId"
+            )
         return command_id
 
     def _poll(self, target: RemoteTarget, command_id: str, *, timeout_seconds: float) -> SSMResult:
@@ -1446,7 +1476,7 @@ class SSMRunner:
                 raise SSMTimeout(
                     f"SSM get-command-invocation exceeded its native timeout: {error}"
                 ) from None
-            except BaseException as error:
+            except Exception as error:
                 if not _invocation_does_not_exist(error):
                     raise SSMError(redact_runtime_text(f"SSM invocation polling failed: {error}")) from None
             else:
@@ -1484,26 +1514,36 @@ class SSMRunner:
             return self._poll(target, command_id, timeout_seconds=timeout_seconds)
         except PROTECTED_CONTROL_FLOW:
             raise
-        except BaseException as wait_error:
+        except KeyboardInterrupt:
+            raise
+        except Exception as wait_error:
             cancellation_request = "requested"
+            terminal_confirmed = False
             try:
                 if not self.cancel(target, command_id, timeout_seconds=cancel_timeout_seconds):
                     cancellation_request = "not accepted"
-            except BaseException as cancel_error:
+            except KeyboardInterrupt:
+                raise
+            except Exception as cancel_error:
                 _rethrow_protected_control_flow(cancel_error)
                 cancellation_request = redact_runtime_text(f"request failed: {cancel_error}")
             try:
                 terminal = self._poll(target, command_id, timeout_seconds=cancel_timeout_seconds)
+                terminal_confirmed = True
                 cancellation = (
                     f"cancellation {cancellation_request}; terminal state {terminal.status} confirmed for {command_id}"
                 )
-            except BaseException as confirmation_error:
+            except KeyboardInterrupt:
+                raise
+            except Exception as confirmation_error:
                 _rethrow_protected_control_flow(confirmation_error)
                 cancellation = redact_runtime_text(
                     f"cancellation {cancellation_request}; terminal state unconfirmed for {command_id}: "
                     f"{confirmation_error}"
                 )
             message = f"{redact_runtime_text(str(wait_error))}; {cancellation}"
+            if not terminal_confirmed:
+                raise SSMTerminationError(message) from None
             if isinstance(wait_error, SSMTimeout):
                 raise SSMTimeout(message) from None
             if isinstance(wait_error, SSMError):
@@ -1524,11 +1564,23 @@ class SSMRunner:
             raise
         except TimeoutError as error:
             raise SSMTimeout(f"SSM cancel-command exceeded its native timeout: {error}") from None
-        except BaseException as error:
+        except Exception as error:
             if _invocation_does_not_exist(error):
                 return False
             raise SSMError(redact_runtime_text(f"SSM cancel-command failed: {error}")) from None
         return True
+
+    def terminate(
+        self,
+        target: RemoteTarget,
+        command_id: str,
+        *,
+        timeout_seconds: float = 5.0,
+    ) -> SSMResult:
+        """Request cancellation and return only after terminal state is observed."""
+
+        self.cancel(target, command_id, timeout_seconds=timeout_seconds)
+        return self._poll(target, command_id, timeout_seconds=timeout_seconds)
 
     def execute(
         self,
@@ -2810,10 +2862,27 @@ class StreamMarker:
             raise StreamAnalysisError("stream marker was received before it was sent")
 
 
+def _compact_stream_attempts(value: Mapping[str, Any]) -> tuple[int, ...]:
+    attempts = value.get("attempts")
+    if (
+        not isinstance(attempts, list)
+        or not attempts
+        or len(attempts) > 160
+        or any(
+            isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0
+            for attempt in attempts
+        )
+        or any(current <= previous for previous, current in zip(attempts, attempts[1:]))
+    ):
+        raise StreamAnalysisError("compact stream attempts are invalid")
+    return tuple(attempts)
+
+
 def _expand_compact_stream_markers(value: Mapping[str, Any]) -> tuple[StreamMarker, ...]:
     flow_id = value.get("flow_id")
     connection_id = value.get("connection_id")
     markers = value.get("markers")
+    attempts = _compact_stream_attempts(value)
     if (
         not isinstance(flow_id, str)
         or not isinstance(connection_id, str)
@@ -2822,7 +2891,13 @@ def _expand_compact_stream_markers(value: Mapping[str, Any]) -> tuple[StreamMark
         raise StreamAnalysisError("compact stream result has an invalid identity or marker list")
     expanded: list[StreamMarker] = []
     for marker in markers:
-        if not isinstance(marker, list) or len(marker) != 3:
+        if (
+            not isinstance(marker, list)
+            or len(marker) != 2
+            or isinstance(marker[0], bool)
+            or not isinstance(marker[0], int)
+            or not 0 <= marker[0] < len(attempts)
+        ):
             raise StreamAnalysisError("compact stream marker has the wrong shape")
         expanded.append(
             StreamMarker.from_value(
@@ -2830,8 +2905,8 @@ def _expand_compact_stream_markers(value: Mapping[str, Any]) -> tuple[StreamMark
                     "flow_id": flow_id,
                     "connection_id": connection_id,
                     "sequence": marker[0],
-                    "sent_monotonic_ns": marker[1],
-                    "received_monotonic_ns": marker[2],
+                    "sent_monotonic_ns": attempts[marker[0]],
+                    "received_monotonic_ns": marker[1],
                 }
             )
         )
@@ -2900,6 +2975,22 @@ class StreamInterruption:
     right_censored: bool
 
 
+def _validated_stream_attempts(
+    attempts: Sequence[int], expected_count: int
+) -> tuple[int, ...]:
+    parsed = tuple(attempts)
+    if (
+        len(parsed) != expected_count
+        or any(
+            isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0
+            for attempt in parsed
+        )
+        or any(current <= previous for previous, current in zip(parsed, parsed[1:]))
+    ):
+        raise StreamAnalysisError("stream attempt timestamps are invalid")
+    return parsed
+
+
 def analyze_interrupted_stream_markers(
     markers: Sequence[StreamMarker | Mapping[str, Any]],
     mutation: MutationInterval,
@@ -2907,7 +2998,7 @@ def analyze_interrupted_stream_markers(
     protocol: str,
     expected_marker_count: int,
     sent_marker_count: int,
-    last_sent_monotonic_ns: int,
+    attempted_monotonic_ns: Sequence[int],
 ) -> StreamInterruption:
     """Validate a mutation-bound terminal interruption without inventing an end time."""
 
@@ -2919,12 +3010,12 @@ def analyze_interrupted_stream_markers(
         or not 20 <= expected_marker_count <= 160
         or isinstance(sent_marker_count, bool)
         or not isinstance(sent_marker_count, int)
-        or not 2 <= sent_marker_count <= expected_marker_count
-        or isinstance(last_sent_monotonic_ns, bool)
-        or not isinstance(last_sent_monotonic_ns, int)
-        or last_sent_monotonic_ns < 0
+        or not 20 <= sent_marker_count <= expected_marker_count
     ):
         raise StreamAnalysisError("interrupted stream observation bounds are invalid")
+    attempts = _validated_stream_attempts(
+        attempted_monotonic_ns, sent_marker_count
+    )
     parsed = tuple(StreamMarker.from_value(marker) for marker in markers)
     if len(parsed) < 2 or len(parsed) > sent_marker_count:
         raise StreamAnalysisError("interrupted stream marker count is invalid")
@@ -2934,6 +3025,8 @@ def analyze_interrupted_stream_markers(
         raise StreamAnalysisError("interrupted stream markers do not use one long-lived socket")
     if tuple(marker.sequence for marker in parsed) != tuple(range(len(parsed))):
         raise StreamAnalysisError("interrupted stream is not one contiguous acknowledged prefix")
+    if any(marker.sent_monotonic_ns != attempts[marker.sequence] for marker in parsed):
+        raise StreamAnalysisError("interrupted stream markers differ from attempted sends")
     if parsed[0].sent_monotonic_ns > mutation.start_monotonic_ns:
         raise StreamAnalysisError("interrupted stream has no marker before the mutation interval")
     if parsed[-1].received_monotonic_ns < mutation.start_monotonic_ns:
@@ -2943,14 +3036,14 @@ def analyze_interrupted_stream_markers(
             raise StreamAnalysisError("interrupted stream send timestamps are not strictly increasing")
         if current.received_monotonic_ns <= previous.received_monotonic_ns:
             raise StreamAnalysisError("interrupted stream receive timestamps are not strictly increasing")
-    if last_sent_monotonic_ns < parsed[-1].sent_monotonic_ns:
-        raise StreamAnalysisError("interrupted stream last-send timestamp precedes an acknowledgement")
-
     if (
         sent_marker_count != expected_marker_count
         or parsed[-1].sequence >= expected_marker_count - 1
-        or last_sent_monotonic_ns <= mutation.end_monotonic_ns
+        or attempts[-1] <= mutation.end_monotonic_ns
         or parsed[-1].received_monotonic_ns > mutation.end_monotonic_ns
+        or not mutation.start_monotonic_ns
+        <= attempts[len(parsed)]
+        <= mutation.end_monotonic_ns
     ):
         raise StreamAnalysisError("terminal stream interruption is not mutation-bound and right-censored")
 
@@ -2970,6 +3063,7 @@ def analyze_stream_markers(
     mutation: MutationInterval,
     *,
     maximum_loss_ns: int,
+    attempted_monotonic_ns: Sequence[int],
     expected_first_sequence: int | None = None,
     expected_last_sequence: int | None = None,
 ) -> StreamAnalysis:
@@ -2988,6 +3082,18 @@ def analyze_stream_markers(
         raise StreamAnalysisError("stream is missing an unbounded leading sequence")
     if expected_last_sequence is not None and parsed[-1].sequence != expected_last_sequence:
         raise StreamAnalysisError("stream is missing an unbounded trailing sequence")
+    attempt_count = (
+        expected_last_sequence + 1
+        if expected_last_sequence is not None
+        else parsed[-1].sequence + 1
+    )
+    attempts = _validated_stream_attempts(attempted_monotonic_ns, attempt_count)
+    if any(
+        marker.sequence >= len(attempts)
+        or marker.sent_monotonic_ns != attempts[marker.sequence]
+        for marker in parsed
+    ):
+        raise StreamAnalysisError("stream markers differ from attempted sends")
     if parsed[0].sent_monotonic_ns > mutation.start_monotonic_ns:
         raise StreamAnalysisError("stream has no marker before the mutation interval")
     if parsed[-1].sent_monotonic_ns <= mutation.end_monotonic_ns:
@@ -3020,7 +3126,17 @@ def analyze_stream_markers(
             window.start_monotonic_ns >= mutation.start_monotonic_ns - maximum_loss_ns
             and window.end_monotonic_ns <= mutation.end_monotonic_ns + maximum_loss_ns
         )
-        if not overlaps_mutation or not inside_expanded_interval:
+        missing_attempts_inside_mutation = all(
+            mutation.start_monotonic_ns
+            <= attempts[sequence]
+            <= mutation.end_monotonic_ns
+            for sequence in range(previous.sequence + 1, current.sequence)
+        )
+        if (
+            not overlaps_mutation
+            or not inside_expanded_interval
+            or not missing_attempts_inside_mutation
+        ):
             raise StreamAnalysisError("stream loss occurred outside the declared mutation interval")
         if window.duration_ns > maximum_loss_ns:
             raise StreamAnalysisError(
@@ -3422,6 +3538,47 @@ class SymmetricRouteFailover:
         }
 
 
+def _continuity_stream_duration_seconds(
+    timeout_seconds: int, *, controlled_completion: bool
+) -> int:
+    headroom = (
+        CONTROLLED_STREAM_COMPLETION_HEADROOM_SECONDS
+        if controlled_completion
+        else STREAM_MUTATION_OVERHEAD_SECONDS
+    )
+    duration = max(35, timeout_seconds + headroom)
+    if duration > 3500:
+        raise StreamAnalysisError(
+            "continuity stream timeout plus completion headroom exceeds the SSM bound"
+        )
+    return duration
+
+
+def _symmetric_non_route_active_reservations(
+    budgets: TimeoutBudgets,
+) -> dict[str, int]:
+    target_process_stream_timeout = max(
+        90, budgets.service_stop + STREAM_MUTATION_OVERHEAD_SECONDS
+    )
+    return {
+        "consume_and_claim": budgets.consume_deployment,
+        "drift_checks": 2 * budgets.drift_check,
+        "readiness": budgets.readiness_topology,
+        "simultaneous_cold_initiation": budgets.cold_direction,
+        "bidirectional_traversal": 2 * budgets.cold_direction,
+        "target_process_recovery": 2
+        * _continuity_stream_duration_seconds(
+            target_process_stream_timeout,
+            controlled_completion=False,
+        ),
+        "target_instance_recovery": _continuity_stream_duration_seconds(
+            max(90, budgets.ec2_reboot),
+            controlled_completion=True,
+        ),
+        "lifecycle_finish_and_evidence": budgets.evidence,
+    }
+
+
 def _validate_route_failover_run_budget(
     route_failover: SymmetricRouteFailover,
     *,
@@ -3429,9 +3586,21 @@ def _validate_route_failover_run_budget(
     observer_counts: Mapping[Site, int],
     hard_timeout_seconds: int,
     cleanup_timeout_seconds: int,
+    active_budgets: TimeoutBudgets = DEFAULT_TIMEOUTS,
 ) -> dict[str, Any]:
     if set(prefix_counts) != set(SITES) or set(observer_counts) != set(SITES):
         raise DeploymentError("route failover budget inputs must cover both sites")
+    if (
+        max(90, active_budgets.service_stop + STREAM_MUTATION_OVERHEAD_SECONDS)
+        + STREAM_MUTATION_OVERHEAD_SECONDS
+        > 3500
+        or max(90, active_budgets.ec2_reboot)
+        + CONTROLLED_STREAM_COMPLETION_HEADROOM_SECONDS
+        > 3500
+    ):
+        raise DeploymentError(
+            "target recovery cannot fit the bounded continuity command"
+        )
     transaction_reservations: dict[Site, int] = {}
     restoration_reservations: dict[Site, int] = {}
     reconciliation_reservations: dict[Site, int] = {}
@@ -3457,8 +3626,11 @@ def _validate_route_failover_run_budget(
                 "route failover timeouts cannot cover every sequential ownership observer and quiet window"
             )
         transaction_reservations[site] = (
-            route_failover.transaction_reservation_seconds(prefix_count)
-            + STREAM_MUTATION_OVERHEAD_SECONDS
+            max(
+                route_failover.transaction_reservation_seconds(prefix_count),
+                active_budgets.route_mutation,
+            )
+            + CONTROLLED_STREAM_COMPLETION_HEADROOM_SECONDS
         )
         restoration_reservations[site] = (
             route_failover.restoration_reservation_seconds(prefix_count)
@@ -3474,10 +3646,16 @@ def _validate_route_failover_run_budget(
         raise DeploymentError(
             "route reconciliation and resource cleanup cannot fit the protected cleanup reservation"
         )
+    non_route_reservations = _symmetric_non_route_active_reservations(
+        active_budgets
+    )
+    non_route_active_seconds = sum(non_route_reservations.values())
+    total_transaction_seconds = sum(transaction_reservations.values())
+    required_active_seconds = non_route_active_seconds + total_transaction_seconds
     if (
         max(transaction_reservations.values())
         > MAX_STREAM_MUTATION_RESERVATION_SECONDS
-        or sum(transaction_reservations.values()) > hard_timeout_seconds
+        or required_active_seconds > hard_timeout_seconds
     ):
         raise DeploymentError(
             "graceful and abrupt route failover cannot fit the stream and active-run reservations"
@@ -3488,7 +3666,11 @@ def _validate_route_failover_run_budget(
         "reconciliation_seconds_by_site": dict(reconciliation_reservations),
         "combined_cleanup_seconds_by_site": dict(combined_cleanup_reservations),
         "resource_cleanup_seconds": PROTECTED_RESOURCE_CLEANUP_SECONDS,
-        "total_transaction_seconds": sum(transaction_reservations.values()),
+        "total_transaction_seconds": total_transaction_seconds,
+        "non_route_active_seconds": non_route_active_seconds,
+        "non_route_active_seconds_by_phase": non_route_reservations,
+        "required_active_seconds": required_active_seconds,
+        "active_run_slack_seconds": hard_timeout_seconds - required_active_seconds,
         "active_run_seconds": hard_timeout_seconds,
         "cleanup_seconds": cleanup_timeout_seconds,
     }
@@ -11322,6 +11504,7 @@ class SymmetricTwoRegionE2ERunner:
                 },
                 hard_timeout_seconds=self.budgets.hard_timeout,
                 cleanup_timeout_seconds=self.budgets.cleanup,
+                active_budgets=self.budgets,
             )
             claim = self.lifecycle.claim(self.raw_deployment, deployment)
             claimed = True
@@ -11543,7 +11726,10 @@ class SymmetricTwoRegionE2ERunner:
                     self._allocate(
                         deployment, "udp", "west", "transport-router-abrupt-established-udp"
                     ),
-                    timeout_seconds=self.budgets.route_mutation,
+                    timeout_seconds=max(
+                        self.budgets.route_mutation,
+                        route_failover.mutation_timeout_seconds,
+                    ),
                 )
             )
             current_phase = Phase.DRIFT_POSTCHECK.value
@@ -15437,6 +15623,7 @@ import json
 import math
 import os
 import socket
+import stat
 import struct
 import sys
 import time
@@ -15461,6 +15648,28 @@ def decode(data):
     if not isinstance(value, dict):
         raise RuntimeError("frame is not an object")
     return value
+
+def private_stop_requested(path, token):
+    if path is None or token is None:
+        return False
+    try:
+        value = os.lstat(path)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            content = os.read(descriptor, 128)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(value.st_mode)
+        and value.st_uid == 0
+        and stat.S_IMODE(value.st_mode) == 0o600
+        and (value.st_dev, value.st_ino) == (opened.st_dev, opened.st_ino)
+        and content == (token + "\n").encode("ascii")
+    )
 
 def internet_checksum(data):
     if len(data) % 2:
@@ -15521,13 +15730,15 @@ def icmp_client(args):
           "reply_source_ip": reply_source, "source_ip": args.source_ip, "success": True})
 
 def tcp_frame(conn, deadline, buffered=b""):
-    data = bytearray(buffered)
+    data = buffered if isinstance(buffered, bytearray) else bytearray(buffered)
     while True:
         newline = data.find(b"\n")
         if newline >= 0:
             if newline > MAX_FRAME:
                 raise RuntimeError("TCP frame too large")
-            return bytes(data[:newline]), bytes(data[newline + 1:])
+            frame = bytes(data[:newline])
+            del data[:newline + 1]
+            return frame, data
         if len(data) > MAX_FRAME:
             raise RuntimeError("TCP frame too large")
         conn.settimeout(max(0.01, deadline - time.monotonic()))
@@ -15616,6 +15827,12 @@ def probe(args):
 
 def stream_server(args):
     tcp = args.protocol == "tcp"
+    if (
+        (args.stop_path is None) != (args.stop_token is None)
+        or args.stop_path is not None
+        and args.stop_path != "/run/envelope-e2e-stream-" + args.flow_id + ".server-stop"
+    ):
+        raise RuntimeError("stream receiver stop path is invalid")
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM if tcp else socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((args.bind, args.port))
@@ -15628,6 +15845,8 @@ def stream_server(args):
     connection = None
     stream_peer = None
     buffer = b""
+    stop_observed = False
+    tcp_ended = False
     try:
         if tcp:
             sock.settimeout(max(0.01, deadline - time.monotonic()))
@@ -15636,9 +15855,39 @@ def stream_server(args):
             # concurrent cold-flow receiver to bind the reviewed probe port.
             sock.close()
         while time.monotonic() < deadline:
+            if private_stop_requested(args.stop_path, args.stop_token):
+                stop_observed = True
+                break
+            if tcp_ended:
+                time.sleep(min(0.1, max(0.01, deadline - time.monotonic())))
+                continue
             try:
                 if tcp:
-                    data, buffer = tcp_frame(connection, deadline, buffer)
+                    newline = buffer.find(b"\n")
+                    if newline < 0:
+                        if len(buffer) > MAX_FRAME:
+                            raise RuntimeError("TCP frame too large")
+                        read_deadline = (
+                            min(deadline, time.monotonic() + 1.0)
+                            if args.stop_path is not None
+                            else deadline
+                        )
+                        connection.settimeout(max(0.01, read_deadline - time.monotonic()))
+                        chunk = connection.recv(MAX_FRAME + 1 - len(buffer))
+                        if not chunk:
+                            if args.stop_path is not None:
+                                connection.close()
+                                connection = None
+                                tcp_ended = True
+                                continue
+                            raise RuntimeError("TCP frame ended early")
+                        buffer += chunk
+                        newline = buffer.find(b"\n")
+                        if newline < 0:
+                            continue
+                    if newline > MAX_FRAME:
+                        raise RuntimeError("TCP frame too large")
+                    data, buffer = buffer[:newline], buffer[newline + 1:]
                 elif stream_peer is not None:
                     sock.settimeout(min(1.0, max(0.01, deadline - time.monotonic())))
                     data = sock.recv(MAX_FRAME + 1)
@@ -15666,25 +15915,37 @@ def stream_server(args):
                 stream_peer = (str(peer[0]), int(peer[1]))
                 sock.connect(stream_peer)
             ack = {"connection_id": request["connection_id"], "flow_id": args.flow_id, "kind": "ack", "sequence": sequence}
+            encoded_ack = encode(ack, tcp)
             if tcp:
-                connection.sendall(encode(ack, True))
-            else:
-                sock.send(encode(ack))
+                connection.sendall(encoded_ack)
+            elif sock.send(encoded_ack) != len(encoded_ack):
+                raise RuntimeError("UDP acknowledgement was not sent in full")
     finally:
         if connection is not None:
             connection.close()
         sock.close()
-    emit({"duplicates": duplicates, "flow_id": args.flow_id, "receives": len(seen), "sessions": len(sources), "success": duplicates == 0 and len(sources) == 1})
+    emit({"duplicates": duplicates, "flow_id": args.flow_id, "receives": len(seen), "sessions": len(sources),
+          "stop_observed": stop_observed, "success": duplicates == 0 and len(sources) == 1})
 
 def stream_client(args):
     tcp = args.protocol == "tcp"
+    if (
+        (args.stop_path is None) != (args.stop_token is None)
+        or args.stop_path is not None
+        and args.stop_path != "/run/envelope-e2e-stream-" + args.flow_id + ".client-stop"
+    ):
+        raise RuntimeError("stream client stop path is invalid")
+    if not 20 <= args.minimum_count <= args.count <= 160:
+        raise RuntimeError("stream marker count is invalid")
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM if tcp else socket.SOCK_DGRAM)
     connection_id = args.flow_id + ":c0001"
     markers = []
     interrupted = False
     sent_markers = 0
+    attempts = []
     last_sent_monotonic_ns = None
-    buffer = b""
+    buffer = bytearray()
+    stop_observed = False
     try:
         try:
             os.unlink(args.ready_path)
@@ -15697,30 +15958,38 @@ def stream_client(args):
             target = started + sequence * args.interval
             if target > time.monotonic():
                 time.sleep(target - time.monotonic())
-            sent = time.monotonic_ns()
+            stop_after_marker = (
+                args.stop_path is not None
+                and sequence + 1 >= args.minimum_count
+                and private_stop_requested(args.stop_path, args.stop_token)
+            )
             request = {"connection_id": connection_id, "flow_id": args.flow_id, "kind": "marker", "sequence": sequence}
+            encoded_request = encode(request, tcp)
             try:
-                sock.sendall(encode(request, True)) if tcp else sock.send(encode(request))
+                if tcp:
+                    sock.sendall(encoded_request)
+                elif sock.send(encoded_request) != len(encoded_request):
+                    raise OSError("UDP marker was not sent in full")
             except OSError:
                 interrupted = True
                 break
+            sent = time.monotonic_ns()
             sent_markers += 1
+            attempts.append(sent)
             last_sent_monotonic_ns = sent
             ack_deadline = time.monotonic() + args.ack_timeout
             while time.monotonic() < ack_deadline:
                 sock.settimeout(max(0.01, ack_deadline - time.monotonic()))
                 try:
                     if tcp:
-                        while b"\n" not in buffer:
-                            buffer += sock.recv(MAX_FRAME + 1 - len(buffer))
-                        raw, buffer = buffer.split(b"\n", 1)
+                        raw, buffer = tcp_frame(sock, ack_deadline, buffer)
                         response = decode(raw)
                     else:
                         response = decode(sock.recv(MAX_FRAME + 1))
                 except (socket.timeout, OSError, RuntimeError):
                     break
                 if response == {"connection_id": connection_id, "flow_id": args.flow_id, "kind": "ack", "sequence": sequence}:
-                    markers.append([sequence, sent, time.monotonic_ns()])
+                    markers.append([sequence, time.monotonic_ns()])
                     if sequence == 0:
                         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
                         if hasattr(os, "O_NOFOLLOW"):
@@ -15731,12 +16000,15 @@ def stream_client(args):
                         finally:
                             os.close(descriptor)
                     break
+            if stop_after_marker:
+                stop_observed = True
+                break
     finally:
         sock.close()
-    emit({"connection_id": connection_id, "flow_id": args.flow_id, "markers": markers,
+    emit({"attempts": attempts, "connection_id": connection_id, "flow_id": args.flow_id, "markers": markers,
           "interrupted": interrupted, "last_sent_monotonic_ns": last_sent_monotonic_ns,
           "sent_markers": sent_markers, "socket_count": 1, "source_port": args.source_port,
-          "success": True})
+          "stop_observed": stop_observed, "success": True})
 
 def sized_udp_server(args):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -15880,6 +16152,7 @@ def main():
     server.add_argument("--protocol", choices=("tcp", "udp"), required=True)
     server.add_argument("--bind", required=True); server.add_argument("--port", type=int, required=True)
     server.add_argument("--flow-id", required=True); server.add_argument("--duration", type=float, required=True)
+    server.add_argument("--stop-path"); server.add_argument("--stop-token")
     stream = sub.add_parser("stream-client")
     stream.add_argument("--protocol", choices=("tcp", "udp"), required=True)
     stream.add_argument("--host", required=True); stream.add_argument("--port", type=int, required=True)
@@ -15887,6 +16160,8 @@ def main():
     stream.add_argument("--flow-id", required=True); stream.add_argument("--count", type=int, required=True)
     stream.add_argument("--interval", type=float, required=True); stream.add_argument("--ack-timeout", type=float, required=True)
     stream.add_argument("--ready-path", required=True)
+    stream.add_argument("--stop-path"); stream.add_argument("--stop-token")
+    stream.add_argument("--minimum-count", type=int, default=20)
     icmp = sub.add_parser("icmp-client")
     icmp.add_argument("--host", required=True); icmp.add_argument("--source-ip", required=True)
     icmp.add_argument("--flow-id", required=True); icmp.add_argument("--payload-bytes", type=int, required=True)
@@ -15978,6 +16253,36 @@ WORKLOAD_SOURCE_ROUTE_JQ = (
 class FlowLogHandle:
     flow_logs: dict[Site, ManagedFlowLog]
     started_milliseconds: int
+
+
+@dataclasses.dataclass
+class _ContinuityStreamState:
+    flow: FlowRecord
+    maximum_loss_ns: int
+    label: str
+    allow_right_censored: bool
+    duration: int
+    count: int
+    ready_path: str
+    client_stop_path: str
+    server_stop_path: str
+    client_stop_token: str
+    server_stop_token: str
+    server_spec: SSMCommand
+    client_spec: SSMCommand
+    server_dispatch_attempted: bool = False
+    client_dispatch_attempted: bool = False
+    server_id: str | None = None
+    client_id: str | None = None
+    server_terminal: bool = False
+    client_terminal: bool = False
+    client_stop_created: bool = False
+    server_stop_created: bool = False
+    pause_acquired: bool = False
+    client_result: SSMResult | None = None
+    server_result: SSMResult | None = None
+    client: dict[str, Any] | None = None
+    receiver: dict[str, Any] | None = None
 
 
 @dataclasses.dataclass
@@ -16808,13 +17113,13 @@ exit 1"""
             pauses[key] = depth + 1
             return
         unit = self._responder_unit(protocol)
+        pauses[key] = 1
         self._execute(
             target,
             f"set -euo pipefail; systemctl stop {shlex.quote(unit)}; ! systemctl is-active --quiet {shlex.quote(unit)}",
             timeout_seconds=20,
             comment="Envelope E2E pause managed receiver",
         )
-        pauses[key] = 1
 
     def _resume_managed_responder(self, target: SSMTarget, protocol: ProtocolName) -> None:
         if protocol == "icmp":
@@ -16827,19 +17132,21 @@ exit 1"""
         if depth > 1:
             pauses[key] = depth - 1
             return
-        del pauses[key]
         unit = self._responder_unit(protocol)
         selector = "-ltn" if protocol == "tcp" else "-lun"
         self._execute(
             target,
             "set -euo pipefail; "
+            f"if ! systemctl is-active --quiet {shlex.quote(unit)}; then "
             f"for attempt in $(seq 1 20); do ss -H {selector} 'sport = :5201' | grep -q . || break; sleep 0.25; done; "
             f"! ss -H {selector} 'sport = :5201' | grep -q .; "
-            f"systemctl start {shlex.quote(unit)}; systemctl is-active --quiet {shlex.quote(unit)}",
+            f"systemctl start {shlex.quote(unit)}; fi; "
+            f"systemctl is-active --quiet {shlex.quote(unit)}",
             timeout_seconds=30,
             comment="Envelope E2E restore managed receiver",
         )
         self._wait_listener(target, protocol, timeout_seconds=10)
+        del pauses[key]
 
     def _start_directional_captures(
         self,
@@ -17268,13 +17575,26 @@ exit 1"""
             comment="Envelope E2E receiver-observed probe",
         )
         server_id: str | None = None
+        server_dispatch_attempted = False
+        server_terminal = False
+        server_wait_in_progress = False
+        listener_dispatch_in_progress = False
+        client_dispatch_in_progress = False
+        commands_terminated = True
         pause_acquired = False
+        pause_dispatch_in_progress = False
         control_flow_interrupted = False
+        primary_error: BaseException | None = None
         try:
-            self._pause_managed_responder(flow.destination, flow.protocol)
             pause_acquired = True
+            pause_dispatch_in_progress = True
+            self._pause_managed_responder(flow.destination, flow.protocol)
+            pause_dispatch_in_progress = False
+            server_dispatch_attempted = True
             server_id = self.ssm.send(server_spec, timeout_seconds=10)
+            listener_dispatch_in_progress = True
             self._wait_listener(flow.destination, flow.protocol, timeout_seconds=min(20, timeout_seconds))
+            listener_dispatch_in_progress = False
             if before_client is not None:
                 before_client()
             client_probe_timeout = min(30, timeout_seconds)
@@ -17304,18 +17624,23 @@ exit 1"""
                     str(client_probe_timeout),
                 ]
             )
+            client_dispatch_in_progress = True
             client = self._execute_json(
                 flow.source,
                 client_command,
                 timeout_seconds=client_execution_timeout,
                 comment="Envelope E2E unique cold probe",
             )
+            client_dispatch_in_progress = False
+            server_wait_in_progress = True
             server_result = self.ssm.wait(
                 flow.destination,
                 cast(str, server_id),
                 timeout_seconds=server_execution_timeout
                 + PROBE_COMMAND_HEADROOM_SECONDS,
             )
+            server_wait_in_progress = False
+            server_terminal = True
             if not server_result.succeeded:
                 raise _attach_ssm_output(
                     ProbeError(
@@ -17327,21 +17652,86 @@ exit 1"""
         except PROTECTED_CONTROL_FLOW:
             control_flow_interrupted = True
             raise
-        except Exception:
-            if server_id is not None:
-                try:
-                    self.ssm.cancel(flow.destination, server_id, timeout_seconds=5)
-                    self.ssm.wait(
-                        flow.destination,
-                        server_id,
-                        timeout_seconds=5,
-                    )
-                except E2EError:
-                    pass
+        except BaseException as error:
+            primary_error = error
+            if (
+                _ssm_ownership_unconfirmed(error)
+                and not server_wait_in_progress
+            ) or (
+                isinstance(error, KeyboardInterrupt)
+                and (
+                    pause_dispatch_in_progress
+                    or listener_dispatch_in_progress
+                    or client_dispatch_in_progress
+                    or server_dispatch_attempted
+                    and server_id is None
+                )
+            ):
+                commands_terminated = False
+                _mark_ssm_ownership_unconfirmed(error)
+            if server_dispatch_attempted and not server_terminal:
+                if server_id is None:
+                    commands_terminated = False
+                    _mark_ssm_ownership_unconfirmed(error)
+                else:
+                    try:
+                        terminate = getattr(self.ssm, "terminate", None)
+                        if callable(terminate):
+                            terminate(
+                                flow.destination,
+                                server_id,
+                                timeout_seconds=5,
+                            )
+                        else:
+                            self.ssm.cancel(
+                                flow.destination,
+                                server_id,
+                                timeout_seconds=5,
+                            )
+                            self.ssm.wait(
+                                flow.destination,
+                                server_id,
+                                timeout_seconds=5,
+                            )
+                        server_terminal = True
+                    except (
+                        ProtectedHardTimeout,
+                        ProtectedTermination,
+                        KeyboardInterrupt,
+                    ) as termination_error:
+                        control_flow_interrupted = True
+                        _mark_ssm_ownership_unconfirmed(termination_error)
+                        raise
+                    except Exception as termination_error:
+                        commands_terminated = False
+                        _mark_ssm_ownership_unconfirmed(error)
+                        if hasattr(error, "add_note"):
+                            error.add_note(
+                                "probe receiver termination was not verified: "
+                                + _sanitize_string(str(termination_error))
+                            )
             raise
         finally:
-            if pause_acquired and not control_flow_interrupted:
-                self._resume_managed_responder(flow.destination, flow.protocol)
+            if (
+                pause_acquired
+                and not pause_dispatch_in_progress
+                and not control_flow_interrupted
+                and commands_terminated
+            ):
+                try:
+                    self._resume_managed_responder(
+                        flow.destination, flow.protocol
+                    )
+                except (ProtectedHardTimeout, ProtectedTermination, KeyboardInterrupt):
+                    raise
+                except BaseException as restoration_error:
+                    if primary_error is not None:
+                        if hasattr(primary_error, "add_note"):
+                            primary_error.add_note(
+                                "managed responder restoration also failed"
+                            )
+                        raise primary_error from restoration_error
+                    raise
         if (
             client.get("flow_id") != flow.flow_id
             or client.get("payload_sha256") != payload_sha256
@@ -17524,9 +17914,12 @@ exit 1"""
         )
         server_id: str | None = None
         pause_acquired = False
+        pause_dispatch_in_progress = False
         try:
-            self._pause_managed_responder(flow.destination, "udp")
             pause_acquired = True
+            pause_dispatch_in_progress = True
+            self._pause_managed_responder(flow.destination, "udp")
+            pause_dispatch_in_progress = False
             server_id = self.ssm.send(server_spec, timeout_seconds=10)
             self._wait_listener(flow.destination, "udp", timeout_seconds=min(15, timeout_seconds))
             client_parts = [
@@ -17571,7 +17964,7 @@ exit 1"""
                     pass
             raise
         finally:
-            if pause_acquired:
+            if pause_acquired and not pause_dispatch_in_progress:
                 self._resume_managed_responder(flow.destination, "udp")
         if client.get("payload_sha256") != payload_sha256 or client.get("payload_bytes") != payload_bytes:
             raise TransportError(f"sized UDP client {flow.flow_id} changed its exact payload")
@@ -17791,9 +18184,12 @@ exit 1"""
         raw_capture_deleted = False
         capture_path = f"/run/envelope-e2e-capture/{flow.flow_id}-syn.pcap"
         pause_acquired = False
+        pause_dispatch_in_progress = False
         try:
-            self._pause_managed_responder(flow.destination, "tcp")
             pause_acquired = True
+            pause_dispatch_in_progress = True
+            self._pause_managed_responder(flow.destination, "tcp")
+            pause_dispatch_in_progress = False
             server_id = self.ssm.send(
                 SSMCommand(
                     flow.destination,
@@ -17908,7 +18304,7 @@ exit 1"""
                         "error_count": 0 if raw_capture_deleted else 1,
                     }
                 )
-                if pause_acquired:
+                if pause_acquired and not pause_dispatch_in_progress:
                     self._resume_managed_responder(flow.destination, "tcp")
         connected = client.get("start", {}).get("connected") if isinstance(client.get("start"), Mapping) else None
         received = client.get("end", {}).get("sum_received") if isinstance(client.get("end"), Mapping) else None
@@ -18176,14 +18572,23 @@ exit 1"""
         label: str,
         mutate_and_restore: Callable[[], Mapping[str, Any]],
         allow_right_censored: bool = False,
-        expose_interval: bool = False,
+        stop_after_mutation: bool = False,
     ) -> tuple[StreamAnalysis | StreamInterruption, dict[str, Any], Mapping[str, Any]]:
         if flow.protocol not in TRANSPORT_PROTOCOLS:
             raise StreamAnalysisError("continuity stream must use TCP or UDP")
-        duration = max(35, min(3500, timeout_seconds + 30))
+        if type(stop_after_mutation) is not bool:
+            raise StreamAnalysisError("continuity stream completion mode must be boolean")
+        duration = _continuity_stream_duration_seconds(
+            timeout_seconds,
+            controlled_completion=stop_after_mutation,
+        )
         interval = max(0.5, duration / 160.0)
         count = max(20, int((duration - 2) / interval))
         ready_path = f"/run/envelope-e2e-stream-{flow.flow_id}.ready"
+        client_stop_path = f"/run/envelope-e2e-stream-{flow.flow_id}.client-stop"
+        server_stop_path = f"/run/envelope-e2e-stream-{flow.flow_id}.server-stop"
+        client_stop_token = str(uuid.uuid4())
+        server_stop_token = str(uuid.uuid4())
         server_command = " ".join(
             [
                 "set -euo pipefail; exec",
@@ -18199,6 +18604,16 @@ exit 1"""
                 flow.flow_id,
                 "--duration",
                 str(duration),
+                *(
+                    [
+                        "--stop-path",
+                        shlex.quote(server_stop_path),
+                        "--stop-token",
+                        shlex.quote(server_stop_token),
+                    ]
+                    if stop_after_mutation
+                    else []
+                ),
             ]
         )
         client_command = " ".join(
@@ -18226,6 +18641,18 @@ exit 1"""
                 "0.3",
                 "--ready-path",
                 shlex.quote(ready_path),
+                *(
+                    [
+                        "--stop-path",
+                        shlex.quote(client_stop_path),
+                        "--stop-token",
+                        shlex.quote(client_stop_token),
+                        "--minimum-count",
+                        "20",
+                    ]
+                    if stop_after_mutation
+                    else []
+                ),
             ]
         )
         server_spec = SSMCommand(
@@ -18242,19 +18669,136 @@ exit 1"""
         )
         server_id: str | None = None
         client_id: str | None = None
+        server_dispatch_attempted = False
+        client_dispatch_attempted = False
+        server_terminal = False
+        client_terminal = False
+        client_stop_created = False
+        server_stop_created = False
         pause_acquired = False
         control_flow_interrupted = False
+        pause_dispatch_in_progress = False
+        stop_dispatch_in_progress = False
+        cleanup_dispatch_in_progress = False
+        primary_error: BaseException | None = None
+        commands_terminated = True
+
+        validate_stop_source = (
+            "import os,stat,sys; expected=(sys.argv[2]+'\\n').encode('ascii'); "
+            "before=os.lstat(sys.argv[1]); flags=os.O_RDONLY|getattr(os,'O_NOFOLLOW',0); "
+            "descriptor=os.open(sys.argv[1],flags); opened=os.fstat(descriptor); "
+            "content=os.read(descriptor,128); os.close(descriptor); valid=("
+            "stat.S_ISREG(before.st_mode) and before.st_uid==0 and "
+            "stat.S_IMODE(before.st_mode)==0o600 and "
+            "(before.st_dev,before.st_ino)==(opened.st_dev,opened.st_ino) and "
+            "content==expected); raise SystemExit(0 if valid else 2)"
+        )
+
+        def create_stop_file(
+            target: RemoteTarget, path: str, token: str, comment: str
+        ) -> None:
+            source = (
+                "import os,stat,sys\n"
+                "payload=(sys.argv[2]+'\\n').encode('ascii')\n"
+                "flags=os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,'O_NOFOLLOW',0)\n"
+                "descriptor=os.open(sys.argv[1],flags,0o600)\n"
+                "valid=False\n"
+                "try:\n"
+                " os.fchmod(descriptor,0o600)\n"
+                " written=os.write(descriptor,payload)\n"
+                " os.fsync(descriptor)\n"
+                " value=os.fstat(descriptor)\n"
+                " valid=(written==len(payload) and stat.S_ISREG(value.st_mode) and "
+                "value.st_uid==0 and stat.S_IMODE(value.st_mode)==0o600)\n"
+                "finally:\n"
+                " os.close(descriptor)\n"
+                " if not valid:\n"
+                "  try: os.unlink(sys.argv[1])\n"
+                "  except FileNotFoundError: pass\n"
+                "raise SystemExit(0 if valid else 2)"
+            )
+            try:
+                self._execute(
+                    target,
+                    f"set -euo pipefail; python3 -c {shlex.quote(source)} "
+                    f"{shlex.quote(path)} {shlex.quote(token)}",
+                    timeout_seconds=15,
+                    comment=comment,
+                )
+            except PROTECTED_CONTROL_FLOW:
+                raise
+            except KeyboardInterrupt:
+                raise
+            except (SSMDispatchError, SSMTerminationError):
+                raise
+            except E2EError as error:
+                try:
+                    self._execute(
+                        target,
+                        f"set -euo pipefail; python3 -c {shlex.quote(validate_stop_source)} "
+                        f"{shlex.quote(path)} {shlex.quote(token)}",
+                        timeout_seconds=15,
+                        comment=f"{comment} reconciliation",
+                    )
+                except PROTECTED_CONTROL_FLOW:
+                    raise
+                except KeyboardInterrupt:
+                    raise
+                except (SSMDispatchError, SSMTerminationError):
+                    raise
+                except E2EError:
+                    raise error
+
+        def delete_stop_file(
+            target: RemoteTarget, path: str, token: str, comment: str
+        ) -> None:
+            source = (
+                validate_stop_source.rsplit("; raise SystemExit", 1)[0]
+                + "; current=os.lstat(sys.argv[1]); valid=valid and "
+                "(current.st_dev,current.st_ino)==(opened.st_dev,opened.st_ino); "
+                "os.unlink(sys.argv[1]) if valid else None; "
+                "raise SystemExit(0 if valid else 2)"
+            )
+            self._execute(
+                target,
+                f"set -euo pipefail; python3 -c {shlex.quote(source)} "
+                f"{shlex.quote(path)} {shlex.quote(token)}; "
+                f"test ! -e {shlex.quote(path)}; test ! -L {shlex.quote(path)}",
+                timeout_seconds=15,
+                comment=comment,
+            )
+
         try:
-            self._pause_managed_responder(flow.destination, flow.protocol)
             pause_acquired = True
+            pause_dispatch_in_progress = True
+            self._pause_managed_responder(flow.destination, flow.protocol)
+            pause_dispatch_in_progress = False
+            if stop_after_mutation:
+                self._execute(
+                    flow.destination,
+                    f"set -euo pipefail; test ! -e {shlex.quote(server_stop_path)}; "
+                    f"test ! -L {shlex.quote(server_stop_path)}",
+                    timeout_seconds=15,
+                    comment="Envelope E2E reset continuity receiver stop",
+                )
+            server_dispatch_attempted = True
             server_id = self.ssm.send(server_spec, timeout_seconds=10)
             self._wait_listener(flow.destination, flow.protocol, timeout_seconds=15)
+            stop_absence = (
+                f"; test ! -e {shlex.quote(client_stop_path)}; "
+                f"test ! -L {shlex.quote(client_stop_path)}"
+                if stop_after_mutation
+                else ""
+            )
             self._execute(
                 flow.source,
-                f"set -euo pipefail; rm -f {shlex.quote(ready_path)}; ! test -e {shlex.quote(ready_path)}",
+                f"set -euo pipefail; rm -f -- {shlex.quote(ready_path)}; "
+                f"test ! -e {shlex.quote(ready_path)}; "
+                f"test ! -L {shlex.quote(ready_path)}{stop_absence}",
                 timeout_seconds=15,
                 comment="Envelope E2E reset continuity readiness",
             )
+            client_dispatch_attempted = True
             client_id = self.ssm.send(client_spec, timeout_seconds=10)
             self._wait_until(
                 lambda: self._execute_json(
@@ -18272,16 +18816,30 @@ exit 1"""
             mutation_start = self._remote_monotonic_ns(flow.source)
             mutation_summary = dict(mutate_and_restore())
             mutation_end = self._remote_monotonic_ns(flow.source)
+            if stop_after_mutation:
+                client_stop_created = True
+                stop_dispatch_in_progress = True
+                create_stop_file(
+                    flow.source,
+                    client_stop_path,
+                    client_stop_token,
+                    "Envelope E2E complete continuity client",
+                )
+                stop_dispatch_in_progress = False
             nested_interval = mutation_summary.pop("_stream_analysis_interval", None)
             if nested_interval is not None:
                 if (
                     not isinstance(nested_interval, Mapping)
+                    or set(nested_interval)
+                    != {"start_monotonic_ns", "end_monotonic_ns"}
                     or isinstance(nested_interval.get("start_monotonic_ns"), bool)
                     or not isinstance(nested_interval.get("start_monotonic_ns"), int)
                     or isinstance(nested_interval.get("end_monotonic_ns"), bool)
                     or not isinstance(nested_interval.get("end_monotonic_ns"), int)
                     or nested_interval["end_monotonic_ns"]
                     < nested_interval["start_monotonic_ns"]
+                    or nested_interval["start_monotonic_ns"] < mutation_start
+                    or nested_interval["end_monotonic_ns"] > mutation_end
                 ):
                     raise StreamAnalysisError("nested stream mutation interval is invalid")
                 mutation_start = cast(int, nested_interval["start_monotonic_ns"])
@@ -18291,11 +18849,23 @@ exit 1"""
                 client_id,
                 timeout_seconds=max(20, duration + 40),
             )
+            client_terminal = True
+            if stop_after_mutation:
+                server_stop_created = True
+                stop_dispatch_in_progress = True
+                create_stop_file(
+                    flow.destination,
+                    server_stop_path,
+                    server_stop_token,
+                    "Envelope E2E complete continuity receiver",
+                )
+                stop_dispatch_in_progress = False
             server_result = self.ssm.wait(
                 flow.destination,
                 cast(str, server_id),
                 timeout_seconds=max(20, duration + 40),
             )
+            server_terminal = True
             if not client_result.succeeded or not server_result.succeeded:
                 raise StreamAnalysisError(
                     f"{label} continuity commands did not both complete: "
@@ -18304,38 +18874,209 @@ exit 1"""
                 )
             client = self._json_from_result(client_result)
             receiver = self._json_from_result(server_result)
+            cleanup_dispatch_in_progress = True
             self._execute(
                 flow.source,
-                f"set -u; rm -f {shlex.quote(ready_path)}; ! test -e {shlex.quote(ready_path)}",
+                f"set -euo pipefail; rm -f -- {shlex.quote(ready_path)}; "
+                f"test ! -e {shlex.quote(ready_path)}; "
+                f"test ! -L {shlex.quote(ready_path)}",
                 timeout_seconds=15,
                 comment="Envelope E2E delete continuity readiness",
             )
-        except PROTECTED_CONTROL_FLOW:
-            control_flow_interrupted = True
-            raise
-        except Exception:
-            for target, command_id in ((flow.source, client_id), (flow.destination, server_id)):
-                if command_id is None:
-                    continue
-                try:
-                    self.ssm.cancel(target, command_id, timeout_seconds=5)
-                except E2EError:
-                    pass
-            try:
-                self._execute(
+            cleanup_dispatch_in_progress = False
+            if client_stop_created:
+                cleanup_dispatch_in_progress = True
+                delete_stop_file(
                     flow.source,
-                    f"set -u; rm -f {shlex.quote(ready_path)}",
-                    timeout_seconds=15,
-                    comment="Envelope E2E delete continuity readiness",
+                    client_stop_path,
+                    client_stop_token,
+                    "Envelope E2E delete continuity client stop",
                 )
-            except E2EError:
-                pass
+                cleanup_dispatch_in_progress = False
+                client_stop_created = False
+            if server_stop_created:
+                cleanup_dispatch_in_progress = True
+                delete_stop_file(
+                    flow.destination,
+                    server_stop_path,
+                    server_stop_token,
+                    "Envelope E2E delete continuity receiver stop",
+                )
+                cleanup_dispatch_in_progress = False
+                server_stop_created = False
+        except BaseException as error:
+            primary_error = error
+            if isinstance(error, PROTECTED_CONTROL_FLOW):
+                control_flow_interrupted = True
+                raise
+            if _ssm_ownership_unconfirmed(error) or (
+                isinstance(error, KeyboardInterrupt)
+                and (
+                    pause_dispatch_in_progress
+                    or stop_dispatch_in_progress
+                    or cleanup_dispatch_in_progress
+                )
+            ):
+                commands_terminated = False
+            try:
+                for target, attempted, command_id, terminal in (
+                    (
+                        flow.source,
+                        client_dispatch_attempted,
+                        client_id,
+                        client_terminal,
+                    ),
+                    (
+                        flow.destination,
+                        server_dispatch_attempted,
+                        server_id,
+                        server_terminal,
+                    ),
+                ):
+                    if not attempted or terminal:
+                        continue
+                    if command_id is None:
+                        commands_terminated = False
+                        if hasattr(error, "add_note"):
+                            error.add_note(
+                                "continuity command dispatch ownership is unknown; "
+                                "managed responder restoration was suppressed"
+                            )
+                        continue
+                    try:
+                        terminate = getattr(self.ssm, "terminate", None)
+                        if callable(terminate):
+                            terminate(target, command_id, timeout_seconds=5)
+                        else:
+                            self.ssm.cancel(target, command_id, timeout_seconds=5)
+                            self.ssm.wait(target, command_id, timeout_seconds=5)
+                    except (ProtectedHardTimeout, ProtectedTermination, KeyboardInterrupt):
+                        control_flow_interrupted = True
+                        raise
+                    except Exception as termination_error:
+                        commands_terminated = False
+                        if hasattr(error, "add_note"):
+                            error.add_note(
+                                "continuity command termination was not verified: "
+                                + _sanitize_string(str(termination_error))
+                            )
+                if commands_terminated:
+                    try:
+                        self._execute(
+                            flow.source,
+                            "set -u; rm -f -- " + shlex.quote(ready_path),
+                            timeout_seconds=15,
+                            comment="Envelope E2E delete continuity readiness",
+                        )
+                    except PROTECTED_CONTROL_FLOW:
+                        raise
+                    except (SSMDispatchError, SSMTerminationError) as cleanup_error:
+                        commands_terminated = False
+                        if hasattr(error, "add_note"):
+                            error.add_note(
+                                "continuity readiness cleanup dispatch was not confirmed: "
+                                + _sanitize_string(str(cleanup_error))
+                            )
+                    except E2EError as cleanup_error:
+                        if hasattr(error, "add_note"):
+                            error.add_note(
+                                "continuity readiness cleanup failed: "
+                                + _sanitize_string(str(cleanup_error))
+                            )
+                    for target, path, token, comment in (
+                        (
+                            flow.source,
+                            client_stop_path,
+                            client_stop_token,
+                            "Envelope E2E delete continuity client stop",
+                        )
+                        if client_stop_created
+                        else (None, None, None, None),
+                        (
+                            flow.destination,
+                            server_stop_path,
+                            server_stop_token,
+                            "Envelope E2E delete continuity receiver stop",
+                        )
+                        if server_stop_created
+                        else (None, None, None, None),
+                    ):
+                        if target is None:
+                            continue
+                        try:
+                            delete_stop_file(
+                                target,
+                                cast(str, path),
+                                cast(str, token),
+                                cast(str, comment),
+                            )
+                        except PROTECTED_CONTROL_FLOW:
+                            raise
+                        except (SSMDispatchError, SSMTerminationError) as cleanup_error:
+                            commands_terminated = False
+                            if hasattr(error, "add_note"):
+                                error.add_note(
+                                    "continuity stop cleanup dispatch was not confirmed: "
+                                    + _sanitize_string(str(cleanup_error))
+                                )
+                        except E2EError as cleanup_error:
+                            if hasattr(error, "add_note"):
+                                error.add_note(
+                                    "continuity stop cleanup failed: "
+                                    + _sanitize_string(str(cleanup_error))
+                                )
+            except (ProtectedHardTimeout, ProtectedTermination, KeyboardInterrupt):
+                control_flow_interrupted = True
+                raise
             raise
         finally:
-            if pause_acquired and not control_flow_interrupted:
-                self._resume_managed_responder(flow.destination, flow.protocol)
+            if pause_acquired and not control_flow_interrupted and commands_terminated:
+                try:
+                    self._resume_managed_responder(flow.destination, flow.protocol)
+                except PROTECTED_CONTROL_FLOW:
+                    raise
+                except KeyboardInterrupt:
+                    raise
+                except BaseException as restoration_error:
+                    if primary_error is not None:
+                        if hasattr(primary_error, "add_note"):
+                            primary_error.add_note(
+                                "managed responder restoration also failed"
+                            )
+                        raise primary_error from restoration_error
+                    raise
+        analysis = self._analyze_continuity_stream(
+            flow,
+            count=count,
+            client=client,
+            receiver=receiver,
+            mutation_start=mutation_start,
+            mutation_end=mutation_end,
+            maximum_loss_ns=maximum_loss_ns,
+            label=label,
+            allow_right_censored=allow_right_censored,
+            controlled_completion=stop_after_mutation,
+        )
+        return analysis, receiver, mutation_summary
+
+    @staticmethod
+    def _analyze_continuity_stream(
+        flow: FlowRecord,
+        *,
+        count: int,
+        client: Mapping[str, Any],
+        receiver: Mapping[str, Any],
+        mutation_start: int,
+        mutation_end: int,
+        maximum_loss_ns: int,
+        label: str,
+        allow_right_censored: bool,
+        controlled_completion: bool,
+    ) -> StreamAnalysis | StreamInterruption:
+        attempts = _compact_stream_attempts(client)
         markers = _expand_compact_stream_markers(client)
         client_keys = {
+            "attempts",
             "connection_id",
             "flow_id",
             "interrupted",
@@ -18344,34 +19085,57 @@ exit 1"""
             "sent_markers",
             "socket_count",
             "source_port",
+            "stop_observed",
             "success",
         }
         sent_marker_count = client.get("sent_markers")
         last_sent_monotonic_ns = client.get("last_sent_monotonic_ns")
         client_interrupted = client.get("interrupted")
+        client_stop_observed = client.get("stop_observed")
         if (
             set(client) != client_keys
             or client.get("flow_id") != flow.flow_id
             or client.get("connection_id") != f"{flow.flow_id}:c0001"
             or client_interrupted is not False
+            or type(client_stop_observed) is not bool
             or client.get("socket_count") != 1
             or client.get("source_port") != flow.source_port
             or isinstance(sent_marker_count, bool)
             or not isinstance(sent_marker_count, int)
-            or not 2 <= sent_marker_count <= count
+            or not 20 <= sent_marker_count <= count
             or isinstance(last_sent_monotonic_ns, bool)
             or not isinstance(last_sent_monotonic_ns, int)
             or last_sent_monotonic_ns < 0
-            or sent_marker_count != count
+            or len(attempts) != sent_marker_count
+            or attempts[-1] != last_sent_monotonic_ns
+            or not controlled_completion
+            and sent_marker_count != count
+            or not controlled_completion
+            and client_stop_observed is not False
+            or controlled_completion
+            and client_stop_observed is not True
         ):
             raise StreamAnalysisError(f"{label} did not retain one exact source socket")
-        receiver_keys = {"duplicates", "flow_id", "receives", "sessions", "success"}
+        receiver_keys = {
+            "duplicates",
+            "flow_id",
+            "receives",
+            "sessions",
+            "stop_observed",
+            "success",
+        }
         receiver_count = receiver.get("receives")
+        receiver_stop_observed = receiver.get("stop_observed")
         if (
             set(receiver) != receiver_keys
             or receiver.get("flow_id") != flow.flow_id
             or receiver.get("duplicates") != 0
             or receiver.get("sessions") != 1
+            or type(receiver_stop_observed) is not bool
+            or not controlled_completion
+            and receiver_stop_observed is not False
+            or controlled_completion
+            and receiver_stop_observed is not True
             or isinstance(receiver_count, bool)
             or not isinstance(receiver_count, int)
             or not len(markers) <= receiver_count <= sent_marker_count
@@ -18380,40 +19144,603 @@ exit 1"""
                 f"{label} receiver observed invalid marker, duplicate, or session state"
             )
         mutation = MutationInterval(mutation_start, mutation_end, label)
-        if markers and markers[-1].sequence == count - 1:
+        if markers and markers[-1].sequence == sent_marker_count - 1:
             analysis: StreamAnalysis | StreamInterruption = analyze_stream_markers(
                 markers,
                 mutation,
                 maximum_loss_ns=maximum_loss_ns,
+                attempted_monotonic_ns=attempts,
                 expected_first_sequence=0,
-                expected_last_sequence=count - 1,
+                expected_last_sequence=sent_marker_count - 1,
             )
         elif allow_right_censored:
             analysis = analyze_interrupted_stream_markers(
                 markers,
                 mutation,
                 protocol=flow.protocol,
-                expected_marker_count=count,
+                expected_marker_count=sent_marker_count,
                 sent_marker_count=sent_marker_count,
-                last_sent_monotonic_ns=last_sent_monotonic_ns,
+                attempted_monotonic_ns=attempts,
             )
         else:
             analysis = analyze_stream_markers(
                 markers,
                 mutation,
                 maximum_loss_ns=maximum_loss_ns,
+                attempted_monotonic_ns=attempts,
                 expected_first_sequence=0,
-                expected_last_sequence=count - 1,
+                expected_last_sequence=sent_marker_count - 1,
             )
-        if expose_interval:
-            mutation_summary = {
-                **dict(mutation_summary),
-                "_stream_analysis_interval": {
-                    "start_monotonic_ns": mutation_start,
-                    "end_monotonic_ns": mutation_end,
-                },
-            }
-        return analysis, receiver, mutation_summary
+        return analysis
+
+    def _new_controlled_continuity_state(
+        self,
+        flow: FlowRecord,
+        *,
+        timeout_seconds: int,
+        maximum_loss_ns: int,
+        label: str,
+    ) -> _ContinuityStreamState:
+        duration = _continuity_stream_duration_seconds(
+            timeout_seconds,
+            controlled_completion=True,
+        )
+        interval = max(0.5, duration / 160.0)
+        count = max(20, int((duration - 2) / interval))
+        ready_path = f"/run/envelope-e2e-stream-{flow.flow_id}.ready"
+        client_stop_path = (
+            f"/run/envelope-e2e-stream-{flow.flow_id}.client-stop"
+        )
+        server_stop_path = (
+            f"/run/envelope-e2e-stream-{flow.flow_id}.server-stop"
+        )
+        client_stop_token = str(uuid.uuid4())
+        server_stop_token = str(uuid.uuid4())
+        server_command = " ".join(
+            [
+                "set -euo pipefail; exec",
+                shlex.quote(REMOTE_AGENT_PATH),
+                "stream-server",
+                "--protocol",
+                flow.protocol,
+                "--bind",
+                flow.destination.private_ip,
+                "--port",
+                str(flow.destination_port),
+                "--flow-id",
+                flow.flow_id,
+                "--duration",
+                str(duration),
+                "--stop-path",
+                shlex.quote(server_stop_path),
+                "--stop-token",
+                shlex.quote(server_stop_token),
+            ]
+        )
+        client_command = " ".join(
+            [
+                "set -euo pipefail; exec",
+                shlex.quote(REMOTE_AGENT_PATH),
+                "stream-client",
+                "--protocol",
+                flow.protocol,
+                "--host",
+                flow.destination.private_ip,
+                "--port",
+                str(flow.destination_port),
+                "--source-ip",
+                flow.source.private_ip,
+                "--source-port",
+                str(flow.source_port),
+                "--flow-id",
+                flow.flow_id,
+                "--count",
+                str(count),
+                "--interval",
+                str(interval),
+                "--ack-timeout",
+                "0.3",
+                "--ready-path",
+                shlex.quote(ready_path),
+                "--stop-path",
+                shlex.quote(client_stop_path),
+                "--stop-token",
+                shlex.quote(client_stop_token),
+                "--minimum-count",
+                "20",
+            ]
+        )
+        return _ContinuityStreamState(
+            flow=flow,
+            maximum_loss_ns=maximum_loss_ns,
+            label=label,
+            allow_right_censored=True,
+            duration=duration,
+            count=count,
+            ready_path=ready_path,
+            client_stop_path=client_stop_path,
+            server_stop_path=server_stop_path,
+            client_stop_token=client_stop_token,
+            server_stop_token=server_stop_token,
+            server_spec=SSMCommand(
+                flow.destination,
+                (server_command,),
+                timeout_seconds=duration + 30,
+                comment="Envelope E2E continuity receiver",
+            ),
+            client_spec=SSMCommand(
+                flow.source,
+                (client_command,),
+                timeout_seconds=duration + 30,
+                comment="Envelope E2E one-socket continuity stream",
+            ),
+        )
+
+    @staticmethod
+    def _continuity_stop_validation_source() -> str:
+        return (
+            "import os,stat,sys; expected=(sys.argv[2]+'\\n').encode('ascii'); "
+            "before=os.lstat(sys.argv[1]); flags=os.O_RDONLY|getattr(os,'O_NOFOLLOW',0); "
+            "descriptor=os.open(sys.argv[1],flags); opened=os.fstat(descriptor); "
+            "content=os.read(descriptor,128); os.close(descriptor); valid=("
+            "stat.S_ISREG(before.st_mode) and before.st_uid==0 and "
+            "stat.S_IMODE(before.st_mode)==0o600 and "
+            "(before.st_dev,before.st_ino)==(opened.st_dev,opened.st_ino) and "
+            "content==expected); raise SystemExit(0 if valid else 2)"
+        )
+
+    def _create_continuity_stop_file(
+        self,
+        target: RemoteTarget,
+        path: str,
+        token: str,
+        comment: str,
+    ) -> None:
+        source = (
+            "import os,stat,sys\n"
+            "payload=(sys.argv[2]+'\\n').encode('ascii')\n"
+            "flags=os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,'O_NOFOLLOW',0)\n"
+            "descriptor=os.open(sys.argv[1],flags,0o600)\n"
+            "valid=False\n"
+            "try:\n"
+            " os.fchmod(descriptor,0o600)\n"
+            " written=os.write(descriptor,payload)\n"
+            " os.fsync(descriptor)\n"
+            " value=os.fstat(descriptor)\n"
+            " valid=(written==len(payload) and stat.S_ISREG(value.st_mode) and "
+            "value.st_uid==0 and stat.S_IMODE(value.st_mode)==0o600)\n"
+            "finally:\n"
+            " os.close(descriptor)\n"
+            " if not valid:\n"
+            "  try: os.unlink(sys.argv[1])\n"
+            "  except FileNotFoundError: pass\n"
+            "raise SystemExit(0 if valid else 2)"
+        )
+        try:
+            self._execute(
+                target,
+                f"set -euo pipefail; python3 -c {shlex.quote(source)} "
+                f"{shlex.quote(path)} {shlex.quote(token)}",
+                timeout_seconds=15,
+                comment=comment,
+            )
+        except (ProtectedHardTimeout, ProtectedTermination, KeyboardInterrupt):
+            raise
+        except (SSMDispatchError, SSMTerminationError):
+            raise
+        except E2EError as error:
+            validation = self._continuity_stop_validation_source()
+            try:
+                self._execute(
+                    target,
+                    f"set -euo pipefail; python3 -c {shlex.quote(validation)} "
+                    f"{shlex.quote(path)} {shlex.quote(token)}",
+                    timeout_seconds=15,
+                    comment=f"{comment} reconciliation",
+                )
+            except (ProtectedHardTimeout, ProtectedTermination, KeyboardInterrupt):
+                raise
+            except (SSMDispatchError, SSMTerminationError):
+                raise
+            except E2EError:
+                raise error
+
+    def _delete_continuity_stop_file(
+        self,
+        target: RemoteTarget,
+        path: str,
+        token: str,
+        comment: str,
+    ) -> None:
+        validation = self._continuity_stop_validation_source()
+        source = (
+            validation.rsplit("; raise SystemExit", 1)[0]
+            + "; current=os.lstat(sys.argv[1]); valid=valid and "
+            "(current.st_dev,current.st_ino)==(opened.st_dev,opened.st_ino); "
+            "os.unlink(sys.argv[1]) if valid else None; "
+            "raise SystemExit(0 if valid else 2)"
+        )
+        self._execute(
+            target,
+            f"set -euo pipefail; python3 -c {shlex.quote(source)} "
+            f"{shlex.quote(path)} {shlex.quote(token)}; "
+            f"test ! -e {shlex.quote(path)}; test ! -L {shlex.quote(path)}",
+            timeout_seconds=15,
+            comment=comment,
+        )
+
+    def _run_paired_stream_mutation(
+        self,
+        tcp_flow: FlowRecord,
+        udp_flow: FlowRecord,
+        *,
+        timeout_seconds: int,
+        maximum_loss_ns: int,
+        label: str,
+        mutate_and_restore: Callable[[], Mapping[str, Any]],
+    ) -> tuple[
+        dict[str, tuple[StreamAnalysis | StreamInterruption, dict[str, Any]]],
+        Mapping[str, Any],
+    ]:
+        if (
+            tcp_flow.protocol != "tcp"
+            or udp_flow.protocol != "udp"
+            or tcp_flow.source != udp_flow.source
+            or tcp_flow.destination != udp_flow.destination
+        ):
+            raise StreamAnalysisError(
+                "paired continuity requires one TCP and one UDP flow on the same directional lane"
+            )
+        states = (
+            self._new_controlled_continuity_state(
+                tcp_flow,
+                timeout_seconds=timeout_seconds,
+                maximum_loss_ns=maximum_loss_ns,
+                label=f"{label}-tcp",
+            ),
+            self._new_controlled_continuity_state(
+                udp_flow,
+                timeout_seconds=timeout_seconds,
+                maximum_loss_ns=maximum_loss_ns,
+                label=f"{label}-udp",
+            ),
+        )
+        commands_terminated = True
+        control_flow_interrupted = False
+        pause_dispatch_in_progress = False
+        stop_dispatch_in_progress = False
+        cleanup_dispatch_in_progress = False
+        primary_error: BaseException | None = None
+
+        def note(error: BaseException, message: str) -> None:
+            if hasattr(error, "add_note"):
+                error.add_note(message)
+
+        def delete_controls(error: BaseException) -> None:
+            nonlocal commands_terminated
+            for state in states:
+                try:
+                    self._execute(
+                        state.flow.source,
+                        "set -u; rm -f -- " + shlex.quote(state.ready_path),
+                        timeout_seconds=15,
+                        comment="Envelope E2E delete continuity readiness",
+                    )
+                except (ProtectedHardTimeout, ProtectedTermination, KeyboardInterrupt):
+                    raise
+                except (SSMDispatchError, SSMTerminationError) as cleanup_error:
+                    commands_terminated = False
+                    note(
+                        error,
+                        "continuity readiness cleanup dispatch was not confirmed: "
+                        + _sanitize_string(str(cleanup_error)),
+                    )
+                except E2EError as cleanup_error:
+                    note(
+                        error,
+                        "continuity readiness cleanup failed: "
+                        + _sanitize_string(str(cleanup_error)),
+                    )
+                for target, path, token, created, comment in (
+                    (
+                        state.flow.source,
+                        state.client_stop_path,
+                        state.client_stop_token,
+                        state.client_stop_created,
+                        "Envelope E2E delete continuity client stop",
+                    ),
+                    (
+                        state.flow.destination,
+                        state.server_stop_path,
+                        state.server_stop_token,
+                        state.server_stop_created,
+                        "Envelope E2E delete continuity receiver stop",
+                    ),
+                ):
+                    if not created:
+                        continue
+                    try:
+                        self._delete_continuity_stop_file(
+                            target, path, token, comment
+                        )
+                    except (ProtectedHardTimeout, ProtectedTermination, KeyboardInterrupt):
+                        raise
+                    except (SSMDispatchError, SSMTerminationError) as cleanup_error:
+                        commands_terminated = False
+                        note(
+                            error,
+                            "continuity stop cleanup dispatch was not confirmed: "
+                            + _sanitize_string(str(cleanup_error)),
+                        )
+                    except E2EError as cleanup_error:
+                        note(
+                            error,
+                            "continuity stop cleanup failed: "
+                            + _sanitize_string(str(cleanup_error)),
+                        )
+
+        try:
+            for state in states:
+                state.pause_acquired = True
+                pause_dispatch_in_progress = True
+                self._pause_managed_responder(
+                    state.flow.destination, state.flow.protocol
+                )
+                pause_dispatch_in_progress = False
+            for state in states:
+                self._execute(
+                    state.flow.destination,
+                    f"set -euo pipefail; test ! -e {shlex.quote(state.server_stop_path)}; "
+                    f"test ! -L {shlex.quote(state.server_stop_path)}",
+                    timeout_seconds=15,
+                    comment="Envelope E2E reset continuity receiver stop",
+                )
+            for state in states:
+                state.server_dispatch_attempted = True
+                state.server_id = self.ssm.send(
+                    state.server_spec, timeout_seconds=10
+                )
+            for state in states:
+                self._wait_listener(
+                    state.flow.destination,
+                    state.flow.protocol,
+                    timeout_seconds=15,
+                )
+            for state in states:
+                self._execute(
+                    state.flow.source,
+                    f"set -euo pipefail; rm -f -- {shlex.quote(state.ready_path)}; "
+                    f"test ! -e {shlex.quote(state.ready_path)}; "
+                    f"test ! -L {shlex.quote(state.ready_path)}; "
+                    f"test ! -e {shlex.quote(state.client_stop_path)}; "
+                    f"test ! -L {shlex.quote(state.client_stop_path)}",
+                    timeout_seconds=15,
+                    comment="Envelope E2E reset continuity readiness",
+                )
+            for state in states:
+                state.client_dispatch_attempted = True
+                state.client_id = self.ssm.send(
+                    state.client_spec, timeout_seconds=10
+                )
+            for state in states:
+                self._wait_until(
+                    lambda state=state: self._execute_json(
+                        state.flow.source,
+                        f"set -euo pipefail; test -s {shlex.quote(state.ready_path)}; "
+                        "printf '{\"stream_ready\":true,\"success\":true}\\n'",
+                        timeout_seconds=10,
+                        comment="Envelope E2E continuity stream readiness",
+                    ),
+                    lambda value: value.get("stream_ready") is True,
+                    timeout_seconds=20,
+                    description=f"{state.label} first acknowledged continuity marker",
+                    interval_seconds=1,
+                )
+            mutation_start = self._remote_monotonic_ns(tcp_flow.source)
+            mutation_summary = dict(mutate_and_restore())
+            if "_stream_analysis_interval" in mutation_summary:
+                raise StreamAnalysisError(
+                    "failure mutation returned reserved continuity metadata"
+                )
+            mutation_end = self._remote_monotonic_ns(tcp_flow.source)
+            for state in states:
+                state.client_stop_created = True
+                stop_dispatch_in_progress = True
+                self._create_continuity_stop_file(
+                    state.flow.source,
+                    state.client_stop_path,
+                    state.client_stop_token,
+                    "Envelope E2E complete continuity client",
+                )
+                stop_dispatch_in_progress = False
+            for state in states:
+                assert state.client_id is not None
+                state.client_result = self.ssm.wait(
+                    state.flow.source,
+                    state.client_id,
+                    timeout_seconds=max(20, state.duration + 40),
+                )
+                state.client_terminal = True
+            for state in states:
+                state.server_stop_created = True
+                stop_dispatch_in_progress = True
+                self._create_continuity_stop_file(
+                    state.flow.destination,
+                    state.server_stop_path,
+                    state.server_stop_token,
+                    "Envelope E2E complete continuity receiver",
+                )
+                stop_dispatch_in_progress = False
+            for state in states:
+                assert state.server_id is not None
+                state.server_result = self.ssm.wait(
+                    state.flow.destination,
+                    state.server_id,
+                    timeout_seconds=max(20, state.duration + 40),
+                )
+                state.server_terminal = True
+            for state in states:
+                assert state.client_result is not None
+                assert state.server_result is not None
+                if (
+                    not state.client_result.succeeded
+                    or not state.server_result.succeeded
+                ):
+                    raise StreamAnalysisError(
+                        f"{state.label} continuity commands did not both complete: "
+                        f"client={state.client_result.status}/{state.client_result.response_code}, "
+                        f"receiver={state.server_result.status}/{state.server_result.response_code}"
+                    )
+                state.client = self._json_from_result(state.client_result)
+                state.receiver = self._json_from_result(state.server_result)
+            for state in states:
+                cleanup_dispatch_in_progress = True
+                self._execute(
+                    state.flow.source,
+                    f"set -euo pipefail; rm -f -- {shlex.quote(state.ready_path)}; "
+                    f"test ! -e {shlex.quote(state.ready_path)}; "
+                    f"test ! -L {shlex.quote(state.ready_path)}",
+                    timeout_seconds=15,
+                    comment="Envelope E2E delete continuity readiness",
+                )
+                cleanup_dispatch_in_progress = False
+            for state in states:
+                cleanup_dispatch_in_progress = True
+                self._delete_continuity_stop_file(
+                    state.flow.source,
+                    state.client_stop_path,
+                    state.client_stop_token,
+                    "Envelope E2E delete continuity client stop",
+                )
+                cleanup_dispatch_in_progress = False
+                state.client_stop_created = False
+                cleanup_dispatch_in_progress = True
+                self._delete_continuity_stop_file(
+                    state.flow.destination,
+                    state.server_stop_path,
+                    state.server_stop_token,
+                    "Envelope E2E delete continuity receiver stop",
+                )
+                cleanup_dispatch_in_progress = False
+                state.server_stop_created = False
+        except BaseException as error:
+            primary_error = error
+            if isinstance(error, PROTECTED_CONTROL_FLOW):
+                control_flow_interrupted = True
+                raise
+            if _ssm_ownership_unconfirmed(error) or (
+                isinstance(error, KeyboardInterrupt)
+                and (
+                    pause_dispatch_in_progress
+                    or stop_dispatch_in_progress
+                    or cleanup_dispatch_in_progress
+                )
+            ):
+                commands_terminated = False
+            try:
+                for state in states:
+                    for role in ("client", "server"):
+                        attempted = cast(
+                            bool,
+                            getattr(state, f"{role}_dispatch_attempted"),
+                        )
+                        terminal = cast(bool, getattr(state, f"{role}_terminal"))
+                        command_id = cast(
+                            str | None, getattr(state, f"{role}_id")
+                        )
+                        target = (
+                            state.flow.source
+                            if role == "client"
+                            else state.flow.destination
+                        )
+                        if not attempted or terminal:
+                            continue
+                        if command_id is None:
+                            commands_terminated = False
+                            note(
+                                error,
+                                "continuity command dispatch ownership is unknown; "
+                                "managed responder restoration was suppressed",
+                            )
+                            continue
+                        try:
+                            terminate = getattr(self.ssm, "terminate", None)
+                            if callable(terminate):
+                                terminate(
+                                    target, command_id, timeout_seconds=5
+                                )
+                            else:
+                                self.ssm.cancel(
+                                    target, command_id, timeout_seconds=5
+                                )
+                                self.ssm.wait(
+                                    target, command_id, timeout_seconds=5
+                                )
+                            setattr(state, f"{role}_terminal", True)
+                        except (
+                            ProtectedHardTimeout,
+                            ProtectedTermination,
+                            KeyboardInterrupt,
+                        ):
+                            control_flow_interrupted = True
+                            raise
+                        except Exception as termination_error:
+                            commands_terminated = False
+                            note(
+                                error,
+                                "continuity command termination was not verified: "
+                                + _sanitize_string(str(termination_error)),
+                            )
+                if commands_terminated:
+                    delete_controls(error)
+            except (ProtectedHardTimeout, ProtectedTermination, KeyboardInterrupt):
+                control_flow_interrupted = True
+                raise
+            raise
+        finally:
+            if not control_flow_interrupted and commands_terminated:
+                restoration_error: BaseException | None = None
+                for state in reversed(states):
+                    if not state.pause_acquired:
+                        continue
+                    try:
+                        self._resume_managed_responder(
+                            state.flow.destination, state.flow.protocol
+                        )
+                    except (ProtectedHardTimeout, ProtectedTermination, KeyboardInterrupt):
+                        raise
+                    except BaseException as error:
+                        if restoration_error is None:
+                            restoration_error = error
+                if restoration_error is not None:
+                    if primary_error is not None:
+                        note(
+                            primary_error,
+                            "managed responder restoration also failed",
+                        )
+                        raise primary_error from restoration_error
+                    raise restoration_error
+
+        results: dict[
+            str, tuple[StreamAnalysis | StreamInterruption, dict[str, Any]]
+        ] = {}
+        for state in states:
+            assert state.client is not None
+            assert state.receiver is not None
+            analysis = self._analyze_continuity_stream(
+                state.flow,
+                count=state.count,
+                client=state.client,
+                receiver=state.receiver,
+                mutation_start=mutation_start,
+                mutation_end=mutation_end,
+                maximum_loss_ns=state.maximum_loss_ns,
+                label=state.label,
+                allow_right_censored=state.allow_right_censored,
+                controlled_completion=True,
+            )
+            results[state.flow.protocol] = (analysis, state.receiver)
+        return results, mutation_summary
 
     def _return_rule_snapshot(self, deployment: ProtectedDeployment, site: Site) -> list[dict[str, Any]]:
         target = deployment.appliance(site)
@@ -19830,6 +21157,7 @@ class AwsSymmetricLiveOperations:
     ) -> dict[str, _SymmetricGeneveCapture]:
         duration = max(8, min(30, timeout_seconds + 5))
         handles: dict[str, _SymmetricGeneveCapture] = {}
+        dispatch_in_progress = False
         try:
             for site in SITES:
                 for member in deployment.topology.site(site).target_fleet:
@@ -19845,6 +21173,7 @@ class AwsSymmetricLiveOperations:
                         "set -e; [[ $status -eq 0 || $status -eq 124 ]]"
                     )
                     target = cast(RemoteTarget, self._remote(member))
+                    dispatch_in_progress = True
                     command_id = self.base.ssm.send(
                         SSMCommand(
                             target,
@@ -19854,6 +21183,7 @@ class AwsSymmetricLiveOperations:
                         ),
                         timeout_seconds=10,
                     )
+                    dispatch_in_progress = False
                     handles[member.instance_id] = _SymmetricGeneveCapture(
                         member, path, command_id, duration
                     )
@@ -19872,8 +21202,24 @@ class AwsSymmetricLiveOperations:
             return handles
         except PROTECTED_CONTROL_FLOW:
             raise
-        except BaseException:
-            self._finish_geneve_captures(handles, inspect=False)
+        except BaseException as error:
+            if isinstance(error, KeyboardInterrupt) and dispatch_in_progress:
+                _mark_ssm_ownership_unconfirmed(error)
+            try:
+                self._finish_geneve_captures(handles, inspect=False)
+            except BaseException as cleanup_error:
+                if isinstance(
+                    cleanup_error,
+                    (ProtectedHardTimeout, ProtectedTermination, KeyboardInterrupt),
+                ):
+                    raise
+                if _ssm_ownership_unconfirmed(cleanup_error):
+                    _mark_ssm_ownership_unconfirmed(error)
+                if hasattr(error, "add_note"):
+                    error.add_note(
+                        "GENEVE capture cleanup also failed: "
+                        + _sanitize_string(str(cleanup_error))
+                    )
             raise
 
     def _finish_geneve_captures(
@@ -19884,11 +21230,12 @@ class AwsSymmetricLiveOperations:
     ) -> dict[str, dict[str, Any]]:
         summaries: dict[str, dict[str, Any]] = {}
         primary_error: BaseException | None = None
+        control_flow_error: BaseException | None = None
+        ownership_unconfirmed = False
         for target_id, handle in handles.items():
             target = cast(RemoteTarget, self._remote(handle.member))
             completed = False
             deleted = False
-            control_flow_error: BaseException | None = None
             try:
                 result = self.base.ssm.wait(
                     target,
@@ -19903,13 +21250,57 @@ class AwsSymmetricLiveOperations:
                         target, handle.path
                     )
             except PROTECTED_CONTROL_FLOW as error:
-                control_flow_error = error
+                control_flow_error = control_flow_error or error
+            except KeyboardInterrupt as error:
+                try:
+                    terminate = getattr(self.base.ssm, "terminate", None)
+                    if callable(terminate):
+                        terminate(target, handle.command_id, timeout_seconds=5)
+                    else:
+                        self.base.ssm.cancel(
+                            target, handle.command_id, timeout_seconds=5
+                        )
+                        self.base.ssm.wait(
+                            target, handle.command_id, timeout_seconds=5
+                        )
+                except BaseException as termination_error:
+                    ownership_unconfirmed = True
+                    _mark_ssm_ownership_unconfirmed(error)
+                    if hasattr(error, "add_note"):
+                        error.add_note(
+                            "GENEVE capture termination was not verified: "
+                            + _sanitize_string(str(termination_error))
+                        )
+                control_flow_error = control_flow_error or error
             except BaseException as error:
                 primary_error = primary_error or error
+                ownership_unconfirmed = (
+                    ownership_unconfirmed
+                    or _ssm_ownership_unconfirmed(error)
+                )
                 try:
-                    self.base.ssm.cancel(target, handle.command_id, timeout_seconds=5)
-                except E2EError:
-                    pass
+                    terminate = getattr(self.base.ssm, "terminate", None)
+                    if callable(terminate):
+                        terminate(target, handle.command_id, timeout_seconds=5)
+                    else:
+                        self.base.ssm.cancel(
+                            target, handle.command_id, timeout_seconds=5
+                        )
+                        self.base.ssm.wait(
+                            target, handle.command_id, timeout_seconds=5
+                        )
+                except (ProtectedHardTimeout, ProtectedTermination, KeyboardInterrupt) as termination_error:
+                    control_flow_error = control_flow_error or termination_error
+                    ownership_unconfirmed = True
+                    _mark_ssm_ownership_unconfirmed(termination_error)
+                except Exception as termination_error:
+                    ownership_unconfirmed = True
+                    _mark_ssm_ownership_unconfirmed(error)
+                    if hasattr(error, "add_note"):
+                        error.add_note(
+                            "GENEVE capture termination was not verified: "
+                            + _sanitize_string(str(termination_error))
+                        )
             finally:
                 try:
                     self.base._execute(
@@ -19920,10 +21311,16 @@ class AwsSymmetricLiveOperations:
                         comment="Envelope symmetric delete raw GENEVE capture",
                     )
                     deleted = True
-                except PROTECTED_CONTROL_FLOW as error:
+                except (ProtectedHardTimeout, ProtectedTermination, KeyboardInterrupt) as error:
                     control_flow_error = control_flow_error or error
+                    ownership_unconfirmed = True
+                    _mark_ssm_ownership_unconfirmed(error)
                 except BaseException as error:
                     primary_error = primary_error or error
+                    ownership_unconfirmed = (
+                        ownership_unconfirmed
+                        or _ssm_ownership_unconfirmed(error)
+                    )
                 finally:
                     events = getattr(self, "_geneve_capture_events", [])
                     events.append(
@@ -19937,13 +21334,18 @@ class AwsSymmetricLiveOperations:
                         }
                     )
                     self._geneve_capture_events = events
-            if control_flow_error is not None:
-                raise control_flow_error
+        if control_flow_error is not None:
+            if ownership_unconfirmed:
+                _mark_ssm_ownership_unconfirmed(control_flow_error)
+            raise control_flow_error
         if primary_error is not None:
-            raise WireAssertionError(
+            wrapped = WireAssertionError(
                 "target GENEVE capture inspection or raw deletion failed: "
                 + _sanitize_string(str(primary_error))
-            ) from primary_error
+            )
+            if ownership_unconfirmed or _ssm_ownership_unconfirmed(primary_error):
+                _mark_ssm_ownership_unconfirmed(wrapped)
+            raise wrapped from primary_error
         return summaries
 
     def _selected_destination_transport_router(
@@ -20116,6 +21518,7 @@ print(json.dumps({"peer_id":match["peer_id"],"success":True},sort_keys=True))'''
             deployment, flow, timeout_seconds=timeout_seconds
         )
         capture_summaries: dict[str, dict[str, Any]] = {}
+        probe_error: BaseException | None = None
         try:
             before = self._target_snapshots(deployment, exclude=exclude_targets)
             probe = (
@@ -20125,8 +21528,29 @@ print(json.dumps({"peer_id":match["peer_id"],"success":True},sort_keys=True))'''
             )
             _validate_probe_evidence(flow, probe, kind="symmetric")
             after = self._target_snapshots(deployment, exclude=exclude_targets)
+        except BaseException as error:
+            probe_error = error
+            raise
         finally:
-            capture_summaries = self._finish_geneve_captures(captures, inspect=True)
+            try:
+                capture_summaries = self._finish_geneve_captures(
+                    captures, inspect=True
+                )
+            except BaseException as capture_error:
+                if isinstance(
+                    capture_error,
+                    (ProtectedHardTimeout, ProtectedTermination, KeyboardInterrupt),
+                ):
+                    raise
+                if probe_error is None:
+                    raise
+                if _ssm_ownership_unconfirmed(capture_error):
+                    _mark_ssm_ownership_unconfirmed(probe_error)
+                if hasattr(probe_error, "add_note"):
+                    probe_error.add_note(
+                        "GENEVE capture finalization also failed: "
+                        + _sanitize_string(str(capture_error))
+                    )
         source_id, source_fidelity = self._selected_target(
             before,
             after,
@@ -20249,6 +21673,8 @@ print(json.dumps({"peer_id":match["peer_id"],"success":True},sort_keys=True))'''
             except PROTECTED_CONTROL_FLOW:
                 raise
             except (E2EError, OSError) as error:
+                if _ssm_ownership_unconfirmed(error):
+                    raise
                 last_error = error
                 attempt += 1
                 if self.base.monotonic() < deadline:
@@ -21767,37 +23193,16 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
                 "failure measurement requires one TCP and one UDP flow on the same directional lane"
             )
         threshold_ms = timeout_seconds * 1000
-        udp_result: dict[str, Any] = {}
-
-        def run_udp_during_tcp() -> Mapping[str, Any]:
-            analysis, receiver, mutation = self.base._run_stream_mutation(
-                udp_flow,
-                timeout_seconds=max(90, timeout_seconds),
-                maximum_loss_ns=threshold_ms * 1_000_000,
-                label=f"{label}-udp",
-                mutate_and_restore=mutate_and_restore,
-                allow_right_censored=True,
-                expose_interval=True,
-            )
-            udp_result.update(
-                {
-                    "analysis": analysis,
-                    "receiver": receiver,
-                }
-            )
-            return mutation
-
-        tcp_analysis, tcp_receiver, mutation = self.base._run_stream_mutation(
+        stream_results, mutation = self.base._run_paired_stream_mutation(
             tcp_flow,
+            udp_flow,
             timeout_seconds=max(90, timeout_seconds),
             maximum_loss_ns=threshold_ms * 1_000_000,
-            label=f"{label}-tcp",
-            mutate_and_restore=run_udp_during_tcp,
-            allow_right_censored=True,
+            label=label,
+            mutate_and_restore=mutate_and_restore,
         )
-        udp_analysis = udp_result.get("analysis")
-        if not isinstance(udp_analysis, (StreamAnalysis, StreamInterruption)):
-            raise StreamAnalysisError("UDP failure measurement did not retain its stream analysis")
+        tcp_analysis, tcp_receiver = stream_results["tcp"]
+        udp_analysis, udp_receiver = stream_results["udp"]
         return mutation, {
             "tcp": self._stream_failure_evidence(
                 tcp_flow,
@@ -21812,12 +23217,8 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
             "receivers": {
                 "tcp_sessions": tcp_receiver.get("sessions"),
                 "tcp_duplicates": tcp_receiver.get("duplicates"),
-                "udp_sessions": cast(Mapping[str, Any], udp_result["receiver"]).get(
-                    "sessions"
-                ),
-                "udp_duplicates": cast(Mapping[str, Any], udp_result["receiver"]).get(
-                    "duplicates"
-                ),
+                "udp_sessions": udp_receiver.get("sessions"),
+                "udp_duplicates": udp_receiver.get("duplicates"),
             },
         }
 
@@ -22348,9 +23749,11 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
                 len(deployment.topology.site(abrupt_failed.site).remote_site_cidrs)
             )
         )
+        graceful_stream_timeout = max(timeout_seconds, graceful_reservation)
+        abrupt_stream_timeout = max(timeout_seconds, abrupt_reservation)
         if (
-            max(graceful_reservation, abrupt_reservation)
-            + STREAM_MUTATION_OVERHEAD_SECONDS
+            max(graceful_stream_timeout, abrupt_stream_timeout)
+            + CONTROLLED_STREAM_COMPLETION_HEADROOM_SECONDS
             > MAX_STREAM_MUTATION_RESERVATION_SECONDS
         ):
             raise ResilienceError(
@@ -22411,7 +23814,7 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
         graceful_route_result, graceful_transport = self._measure_tcp_udp_failure(
             graceful_tcp_flow,
             graceful_udp_flow,
-            timeout_seconds=max(timeout_seconds, graceful_reservation),
+            timeout_seconds=graceful_stream_timeout,
             label="transport-router-graceful-failure",
             mutate_and_restore=graceful_exercise,
         )
@@ -22455,7 +23858,7 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
         route_result, abrupt_transport = self._measure_tcp_udp_failure(
             abrupt_tcp_flow,
             abrupt_udp_flow,
-            timeout_seconds=max(timeout_seconds, abrupt_reservation),
+            timeout_seconds=abrupt_stream_timeout,
             label="transport-router-abrupt-failure",
             mutate_and_restore=lambda: failover().replace(
                 abrupt_failed,
@@ -24173,6 +25576,9 @@ def _run_all_cli(args: argparse.Namespace) -> int:
                 "initial_transport_router_az_by_gwlbe_az"
             ],
         )
+        active_budgets = dataclasses.replace(
+            DEFAULT_TIMEOUTS, hard_timeout=args.hard_timeout_seconds
+        )
         _validate_route_failover_run_budget(
             route_failover,
             prefix_counts={
@@ -24187,6 +25593,7 @@ def _run_all_cli(args: argparse.Namespace) -> int:
             },
             hard_timeout_seconds=args.hard_timeout_seconds,
             cleanup_timeout_seconds=DEFAULT_TIMEOUTS.cleanup,
+            active_budgets=active_budgets,
         )
         gate = "ttl"
         expiry = dt.datetime.fromisoformat(config.expires_at.replace("Z", "+00:00"))
@@ -24221,6 +25628,7 @@ def _run_all_cli(args: argparse.Namespace) -> int:
             operations=operations,
             hard_timeout_seconds=args.hard_timeout_seconds,
             readiness_timeout_seconds=args.readiness_timeout_seconds,
+            budgets=active_budgets,
         )
     except Exception as error:
         _write_run_all_bootstrap_failure(record_path, bootstrap_record, gate=gate, error=error)

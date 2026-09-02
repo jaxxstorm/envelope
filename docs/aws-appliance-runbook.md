@@ -2,7 +2,7 @@
 
 ## Status
 
-The AWS appliance topology retains version `2` while replacing the rejected target-forwarding draft with packet-scoped GWLB turnaround, GWLBE subnet routing, and separate transport routers. The corrected protected profile is still under development, and no passing live acceptance run is documented. Protected runs `ha25`, `ha46`, and `ha47` failed acceptance but supplied the live Tailnet, endpoint-symmetry, and deadline-separation evidence used to correct the transport contract below. This page is a safety and architecture reference, not an executable live-run procedure.
+The AWS appliance topology retains version `2` while replacing the rejected target-forwarding draft with packet-scoped GWLB turnaround, GWLBE subnet routing, and separate transport routers. The corrected protected profile is still under development, and no passing live acceptance run is documented. Protected runs `ha25`, `ha46`, `ha47`, and `ha48` failed acceptance but supplied the live Tailnet, endpoint-symmetry, deadline-separation, and continuity-observation evidence used to correct the transport contract below. This page is a safety and architecture reference, not an executable live-run procedure.
 
 Do not use an older protected configuration, saved plan, state file, workflow, evidence file, or direct Terraform command with this topology. Do not translate an old configuration by hand. A future approved run must create a fresh, run-owned version-2 deployment and own its cleanup.
 
@@ -63,6 +63,8 @@ Failed protected run `ha25` proved this shape directly: each router installed ex
 Failed protected run `ha46` proved the endpoint half of this shape during graceful takeover: east/a received a packet for the east/b workload, but its old uniform local routes selected GWLBE a while the workload reverse route selected GWLBE b. Both GWLBs observed SYNs, no SYN-ACK returned, cleanup reached zero residuals, and the run did not satisfy acceptance.
 
 Failed protected run `ha47` proved the corrected endpoint shape: ownership and both affected routes transferred to east/a, and both full TCP and UDP cross-AZ recovery proofs completed. The second sequential proof finished about eight seconds after the shared 120-second mutation deadline. The runner now bounds ownership transfer and GWLBE route convergence with `mutation_timeout_seconds`, then jointly bounds the sequential TCP and UDP proofs with a fresh `recovery_timeout_seconds` deadline. Restoration and one-attempt cleanup reached zero residuals; the run still did not satisfy acceptance.
+
+Failed protected run `ha48` proved the separated recovery deadline and completed the graceful transfer, both full cross-AZ proofs, and restoration. Its nested TCP agent then lost one isolated marker more than 13 minutes after restoration because observation continued for the full 2,735-second worst-case reservation. The full durable transaction reservation remains the continuity-command watchdog with a conservative 600-second paired-control allowance, but instance and transport-router TCP/UDP streams now run concurrently around one shared mutation and use runner-controlled completion after at least 20 successful sends and a final post-mutation marker. The runner validates every successful-send completion timestamp internally, emits exact sent, acknowledged, and lost counts, and still rejects any earlier loss outside the measured interval; target-process streams are unchanged. One-attempt cleanup reached zero residuals; the run still did not satisfy acceptance.
 
 ## Runner-Owned ENI Failover
 

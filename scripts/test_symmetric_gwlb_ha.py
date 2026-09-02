@@ -2380,6 +2380,23 @@ class SymmetricTopologyTest(unittest.TestCase):
             [flow.flow_id, f"{flow.flow_id}-retry01", f"{flow.flow_id}-retry02"],
         )
 
+        ownership_error = e2e.SSMDispatchError(
+            "fixture recovery probe response omitted CommandId"
+        )
+        operations._run_probe_with_path = mock.Mock(side_effect=ownership_error)
+        with self.assertRaises(e2e.SSMDispatchError) as raised:
+            operations._wait_probe_path(
+                deployment,
+                flow,
+                timeout_seconds=20,
+                exclude_targets={
+                    deployment.topology.west.target_fleet[0].instance_id
+                },
+            )
+
+        self.assertIs(raised.exception, ownership_error)
+        operations._run_probe_with_path.assert_called_once()
+
     def test_instance_replacement_uses_udp_target_when_stream_targets_differ(self) -> None:
         deployment = e2e.parse_symmetric_protected_deployment_output(
             symmetric_protected_output()
@@ -2531,6 +2548,7 @@ class SymmetricTopologyTest(unittest.TestCase):
             mutate_and_restore,
             **_kwargs,
         ):
+            self.assertFalse(_kwargs.get("stop_after_mutation", False))
             stream_calls.append((label, timeout_seconds))
             mutation = mutate_and_restore()
             analysis = e2e.StreamAnalysis(
@@ -2583,6 +2601,84 @@ class SymmetricTopologyTest(unittest.TestCase):
             ],
         )
         self.assertTrue(result["recovery"]["new_flow_succeeded"])
+
+    def test_paired_failure_streams_share_one_controlled_mutation(self) -> None:
+        deployment = e2e.parse_symmetric_protected_deployment_output(
+            symmetric_protected_output()
+        )
+        source = deployment.workloads.target("west", "initiator")
+        destination = deployment.workloads.target("east", "responder")
+        ledger = e2e.FlowLedger("symmetric-fixture")
+
+        def flow(protocol: str) -> e2e.FlowRecord:
+            return ledger.allocate(
+                protocol,
+                source,
+                destination,
+                destination_port=5201,
+                purpose=f"failure-{protocol}",
+                generation=ledger.begin_generation(f"failure-{protocol}"),
+            )
+
+        mutation_calls = 0
+
+        def mutate() -> Mapping[str, Any]:
+            nonlocal mutation_calls
+            mutation_calls += 1
+            return {"restored": True}
+
+        tcp_flow = flow("tcp")
+        udp_flow = flow("udp")
+
+        def run_pair(
+            observed_tcp,
+            observed_udp,
+            *,
+            timeout_seconds,
+            maximum_loss_ns,
+            label,
+            mutate_and_restore,
+        ):
+            self.assertEqual((observed_tcp, observed_udp), (tcp_flow, udp_flow))
+            self.assertEqual(timeout_seconds, 120)
+            mutation = mutate_and_restore()
+
+            def analysis(candidate):
+                return e2e.StreamAnalysis(
+                    flow_id=candidate.flow_id,
+                    connection_id=f"{candidate.flow_id}:fixture",
+                    marker_count=20,
+                    first_sequence=0,
+                    last_sequence=19,
+                    missing_sequences=(),
+                    loss_windows=(),
+                    mutation=e2e.MutationInterval(100, 200, label),
+                    maximum_loss_ns=maximum_loss_ns,
+                )
+
+            return {
+                "tcp": (analysis(observed_tcp), {"duplicates": 0, "sessions": 1}),
+                "udp": (analysis(observed_udp), {"duplicates": 0, "sessions": 1}),
+            }, mutation
+
+        operations = object.__new__(e2e.AwsSymmetricLiveOperations)
+        operations.base = SimpleNamespace(
+            _run_paired_stream_mutation=mock.Mock(side_effect=run_pair)
+        )
+
+        mutation, transport = operations._measure_tcp_udp_failure(
+            tcp_flow,
+            udp_flow,
+            timeout_seconds=120,
+            label="fixture-failure",
+            mutate_and_restore=mutate,
+        )
+
+        self.assertEqual(mutation_calls, 1)
+        operations.base._run_paired_stream_mutation.assert_called_once()
+        self.assertEqual(mutation, {"restored": True})
+        self.assertEqual(transport["tcp"]["expected_markers"], 20)
+        self.assertEqual(transport["udp"]["expected_markers"], 20)
 
     def test_live_cold_probe_uses_the_protocol_specific_sender(self) -> None:
         deployment = e2e.parse_symmetric_protected_deployment_output(symmetric_protected_output())

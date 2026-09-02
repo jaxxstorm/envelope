@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import copy
+import dataclasses
 import datetime as dt
 import gzip
 import hashlib
@@ -2032,10 +2033,20 @@ class GWLBERouteFailoverTest(unittest.TestCase):
             2
             * (
                 failover.transaction_reservation_seconds(prefix_count)
-                + e2e.STREAM_MUTATION_OVERHEAD_SECONDS
+                + e2e.CONTROLLED_STREAM_COMPLETION_HEADROOM_SECONDS
             ),
             e2e.DEFAULT_TIMEOUTS.hard_timeout,
         )
+        transaction_seconds = failover.transaction_reservation_seconds(prefix_count)
+        controlled_duration = (
+            transaction_seconds
+            + e2e.CONTROLLED_STREAM_COMPLETION_HEADROOM_SECONDS
+        )
+        marker_interval = controlled_duration / 160.0
+        marker_count = int((controlled_duration - 2) / marker_interval)
+        final_stop_check = (marker_count - 1) * marker_interval
+        self.assertGreaterEqual(final_stop_check - transaction_seconds, 500)
+        self.assertLessEqual(controlled_duration + 30, 3600)
 
     def test_ha26_over_budget_configuration_is_rejected_before_resource_authority(self) -> None:
         selections = self.topology.route_failover.initial_transport_router_az_by_gwlbe_az
@@ -2062,20 +2073,41 @@ class GWLBERouteFailoverTest(unittest.TestCase):
             recovery_timeout_seconds=300,
             initial_transport_router_az_by_gwlbe_az=selections,
         )
+        with self.assertRaisesRegex(e2e.DeploymentError, "active-run reservations"):
+            e2e._validate_route_failover_run_budget(
+                bounded,
+                prefix_counts={"west": 2, "east": 2},
+                observer_counts={"west": 2, "east": 2},
+                hard_timeout_seconds=7000,
+                cleanup_timeout_seconds=2400,
+            )
+
+        required_active_seconds = 10_330
         summary = e2e._validate_route_failover_run_budget(
             bounded,
             prefix_counts={"west": 2, "east": 2},
             observer_counts={"west": 2, "east": 2},
-            hard_timeout_seconds=6000,
+            hard_timeout_seconds=required_active_seconds,
             cleanup_timeout_seconds=2400,
         )
         self.assertEqual(bounded.restoration_reservation_seconds(2), 1555)
         self.assertEqual(bounded.reconciliation_reservation_seconds(2), 1415)
         self.assertEqual(
             summary["transaction_seconds_by_site"],
-            {"west": 2765, "east": 2765},
+            {"west": 3335, "east": 3335},
         )
-        self.assertEqual(summary["total_transaction_seconds"], 5530)
+        self.assertEqual(summary["total_transaction_seconds"], 6670)
+        self.assertEqual(summary["non_route_active_seconds"], 3660)
+        self.assertEqual(summary["required_active_seconds"], required_active_seconds)
+        self.assertEqual(summary["active_run_slack_seconds"], 0)
+        self.assertEqual(
+            summary["non_route_active_seconds_by_phase"]["target_process_recovery"],
+            480,
+        )
+        self.assertEqual(
+            summary["non_route_active_seconds_by_phase"]["target_instance_recovery"],
+            1200,
+        )
         self.assertEqual(
             summary["combined_cleanup_seconds_by_site"],
             {"west": 2315, "east": 2315},
@@ -2087,8 +2119,41 @@ class GWLBERouteFailoverTest(unittest.TestCase):
                 bounded,
                 prefix_counts={"west": 2, "east": 2},
                 observer_counts={"west": 2, "east": 2},
-                hard_timeout_seconds=6000,
+                hard_timeout_seconds=required_active_seconds,
                 cleanup_timeout_seconds=2314,
+            )
+
+        with self.assertRaisesRegex(e2e.DeploymentError, "active-run reservations"):
+            e2e._validate_route_failover_run_budget(
+                bounded,
+                prefix_counts={"west": 2, "east": 2},
+                observer_counts={"west": 2, "east": 2},
+                hard_timeout_seconds=required_active_seconds - 1,
+                cleanup_timeout_seconds=2400,
+            )
+
+        with self.assertRaisesRegex(e2e.DeploymentError, "stream and active-run"):
+            e2e._validate_route_failover_run_budget(
+                bounded,
+                prefix_counts={"west": 2, "east": 2},
+                observer_counts={"west": 2, "east": 2},
+                hard_timeout_seconds=10_800,
+                cleanup_timeout_seconds=2400,
+                active_budgets=dataclasses.replace(
+                    e2e.DEFAULT_TIMEOUTS, route_mutation=3000
+                ),
+            )
+
+        with self.assertRaisesRegex(e2e.DeploymentError, "bounded continuity command"):
+            e2e._validate_route_failover_run_budget(
+                bounded,
+                prefix_counts={"west": 2, "east": 2},
+                observer_counts={"west": 2, "east": 2},
+                hard_timeout_seconds=10_800,
+                cleanup_timeout_seconds=2400,
+                active_budgets=dataclasses.replace(
+                    e2e.DEFAULT_TIMEOUTS, ec2_reboot=3000
+                ),
             )
 
     def pending_journal(
@@ -5827,6 +5892,39 @@ class SSMRunnerTest(unittest.TestCase):
         maximum_parameters = json.loads(maximum_args[maximum_args.index("--parameters") + 1])
         self.assertEqual(maximum_parameters["executionTimeout"], ["3600"])
 
+    def test_keyboard_interrupt_is_never_normalized_or_cancelled(self) -> None:
+        for operation in ("send", "wait", "cancel"):
+            with self.subTest(operation=operation):
+                control = KeyboardInterrupt(f"fixture {operation} interrupt")
+                aws = ScriptedAWS([control])
+                runner = e2e.SSMRunner(
+                    aws,
+                    poll_interval_seconds=0.01,
+                    api_timeout_seconds=0.5,
+                )
+                if operation == "send":
+                    aws.json = mock.Mock(side_effect=control)
+                    invoke = lambda: runner.send(self.command)
+                elif operation == "wait":
+                    invoke = lambda: runner.wait(
+                        self.target,
+                        "11111111-2222-3333-4444-555555555555",
+                        timeout_seconds=0.5,
+                    )
+                else:
+                    aws.json = mock.Mock(side_effect=control)
+                    invoke = lambda: runner.cancel(
+                        self.target,
+                        "11111111-2222-3333-4444-555555555555",
+                    )
+
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    invoke()
+
+                self.assertIs(raised.exception, control)
+                if operation == "wait":
+                    self.assertFalse(aws.cancellation_requested)
+
     def test_wait_timeout_requests_bounded_cancellation(self) -> None:
         aws = ScriptedAWS(
             [InvocationMissing(), {"Status": "InProgress", "ResponseCode": -1}],
@@ -5855,6 +5953,34 @@ class SSMRunnerTest(unittest.TestCase):
         self.assertGreaterEqual(operations.count("get-command-invocation"), 2)
         cancel_args = next(args for args, _region in aws.calls if args[1] == "cancel-command")
         self.assertIn(self.target.instance_id, cancel_args)
+
+    def test_terminate_reports_confirmed_terminal_state_directly(self) -> None:
+        aws = ScriptedAWS(
+            [],
+            cancellation_polls=[
+                {"Status": "InProgress", "ResponseCode": -1},
+                {"Status": "Cancelled", "ResponseCode": -1},
+            ],
+        )
+        clock = FakeClock()
+        runner = e2e.SSMRunner(
+            aws,
+            clock=clock,
+            sleep=clock.sleep,
+            poll_interval_seconds=0.1,
+        )
+
+        result = runner.terminate(
+            self.target,
+            "11111111-2222-3333-4444-555555555555",
+            timeout_seconds=1,
+        )
+
+        self.assertEqual(result.status, "Cancelled")
+        self.assertEqual(
+            [args[1] for args, _region in aws.calls],
+            ["cancel-command", "get-command-invocation", "get-command-invocation"],
+        )
 
     def test_unknown_status_and_poll_api_error_cancel_and_confirm_terminal_state(self) -> None:
         cases = {
@@ -5896,7 +6022,9 @@ class SSMRunnerTest(unittest.TestCase):
             api_timeout_seconds=0.5,
         )
 
-        with self.assertRaisesRegex(e2e.SSMError, "terminal state unconfirmed"):
+        with self.assertRaisesRegex(
+            e2e.SSMTerminationError, "terminal state unconfirmed"
+        ):
             runner.execute(
                 self.command,
                 send_timeout_seconds=0.5,
@@ -5960,7 +6088,7 @@ class SSMRunnerTest(unittest.TestCase):
         aws = HangingAWS()
         runner = e2e.SSMRunner(aws, api_timeout_seconds=0.02)
         started = time.monotonic()
-        with self.assertRaisesRegex(e2e.SSMTimeout, "send-command"):
+        with self.assertRaisesRegex(e2e.SSMDispatchError, "send-command"):
             runner.send(self.command, timeout_seconds=0.02)
         self.assertLess(time.monotonic() - started, 0.5)
         self.assertEqual(aws.timeout, 0.02)
@@ -7585,6 +7713,7 @@ class StreamAnalyzerTest(unittest.TestCase):
             markers,
             self.mutation,
             maximum_loss_ns=150,
+            attempted_monotonic_ns=(40, 80, 120, 160, 205, 240),
             expected_first_sequence=0,
             expected_last_sequence=5,
         )
@@ -7602,7 +7731,12 @@ class StreamAnalyzerTest(unittest.TestCase):
             marker(5, 260, 265),
         ]
         with self.assertRaisesRegex(e2e.StreamAnalysisError, "outside"):
-            e2e.analyze_stream_markers(outside, self.mutation, maximum_loss_ns=100)
+            e2e.analyze_stream_markers(
+                outside,
+                self.mutation,
+                maximum_loss_ns=100,
+                attempted_monotonic_ns=(40, 205, 220, 230, 240, 260),
+            )
 
         over_bound = [
             marker(0, 40, 45),
@@ -7611,15 +7745,26 @@ class StreamAnalyzerTest(unittest.TestCase):
             marker(5, 240, 245),
         ]
         with self.assertRaisesRegex(e2e.StreamAnalysisError, "exceeds"):
-            e2e.analyze_stream_markers(over_bound, self.mutation, maximum_loss_ns=100)
+            e2e.analyze_stream_markers(
+                over_bound,
+                self.mutation,
+                maximum_loss_ns=100,
+                attempted_monotonic_ns=(40, 80, 120, 160, 205, 240),
+            )
 
     def test_socket_change_is_rejected(self) -> None:
         markers = [marker(0, 40, 45), marker(1, 210, 215, connection="flow:c0002")]
         with self.assertRaisesRegex(e2e.StreamAnalysisError, "one long-lived socket"):
-            e2e.analyze_stream_markers(markers, self.mutation, maximum_loss_ns=200)
+            e2e.analyze_stream_markers(
+                markers,
+                self.mutation,
+                maximum_loss_ns=200,
+                attempted_monotonic_ns=(40, 210),
+            )
 
     def test_right_censored_interruption_retains_exact_observed_loss(self) -> None:
         markers = [marker(0, 40, 45), marker(1, 80, 90), marker(2, 120, 130)]
+        attempts = (40, 80, 120, *range(160, 1720, 10))
 
         interruption = e2e.analyze_interrupted_stream_markers(
             markers,
@@ -7627,7 +7772,7 @@ class StreamAnalyzerTest(unittest.TestCase):
             protocol="udp",
             expected_marker_count=159,
             sent_marker_count=159,
-            last_sent_monotonic_ns=240,
+            attempted_monotonic_ns=attempts,
         )
 
         self.assertEqual(interruption.sent_marker_count, 159)
@@ -7635,14 +7780,15 @@ class StreamAnalyzerTest(unittest.TestCase):
         self.assertTrue(interruption.observation_complete)
         self.assertTrue(interruption.right_censored)
 
+        incomplete_attempts = (40, 80, 120, *range(121, 277))
         with self.assertRaisesRegex(e2e.StreamAnalysisError, "right-censored"):
             e2e.analyze_interrupted_stream_markers(
                 markers,
-                self.mutation,
+                e2e.MutationInterval(100, 1000, "restart-west"),
                 protocol="udp",
                 expected_marker_count=159,
                 sent_marker_count=159,
-                last_sent_monotonic_ns=200,
+                attempted_monotonic_ns=incomplete_attempts,
             )
         with self.assertRaisesRegex(e2e.StreamAnalysisError, "contiguous"):
             e2e.analyze_interrupted_stream_markers(
@@ -7651,7 +7797,7 @@ class StreamAnalyzerTest(unittest.TestCase):
                 protocol="udp",
                 expected_marker_count=159,
                 sent_marker_count=159,
-                last_sent_monotonic_ns=240,
+                attempted_monotonic_ns=attempts,
             )
         with self.assertRaisesRegex(e2e.StreamAnalysisError, "acknowledgement during"):
             e2e.analyze_interrupted_stream_markers(
@@ -7660,16 +7806,26 @@ class StreamAnalyzerTest(unittest.TestCase):
                 protocol="udp",
                 expected_marker_count=159,
                 sent_marker_count=159,
-                last_sent_monotonic_ns=240,
+                attempted_monotonic_ns=(40, 70, *range(120, 1690, 10)),
             )
-        with self.assertRaisesRegex(e2e.StreamAnalysisError, "right-censored"):
+        with self.assertRaisesRegex(e2e.StreamAnalysisError, "bounds"):
             e2e.analyze_interrupted_stream_markers(
                 markers,
                 self.mutation,
                 protocol="tcp",
                 expected_marker_count=159,
                 sent_marker_count=3,
-                last_sent_monotonic_ns=150,
+                attempted_monotonic_ns=(40, 80, 120),
+            )
+
+        with self.assertRaisesRegex(e2e.StreamAnalysisError, "right-censored"):
+            e2e.analyze_interrupted_stream_markers(
+                markers,
+                self.mutation,
+                protocol="udp",
+                expected_marker_count=159,
+                sent_marker_count=159,
+                attempted_monotonic_ns=(40, 80, 120, *range(210, 1770, 10)),
             )
 
 
@@ -7688,6 +7844,7 @@ def evidence_fixture() -> dict[str, Any]:
         [marker(0, 40, 45), marker(1, 210, 215)],
         e2e.MutationInterval(100, 200, "restart-west"),
         maximum_loss_ns=200,
+        attempted_monotonic_ns=(40, 210),
         expected_first_sequence=0,
         expected_last_sequence=1,
     )
@@ -9129,6 +9286,20 @@ class ProbeLifecycleTest(unittest.TestCase):
             generation=ledger.begin_generation("fixture-probe"),
         )
 
+    def _paired_flows(self) -> tuple[e2e.FlowRecord, e2e.FlowRecord]:
+        deployment = parsed_deployment()
+        ledger = e2e.FlowLedger("fixture-paired-probe")
+        return tuple(
+            ledger.allocate(
+                protocol,
+                deployment.west.initiator,
+                deployment.east.responder,
+                destination_port=5201,
+                generation=ledger.begin_generation(f"fixture-paired-{protocol}"),
+            )
+            for protocol in e2e.TRANSPORT_PROTOCOLS
+        )
+
     def test_managed_responder_pause_is_reentrant(self) -> None:
         target = self._tcp_flow().destination
         operations = object.__new__(e2e.AwsLiveOperations)
@@ -9150,6 +9321,36 @@ class ProbeLifecycleTest(unittest.TestCase):
         operations._wait_listener.assert_called_once_with(
             target, "tcp", timeout_seconds=10
         )
+        self.assertEqual(operations._responder_pause_depth, {})
+
+    def test_managed_responder_lease_survives_ambiguous_pause_and_resume(self) -> None:
+        target = self._tcp_flow().destination
+        key = (target.instance_id, "tcp")
+        operations = object.__new__(e2e.AwsLiveOperations)
+        operations._responder_pause_depth = {}
+        operations._execute = mock.Mock(
+            side_effect=e2e.SSMDispatchError("fixture ambiguous pause")
+        )
+        operations._wait_listener = mock.Mock()
+
+        with self.assertRaises(e2e.SSMDispatchError):
+            operations._pause_managed_responder(target, "tcp")
+
+        self.assertEqual(operations._responder_pause_depth, {key: 1})
+        operations._execute.side_effect = None
+        operations._resume_managed_responder(target, "tcp")
+        self.assertEqual(operations._responder_pause_depth, {})
+
+        operations._pause_managed_responder(target, "tcp")
+        control = KeyboardInterrupt("fixture interrupted resume")
+        operations._execute.side_effect = control
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            operations._resume_managed_responder(target, "tcp")
+
+        self.assertIs(raised.exception, control)
+        self.assertEqual(operations._responder_pause_depth, {key: 1})
+        operations._execute.side_effect = None
+        operations._resume_managed_responder(target, "tcp")
         self.assertEqual(operations._responder_pause_depth, {})
 
     def test_one_shot_probe_commands_reserve_agent_shutdown_headroom(self) -> None:
@@ -9195,6 +9396,848 @@ class ProbeLifecycleTest(unittest.TestCase):
         )
         self.assertEqual(operations.ssm.wait.call_args.kwargs["timeout_seconds"], 40)
         self.assertEqual(result["source_port"], flow.source_port)
+        operations._resume_managed_responder.assert_called_once_with(
+            flow.destination, "tcp"
+        )
+
+    def test_probe_client_dispatch_interrupt_keeps_nested_responder_paused(self) -> None:
+        flow = self._tcp_flow()
+        control = KeyboardInterrupt("fixture nested probe client dispatch")
+        operations = object.__new__(e2e.AwsLiveOperations)
+        operations.ssm = SimpleNamespace(
+            send=mock.Mock(return_value="fixture-server-command"),
+            terminate=mock.Mock(return_value=SimpleNamespace(status="Cancelled")),
+        )
+        operations._pause_managed_responder = mock.Mock()
+        operations._resume_managed_responder = mock.Mock()
+        operations._wait_listener = mock.Mock()
+        operations._execute_json = mock.Mock(side_effect=control)
+
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            operations._run_probe(flow, timeout_seconds=20)
+
+        self.assertIs(raised.exception, control)
+        self.assertTrue(e2e._ssm_ownership_unconfirmed(control))
+        operations.ssm.terminate.assert_called_once_with(
+            flow.destination,
+            "fixture-server-command",
+            timeout_seconds=5,
+        )
+        operations._resume_managed_responder.assert_not_called()
+
+    def test_probe_listener_dispatch_interrupt_keeps_nested_responder_paused(self) -> None:
+        flow = self._tcp_flow()
+        control = KeyboardInterrupt("fixture nested probe listener dispatch")
+        operations = object.__new__(e2e.AwsLiveOperations)
+        operations.ssm = SimpleNamespace(
+            send=mock.Mock(return_value="fixture-server-command"),
+            terminate=mock.Mock(return_value=SimpleNamespace(status="Cancelled")),
+        )
+        operations._pause_managed_responder = mock.Mock()
+        operations._resume_managed_responder = mock.Mock()
+        operations._wait_listener = mock.Mock(side_effect=control)
+
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            operations._run_probe(flow, timeout_seconds=20)
+
+        self.assertIs(raised.exception, control)
+        self.assertTrue(e2e._ssm_ownership_unconfirmed(control))
+        operations.ssm.terminate.assert_called_once_with(
+            flow.destination,
+            "fixture-server-command",
+            timeout_seconds=5,
+        )
+        operations._resume_managed_responder.assert_not_called()
+
+    def test_stream_mutation_cooperatively_completes_with_actual_marker_count(self) -> None:
+        flow = self._tcp_flow()
+        attempts = [40 + sequence * 10 for sequence in range(20)]
+        markers = [
+            [sequence, 45 + sequence * 10]
+            for sequence in range(20)
+        ]
+        client = {
+            "attempts": attempts,
+            "connection_id": f"{flow.flow_id}:c0001",
+            "flow_id": flow.flow_id,
+            "interrupted": False,
+            "last_sent_monotonic_ns": attempts[-1],
+            "markers": markers,
+            "sent_markers": 20,
+            "socket_count": 1,
+            "source_port": flow.source_port,
+            "stop_observed": True,
+            "success": True,
+        }
+        receiver = {
+            "duplicates": 0,
+            "flow_id": flow.flow_id,
+            "receives": 20,
+            "sessions": 1,
+            "stop_observed": True,
+            "success": True,
+        }
+        results = {
+            "fixture-client-command": e2e.SSMResult(
+                flow.source,
+                "fixture-client-command",
+                "Success",
+                0,
+                stdout=json.dumps(client),
+            ),
+            "fixture-server-command": e2e.SSMResult(
+                flow.destination,
+                "fixture-server-command",
+                "Success",
+                0,
+                stdout=json.dumps(receiver),
+            ),
+        }
+        events: list[str] = []
+        ambiguous_client_stop = True
+
+        def wait(_target, command_id, **_kwargs):
+            events.append(f"wait:{command_id}")
+            return results[command_id]
+
+        def execute(_target, _command, *, comment, **_kwargs):
+            nonlocal ambiguous_client_stop
+            events.append(comment)
+            if (
+                comment == "Envelope E2E complete continuity client"
+                and ambiguous_client_stop
+            ):
+                ambiguous_client_stop = False
+                raise e2e.SSMError("fixture lost committed stop response")
+
+        clocks = iter((100, 200))
+
+        def remote_monotonic(_target):
+            value = next(clocks)
+            events.append(f"clock:{value}")
+            return value
+
+        operations = object.__new__(e2e.AwsLiveOperations)
+        operations.ssm = SimpleNamespace(
+            send=mock.Mock(
+                side_effect=("fixture-server-command", "fixture-client-command")
+            ),
+            wait=mock.Mock(side_effect=wait),
+            cancel=mock.Mock(),
+        )
+        operations._pause_managed_responder = mock.Mock()
+        operations._resume_managed_responder = mock.Mock()
+        operations._wait_listener = mock.Mock()
+        operations._execute = mock.Mock(side_effect=execute)
+        operations._execute_json = mock.Mock(return_value={"stream_ready": True})
+        operations._remote_monotonic_ns = mock.Mock(side_effect=remote_monotonic)
+
+        def wait_until(observe, predicate, **_kwargs):
+            observed = observe()
+            self.assertTrue(predicate(observed))
+            return observed
+
+        operations._wait_until = wait_until
+        analysis, observed_receiver, mutation = operations._run_stream_mutation(
+            flow,
+            timeout_seconds=90,
+            maximum_loss_ns=1_000,
+            label="fixture-controlled-stream",
+            mutate_and_restore=lambda: events.append("mutation") or {"restored": True},
+            allow_right_censored=True,
+            stop_after_mutation=True,
+        )
+
+        self.assertIsInstance(analysis, e2e.StreamAnalysis)
+        self.assertEqual(analysis.marker_count, 20)
+        self.assertEqual(analysis.last_sequence, 19)
+        self.assertEqual(observed_receiver, receiver)
+        self.assertEqual(mutation, {"restored": True})
+        server_spec = operations.ssm.send.call_args_list[0].args[0]
+        client_spec = operations.ssm.send.call_args_list[1].args[0]
+        self.assertIn("--stop-path", server_spec.commands[0])
+        self.assertIn("--stop-path", client_spec.commands[0])
+        self.assertIn("--stop-token", server_spec.commands[0])
+        self.assertIn("--stop-token", client_spec.commands[0])
+        self.assertIn("--minimum-count 20", client_spec.commands[0])
+        comments = [call.kwargs.get("comment") for call in operations._execute.call_args_list]
+        self.assertIn("Envelope E2E complete continuity client", comments)
+        self.assertIn(
+            "Envelope E2E complete continuity client reconciliation", comments
+        )
+        self.assertIn("Envelope E2E complete continuity receiver", comments)
+        receiver_reset = next(
+            call
+            for call in operations._execute.call_args_list
+            if call.kwargs.get("comment")
+            == "Envelope E2E reset continuity receiver stop"
+        )
+        self.assertNotIn("rm -f", receiver_reset.args[1])
+        self.assertIn("test ! -e", receiver_reset.args[1])
+        stop_commands = [
+            call.args[1]
+            for call in operations._execute.call_args_list
+            if "python3 -c" in call.args[1]
+        ]
+        self.assertGreaterEqual(len(stop_commands), 5)
+        for command in stop_commands:
+            arguments = shlex.split(command)
+            compile(arguments[arguments.index("-c") + 1], "<stop-control>", "exec")
+        create_call = next(
+            call
+            for call in operations._execute.call_args_list
+            if call.kwargs.get("comment")
+            == "Envelope E2E complete continuity receiver"
+        )
+        create_source = shlex.split(create_call.args[1])[
+            shlex.split(create_call.args[1]).index("-c") + 1
+        ]
+        self.assertIn("if not valid", create_source)
+        self.assertIn("os.unlink(sys.argv[1])", create_source)
+        self.assertLess(events.index("mutation"), events.index("clock:200"))
+        self.assertLess(
+            events.index("clock:200"),
+            events.index("Envelope E2E complete continuity client"),
+        )
+        self.assertLess(
+            events.index("wait:fixture-client-command"),
+            events.index("Envelope E2E complete continuity receiver"),
+        )
+        operations.ssm.cancel.assert_not_called()
+
+        invalid_client = {**client, "stop_observed": False}
+        results["fixture-client-command"] = e2e.SSMResult(
+            flow.source,
+            "fixture-client-command",
+            "Success",
+            0,
+            stdout=json.dumps(invalid_client),
+        )
+        operations.ssm.send.side_effect = (
+            "fixture-server-command",
+            "fixture-client-command",
+        )
+        operations._remote_monotonic_ns.side_effect = (100, 200)
+        with self.assertRaisesRegex(e2e.StreamAnalysisError, "exact source socket"):
+            operations._run_stream_mutation(
+                flow,
+                timeout_seconds=90,
+                maximum_loss_ns=1_000,
+                label="fixture-uncontrolled-completion",
+                mutate_and_restore=lambda: {"restored": True},
+                allow_right_censored=True,
+                stop_after_mutation=True,
+            )
+
+    def test_paired_stream_mutation_uses_one_main_thread_controlled_lifecycle(self) -> None:
+        tcp_flow, udp_flow = self._paired_flows()
+        events: list[str] = []
+        caller_thread = threading.get_ident()
+        mutation_threads: list[int] = []
+
+        def client(flow: e2e.FlowRecord) -> dict[str, Any]:
+            attempts = [40 + sequence * 10 for sequence in range(20)]
+            return {
+                "attempts": attempts,
+                "connection_id": f"{flow.flow_id}:c0001",
+                "flow_id": flow.flow_id,
+                "interrupted": False,
+                "last_sent_monotonic_ns": attempts[-1],
+                "markers": [
+                    [sequence, 45 + sequence * 10]
+                    for sequence in range(20)
+                ],
+                "sent_markers": 20,
+                "socket_count": 1,
+                "source_port": flow.source_port,
+                "stop_observed": True,
+                "success": True,
+            }
+
+        def receiver(flow: e2e.FlowRecord) -> dict[str, Any]:
+            return {
+                "duplicates": 0,
+                "flow_id": flow.flow_id,
+                "receives": 20,
+                "sessions": 1,
+                "stop_observed": True,
+                "success": True,
+            }
+
+        results = {
+            "tcp-client": e2e.SSMResult(
+                tcp_flow.source,
+                "tcp-client",
+                "Success",
+                0,
+                stdout=json.dumps(client(tcp_flow)),
+            ),
+            "udp-client": e2e.SSMResult(
+                udp_flow.source,
+                "udp-client",
+                "Success",
+                0,
+                stdout=json.dumps(client(udp_flow)),
+            ),
+            "tcp-server": e2e.SSMResult(
+                tcp_flow.destination,
+                "tcp-server",
+                "Success",
+                0,
+                stdout=json.dumps(receiver(tcp_flow)),
+            ),
+            "udp-server": e2e.SSMResult(
+                udp_flow.destination,
+                "udp-server",
+                "Success",
+                0,
+                stdout=json.dumps(receiver(udp_flow)),
+            ),
+        }
+
+        def wait(_target, command_id, **_kwargs):
+            events.append(f"wait:{command_id}")
+            return results[command_id]
+
+        def execute(_target, _command, *, comment, **_kwargs):
+            events.append(comment)
+
+        clocks = iter((100, 200))
+
+        def remote_monotonic(_target):
+            value = next(clocks)
+            events.append(f"clock:{value}")
+            return value
+
+        operations = object.__new__(e2e.AwsLiveOperations)
+        operations.ssm = SimpleNamespace(
+            send=mock.Mock(
+                side_effect=("tcp-server", "udp-server", "tcp-client", "udp-client")
+            ),
+            wait=mock.Mock(side_effect=wait),
+            cancel=mock.Mock(),
+        )
+        operations._pause_managed_responder = mock.Mock()
+        operations._resume_managed_responder = mock.Mock()
+        operations._wait_listener = mock.Mock()
+        operations._execute = mock.Mock(side_effect=execute)
+        operations._execute_json = mock.Mock(return_value={"stream_ready": True})
+        operations._remote_monotonic_ns = mock.Mock(side_effect=remote_monotonic)
+
+        def wait_until(observe, predicate, **_kwargs):
+            observed = observe()
+            self.assertTrue(predicate(observed))
+            return observed
+
+        operations._wait_until = wait_until
+
+        def mutate() -> Mapping[str, Any]:
+            mutation_threads.append(threading.get_ident())
+            events.append("mutation")
+            return {"restored": True}
+
+        observed, mutation = operations._run_paired_stream_mutation(
+            tcp_flow,
+            udp_flow,
+            timeout_seconds=90,
+            maximum_loss_ns=1_000,
+            label="fixture-paired",
+            mutate_and_restore=mutate,
+        )
+
+        self.assertEqual(mutation_threads, [caller_thread])
+        self.assertEqual(mutation, {"restored": True})
+        self.assertEqual(set(observed), {"tcp", "udp"})
+        self.assertTrue(
+            all(
+                value[0].mutation.start_monotonic_ns == 100
+                and value[0].mutation.end_monotonic_ns == 200
+                for value in observed.values()
+            )
+        )
+        client_stops = [
+            index
+            for index, event in enumerate(events)
+            if event == "Envelope E2E complete continuity client"
+        ]
+        client_waits = [
+            events.index("wait:tcp-client"),
+            events.index("wait:udp-client"),
+        ]
+        receiver_stops = [
+            index
+            for index, event in enumerate(events)
+            if event == "Envelope E2E complete continuity receiver"
+        ]
+        receiver_waits = [
+            events.index("wait:tcp-server"),
+            events.index("wait:udp-server"),
+        ]
+        self.assertLess(max(client_stops), min(client_waits))
+        self.assertLess(max(client_waits), min(receiver_stops))
+        self.assertLess(max(receiver_stops), min(receiver_waits))
+        self.assertLess(events.index("mutation"), events.index("clock:200"))
+        operations.ssm.cancel.assert_not_called()
+        self.assertEqual(operations._resume_managed_responder.call_count, 2)
+        for call in operations.ssm.send.call_args_list:
+            command = call.args[0].commands[0]
+            self.assertIn("--stop-path", command)
+            self.assertIn("--stop-token", command)
+        for call in operations._execute.call_args_list:
+            command = call.args[1]
+            if "python3 -c" not in command:
+                continue
+            arguments = shlex.split(command)
+            compile(arguments[arguments.index("-c") + 1], "<stop-control>", "exec")
+
+    def test_paired_stream_mutation_preserves_main_thread_interrupt(self) -> None:
+        tcp_flow, udp_flow = self._paired_flows()
+        control = KeyboardInterrupt("fixture paired mutation interrupt")
+        mutation_threads: list[int] = []
+        operations = object.__new__(e2e.AwsLiveOperations)
+        operations.ssm = SimpleNamespace(
+            send=mock.Mock(
+                side_effect=("tcp-server", "udp-server", "tcp-client", "udp-client")
+            ),
+            terminate=mock.Mock(return_value=SimpleNamespace(status="Cancelled")),
+        )
+        operations._pause_managed_responder = mock.Mock()
+        operations._resume_managed_responder = mock.Mock()
+        operations._wait_listener = mock.Mock()
+        operations._execute = mock.Mock()
+        operations._execute_json = mock.Mock(return_value={"stream_ready": True})
+        operations._wait_until = mock.Mock()
+        operations._remote_monotonic_ns = mock.Mock(return_value=100)
+
+        def interrupt() -> Mapping[str, Any]:
+            mutation_threads.append(threading.get_ident())
+            raise control
+
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            operations._run_paired_stream_mutation(
+                tcp_flow,
+                udp_flow,
+                timeout_seconds=90,
+                maximum_loss_ns=1_000,
+                label="fixture-paired-interrupt",
+                mutate_and_restore=interrupt,
+            )
+
+        self.assertIs(raised.exception, control)
+        self.assertEqual(mutation_threads, [threading.get_ident()])
+        self.assertEqual(operations.ssm.terminate.call_count, 4)
+        self.assertEqual(operations._resume_managed_responder.call_count, 2)
+
+    def test_paired_stream_ambiguous_dispatch_fails_closed(self) -> None:
+        tcp_flow, udp_flow = self._paired_flows()
+        dispatch_error = e2e.SSMDispatchError(
+            "fixture UDP client response omitted CommandId"
+        )
+        operations = object.__new__(e2e.AwsLiveOperations)
+        operations.ssm = SimpleNamespace(
+            send=mock.Mock(
+                side_effect=(
+                    "tcp-server",
+                    "udp-server",
+                    "tcp-client",
+                    dispatch_error,
+                )
+            ),
+            terminate=mock.Mock(return_value=SimpleNamespace(status="Cancelled")),
+        )
+        operations._pause_managed_responder = mock.Mock()
+        operations._resume_managed_responder = mock.Mock()
+        operations._wait_listener = mock.Mock()
+        operations._execute = mock.Mock()
+
+        with self.assertRaises(e2e.SSMDispatchError) as raised:
+            operations._run_paired_stream_mutation(
+                tcp_flow,
+                udp_flow,
+                timeout_seconds=90,
+                maximum_loss_ns=1_000,
+                label="fixture-paired-ambiguous",
+                mutate_and_restore=lambda: {"restored": True},
+            )
+
+        self.assertIs(raised.exception, dispatch_error)
+        self.assertEqual(operations.ssm.terminate.call_count, 3)
+        operations._resume_managed_responder.assert_not_called()
+
+    def test_stream_cleanup_preserves_protected_control_flow(self) -> None:
+        flow = self._tcp_flow()
+        for stage in ("cancel", "resume"):
+            with self.subTest(stage=stage):
+                control = e2e.ProtectedHardTimeout(f"protected {stage}")
+                operations = object.__new__(e2e.AwsLiveOperations)
+                operations.ssm = SimpleNamespace(
+                    send=mock.Mock(
+                        side_effect=("fixture-server-command", "fixture-client-command")
+                    ),
+                    wait=mock.Mock(return_value=SimpleNamespace()),
+                    cancel=mock.Mock(
+                        side_effect=control if stage == "cancel" else None
+                    ),
+                )
+                operations._pause_managed_responder = mock.Mock()
+                operations._resume_managed_responder = mock.Mock(
+                    side_effect=control if stage == "resume" else None
+                )
+                operations._wait_listener = mock.Mock()
+                operations._execute = mock.Mock()
+                operations._execute_json = mock.Mock(return_value={"stream_ready": True})
+                operations._wait_until = mock.Mock(
+                    side_effect=e2e.StreamAnalysisError("fixture primary failure")
+                )
+
+                with self.assertRaises(e2e.ProtectedHardTimeout) as raised:
+                    operations._run_stream_mutation(
+                        flow,
+                        timeout_seconds=90,
+                        maximum_loss_ns=1_000,
+                        label=f"fixture-protected-{stage}",
+                        mutate_and_restore=lambda: {"restored": True},
+                    )
+
+                self.assertIs(raised.exception, control)
+                if stage == "cancel":
+                    operations._resume_managed_responder.assert_not_called()
+                else:
+                    operations._resume_managed_responder.assert_called_once()
+
+    def test_ambiguous_stream_dispatch_suppresses_responder_restoration(self) -> None:
+        flow = self._tcp_flow()
+        for stage in ("server", "client"):
+            with self.subTest(stage=stage):
+                dispatch_error = e2e.SSMError(
+                    f"fixture {stage} response omitted CommandId"
+                )
+                send_values = (
+                    (dispatch_error,)
+                    if stage == "server"
+                    else ("fixture-server-command", dispatch_error)
+                )
+                operations = object.__new__(e2e.AwsLiveOperations)
+                operations.ssm = SimpleNamespace(
+                    send=mock.Mock(side_effect=send_values),
+                    wait=mock.Mock(return_value=SimpleNamespace()),
+                    cancel=mock.Mock(return_value=True),
+                )
+                operations._pause_managed_responder = mock.Mock()
+                operations._resume_managed_responder = mock.Mock()
+                operations._wait_listener = mock.Mock()
+                operations._execute = mock.Mock()
+                operations._wait_until = mock.Mock()
+
+                with self.assertRaises(e2e.SSMError) as raised:
+                    operations._run_stream_mutation(
+                        flow,
+                        timeout_seconds=90,
+                        maximum_loss_ns=1_000,
+                        label=f"fixture-ambiguous-{stage}",
+                        mutate_and_restore=lambda: {"restored": True},
+                    )
+
+                self.assertIs(raised.exception, dispatch_error)
+                operations._resume_managed_responder.assert_not_called()
+                if stage == "server":
+                    operations.ssm.cancel.assert_not_called()
+                else:
+                    operations.ssm.cancel.assert_called_once_with(
+                        flow.destination,
+                        "fixture-server-command",
+                        timeout_seconds=5,
+                    )
+
+    def test_unconfirmed_stop_command_is_not_reconciled_as_safe(self) -> None:
+        flow = self._tcp_flow()
+        dispatch_error = e2e.SSMTerminationError(
+            "fixture stop command terminal state unconfirmed"
+        )
+
+        def execute(_target, _command, *, comment, **_kwargs):
+            if comment == "Envelope E2E complete continuity client":
+                raise dispatch_error
+
+        operations = object.__new__(e2e.AwsLiveOperations)
+        operations.ssm = SimpleNamespace(
+            send=mock.Mock(
+                side_effect=("fixture-server-command", "fixture-client-command")
+            ),
+            wait=mock.Mock(return_value=SimpleNamespace()),
+            cancel=mock.Mock(return_value=True),
+        )
+        operations._pause_managed_responder = mock.Mock()
+        operations._resume_managed_responder = mock.Mock()
+        operations._wait_listener = mock.Mock()
+        operations._execute = mock.Mock(side_effect=execute)
+        operations._execute_json = mock.Mock(return_value={"stream_ready": True})
+        operations._wait_until = mock.Mock()
+        operations._remote_monotonic_ns = mock.Mock(side_effect=(100, 200))
+
+        with self.assertRaises(e2e.SSMTerminationError) as raised:
+            operations._run_stream_mutation(
+                flow,
+                timeout_seconds=90,
+                maximum_loss_ns=1_000,
+                label="fixture-ambiguous-stop",
+                mutate_and_restore=lambda: {"restored": True},
+                stop_after_mutation=True,
+            )
+
+        self.assertIs(raised.exception, dispatch_error)
+        operations._resume_managed_responder.assert_not_called()
+        comments = [
+            call.kwargs.get("comment") for call in operations._execute.call_args_list
+        ]
+        self.assertNotIn(
+            "Envelope E2E complete continuity client reconciliation", comments
+        )
+        self.assertEqual(operations.ssm.cancel.call_count, 2)
+
+    def test_ambiguous_stop_cleanup_dispatch_suppresses_restoration(self) -> None:
+        flow = self._tcp_flow()
+        primary = e2e.StreamAnalysisError("fixture client wait failed")
+
+        def execute(_target, _command, *, comment, **_kwargs):
+            if comment == "Envelope E2E delete continuity client stop":
+                raise e2e.SSMDispatchError(
+                    "fixture stop cleanup response omitted CommandId"
+                )
+
+        operations = object.__new__(e2e.AwsLiveOperations)
+        operations.ssm = SimpleNamespace(
+            send=mock.Mock(
+                side_effect=("fixture-server-command", "fixture-client-command")
+            ),
+            wait=mock.Mock(side_effect=primary),
+            terminate=mock.Mock(return_value=SimpleNamespace(status="Cancelled")),
+        )
+        operations._pause_managed_responder = mock.Mock()
+        operations._resume_managed_responder = mock.Mock()
+        operations._wait_listener = mock.Mock()
+        operations._execute = mock.Mock(side_effect=execute)
+        operations._execute_json = mock.Mock(return_value={"stream_ready": True})
+        operations._wait_until = mock.Mock()
+        operations._remote_monotonic_ns = mock.Mock(side_effect=(100, 200))
+
+        with self.assertRaises(e2e.StreamAnalysisError) as raised:
+            operations._run_stream_mutation(
+                flow,
+                timeout_seconds=90,
+                maximum_loss_ns=1_000,
+                label="fixture-ambiguous-stop-cleanup",
+                mutate_and_restore=lambda: {"restored": True},
+                stop_after_mutation=True,
+            )
+
+        self.assertIs(raised.exception, primary)
+        operations._resume_managed_responder.assert_not_called()
+        self.assertEqual(operations.ssm.terminate.call_count, 2)
+        self.assertTrue(
+            any("cleanup dispatch was not confirmed" in note for note in primary.__notes__)
+        )
+
+    def test_keyboard_interrupt_during_success_cleanup_suppresses_restoration(self) -> None:
+        flow = self._tcp_flow()
+        control = KeyboardInterrupt("fixture successful cleanup interrupt")
+        attempts = [40 + sequence * 10 for sequence in range(20)]
+        client = {
+            "attempts": attempts,
+            "connection_id": f"{flow.flow_id}:c0001",
+            "flow_id": flow.flow_id,
+            "interrupted": False,
+            "last_sent_monotonic_ns": attempts[-1],
+            "markers": [
+                [sequence, 45 + sequence * 10] for sequence in range(20)
+            ],
+            "sent_markers": 20,
+            "socket_count": 1,
+            "source_port": flow.source_port,
+            "stop_observed": True,
+            "success": True,
+        }
+        receiver = {
+            "duplicates": 0,
+            "flow_id": flow.flow_id,
+            "receives": 20,
+            "sessions": 1,
+            "stop_observed": True,
+            "success": True,
+        }
+        results = (
+            e2e.SSMResult(
+                flow.source,
+                "fixture-client-command",
+                "Success",
+                0,
+                stdout=json.dumps(client),
+            ),
+            e2e.SSMResult(
+                flow.destination,
+                "fixture-server-command",
+                "Success",
+                0,
+                stdout=json.dumps(receiver),
+            ),
+        )
+
+        def execute(_target, _command, *, comment, **_kwargs):
+            if comment == "Envelope E2E delete continuity readiness":
+                raise control
+
+        operations = object.__new__(e2e.AwsLiveOperations)
+        operations.ssm = SimpleNamespace(
+            send=mock.Mock(
+                side_effect=("fixture-server-command", "fixture-client-command")
+            ),
+            wait=mock.Mock(side_effect=results),
+            terminate=mock.Mock(),
+        )
+        operations._pause_managed_responder = mock.Mock()
+        operations._resume_managed_responder = mock.Mock()
+        operations._wait_listener = mock.Mock()
+        operations._execute = mock.Mock(side_effect=execute)
+        operations._execute_json = mock.Mock(return_value={"stream_ready": True})
+        operations._wait_until = mock.Mock()
+        operations._remote_monotonic_ns = mock.Mock(side_effect=(100, 200))
+
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            operations._run_stream_mutation(
+                flow,
+                timeout_seconds=90,
+                maximum_loss_ns=1_000,
+                label="fixture-success-cleanup-interrupt",
+                mutate_and_restore=lambda: {"restored": True},
+                stop_after_mutation=True,
+            )
+
+        self.assertIs(raised.exception, control)
+        operations._resume_managed_responder.assert_not_called()
+        operations.ssm.terminate.assert_not_called()
+
+    def test_keyboard_interrupt_during_stop_dispatch_fails_closed(self) -> None:
+        flow = self._tcp_flow()
+        for stop_role in ("client", "receiver"):
+            with self.subTest(stop_role=stop_role):
+                control = KeyboardInterrupt(
+                    f"fixture {stop_role} stop dispatch interrupt"
+                )
+                target_comment = (
+                    f"Envelope E2E complete continuity {stop_role}"
+                )
+
+                def execute(_target, _command, *, comment, **_kwargs):
+                    if comment == target_comment:
+                        raise control
+
+                operations = object.__new__(e2e.AwsLiveOperations)
+                operations.ssm = SimpleNamespace(
+                    send=mock.Mock(
+                        side_effect=(
+                            "fixture-server-command",
+                            "fixture-client-command",
+                        )
+                    ),
+                    wait=mock.Mock(return_value=SimpleNamespace()),
+                    terminate=mock.Mock(
+                        return_value=SimpleNamespace(status="Cancelled")
+                    ),
+                )
+                operations._pause_managed_responder = mock.Mock()
+                operations._resume_managed_responder = mock.Mock()
+                operations._wait_listener = mock.Mock()
+                operations._execute = mock.Mock(side_effect=execute)
+                operations._execute_json = mock.Mock(
+                    return_value={"stream_ready": True}
+                )
+                operations._wait_until = mock.Mock()
+                operations._remote_monotonic_ns = mock.Mock(
+                    side_effect=(100, 200)
+                )
+
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    operations._run_stream_mutation(
+                        flow,
+                        timeout_seconds=90,
+                        maximum_loss_ns=1_000,
+                        label=f"fixture-{stop_role}-stop-interrupt",
+                        mutate_and_restore=lambda: {"restored": True},
+                        stop_after_mutation=True,
+                    )
+
+                self.assertIs(raised.exception, control)
+                operations._resume_managed_responder.assert_not_called()
+                self.assertGreaterEqual(operations.ssm.terminate.call_count, 1)
+
+    def test_paired_keyboard_interrupt_during_stop_dispatch_fails_closed(self) -> None:
+        tcp_flow, udp_flow = self._paired_flows()
+        control = KeyboardInterrupt("fixture paired stop dispatch interrupt")
+
+        def execute(_target, _command, *, comment, **_kwargs):
+            if comment == "Envelope E2E complete continuity client":
+                raise control
+
+        operations = object.__new__(e2e.AwsLiveOperations)
+        operations.ssm = SimpleNamespace(
+            send=mock.Mock(
+                side_effect=("tcp-server", "udp-server", "tcp-client", "udp-client")
+            ),
+            terminate=mock.Mock(return_value=SimpleNamespace(status="Cancelled")),
+        )
+        operations._pause_managed_responder = mock.Mock()
+        operations._resume_managed_responder = mock.Mock()
+        operations._wait_listener = mock.Mock()
+        operations._execute = mock.Mock(side_effect=execute)
+        operations._execute_json = mock.Mock(return_value={"stream_ready": True})
+        operations._wait_until = mock.Mock()
+        operations._remote_monotonic_ns = mock.Mock(side_effect=(100, 200))
+
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            operations._run_paired_stream_mutation(
+                tcp_flow,
+                udp_flow,
+                timeout_seconds=90,
+                maximum_loss_ns=1_000,
+                label="fixture-paired-stop-interrupt",
+                mutate_and_restore=lambda: {"restored": True},
+            )
+
+        self.assertIs(raised.exception, control)
+        self.assertEqual(operations.ssm.terminate.call_count, 4)
+        operations._resume_managed_responder.assert_not_called()
+
+    def test_stream_mutation_preserves_keyboard_interrupt_after_termination(self) -> None:
+        flow = self._tcp_flow()
+        control = KeyboardInterrupt("fixture mutation interrupt")
+        operations = object.__new__(e2e.AwsLiveOperations)
+        operations.ssm = SimpleNamespace(
+            send=mock.Mock(
+                side_effect=("fixture-server-command", "fixture-client-command")
+            ),
+            wait=mock.Mock(return_value=SimpleNamespace()),
+            cancel=mock.Mock(return_value=True),
+        )
+        operations._pause_managed_responder = mock.Mock()
+        operations._resume_managed_responder = mock.Mock()
+        operations._wait_listener = mock.Mock()
+        operations._execute = mock.Mock()
+        operations._execute_json = mock.Mock(return_value={"stream_ready": True})
+        operations._wait_until = mock.Mock()
+        operations._remote_monotonic_ns = mock.Mock(return_value=100)
+
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            operations._run_stream_mutation(
+                flow,
+                timeout_seconds=90,
+                maximum_loss_ns=1_000,
+                label="fixture-keyboard-interrupt",
+                mutate_and_restore=lambda: (_ for _ in ()).throw(control),
+            )
+
+        self.assertIs(raised.exception, control)
+        self.assertEqual(operations.ssm.cancel.call_count, 2)
+        self.assertEqual(operations.ssm.wait.call_count, 2)
         operations._resume_managed_responder.assert_called_once_with(
             flow.destination, "tcp"
         )
@@ -12191,8 +13234,13 @@ class ProtectedExecutionTest(unittest.TestCase):
     def test_embedded_remote_agent_is_valid_python_and_bounded_for_ssm(self) -> None:
         compile(e2e.REMOTE_AGENT_SOURCE, "<remote-agent>", "exec")
         self.assertIn('stream.add_argument("--ready-path", required=True)', e2e.REMOTE_AGENT_SOURCE)
+        self.assertIn('stream.add_argument("--stop-path")', e2e.REMOTE_AGENT_SOURCE)
+        self.assertIn('server.add_argument("--stop-path")', e2e.REMOTE_AGENT_SOURCE)
+        self.assertIn('stream.add_argument("--stop-token")', e2e.REMOTE_AGENT_SOURCE)
+        self.assertIn('server.add_argument("--stop-token")', e2e.REMOTE_AGENT_SOURCE)
         self.assertIn("os.O_WRONLY | os.O_CREAT | os.O_EXCL", e2e.REMOTE_AGENT_SOURCE)
-        self.assertIn("markers.append([sequence, sent, time.monotonic_ns()])", e2e.REMOTE_AGENT_SOURCE)
+        self.assertIn("attempts.append(sent)", e2e.REMOTE_AGENT_SOURCE)
+        self.assertIn("markers.append([sequence, time.monotonic_ns()])", e2e.REMOTE_AGENT_SOURCE)
         self.assertIn('"sent_markers": sent_markers', e2e.REMOTE_AGENT_SOURCE)
         self.assertIn('"last_sent_monotonic_ns": last_sent_monotonic_ns', e2e.REMOTE_AGENT_SOURCE)
         compressed = gzip.compress(e2e.REMOTE_AGENT_SOURCE.encode("utf-8"), mtime=0)
@@ -12204,28 +13252,32 @@ class ProtectedExecutionTest(unittest.TestCase):
     def test_compact_stream_markers_fit_ssm_output_and_expand_strictly(self) -> None:
         flow_id = "fixture-tcp-0001"
         connection_id = f"{flow_id}:c0001"
+        attempts = [10**18 + sequence * 2 for sequence in range(160)]
         markers = [
-            [sequence, 10**18 + sequence * 2, 10**18 + sequence * 2 + 1]
+            [sequence, 10**18 + sequence * 2 + 1]
             for sequence in range(160)
         ]
         result = {
+            "attempts": attempts,
             "connection_id": connection_id,
             "flow_id": flow_id,
             "interrupted": False,
-            "last_sent_monotonic_ns": markers[-1][1],
+            "last_sent_monotonic_ns": attempts[-1],
             "markers": markers,
             "sent_markers": len(markers),
             "socket_count": 1,
             "source_port": 30000,
+            "stop_observed": False,
             "success": True,
         }
 
         self.assertLess(len(json.dumps(result, separators=(",", ":"))), 12_000)
         expanded = e2e._expand_compact_stream_markers(result)
         self.assertEqual([marker.sequence for marker in expanded], list(range(160)))
+        self.assertEqual([marker.sent_monotonic_ns for marker in expanded], attempts)
         self.assertTrue(all(marker.flow_id == flow_id for marker in expanded))
         with self.assertRaisesRegex(e2e.StreamAnalysisError, "wrong shape"):
-            e2e._expand_compact_stream_markers({**result, "markers": [[0, 1]]})
+            e2e._expand_compact_stream_markers({**result, "markers": [[0]]})
 
     def test_embedded_tcp_framing_retains_coalesced_trailing_bytes(self) -> None:
         namespace: dict[str, Any] = {"__name__": "remote_agent_fixture"}
@@ -12256,6 +13308,43 @@ class ProtectedExecutionTest(unittest.TestCase):
         )
         self.assertEqual(namespace["decode"](frame), second)
         self.assertEqual(buffered, b"")
+
+        class PartialTimeoutSocket:
+            def __init__(self) -> None:
+                self.values: list[bytes | BaseException] = [
+                    b'{"flow_id":"fixture",',
+                    socket.timeout("fixture partial timeout"),
+                    b'"kind":"ack","sequence":3}\n',
+                ]
+
+            def settimeout(self, _seconds: float) -> None:
+                pass
+
+            def recv(self, _size: int) -> bytes:
+                value = self.values.pop(0)
+                if isinstance(value, BaseException):
+                    raise value
+                return value
+
+        partial = PartialTimeoutSocket()
+        retained = bytearray()
+        with self.assertRaises(socket.timeout):
+            namespace["tcp_frame"](
+                partial,
+                time.monotonic() + 1,
+                retained,
+            )
+        self.assertEqual(retained, b'{"flow_id":"fixture",')
+        frame, retained = namespace["tcp_frame"](
+            partial,
+            time.monotonic() + 1,
+            retained,
+        )
+        self.assertEqual(
+            namespace["decode"](frame),
+            {"flow_id": "fixture", "kind": "ack", "sequence": 3},
+        )
+        self.assertEqual(retained, b"")
 
     def test_embedded_stream_server_releases_protocol_listener_identity(self) -> None:
         marker = {
@@ -12320,8 +13409,9 @@ class ProtectedExecutionTest(unittest.TestCase):
                     def connect(self, value: tuple[str, int]) -> None:
                         events.append(("udp-connect", value))
 
-                    def send(self, _payload: bytes) -> None:
+                    def send(self, payload: bytes) -> int:
                         events.append("udp-send")
+                        return len(payload)
 
                     def sendto(self, _payload: bytes, _peer: tuple[str, int]) -> None:
                         events.append("udp-sendto")
@@ -12349,6 +13439,8 @@ class ProtectedExecutionTest(unittest.TestCase):
                         flow_id="fixture-stream",
                         port=5201,
                         protocol=protocol,
+                        stop_path=None,
+                        stop_token=None,
                     )
                 )
 
@@ -12363,6 +13455,327 @@ class ProtectedExecutionTest(unittest.TestCase):
                     self.assertIn(("udp-connect", peer), events)
                     self.assertIn("udp-send", events)
                     self.assertNotIn("udp-sendto", events)
+
+    def test_controlled_tcp_receiver_waits_for_stop_after_client_eof(self) -> None:
+        namespace: dict[str, Any] = {"__name__": "remote_agent_fixture"}
+        exec(e2e.REMOTE_AGENT_SOURCE, namespace)
+        flow_id = "fixture-stream"
+        stop_path = f"/run/envelope-e2e-stream-{flow_id}.server-stop"
+        stop_token = "11111111-2222-4333-8444-555555555555"
+        marker = {
+            "connection_id": f"{flow_id}:c0001",
+            "flow_id": flow_id,
+            "kind": "marker",
+            "sequence": 0,
+        }
+        events: list[str] = []
+        emitted: list[dict[str, Any]] = []
+
+        class Clock:
+            def __init__(self) -> None:
+                self.value = 0.0
+
+            def monotonic(self) -> float:
+                self.value += 0.01
+                return self.value
+
+            def sleep(self, seconds: float) -> None:
+                self.value += seconds
+
+        class Connection:
+            def __init__(self) -> None:
+                self.reads = 0
+
+            def settimeout(self, _seconds: float) -> None:
+                pass
+
+            def recv(self, _size: int) -> bytes:
+                self.reads += 1
+                events.append(f"recv:{self.reads}")
+                return namespace["encode"](marker, True) if self.reads == 1 else b""
+
+            def sendall(self, _payload: bytes) -> None:
+                events.append("ack")
+
+            def close(self) -> None:
+                events.append("connection-close")
+
+        connection = Connection()
+
+        class Listener:
+            def setsockopt(self, *_args: object) -> None:
+                pass
+
+            def bind(self, _address: tuple[str, int]) -> None:
+                pass
+
+            def listen(self, _backlog: int) -> None:
+                pass
+
+            def settimeout(self, _seconds: float) -> None:
+                pass
+
+            def accept(self):
+                return connection, ("192.0.2.10", 41000)
+
+            def close(self) -> None:
+                events.append("listener-close")
+
+        checks = 0
+
+        def stop_requested(path: str, token: str) -> bool:
+            nonlocal checks
+            self.assertEqual((path, token), (stop_path, stop_token))
+            checks += 1
+            return checks >= 3
+
+        namespace["socket"] = SimpleNamespace(
+            AF_INET=socket.AF_INET,
+            SOCK_STREAM=socket.SOCK_STREAM,
+            SOCK_DGRAM=socket.SOCK_DGRAM,
+            SOL_SOCKET=socket.SOL_SOCKET,
+            SO_REUSEADDR=socket.SO_REUSEADDR,
+            timeout=socket.timeout,
+            socket=lambda *_args: Listener(),
+        )
+        namespace["time"] = Clock()
+        namespace["emit"] = emitted.append
+        namespace["private_stop_requested"] = stop_requested
+        namespace["stream_server"](
+            SimpleNamespace(
+                bind="192.0.2.20",
+                duration=10.0,
+                flow_id=flow_id,
+                port=5201,
+                protocol="tcp",
+                stop_path=stop_path,
+                stop_token=stop_token,
+            )
+        )
+
+        self.assertEqual(events.count("ack"), 1)
+        self.assertIn("recv:2", events)
+        self.assertTrue(emitted[-1]["stop_observed"])
+        self.assertEqual(emitted[-1]["receives"], 1)
+
+    def test_embedded_stream_client_stops_after_minimum_and_final_marker(self) -> None:
+        namespace: dict[str, Any] = {"__name__": "remote_agent_fixture"}
+        exec(e2e.REMOTE_AGENT_SOURCE, namespace)
+        flow_id = "fixture-stream"
+        connection_id = f"{flow_id}:c0001"
+        emitted: list[dict[str, Any]] = []
+        events: list[str] = []
+
+        class Clock:
+            def __init__(self) -> None:
+                self.value = 0.0
+
+            def monotonic(self) -> float:
+                self.value += 0.001
+                return self.value
+
+            def monotonic_ns(self) -> int:
+                self.value += 0.001
+                events.append("send-completion-clock")
+                return int(self.value * 1_000_000_000)
+
+            def sleep(self, seconds: float) -> None:
+                self.value += max(0.0, seconds)
+
+        class ClientSocket:
+            def __init__(self) -> None:
+                self.request: dict[str, Any] | None = None
+
+            def bind(self, _address: tuple[str, int]) -> None:
+                pass
+
+            def connect(self, _address: tuple[str, int]) -> None:
+                pass
+
+            def settimeout(self, _seconds: float) -> None:
+                pass
+
+            def send(self, payload: bytes) -> int:
+                self.request = namespace["decode"](payload)
+                events.append("udp-send-returned")
+                return len(payload)
+
+            def recv(self, _size: int) -> bytes:
+                assert self.request is not None
+                return namespace["encode"](
+                    {
+                        "connection_id": connection_id,
+                        "flow_id": flow_id,
+                        "kind": "ack",
+                        "sequence": self.request["sequence"],
+                    }
+                )
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            ready_path = pathlib.Path(temporary) / "ready"
+            stop_path = f"/run/envelope-e2e-stream-{flow_id}.client-stop"
+            stop_token = "11111111-2222-4333-8444-555555555555"
+            namespace["socket"] = SimpleNamespace(
+                AF_INET=socket.AF_INET,
+                SOCK_STREAM=socket.SOCK_STREAM,
+                SOCK_DGRAM=socket.SOCK_DGRAM,
+                timeout=socket.timeout,
+                socket=lambda *_args: ClientSocket(),
+            )
+            namespace["time"] = Clock()
+            namespace["emit"] = emitted.append
+            namespace["private_stop_requested"] = (
+                lambda path, token: (path, token) == (stop_path, stop_token)
+            )
+            namespace["stream_client"](
+                SimpleNamespace(
+                    ack_timeout=0.1,
+                    count=160,
+                    flow_id=flow_id,
+                    host="192.0.2.20",
+                    interval=0.01,
+                    minimum_count=20,
+                    port=5201,
+                    protocol="udp",
+                    ready_path=str(ready_path),
+                    source_ip="192.0.2.10",
+                    source_port=41000,
+                    stop_path=stop_path,
+                    stop_token=stop_token,
+                )
+            )
+
+        self.assertEqual(emitted[-1]["sent_markers"], 20)
+        self.assertEqual(len(emitted[-1]["markers"]), 20)
+        self.assertTrue(emitted[-1]["stop_observed"])
+        self.assertEqual(events.count("udp-send-returned"), 20)
+        self.assertEqual(events.count("send-completion-clock"), 40)
+        self.assertLess(
+            events.index("udp-send-returned"),
+            events.index("send-completion-clock"),
+        )
+
+    def test_embedded_udp_short_sends_are_local_failures(self) -> None:
+        namespace: dict[str, Any] = {"__name__": "remote_agent_fixture"}
+        exec(e2e.REMOTE_AGENT_SOURCE, namespace)
+        flow_id = "fixture-stream"
+        connection_id = f"{flow_id}:c0001"
+        emitted: list[dict[str, Any]] = []
+
+        class Clock:
+            def __init__(self) -> None:
+                self.value = 0.0
+
+            def monotonic(self) -> float:
+                self.value += 0.001
+                return self.value
+
+            def monotonic_ns(self) -> int:
+                self.value += 0.001
+                return int(self.value * 1_000_000_000)
+
+            def sleep(self, seconds: float) -> None:
+                self.value += max(0.0, seconds)
+
+        class ShortClientSocket:
+            def bind(self, _address: tuple[str, int]) -> None:
+                pass
+
+            def connect(self, _address: tuple[str, int]) -> None:
+                pass
+
+            def send(self, payload: bytes) -> int:
+                return len(payload) - 1
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            namespace["socket"] = SimpleNamespace(
+                AF_INET=socket.AF_INET,
+                SOCK_STREAM=socket.SOCK_STREAM,
+                SOCK_DGRAM=socket.SOCK_DGRAM,
+                socket=lambda *_args: ShortClientSocket(),
+            )
+            namespace["time"] = Clock()
+            namespace["emit"] = emitted.append
+            namespace["private_stop_requested"] = lambda *_args: False
+            namespace["stream_client"](
+                SimpleNamespace(
+                    ack_timeout=0.1,
+                    count=20,
+                    flow_id=flow_id,
+                    host="192.0.2.20",
+                    interval=0.01,
+                    minimum_count=20,
+                    port=5201,
+                    protocol="udp",
+                    ready_path=str(pathlib.Path(temporary) / "ready"),
+                    source_ip="192.0.2.10",
+                    source_port=41000,
+                    stop_path=None,
+                    stop_token=None,
+                )
+            )
+
+        self.assertTrue(emitted[-1]["interrupted"])
+        self.assertEqual(emitted[-1]["sent_markers"], 0)
+        self.assertEqual(emitted[-1]["attempts"], [])
+
+        marker_value = {
+            "connection_id": connection_id,
+            "flow_id": flow_id,
+            "kind": "marker",
+            "sequence": 0,
+        }
+
+        class ShortServerSocket:
+            def setsockopt(self, *_args: object) -> None:
+                pass
+
+            def bind(self, _address: tuple[str, int]) -> None:
+                pass
+
+            def settimeout(self, _seconds: float) -> None:
+                pass
+
+            def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+                return namespace["encode"](marker_value), ("192.0.2.10", 41000)
+
+            def connect(self, _peer: tuple[str, int]) -> None:
+                pass
+
+            def send(self, payload: bytes) -> int:
+                return len(payload) - 1
+
+            def close(self) -> None:
+                pass
+
+        namespace["socket"] = SimpleNamespace(
+            AF_INET=socket.AF_INET,
+            SOCK_STREAM=socket.SOCK_STREAM,
+            SOCK_DGRAM=socket.SOCK_DGRAM,
+            SOL_SOCKET=socket.SOL_SOCKET,
+            SO_REUSEADDR=socket.SO_REUSEADDR,
+            timeout=socket.timeout,
+            socket=lambda *_args: ShortServerSocket(),
+        )
+        namespace["time"] = Clock()
+        with self.assertRaisesRegex(RuntimeError, "not sent in full"):
+            namespace["stream_server"](
+                SimpleNamespace(
+                    bind="192.0.2.20",
+                    duration=1.0,
+                    flow_id=flow_id,
+                    port=5201,
+                    protocol="udp",
+                    stop_path=None,
+                    stop_token=None,
+                )
+            )
 
     def test_embedded_icmp_sender_preserves_every_payload_byte(self) -> None:
         namespace: dict[str, Any] = {"__name__": "remote_agent_fixture"}
