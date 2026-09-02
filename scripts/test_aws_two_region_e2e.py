@@ -6509,9 +6509,16 @@ class PacketCaptureAssertionTest(unittest.TestCase):
 
 class CaptureControllerTest(unittest.TestCase):
     class FakeSSM:
-        def __init__(self, *, fail_inspection: bool = False, malformed_summary: bool = False) -> None:
+        def __init__(
+            self,
+            *,
+            fail_inspection: bool = False,
+            malformed_summary: bool = False,
+            inspection_timeouts: int = 0,
+        ) -> None:
             self.fail_inspection = fail_inspection
             self.malformed_summary = malformed_summary
+            self.inspection_timeouts = inspection_timeouts
             self.sent: list[e2e.SSMCommand] = []
             self.executed: list[e2e.SSMCommand] = []
 
@@ -6537,6 +6544,9 @@ class CaptureControllerTest(unittest.TestCase):
             if command.comment == "Envelope E2E capture readiness":
                 output = '{"capture_ready":true,"success":true}\n'
             elif command.comment == "Envelope E2E inspect sanitized capture":
+                if self.inspection_timeouts > 0:
+                    self.inspection_timeouts -= 1
+                    raise e2e.SSMTimeout("fixture document-worker timeout")
                 if self.fail_inspection:
                     return e2e.SSMResult(command.target, "inspect", "Failed", 2, stderr="fixture parse failure")
                 payload = (
@@ -6794,6 +6804,190 @@ class CaptureControllerTest(unittest.TestCase):
             sum(command.comment == "Envelope E2E delete raw captures" for command in fake.executed),
             3,
         )
+        self.assertEqual(
+            sum(command.comment == "Envelope E2E inspect sanitized capture" for command in fake.executed),
+            1,
+        )
+
+    def test_inspector_retries_only_one_ssm_timeout(self) -> None:
+        fake = self.FakeSSM(inspection_timeouts=1)
+        operations, deployment, _flows = self.fixture(fake)
+
+        summary = operations._inspect_capture_summary(
+            deployment.appliance("west"), "/run/envelope-e2e-capture/fixture.pcap"
+        )
+
+        self.assertTrue(summary["success"])
+        self.assertEqual(
+            sum(command.comment == "Envelope E2E inspect sanitized capture" for command in fake.executed),
+            2,
+        )
+
+        exhausted = self.FakeSSM(inspection_timeouts=2)
+        operations, deployment, _flows = self.fixture(exhausted)
+        with self.assertRaisesRegex(e2e.SSMTimeout, "document-worker timeout"):
+            operations._inspect_capture_summary(
+                deployment.appliance("west"),
+                "/run/envelope-e2e-capture/fixture.pcap",
+            )
+        self.assertEqual(
+            sum(
+                command.comment == "Envelope E2E inspect sanitized capture"
+                for command in exhausted.executed
+            ),
+            2,
+        )
+
+    def test_inspector_retry_paths_delete_raw_captures(self) -> None:
+        recovered = self.FakeSSM(inspection_timeouts=1)
+        operations, deployment, flows = self.fixture(recovered)
+        handle = operations._start_directional_captures(
+            deployment, "west", flows, timeout_seconds=60
+        )
+
+        result = operations._finish_directional_captures(
+            deployment, handle, inspect=True
+        )
+
+        self.assertTrue(result["raw_deleted"])
+        self.assertTrue(handle.raw_deleted)
+
+        exhausted = self.FakeSSM(inspection_timeouts=2)
+        operations, deployment, flows = self.fixture(exhausted)
+        handle = operations._start_directional_captures(
+            deployment, "west", flows, timeout_seconds=60
+        )
+        with self.assertRaisesRegex(e2e.WireAssertionError, "document-worker timeout"):
+            operations._finish_directional_captures(
+                deployment, handle, inspect=True
+            )
+        self.assertTrue(handle.raw_deleted)
+        self.assertEqual(
+            sum(
+                command.comment == "Envelope E2E inspect sanitized capture"
+                for command in exhausted.executed
+            ),
+            2,
+        )
+
+    def test_capture_inspection_preserves_protected_control_flow(self) -> None:
+        fake = self.FakeSSM()
+        operations, deployment, flows = self.fixture(fake)
+        handle = operations._start_directional_captures(
+            deployment, "west", flows, timeout_seconds=60
+        )
+
+        with (
+            mock.patch.object(
+                operations,
+                "_inspect_capture_summary",
+                side_effect=e2e.ProtectedHardTimeout("fixture hard deadline"),
+            ),
+            self.assertRaisesRegex(e2e.ProtectedHardTimeout, "hard deadline"),
+        ):
+            operations._finish_directional_captures(
+                deployment, handle, inspect=True
+            )
+
+        self.assertTrue(handle.raw_deleted)
+
+    def test_cold_direction_prioritizes_protected_capture_control_flow(self) -> None:
+        fake = self.FakeSSM()
+        operations, deployment, flows = self.fixture(fake)
+        handle = e2e.DirectionalCaptureHandle("west", {}, {}, {})
+
+        with (
+            mock.patch.object(
+                operations,
+                "_restart_envelope",
+                return_value={"west": 101, "east": 202},
+            ),
+            mock.patch.object(
+                operations,
+                "_start_directional_captures",
+                return_value=handle,
+            ),
+            mock.patch.object(
+                operations,
+                "_metric_snapshots",
+                return_value={},
+            ),
+            mock.patch.object(
+                operations,
+                "_run_icmp_probe",
+                side_effect=e2e.ProbeError("fixture probe failure"),
+            ),
+            mock.patch.object(
+                operations,
+                "_finish_directional_captures",
+                side_effect=e2e.ProtectedHardTimeout("fixture hard deadline"),
+            ),
+            self.assertRaisesRegex(e2e.ProtectedHardTimeout, "hard deadline"),
+        ):
+            operations.run_cold_direction(
+                deployment, "west", flows, timeout_seconds=60
+            )
+
+    def test_cold_direction_does_not_inspect_after_protected_primary_error(self) -> None:
+        fake = self.FakeSSM()
+        operations, deployment, flows = self.fixture(fake)
+        handle = e2e.DirectionalCaptureHandle("west", {}, {}, {})
+        finish = mock.Mock(return_value={"raw_deleted": True})
+
+        with (
+            mock.patch.object(
+                operations,
+                "_restart_envelope",
+                return_value={"west": 101, "east": 202},
+            ),
+            mock.patch.object(
+                operations,
+                "_start_directional_captures",
+                return_value=handle,
+            ),
+            mock.patch.object(
+                operations,
+                "_metric_snapshots",
+                return_value={},
+            ),
+            mock.patch.object(
+                operations,
+                "_run_icmp_probe",
+                side_effect=e2e.ProtectedHardTimeout("fixture hard deadline"),
+            ),
+            mock.patch.object(
+                operations,
+                "_finish_directional_captures",
+                finish,
+            ),
+            self.assertRaisesRegex(e2e.ProtectedHardTimeout, "hard deadline"),
+        ):
+            operations.run_cold_direction(
+                deployment, "west", flows, timeout_seconds=60
+            )
+
+        finish.assert_called_once_with(deployment, handle, inspect=False)
+
+    def test_capture_start_rollback_preserves_protected_control_flow(self) -> None:
+        fake = self.FakeSSM()
+        operations, deployment, flows = self.fixture(fake)
+
+        with (
+            mock.patch.object(
+                operations,
+                "_execute_json",
+                side_effect=e2e.SSMError("fixture readiness failure"),
+            ),
+            mock.patch.object(
+                operations,
+                "_finish_directional_captures",
+                side_effect=e2e.ProtectedTermination("fixture termination"),
+            ),
+            self.assertRaisesRegex(e2e.ProtectedTermination, "termination"),
+        ):
+            operations._start_directional_captures(
+                deployment, "west", flows, timeout_seconds=60
+            )
 
     def test_summary_parse_failure_still_deletes_every_raw_capture(self) -> None:
         fake = self.FakeSSM(malformed_summary=True)
@@ -6808,6 +7002,10 @@ class CaptureControllerTest(unittest.TestCase):
         self.assertEqual(
             sum(command.comment == "Envelope E2E delete raw captures" for command in fake.executed),
             3,
+        )
+        self.assertEqual(
+            sum(command.comment == "Envelope E2E inspect sanitized capture" for command in fake.executed),
+            1,
         )
 
     def test_flow_id_cannot_escape_capture_directory(self) -> None:

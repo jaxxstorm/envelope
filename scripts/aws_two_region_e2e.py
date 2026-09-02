@@ -16720,7 +16720,8 @@ exit 1"""
         except BaseException:
             try:
                 self._finish_directional_captures(deployment, handle, inspect=False)
-            except Exception:
+            except Exception as cleanup_error:
+                _rethrow_protected_control_flow(cleanup_error)
                 pass
             raise
 
@@ -16768,6 +16769,7 @@ exit 1"""
                     if not result.succeeded:
                         errors.append(f"{site} capture command ended {result.status}")
                 except Exception as error:
+                    _rethrow_protected_control_flow(error)
                     errors.append(f"{site} capture wait failed: {_sanitize_string(str(error))}")
             if handle.source_target is not None and handle.source_command_id is not None:
                 try:
@@ -16775,6 +16777,7 @@ exit 1"""
                     if not result.succeeded:
                         errors.append(f"{handle.source_site} source workload capture command ended {result.status}")
                 except Exception as error:
+                    _rethrow_protected_control_flow(error)
                     errors.append(
                         f"{handle.source_site} source workload capture wait failed: {_sanitize_string(str(error))}"
                     )
@@ -16787,6 +16790,7 @@ exit 1"""
                         try:
                             summaries[site][logical] = self._inspect_capture_summary(target, path)
                         except Exception as error:
+                            _rethrow_protected_control_flow(error)
                             errors.append(
                                 f"{site} {logical} capture inspection failed: {_sanitize_string(str(error))}"
                             )
@@ -16795,6 +16799,7 @@ exit 1"""
                     try:
                         source_summary = self._inspect_capture_summary(handle.source_target, handle.source_path)
                     except Exception as error:
+                        _rethrow_protected_control_flow(error)
                         errors.append(
                             f"{handle.source_site} source workload capture inspection failed: "
                             f"{_sanitize_string(str(error))}"
@@ -16819,6 +16824,7 @@ exit 1"""
                     if deleted.get("deleted") is not True:
                         errors.append(f"{site} did not prove raw capture deletion")
                 except Exception as error:
+                    _rethrow_protected_control_flow(error)
                     errors.append(f"{site} raw capture deletion failed: {_sanitize_string(str(error))}")
             if (
                 handle.source_target is not None
@@ -16838,6 +16844,7 @@ exit 1"""
                     if deleted.get("deleted") is not True:
                         errors.append(f"{handle.source_site} did not prove source workload raw capture deletion")
                 except Exception as error:
+                    _rethrow_protected_control_flow(error)
                     errors.append(
                         f"{handle.source_site} source workload raw capture deletion failed: "
                         f"{_sanitize_string(str(error))}"
@@ -16863,12 +16870,25 @@ exit 1"""
         }
 
     def _inspect_capture_summary(self, target: RemoteTarget, path: str) -> dict[str, Any]:
-        result = self._execute(
-            target,
-            f"set -euo pipefail; {shlex.quote(WIRE_INSPECTOR_PATH)} {shlex.quote(path)} | gzip -n -9 | base64 -w0",
-            timeout_seconds=30,
-            comment="Envelope E2E inspect sanitized capture",
+        command = (
+            f"set -euo pipefail; {shlex.quote(WIRE_INSPECTOR_PATH)} {shlex.quote(path)} "
+            "| gzip -n -9 | base64 -w0"
         )
+        try:
+            result = self._execute(
+                target,
+                command,
+                timeout_seconds=30,
+                comment="Envelope E2E inspect sanitized capture",
+            )
+        except SSMTimeout:
+            # Inspection is read-only, and the owned raw capture remains until the outer cleanup.
+            result = self._execute(
+                target,
+                command,
+                timeout_seconds=30,
+                comment="Envelope E2E inspect sanitized capture",
+            )
         encoded = result.stdout.strip()
         if not encoded or len(encoded) > 20_000:
             raise WireAssertionError("compressed capture summary is absent or exceeds the SSM evidence bound")
@@ -17153,9 +17173,17 @@ exit 1"""
         finally:
             if handle is not None:
                 try:
-                    capture_result = self._finish_directional_captures(deployment, handle, inspect=True)
+                    capture_result = self._finish_directional_captures(
+                        deployment,
+                        handle,
+                        inspect=not isinstance(primary_error, PROTECTED_CONTROL_FLOW),
+                    )
                 except BaseException as error:
                     capture_error = error
+        if primary_error is not None:
+            _rethrow_protected_control_flow(primary_error)
+        if capture_error is not None:
+            _rethrow_protected_control_flow(capture_error)
         wire: dict[str, Any] | None = None
         if capture_result is not None and capture_error is None:
             try:
@@ -17181,6 +17209,8 @@ exit 1"""
                 self.capture_assertion_events.append(wire)
             except BaseException as error:
                 capture_error = error
+        if capture_error is not None:
+            _rethrow_protected_control_flow(capture_error)
         if primary_error is not None:
             if capture_error is not None:
                 source_detail = ""
