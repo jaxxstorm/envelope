@@ -263,6 +263,8 @@ def verify_transport_contract(text: str, unit: str) -> None:
             f"ExecReload={network_path} activate",
             "ExecStop=/usr/bin/rm -f /var/lib/envelope/transport-router-network.ready /var/lib/envelope/transport-router-network.state.json",
             "RemainAfterExit=yes",
+            "Restart=on-failure",
+            "RestartSec=10s",
             "RuntimeDirectory=envelope-transport-router-network",
             "RuntimeDirectoryMode=0700",
             "ProtectSystem=strict",

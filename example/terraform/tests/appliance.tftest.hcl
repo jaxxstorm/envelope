@@ -349,13 +349,17 @@ run "symmetric_two_az_paths" {
       strcontains(local.transport_router_bootstrap.west, "After=network-online.target tailscaled.service") &&
       strcontains(local.transport_router_bootstrap.west, "PartOf=tailscaled.service") &&
       strcontains(local.transport_router_bootstrap.west, "ConditionPathExists=/var/lib/envelope/transport-router-network.configured") &&
+      strcontains(local.transport_router_bootstrap.west, "Restart=on-failure") &&
+      strcontains(local.transport_router_bootstrap.west, "RestartSec=10s") &&
       strcontains(local.transport_router_bootstrap.west, "WantedBy=tailscaled.service") &&
       strcontains(local.transport_router_bootstrap.west, "/usr/local/sbin/envelope-transport-router-network stage") &&
       !strcontains(local.transport_router_bootstrap.west, "net.ipv6.conf.all.forwarding=1") &&
       strcontains(local.transport_router_activation, "touch \"$recovery\"") &&
-      strcontains(local.transport_router_activation, "systemctl restart envelope-transport-router-network.service") &&
-      strcontains(local.transport_router_activation, ".ipv6_forwarding == false") &&
-      strcontains(local.transport_router_activation, "test -f \"$ready\"") &&
+      strcontains(local.transport_router_activation, "rm -f \"$ready\" \"$state\"") &&
+      strcontains(local.transport_router_activation, "systemctl stop envelope-transport-router-network.service") &&
+      strcontains(local.transport_router_activation, "systemctl reset-failed envelope-transport-router-network.service") &&
+      strcontains(local.transport_router_activation, "systemctl start --no-block envelope-transport-router-network.service") &&
+      !strcontains(local.transport_router_activation, "systemctl restart envelope-transport-router-network.service") &&
       !strcontains(local.transport_router_bootstrap.west, "-j SNAT") &&
       !strcontains(local.transport_router_bootstrap.west, "-j MASQUERADE")
     )

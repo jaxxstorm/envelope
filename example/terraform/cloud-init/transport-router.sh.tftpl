@@ -829,6 +829,8 @@ ExecStop=/usr/sbin/sysctl -q -w net.ipv6.conf.all.forwarding=0
 ExecStop=/usr/sbin/sysctl -q -w net.ipv6.conf.default.forwarding=0
 ExecStop=/usr/bin/rm -f /var/lib/envelope/transport-router-network.ready /var/lib/envelope/transport-router-network.state.json
 RemainAfterExit=yes
+Restart=on-failure
+RestartSec=10s
 TimeoutStartSec=270s
 RuntimeDirectory=envelope-transport-router-network
 RuntimeDirectoryMode=0700

@@ -1015,19 +1015,35 @@ write_state "$requested_generation" "$requested_routes_json"
             2,
         )
         activation = assigned_heredoc(self.user_data, "transport_router_activation")
-        self.assertIn(
-            "systemctl restart envelope-transport-router-network.service",
-            activation,
+        enabled = activation.index(
+            "systemctl is-enabled --quiet envelope-transport-router-network.service"
         )
-        self.assertIn(
-            "systemctl is-active --quiet envelope-transport-router-network.service tailscaled.service",
-            activation,
+        tailscaled = activation.index(
+            "systemctl is-active --quiet tailscaled.service"
         )
-        self.assertIn(
-            "/usr/bin/jq -e '.ready == true and .ipv4_forwarding == true and .ipv6_forwarding == false and .filter_forward_policy == \"DROP\" and .mangle_forward_policy == \"ACCEPT\" and .no_nat == true'",
-            activation,
+        stop = activation.index(
+            "\n    systemctl stop envelope-transport-router-network.service"
         )
-        self.assertIn('test -f "$ready"', activation)
+        reset = activation.index(
+            "systemctl reset-failed envelope-transport-router-network.service"
+        )
+        start = activation.index(
+            "systemctl start --no-block envelope-transport-router-network.service"
+        )
+        self.assertLess(enabled, tailscaled)
+        self.assertLess(tailscaled, stop)
+        self.assertLess(stop, reset)
+        self.assertLess(reset, start)
+        self.assertNotIn(
+            "systemctl restart envelope-transport-router-network.service", activation
+        )
+
+        unit = heredoc(
+            self.transport_router,
+            "/etc/systemd/system/envelope-transport-router-network.service",
+        )
+        self.assertIn("Restart=on-failure", unit)
+        self.assertIn("RestartSec=10s", unit)
 
         stage = self.transport_router.rindex(
             "/usr/local/sbin/envelope-transport-router-network stage"

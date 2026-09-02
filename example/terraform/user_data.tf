@@ -187,13 +187,15 @@ locals {
     readonly ready=/var/lib/envelope/transport-router-network.ready
     readonly state=/var/lib/envelope/transport-router-network.state.json
     readonly recovery=/var/lib/envelope/transport-router-network.configured
-    rm -f "$ready"
-    trap 'systemctl stop envelope-transport-router-network.service >/dev/null 2>&1 || true; rm -f "$ready"' ERR
+    rm -f "$ready" "$state"
+    trap 'systemctl stop envelope-transport-router-network.service >/dev/null 2>&1 || true; rm -f "$ready" "$state"' ERR
     touch "$recovery"
-    systemctl restart envelope-transport-router-network.service
-    systemctl is-active --quiet envelope-transport-router-network.service tailscaled.service
-    /usr/bin/jq -e '.ready == true and .ipv4_forwarding == true and .ipv6_forwarding == false and .filter_forward_policy == "DROP" and .mangle_forward_policy == "ACCEPT" and .no_nat == true' "$state" >/dev/null
-    test -f "$ready"
+    systemctl is-enabled --quiet envelope-transport-router-network.service
+    systemctl is-active --quiet tailscaled.service
+    systemctl stop envelope-transport-router-network.service
+    systemctl reset-failed envelope-transport-router-network.service
+    # Peer routes converge independently; protected readiness validates the completed contract.
+    systemctl start --no-block envelope-transport-router-network.service
     trap - ERR
   SCRIPT
 }

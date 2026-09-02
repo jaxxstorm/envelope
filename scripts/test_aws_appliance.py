@@ -11292,8 +11292,10 @@ class ReadinessTest(unittest.TestCase):
         self.assertNotIn("-ingress-", transport)
         self.assertNotIn("envelope.service", transport)
         self.assertNotIn("get-parameter", transport)
+        self.assertIn("signal=KILL 700s", transport)
+        self.assertIn("600s cloud-init status --wait", transport)
         subprocess.run(["bash", "-n"], input=transport, text=True, capture_output=True, check=True)
-        transport_inner = transport_commands[2].split("'TRANSPORT_READINESS'\n", 1)[1].split(
+        transport_inner = transport_commands[-1].split("'TRANSPORT_READINESS'\n", 1)[1].split(
             "\nTRANSPORT_READINESS\n", 1
         )[0]
         subprocess.run(["bash", "-n"], input=transport_inner, text=True, capture_output=True, check=True)
@@ -11302,7 +11304,7 @@ class ReadinessTest(unittest.TestCase):
     def test_transport_readiness_requires_remote_owners_and_rejects_local_claims(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = make_config(pathlib.Path(temporary))
-            command = appliance.transport_readiness_commands(config, "west", "a")[2]
+            command = appliance.transport_readiness_commands(config, "west", "a")[-1]
         match = re.search(r"/usr/bin/jq .*? '\n(.*?)\n    ' <<<", command, re.DOTALL)
         self.assertIsNotNone(match)
         jq_filter = match.group(1)

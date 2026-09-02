@@ -9036,7 +9036,9 @@ def transport_readiness_commands(config: RunConfig, site: str, az_key: str) -> l
         )
     )
     expected_self = shlex.quote(f"{config.run_id}-{site}-transport-{az_key}")
-    command = f"""if /usr/bin/timeout --signal=KILL 120s /bin/bash <<'TRANSPORT_READINESS'
+    command = f"""if /usr/bin/timeout --signal=KILL 700s /bin/bash <<'TRANSPORT_READINESS'
+set -euo pipefail
+/usr/bin/timeout --signal=TERM --kill-after=5s 600s cloud-init status --wait --long
 set -uo pipefail
 expected_local={expected_local}
 expected_remote={expected_remote}
@@ -9098,7 +9100,6 @@ printf '%s\n' 'transport router did not expose exact protected primary-route own
 exit 1"""
     return [
         "set -euo pipefail",
-        "/usr/bin/timeout --signal=TERM --kill-after=5s 600s cloud-init status --wait --long",
         command,
     ]
 
