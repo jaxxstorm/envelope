@@ -1494,30 +1494,82 @@ class SymmetricTopologyTest(unittest.TestCase):
         with self.assertRaisesRegex(e2e.ReadinessError, "protected next hop"):
             operations._verify_gwlbe_post_inspection_routes(deployment, member, endpoint_subnet)
 
-    def test_target_selection_uses_geneve_receive_and_return_not_tun_tx(self) -> None:
+    def test_target_selection_uses_packet_correlation_during_concurrent_traffic(self) -> None:
         deployment = e2e.parse_symmetric_protected_deployment_output(symmetric_protected_output())
         first, second = deployment.topology.west.target_fleet
 
-        def snapshot(generation: str, rx: int, tx: int, tun_tx: int) -> e2e.MetricSnapshot:
+        def snapshot(generation: str, rx: int, tx: int) -> e2e.MetricSnapshot:
             return e2e.parse_prometheus_metrics(
-                f"geneve_rx_packets {rx}\ngeneve_tx_packets {tx}\ntun_tx_packets {tun_tx}\n",
+                f"geneve_rx_packets {rx}\ngeneve_tx_packets {tx}\n",
                 generation=generation,
             )
 
         before = {
-            first.instance_id: snapshot("first", 10, 10, 10),
-            second.instance_id: snapshot("second", 10, 10, 10),
+            first.instance_id: snapshot("first", 10, 10),
+            second.instance_id: snapshot("second", 10, 10),
         }
         after = {
-            first.instance_id: snapshot("first", 11, 11, 10),
-            second.instance_id: snapshot("second", 11, 10, 11),
+            first.instance_id: snapshot("first", 11, 11),
+            second.instance_id: snapshot("second", 11, 11),
         }
         operations = object.__new__(e2e.AwsSymmetricLiveOperations)
+        captures = {
+            first.instance_id: {"selected": True},
+            second.instance_id: {},
+        }
 
-        self.assertEqual(
-            operations._selected_target(before, after, "west", deployment),
-            first.instance_id,
-        )
+        def correlate(capture, _flow, *, target_id, raw_deleted):
+            self.assertTrue(raw_deleted)
+            if capture.get("selected") is not True:
+                raise e2e.FlowNotObservedError("no exact tuple")
+            return {"observed": True, "target_id": target_id}
+
+        with mock.patch.object(
+            e2e, "correlate_geneve_turnaround_capture", side_effect=correlate
+        ):
+            selected, fidelity = operations._selected_target(
+                before,
+                after,
+                "west",
+                deployment,
+                captures,
+                mock.sentinel.flow,
+            )
+
+        self.assertEqual(selected, first.instance_id)
+        self.assertEqual(fidelity["target_id"], first.instance_id)
+
+        captures[second.instance_id] = {"selected": True}
+        with mock.patch.object(
+            e2e, "correlate_geneve_turnaround_capture", side_effect=correlate
+        ), self.assertRaisesRegex(e2e.WireAssertionError, "packet-correlated to 2"):
+            operations._selected_target(
+                before,
+                after,
+                "west",
+                deployment,
+                captures,
+                mock.sentinel.flow,
+            )
+
+        def reject_invalid(capture, _flow, *, target_id, raw_deleted):
+            self.assertTrue(raw_deleted)
+            if capture.get("invalid") is True:
+                raise e2e.WireAssertionError("invalid capture summary")
+            return {"observed": True, "target_id": target_id}
+
+        captures[second.instance_id] = {"invalid": True}
+        with mock.patch.object(
+            e2e, "correlate_geneve_turnaround_capture", side_effect=reject_invalid
+        ), self.assertRaisesRegex(e2e.WireAssertionError, "invalid capture summary"):
+            operations._selected_target(
+                before,
+                after,
+                "west",
+                deployment,
+                captures,
+                mock.sentinel.flow,
+            )
 
     def test_destination_router_discovery_runs_on_source_transport_router(self) -> None:
         deployment = e2e.parse_symmetric_protected_deployment_output(symmetric_protected_output())
@@ -2093,7 +2145,7 @@ class SymmetricTopologyTest(unittest.TestCase):
         def correlate(capture, _flow, *, target_id, raw_deleted):
             self.assertTrue(raw_deleted)
             if capture.get("selected") is not True:
-                raise e2e.WireAssertionError("no exact tuple")
+                raise e2e.FlowNotObservedError("no exact tuple")
             return {"target_id": target_id}
 
         with mock.patch.object(

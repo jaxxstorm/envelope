@@ -329,6 +329,10 @@ class WireAssertionError(AcceptanceError):
     pass
 
 
+class FlowNotObservedError(WireAssertionError):
+    pass
+
+
 class TransportError(AcceptanceError):
     pass
 
@@ -2125,7 +2129,7 @@ def correlate_geneve_turnaround_capture(
             }
         )
     if not pairs:
-        raise WireAssertionError(
+        raise FlowNotObservedError(
             f"target {target_id} capture has no correlated ingress/return GENEVE pair"
         )
     return {
@@ -19444,24 +19448,28 @@ class AwsSymmetricLiveOperations:
         after: Mapping[str, MetricSnapshot],
         site: Site,
         deployment: SymmetricProtectedDeployment,
-    ) -> str:
-        candidates: list[str] = []
+        capture_summaries: Mapping[str, Mapping[str, Any]],
+        flow: FlowRecord,
+    ) -> tuple[str, dict[str, Any]]:
+        candidates: list[tuple[str, dict[str, Any]]] = []
         site_ids = {member.instance_id for member in deployment.topology.site(site).target_fleet}
         for instance_id in sorted(set(before).intersection(after).intersection(site_ids)):
             initial, final = before[instance_id], after[instance_id]
             if initial.generation != final.generation:
                 continue
-            geneve_rx_delta = self._metric_value(final, "geneve_rx_packets") - self._metric_value(
-                initial, "geneve_rx_packets"
-            )
-            geneve_tx_delta = self._metric_value(final, "geneve_tx_packets") - self._metric_value(
-                initial, "geneve_tx_packets"
-            )
-            if geneve_rx_delta > 0 and geneve_tx_delta > 0:
-                candidates.append(instance_id)
+            try:
+                fidelity = correlate_geneve_turnaround_capture(
+                    capture_summaries.get(instance_id, {}),
+                    flow,
+                    target_id=instance_id,
+                    raw_deleted=True,
+                )
+            except FlowNotObservedError:
+                continue
+            candidates.append((instance_id, fidelity))
         if len(candidates) != 1:
-            raise MetricAssertionError(
-                f"{site} symmetric probe selected {len(candidates)} targets instead of exactly one"
+            raise WireAssertionError(
+                f"{site} symmetric probe packet-correlated to {len(candidates)} targets instead of exactly one"
             )
         return candidates[0]
 
@@ -19754,7 +19762,7 @@ print(json.dumps({"peer_id":match["peer_id"],"success":True},sort_keys=True))'''
                     target_id=member.instance_id,
                     raw_deleted=True,
                 )
-            except WireAssertionError:
+            except FlowNotObservedError:
                 continue
             candidates.append(member)
         if len(candidates) != 1:
@@ -19837,19 +19845,21 @@ print(json.dumps({"peer_id":match["peer_id"],"success":True},sort_keys=True))'''
             after = self._target_snapshots(deployment, exclude=exclude_targets)
         finally:
             capture_summaries = self._finish_geneve_captures(captures, inspect=True)
-        source_id = self._selected_target(before, after, flow.source.site, deployment)
-        destination_id = self._selected_target(before, after, flow.destination.site, deployment)
-        source_fidelity = correlate_geneve_turnaround_capture(
-            capture_summaries.get(source_id, {}),
+        source_id, source_fidelity = self._selected_target(
+            before,
+            after,
+            flow.source.site,
+            deployment,
+            capture_summaries,
             flow,
-            target_id=source_id,
-            raw_deleted=True,
         )
-        destination_fidelity = correlate_geneve_turnaround_capture(
-            capture_summaries.get(destination_id, {}),
+        destination_id, destination_fidelity = self._selected_target(
+            before,
+            after,
+            flow.destination.site,
+            deployment,
+            capture_summaries,
             flow,
-            target_id=destination_id,
-            raw_deleted=True,
         )
         if flow.source.az_key is None or flow.destination.az_key is None:
             raise ProbeError("symmetric probe omitted a protected workload AZ")

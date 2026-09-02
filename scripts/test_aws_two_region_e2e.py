@@ -6402,7 +6402,7 @@ class PacketCaptureAssertionTest(unittest.TestCase):
                 ]
             )
         )
-        with self.assertRaisesRegex(e2e.WireAssertionError, "no correlated"):
+        with self.assertRaisesRegex(e2e.FlowNotObservedError, "no correlated"):
             e2e.correlate_geneve_turnaround_capture(
                 changed,
                 self.flow,
