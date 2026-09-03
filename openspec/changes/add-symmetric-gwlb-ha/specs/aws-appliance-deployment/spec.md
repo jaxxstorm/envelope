@@ -74,7 +74,7 @@ The protected deployment SHALL keep topology and runtime configuration version 2
 - **THEN** preflight rejects it without translation, compatibility resources, or a version change
 
 ### Requirement: Redundant Tailscale transport routers
-The deployment SHALL create at least two independent Tailscale transport routers per site, spread across enabled AZs. Each router's baseline enabled advertisement SHALL be its non-empty singleton assigned workload prefix; those assignments SHALL be pairwise disjoint and their exact union SHALL equal all local-site CIDRs. Every router SHALL accept all exact remote-site routes, remain capable of forwarding every site prefix during failover, disable subnet-route SNAT, preserve workload source addresses, and forward in both site-transit directions. Readiness SHALL require table 52 to contain exactly the opposite site's exact workload routes, bind each route to its configured stable owner on every opposite-site observer, and reject every same-site protected local `PrimaryRoutes` claim or table-52 route. Every local prefix, whether its singleton advertiser is self or sibling, SHALL remain on the main/VPC underlay, and the higher-priority `iif tailscale0` rules SHALL make every router capable of delivering all local prefixes during normal and takeover paths. The deployment SHALL expose each router's primary ENI and advertised prefix; source-prefix owner/ENI coupling SHALL be derived from singleton advertisements, control-plane stable identities, and opposite-site observations. Envelope targets SHALL not join Tailscale or act as route advertisers.
+The deployment SHALL create at least two independent Tailscale transport routers per site, spread across enabled AZs. Each router's baseline enabled advertisement SHALL be its non-empty singleton assigned workload prefix; those assignments SHALL be pairwise disjoint and their exact union SHALL equal all local-site CIDRs. Every router SHALL accept all exact remote-site routes, remain capable of forwarding every site prefix during failover, disable subnet-route SNAT and Tailnet DNS acceptance, preserve the VPC resolver and workload source addresses, and forward in both site-transit directions. Readiness SHALL require table 52 to contain exactly the opposite site's exact workload routes, bind each route to its configured stable owner on every opposite-site observer, reject every same-site protected local `PrimaryRoutes` claim or table-52 route, verify the live `CorpDNS` preference is false, and reject every Tailscale health condition. Every local prefix, whether its singleton advertiser is self or sibling, SHALL remain on the main/VPC underlay, and the higher-priority `iif tailscale0` rules SHALL make every router capable of delivering all local prefixes during normal and takeover paths. The deployment SHALL expose each router's primary ENI and advertised prefix; source-prefix owner/ENI coupling SHALL be derived from singleton advertisements, control-plane stable identities, and opposite-site observations. Envelope targets SHALL not join Tailscale or act as route advertisers.
 
 #### Scenario: Redundant local-site advertisements
 - **WHEN** a site is deployed successfully
@@ -89,8 +89,8 @@ The deployment SHALL create at least two independent Tailscale transport routers
 - **THEN** the higher-priority local rule selects `main` and the VPC underlay to the destination workload prefix's AZ GWLBE without a local table-52 route
 
 #### Scenario: Incomplete router contract
-- **WHEN** one transport router advertises a broader, narrower, or missing local-site prefix, lacks a remote route, enables SNAT, or cannot forward one direction
-- **THEN** protected preflight fails before resources are created
+- **WHEN** one transport router advertises a broader, narrower, or missing local-site prefix, lacks a remote route, enables SNAT or Tailnet DNS acceptance, reports a Tailscale health condition, or cannot forward one direction
+- **THEN** protected readiness fails before acceptance traffic or GWLBE route eligibility
 
 - **WHEN** a configured local-site prefix contains the VPC DNS resolver address and would therefore have an unavoidable narrower main-table route
 - **THEN** protected configuration validation fails before AWS resources are created
@@ -121,7 +121,7 @@ The protected runner SHALL be the only component authorized to coordinate tempor
 
 #### Scenario: Bounded restoration
 - **WHEN** the exercise completes, fails, times out, or is interrupted after mutation
-- **THEN** owned cleanup restores and verifies each router's baseline advertisements and each prior route target within independent deadlines and residual auditing reports any failure
+- **THEN** owned cleanup restores and verifies each router's baseline advertisements with Tailnet DNS acceptance disabled and each prior route target within independent deadlines and residual auditing reports any failure
 
 #### Scenario: Runner lost after mutation
 - **WHEN** the route-transaction owner disappears and its durable lease expires

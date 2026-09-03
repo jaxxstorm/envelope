@@ -860,6 +860,7 @@ def validate_readiness(
         "AdvertisedRoutes",
         "AcceptedRoutes",
         "NoSNAT",
+        "CorpDNS",
         "RoutePeers",
     }:
         raise ReadinessError("status.Self has the wrong sanitized fixture shape")
@@ -978,6 +979,8 @@ def validate_readiness(
         raise ReadinessError("transport router self node key is expired")
     if self_status.get("NoSNAT") is not True:
         raise ReadinessError("subnet-route SNAT is enabled")
+    if self_status.get("CorpDNS") is not False:
+        raise ReadinessError("Tailnet DNS acceptance is enabled or unverified")
     if set(advertised) != set(expected_advertisements):
         raise ReadinessError(
             "transport-router advertisement is not its exact assigned local-site CIDR"

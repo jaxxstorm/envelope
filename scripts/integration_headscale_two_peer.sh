@@ -1478,8 +1478,12 @@ expected = {sys.argv[1]}
 prefs = json.load(sys.stdin)
 if set(prefs.get("AdvertiseRoutes", [])) != expected:
     raise SystemExit("transport-router does not advertise the exact local prefix")
-if prefs.get("RouteAll") is not True or prefs.get("NoSNAT") is not True:
-    raise SystemExit("transport-router does not accept routes without SNAT")
+if (
+    prefs.get("RouteAll") is not True
+    or prefs.get("NoSNAT") is not True
+    or prefs.get("CorpDNS") is not False
+):
+    raise SystemExit("transport-router does not accept routes without SNAT or has Tailnet DNS enabled")
 ' "$expected_local"
 }
 for node in "$transport_a1" "$transport_a2"; do

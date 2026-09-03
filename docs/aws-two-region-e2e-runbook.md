@@ -29,7 +29,7 @@ The dedicated transport routers are bidirectional. A source-site router receives
 - A GWLBE and healthy-capable target path in every enabled AZ.
 - At least two AZ-spread transport routers per site with distinct eligible ENIs.
 - Exactly one assigned workload-prefix advertisement per router at baseline; each site's per-router prefix sets are non-empty, pairwise disjoint, and exactly cover local workload CIDRs.
-- Every router remains forwarding-capable for bounded takeover of all local prefixes, accepts exact remote-site routes, disables subnet-route SNAT, and preserves source addresses.
+- Every router remains forwarding-capable for bounded takeover of all local prefixes, accepts exact remote-site routes, disables subnet-route SNAT and Tailnet DNS acceptance, retains VPC DNS, and preserves source addresses.
 - Tailscale table 52 and serving paths contain only opposite-site workload prefixes; every local prefix stays on the main/VPC underlay.
 - Disjoint local-site and remote-site CIDRs, with each remote list equal to the peer's local list.
 - Separate workload, transport-router, GWLBE, target, and management route domains.
@@ -55,7 +55,7 @@ Before billable resources or live traffic, protected preflight must fail closed 
 - Exact run ownership, durable cleanup authority, expiry, scoped credentials, artifact identity, and Tailnet policy.
 - Expected two-AZ target and transport-router fleets, route tables, endpoint identities, eligible ENIs, and initial route selections.
 - Target packet-receive, validation, and compliant-send readiness independent of transport readiness.
-- Both transport directions, no NAT, exact advertisements and accepted routes, source preservation, and the complete destination-prefix GWLBE route map on every router.
+- Both transport directions, no NAT, disabled Tailnet DNS acceptance, empty Tailscale health, exact advertisements and accepted routes, source preservation, and the complete destination-prefix GWLBE route map on every router.
 - Exact local policy rules and complete prefix route chains, non-expired serving peers with peer-bound bounded ping observations, and the live-MTU-derived MSS rule in both directions.
 - Every opposite-site observer selects each protected remote prefix's configured stable-node `PrimaryRoutes` owner, with stable-node identity bound to its protected transport-router instance ID.
 - On every router, Tailscale table 52 contains exactly the opposite site's exact workload prefixes and no local-site prefix; no same-site observer reports a protected local `PrimaryRoutes` claim.
@@ -106,6 +106,8 @@ Failed protected run `ha47` proved that endpoint correction. Graceful east/b tak
 
 Failed protected run `ha48` proved that separated deadline. Graceful east/b takeover, both sequential cross-AZ recovery proofs, and restoration completed, and the nested UDP loss windows remained mutation-bound. The outer TCP agent then missed isolated sequence 64 more than 13 minutes after restoration because both agents continued through the full 2,735-second worst-case observation duration. Strict analysis correctly rejected that loss as outside the mutation. The full durable transaction reservation remains the continuity-command watchdog with a conservative 600-second paired-control allowance, but instance and transport-router TCP/UDP streams now run concurrently around one shared mutation and use runner-controlled completion after at least 20 successful sends and a final post-mutation marker. Both client stops precede either client wait, both client results precede either receiver stop, the runner validates every successful-send completion timestamp internally, and schema-3 evidence emits exact sent, acknowledged, and lost counts. Target-process streams retain their fixed post-restoration window. Restoration and one-attempt cleanup completed with `final_residual_count` 0; the retained schema-3 evidence is failed and task 6.4 remains open.
 
+Failed protected run `ha49` proved controlled completion and reached abrupt west/a transport-router recovery. Both full alternate-path probes succeeded, but the restarted original router reported three Tailscale health conditions while its DNS forwarder repeatedly logged that no upstream resolvers were available. Strict readiness withheld original-route restoration and left the durable transaction for cleanup. Cleanup reconciliation restored both singleton advertisements, the opposite-site owner graph, and both original ENI routes before one-attempt cleanup completed with `final_residual_count` 0. Transport bootstrap and every restoration now explicitly set `accept-dns=false`; host-side advertisement verification and both protected readiness layers require live `CorpDNS` false, while the empty-health requirement remains unchanged. The retained schema-3 evidence is failed and task 6.4 remains open.
+
 ## Evidence Expectations
 
 Protected acceptance must prove simultaneous cold initiation from both sites for TCP, UDP, and ICMP without directional CIDR partitioning. For each direction and recovery path, evidence must bind the source-workload-AZ and destination-workload-prefix-AZ GWLBE identities independently from the selected transport routers, then bind GWLB targets, router and ENI identities, and both target turnarounds. Preflight evidence records the complete local-prefix-to-GWLBE map on every router, bounded per-prefix Tailnet ownership from every opposite-site observer, maps stable node IDs to protected transport-router instance IDs, proves local Tailnet routes and claims are absent, and verifies that each source-prefix owner agrees with the GWLBE ENI selection.
@@ -139,7 +141,7 @@ Normal overlap and duplicate primary ownership are forbidden. Temporary overlap 
 
 After success, probe failure, timeout, interruption, or partial mutation, restoration remains in that transaction and follows this order:
 
-1. Restart the original owner at its singleton baseline while the alternate still covers the transferred prefix.
+1. Restart the original owner at its singleton baseline with Tailnet DNS acceptance disabled while the alternate still covers the transferred prefix.
 2. Remove the transferred prefix from the alternate, returning it to its singleton baseline.
 3. Wait for every opposite-site observer to converge on the complete baseline owner graph, verify local Tailnet routes remain absent, and reverify both routers.
 4. Restore all affected routes to the original ENI and hold the complete snapshot through the quiet verification window.

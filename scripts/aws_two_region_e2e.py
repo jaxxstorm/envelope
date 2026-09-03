@@ -22275,7 +22275,8 @@ self_binding=identity_bindings.get(expected_node_id)
 if (not isinstance(self_value,dict) or
     not isinstance(self_binding,dict) or self_binding.get("hostname")!=expected_hostname or
     str(self_value.get("HostName") or self_value.get("DNSName") or "").split(".")[0]!=expected_hostname or
-    self_value.get("ID")!=expected_node_id or prefs.get("RouteAll") is not True):
+    self_value.get("ID")!=expected_node_id or prefs.get("RouteAll") is not True or
+    prefs.get("CorpDNS") is not False):
     raise SystemExit(4)
 peers_value=raw_status.get("Peer",{})
 peers=list(peers_value.values()) if isinstance(peers_value,dict) else peers_value if isinstance(peers_value,list) else []
@@ -22317,7 +22318,7 @@ checked_at=timestamp(datetime.datetime.now(datetime.timezone.utc).isoformat())
 self_expiry=timestamp(self_binding.get("KeyExpiry")); self_expiry_disabled=self_binding.get("KeyExpiryDisabled"); self_authorized=self_binding.get("Authorized")
 if not isinstance(self_expiry_disabled,bool) or not isinstance(self_authorized,bool):
     raise SystemExit(4)
-status={"BackendState":raw_status.get("BackendState"),"TUN":raw_status.get("TUN"),"Health":raw_status.get("Health",[]),"CheckedAt":checked_at,"Self":{"Online":self_value.get("Online"),"Expired":expired(self_expiry,self_expiry_disabled,self_authorized),"KeyExpiry":self_expiry,"KeyExpiryDisabled":self_expiry_disabled,"AdvertisedRoutes":prefs.get("AdvertiseRoutes"),"AcceptedRoutes":sorted(accepted),"NoSNAT":prefs.get("NoSNAT"),"RoutePeers":route_peers}}
+status={"BackendState":raw_status.get("BackendState"),"TUN":raw_status.get("TUN"),"Health":raw_status.get("Health"),"CheckedAt":checked_at,"Self":{"Online":self_value.get("Online"),"Expired":expired(self_expiry,self_expiry_disabled,self_authorized),"KeyExpiry":self_expiry,"KeyExpiryDisabled":self_expiry_disabled,"AdvertisedRoutes":prefs.get("AdvertiseRoutes"),"AcceptedRoutes":sorted(accepted),"NoSNAT":prefs.get("NoSNAT"),"CorpDNS":prefs.get("CorpDNS"),"RoutePeers":route_peers}}
 sysctl_names=["net.ipv4.ip_forward","net.ipv6.conf.all.forwarding","net.ipv6.conf.default.forwarding","net.ipv4.conf.all.rp_filter","net.ipv4.conf.default.rp_filter",f"net.ipv4.conf.{underlay}.rp_filter",f"net.ipv4.conf.{tailscale_iface}.rp_filter"]
 firewall={"iptables_filter":output(["/usr/sbin/iptables-save","-t","filter"]),"iptables_mangle":output(["/usr/sbin/iptables-save","-t","mangle"]),"iptables_nat":output(["/usr/sbin/iptables-save","-t","nat"]),"ip6tables_filter":output(["/usr/sbin/ip6tables-save","-t","filter"]),"ip6tables_mangle":output(["/usr/sbin/ip6tables-save","-t","mangle"]),"ip6tables_nat":output(["/usr/sbin/ip6tables-save","-t","nat"]),"nftables":json_output(["/usr/sbin/nft","-j","list","ruleset"])}
 payload={"runtime_state":state,"status":status,"primary_route_ownership":{"ObservedAt":checked_at,**ownership},"firewall":firewall,"policy_rules":json_output(["/usr/sbin/ip","-j","-details","-4","rule","show"]),"table52_routes":json_output(["/usr/sbin/ip","-j","-details","-4","route","show","table","52"]),"main_routes":json_output(["/usr/sbin/ip","-j","-details","-4","route","show","table","main"]),"sysctls":{name:int(output(["/usr/sbin/sysctl","-n",name]).strip()) for name in sysctl_names},"underlay_mtu":int(open(f"/sys/class/net/{underlay}/mtu",encoding="utf-8").read()),"tailscale_mtu":int(open(f"/sys/class/net/{tailscale_iface}/mtu",encoding="utf-8").read()),"host_network_service":{"unit":"envelope-transport-router-network.service","enabled":True,"active":True,"readiness_marker":marker,"runtime_state":runtime_state,"recovery_marker":expected_contract["recovery_marker"]}}
@@ -23562,6 +23563,7 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
             self.adapter.command(
                 member,
                 "tailscale set --accept-routes=true --snat-subnet-routes=false "
+                "--accept-dns=false "
                 "--advertise-routes="
                 + shlex.quote(routes),
             )

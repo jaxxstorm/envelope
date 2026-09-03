@@ -290,6 +290,7 @@ def effective_transport_payload(
                 "AdvertisedRoutes": [advertised_prefix],
                 "AcceptedRoutes": contract["remote_site_cidrs"],
                 "NoSNAT": True,
+                "CorpDNS": False,
                 "RoutePeers": [
                     {
                         "Prefix": prefix,
@@ -1966,6 +1967,9 @@ class SymmetricTopologyTest(unittest.TestCase):
         self.assertIn('"--until-direct=false"', commands[0])
         self.assertIn('binding.get("KeyExpiry")', commands[0])
         self.assertIn('binding.get("KeyExpiryDisabled")', commands[0])
+        self.assertIn('prefs.get("CorpDNS") is not False', commands[0])
+        self.assertIn('"Health":raw_status.get("Health")', commands[0])
+        self.assertNotIn('raw_status.get("Health",[])', commands[0])
         self.assertNotIn('peer.get("KeyExpiry")', commands[0])
         self.assertNotIn('self_value.get("KeyExpiry")', commands[0])
         self.assertNotIn('.get("Expired")', commands[0])
@@ -2224,6 +2228,7 @@ class SymmetricTopologyTest(unittest.TestCase):
         self.assertEqual(commands[0], "systemctl start tailscaled.service")
         self.assertIn("tailscale set --accept-routes=true", commands[1])
         self.assertIn("--snat-subnet-routes=false", commands[1])
+        self.assertIn("--accept-dns=false", commands[1])
         self.assertIn("--advertise-routes=10.10.1.0/24", commands[1])
         self.assertIn("transport-router-network.configured", commands[2])
         self.assertIn("systemctl enable envelope-transport-router-network.service", commands[2])

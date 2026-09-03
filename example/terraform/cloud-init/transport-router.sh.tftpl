@@ -660,19 +660,19 @@ verify_actual() {
   local routes_json=$1 service=$2 mode=$3 unit_state
   unit_state=$(systemctl is-enabled tailscaled.service 2>/dev/null || true)
   if [[ "$service" == running ]]; then
-    [[ "$unit_state" != masked* ]]
-    systemctl is-active --quiet tailscaled.service
+    [[ "$unit_state" != masked* ]] || return 1
+    systemctl is-active --quiet tailscaled.service || return 1
     /usr/bin/jq -e --argjson expected "$routes_json" '
-      .RouteAll == true and .NoSNAT == true and
+      .RouteAll == true and .NoSNAT == true and .CorpDNS == false and
       (((.AdvertiseRoutes // []) | sort) == ($expected | sort))
-    ' < <(/usr/bin/tailscale debug prefs) >/dev/null
-    systemctl is-active --quiet envelope-transport-router-network.service
+    ' < <(/usr/bin/tailscale debug prefs) >/dev/null || return 1
+    systemctl is-active --quiet envelope-transport-router-network.service || return 1
   else
-    ! systemctl is-active --quiet tailscaled.service
+    ! systemctl is-active --quiet tailscaled.service || return 1
     if [[ "$mode" == abrupt ]]; then
-      [[ "$unit_state" == masked ]]
+      [[ "$unit_state" == masked ]] || return 1
     else
-      [[ "$unit_state" != masked* ]]
+      [[ "$unit_state" != masked* ]] || return 1
     fi
   fi
 }
@@ -772,7 +772,7 @@ if [[ "$desired_service" == running ]]; then
   done
   /usr/bin/tailscale status --json | /usr/bin/jq -e '.BackendState == "Running"' >/dev/null
   routes_csv=$(/usr/bin/jq -r 'join(",")' <<<"$desired_routes")
-  /usr/bin/tailscale set --accept-routes=true --snat-subnet-routes=false --advertise-routes="$routes_csv"
+  /usr/bin/tailscale set --accept-routes=true --snat-subnet-routes=false --accept-dns=false --advertise-routes="$routes_csv"
   systemctl restart envelope-transport-router-network.service
 else
   if [[ "$desired_mode" == graceful ]]; then

@@ -61,6 +61,7 @@ def status_fixture() -> dict:
             "AdvertisedRoutes": [LOCAL[0]],
             "AcceptedRoutes": list(REMOTE),
             "NoSNAT": True,
+            "CorpDNS": False,
             "RoutePeers": [
                 {
                     "Prefix": prefix,
@@ -556,7 +557,7 @@ class TransportRouterReadinessTest(unittest.TestCase):
         with self.assertRaisesRegex(readiness.ReadinessError, "key-expiry mode"):
             validate(status=invalid_peer)
 
-    def test_local_advertisements_must_be_exact_and_without_snat(self) -> None:
+    def test_local_advertisements_must_be_exact_without_snat_or_tailnet_dns(self) -> None:
         cases = {
             "missing": [],
             "wrong assignment": [LOCAL[1]],
@@ -578,6 +579,13 @@ class TransportRouterReadinessTest(unittest.TestCase):
         status["Self"]["NoSNAT"] = False
         with self.assertRaisesRegex(readiness.ReadinessError, "SNAT"):
             validate(status=status)
+
+        for value in (True, None, "false"):
+            status = status_fixture()
+            status["Self"]["CorpDNS"] = value
+            with self.subTest(corp_dns=value):
+                with self.assertRaisesRegex(readiness.ReadinessError, "Tailnet DNS"):
+                    validate(status=status)
 
     def test_required_remote_routes_must_be_accepted(self) -> None:
         status = status_fixture()

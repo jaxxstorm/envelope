@@ -11360,6 +11360,8 @@ class ReadinessTest(unittest.TestCase):
         self.assertNotIn("envelope-ingress-router-network.service", transport)
         self.assertIn("PrimaryRoutes", transport)
         self.assertIn("tailscale debug prefs", transport)
+        self.assertIn("$status.Health == []", transport)
+        self.assertIn("$prefs.CorpDNS == false", transport)
         self.assertIn("10.20.1.0/24", transport)
         self.assertIn("10.20.2.0/24", transport)
         self.assertIn("10.10.1.0/24", transport)
@@ -11399,6 +11401,7 @@ class ReadinessTest(unittest.TestCase):
         prefs = {
             "RouteAll": True,
             "NoSNAT": True,
+            "CorpDNS": False,
             "AdvertiseRoutes": [expected_self_prefix],
         }
 
@@ -11436,6 +11439,7 @@ class ReadinessTest(unittest.TestCase):
 
         status = {
             "BackendState": "Running",
+            "Health": [],
             "Self": {"Online": True, "HostName": expected_self},
             "Peer": {
                 "east-a": {
@@ -11456,6 +11460,18 @@ class ReadinessTest(unittest.TestCase):
             },
         }
         self.assertTrue(accepted(status))
+        for health in (["dns unavailable"], None, False, {}, ""):
+            unhealthy = copy.deepcopy(status)
+            unhealthy["Health"] = health
+            with self.subTest(health=health):
+                self.assertFalse(accepted(unhealthy))
+        missing_health = copy.deepcopy(status)
+        missing_health.pop("Health")
+        self.assertFalse(accepted(missing_health))
+        self.assertFalse(accepted(status, {**prefs, "CorpDNS": True}))
+        self.assertFalse(
+            accepted(status, {key: value for key, value in prefs.items() if key != "CorpDNS"})
+        )
         unrelated = copy.deepcopy(status)
         unrelated["Peer"]["east-a"]["PrimaryRoutes"].append("10.99.0.0/24")
         self.assertTrue(accepted(unrelated))

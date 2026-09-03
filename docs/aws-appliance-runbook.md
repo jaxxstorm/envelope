@@ -2,7 +2,7 @@
 
 ## Status
 
-The AWS appliance topology retains version `2` while replacing the rejected target-forwarding draft with packet-scoped GWLB turnaround, GWLBE subnet routing, and separate transport routers. The corrected protected profile is still under development, and no passing live acceptance run is documented. Protected runs `ha25`, `ha46`, `ha47`, and `ha48` failed acceptance but supplied the live Tailnet, endpoint-symmetry, deadline-separation, and continuity-observation evidence used to correct the transport contract below. This page is a safety and architecture reference, not an executable live-run procedure.
+The AWS appliance topology retains version `2` while replacing the rejected target-forwarding draft with packet-scoped GWLB turnaround, GWLBE subnet routing, and separate transport routers. The corrected protected profile is still under development, and no passing live acceptance run is documented. Protected runs `ha25`, `ha46`, `ha47`, `ha48`, and `ha49` failed acceptance but supplied the live Tailnet, endpoint-symmetry, deadline-separation, continuity-observation, and abrupt-restart DNS-health evidence used to correct the transport contract below. This page is a safety and architecture reference, not an executable live-run procedure.
 
 Do not use an older protected configuration, saved plan, state file, workflow, evidence file, or direct Terraform command with this topology. Do not translate an old configuration by hand. A future approved run must create a fresh, run-owned version-2 deployment and own its cleanup.
 
@@ -18,7 +18,7 @@ Each site must have at least two enabled availability zones and these separate r
 | Envelope target | Outer GWLB and management traffic only; no inner site route, TUN, Tailscale, or host transit. |
 | Management | Kept separate from packet-transit route domains. |
 
-Every enabled AZ requires a local GWLBE and a healthy-capable Envelope target path. Each site also requires at least two independent AZ-spread Tailscale transport routers with distinct eligible ENIs. At baseline, each router advertises exactly one assigned workload prefix. The per-router assigned prefix sets are non-empty and pairwise disjoint and exactly cover the local workload CIDRs; every router nevertheless remains forwarding-capable for bounded takeover of all local prefixes. Routers accept exact remote-site routes, disable subnet-route SNAT, and forward both site-transit directions. Tailscale table 52 and serving paths contain only opposite-site workload prefixes. Local-site CIDRs must exclude the VPC DNS resolver address at VPC network address plus two so its unavoidable host route cannot intersect a protected prefix. Targets do not join Tailscale or advertise routes.
+Every enabled AZ requires a local GWLBE and a healthy-capable Envelope target path. Each site also requires at least two independent AZ-spread Tailscale transport routers with distinct eligible ENIs. At baseline, each router advertises exactly one assigned workload prefix. The per-router assigned prefix sets are non-empty and pairwise disjoint and exactly cover the local workload CIDRs; every router nevertheless remains forwarding-capable for bounded takeover of all local prefixes. Routers accept exact remote-site routes, disable subnet-route SNAT and Tailnet DNS acceptance, retain the VPC resolver, and forward both site-transit directions. Tailscale table 52 and serving paths contain only opposite-site workload prefixes. Local-site CIDRs must exclude the VPC DNS resolver address at VPC network address plus two so its unavoidable host route cannot intersect a protected prefix. Targets do not join Tailscale or advertise routes.
 
 ## Packet Turnaround
 
@@ -44,6 +44,7 @@ Target readiness must not depend on TUN state, Tailscale, host forwarding, site 
 Transport-router readiness is independent of target health. Every eligible router must prove:
 
 - Running Tailscale in kernel-TUN mode, an online non-expired node, and exactly its one assigned `advertised_prefix` at baseline.
+- Live `CorpDNS` false, VPC DNS still authoritative, and no Tailscale health condition.
 - Exact accepted remote-site routes with a bounded data-plane check to the serving peer.
 - Every opposite-site observer selects each protected remote prefix's configured stable-node `PrimaryRoutes` owner, which is online and non-expired.
 - On every router, Tailscale table 52 contains exactly the opposite site's exact workload prefixes and no local-site prefix; no same-site observer reports a protected local `PrimaryRoutes` claim.
@@ -66,6 +67,8 @@ Failed protected run `ha47` proved the corrected endpoint shape: ownership and b
 
 Failed protected run `ha48` proved the separated recovery deadline and completed the graceful transfer, both full cross-AZ proofs, and restoration. Its nested TCP agent then lost one isolated marker more than 13 minutes after restoration because observation continued for the full 2,735-second worst-case reservation. The full durable transaction reservation remains the continuity-command watchdog with a conservative 600-second paired-control allowance, but instance and transport-router TCP/UDP streams now run concurrently around one shared mutation and use runner-controlled completion after at least 20 successful sends and a final post-mutation marker. The runner validates every successful-send completion timestamp internally, emits exact sent, acknowledged, and lost counts, and still rejects any earlier loss outside the measured interval; target-process streams are unchanged. One-attempt cleanup reached zero residuals; the run still did not satisfy acceptance.
 
+Failed protected run `ha49` proved controlled completion and both abrupt alternate-path probes, then the abruptly restarted original router reported three Tailscale health conditions while its DNS forwarder logged that no upstream resolvers were available. Strict readiness correctly withheld original-route restoration. Transport bootstrap and restoration now explicitly keep `accept-dns=false`, and host plus protected readiness verify `CorpDNS` false while retaining the empty-health gate. Cleanup reconciled both singleton advertisements, opposite-site ownership, and original ENI routes before one-attempt cleanup returned `final_residual_count` 0; the run still did not satisfy acceptance.
+
 ## Runner-Owned ENI Failover
 
 Each GWLBE table's exact remote-site routes have one active transport-router ENI target and at least one ready same-site alternate. At baseline, the same router owns that GWLBE AZ's source workload prefix in Tailscale; route and stable-node ownership must agree.
@@ -87,7 +90,7 @@ Normal advertisement overlap and duplicate primary ownership are forbidden. Temp
 
 Restoration is unconditional and remains in the same transaction on success, failure, timeout, or interruption. It runs in this order:
 
-1. Restart the original owner at its singleton baseline while the alternate still covers the transferred prefix.
+1. Restart the original owner at its singleton baseline with Tailnet DNS acceptance disabled while the alternate still covers the transferred prefix.
 2. Return the alternate to its singleton baseline, removing the transferred prefix.
 3. Wait for every opposite-site observer to converge on the complete original owner graph, verify local Tailnet routes remain absent, and verify both routers are ready.
 4. Restore every affected route to the original owner ENI, then hold the complete route snapshot through the quiet verification window.

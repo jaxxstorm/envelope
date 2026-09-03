@@ -34,6 +34,7 @@ for ((attempt = 1; attempt <= max_retries; attempt++)); do
       --advertise-tags='${advertise_tags}' \
       --advertise-routes='${advertise_routes}' \
       --accept-routes='${accept_routes}' \
+      --accept-dns=false \
       --snat-subnet-routes='${snat_subnet_routes}' \
       --netfilter-mode='${netfilter_mode}' \
       --timeout='${timeout}'; then

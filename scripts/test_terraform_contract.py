@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import shutil
 import subprocess
 import unittest
 
@@ -465,6 +466,8 @@ class SymmetricTerraformContractTest(unittest.TestCase):
             "stale advertisement generation was fenced",
             "an existing advertisement generation has different desired state",
             "--accept-routes=true --snat-subnet-routes=false",
+            "--accept-dns=false",
+            ".CorpDNS == false",
             "systemctl kill --kill-who=main --signal=SIGKILL tailscaled.service",
             "transport-advertisements.epoch",
             "transport-advertisements.initialized",
@@ -531,6 +534,18 @@ write_state "$requested_generation" "$requested_routes_json"
             "/usr/bin/jq -c '{success: true, payload: .}' \"$state\"",
             inspect_start,
         )
+        verify_actual = advertisements[
+            advertisements.index("verify_actual() {") : advertisements.index(
+                "\n}\n\nexec 9>", advertisements.index("verify_actual() {")
+            )
+        ]
+        for value in (
+            ".CorpDNS == false",
+            "] || return 1",
+            "systemctl is-active --quiet tailscaled.service || return 1",
+            "systemctl is-active --quiet envelope-transport-router-network.service || return 1",
+        ):
+            self.assertIn(value, verify_actual)
         self.assertLess(
             advertisements.index("verify_actual", inspect_start), inspect_output
         )
@@ -564,6 +579,42 @@ write_state "$requested_generation" "$requested_routes_json"
             "systemctl kill --kill-who=main --signal=SIGKILL tailscaled.service >/dev/null 2>&1 || true",
             advertisements,
         )
+
+    @unittest.skipUnless(shutil.which("jq"), "jq is required for helper behavior coverage")
+    def test_transport_advertisement_inspection_cannot_mask_dns_preference_failure(self) -> None:
+        advertisements = heredoc(
+            self.transport_router,
+            "/usr/local/sbin/envelope-transport-advertisements",
+        )
+        start = advertisements.index("verify_actual() {")
+        verify_actual = advertisements[start : advertisements.index("\n}\n\nexec 9>", start) + 2]
+        verify_actual = verify_actual.replace("/usr/bin/tailscale", "tailscale").replace(
+            "/usr/bin/jq", "jq"
+        )
+        completed = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f'''set -euo pipefail
+systemctl() {{
+  if [[ "$1" == is-enabled ]]; then printf '%s\n' enabled; fi
+  return 0
+}}
+tailscale() {{
+  printf '{{"RouteAll":true,"NoSNAT":true,"CorpDNS":%s,"AdvertiseRoutes":["10.10.1.0/24"]}}\n' "$corp_dns"
+}}
+{verify_actual}
+corp_dns=true
+if verify_actual '["10.10.1.0/24"]' running normal; then exit 1; fi
+corp_dns=false
+verify_actual '["10.10.1.0/24"]' running normal
+''',
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn('[[ "$unit_state" == masked ]]', advertisements)
         self.assertIn(
             '.generation == $initial or (.generation | test(', advertisements
@@ -1090,6 +1141,7 @@ write_state "$requested_generation" "$requested_routes_json"
         )
         self.assertNotIn("enable --now", self.transport_router)
         self.assertIn("required pre-setup gate did not complete", self.tailscale_setup)
+        self.assertIn("--accept-dns=false", self.tailscale_setup)
         gate_check = self.tailscale_setup.index(
             'if [[ -n "$pre_setup_gate" && ! -f "$pre_setup_gate" ]]'
         )

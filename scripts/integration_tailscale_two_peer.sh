@@ -109,8 +109,12 @@ expected = set(sys.argv[1].split(","))
 prefs = json.load(sys.stdin)
 if set(prefs.get("AdvertiseRoutes", [])) != expected:
     raise SystemExit("transport-router does not advertise the exact optional SaaS prefixes")
-if prefs.get("RouteAll") is not True or prefs.get("NoSNAT") is not True:
-    raise SystemExit("transport-router does not accept routes without SNAT")
+if (
+    prefs.get("RouteAll") is not True
+    or prefs.get("NoSNAT") is not True
+    or prefs.get("CorpDNS") is not False
+):
+    raise SystemExit("transport-router does not accept routes without SNAT or has Tailnet DNS enabled")
 ' "$expected_routes"
 }
 verify_transport_router_control_plane "$transport_router_a" "$transport_router_a" \

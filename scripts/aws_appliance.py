@@ -9178,10 +9178,12 @@ while true; do
     /usr/bin/jq -e --arg expected_self "$expected_self" --arg expected_self_prefix "$expected_self_prefix" --argjson expected_local "$expected_local" --argjson expected_remote "$expected_remote" --argjson expected_remote_owners "$expected_remote_owners" --argjson prefs "$prefs" '
       . as $status
       | ($status.BackendState == "Running")
+        and ($status.Health == [])
         and ($status.Self.Online == true)
         and ((($status.Self.HostName // $status.Self.DNSName // "") | split(".")[0]) == $expected_self)
         and ($prefs.RouteAll == true)
         and ($prefs.NoSNAT == true)
+        and ($prefs.CorpDNS == false)
         and ((($prefs.AdvertiseRoutes // []) | sort) == [$expected_self_prefix])
         and (([
             ($status.Peer // {{}})
