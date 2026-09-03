@@ -542,6 +542,55 @@ class SymmetricTopologyTest(unittest.TestCase):
         with self.assertRaisesRegex(e2e.DeploymentError, "overlap|peer"):
             e2e.parse_symmetric_topology_v2(invalid_topology)
 
+    def test_topology_binds_target_groups_to_region_site_and_account(self) -> None:
+        wrong_region = topology_document()
+        wrong_region["sites"]["west"]["target_fleet"][0][
+            "target_group_arn"
+        ] = wrong_region["sites"]["west"]["target_fleet"][0][
+            "target_group_arn"
+        ].replace("us-west-2", "us-east-1")
+
+        split_site = topology_document()
+        split_site["sites"]["west"]["target_fleet"][1][
+            "target_group_arn"
+        ] = split_site["sites"]["west"]["target_fleet"][1][
+            "target_group_arn"
+        ].replace("targetgroup/west/", "targetgroup/west-other/")
+
+        foreign_account = topology_document()
+        for member in foreign_account["sites"]["east"]["target_fleet"]:
+            member["target_group_arn"] = member["target_group_arn"].replace(
+                "123456789012", "210987654321"
+            )
+
+        same_region = topology_document()
+        same_region["sites"]["east"]["region"] = "us-west-2"
+        for fleet_name in ("target_fleet", "transport_router_fleet"):
+            for member in same_region["sites"]["east"][fleet_name]:
+                member["region"] = "us-west-2"
+                if "target_group_arn" in member:
+                    member["target_group_arn"] = member[
+                        "target_group_arn"
+                    ].replace("us-east-1", "us-west-2")
+
+        for name, document in (
+            ("foreign region", wrong_region),
+            ("split site", split_site),
+            ("foreign account", foreign_account),
+            ("same region", same_region),
+        ):
+            with self.subTest(name=name), self.assertRaises(e2e.DeploymentError):
+                e2e.parse_symmetric_topology_v2(document)
+
+        class StringLikeRunId:
+            def __str__(self) -> str:
+                return "symmetric-fixture"
+
+        string_like = topology_document()
+        string_like["run_id"] = StringLikeRunId()
+        with self.assertRaisesRegex(e2e.DeploymentError, "must be a string"):
+            e2e.parse_symmetric_topology_v2(string_like)
+
     def test_primary_route_ownership_requires_remote_owners_and_empty_local_selection(self) -> None:
         topology = e2e.parse_symmetric_topology_v2(topology_document())
         observer = topology.west.transport_router_fleet[0]
@@ -2441,9 +2490,13 @@ class SymmetricTopologyTest(unittest.TestCase):
                 ),
             ),
         )
-        old_identity = {
+        cached_identity = {
             "target_group_arn": second.target_group_arn,
             "registration_port": 6081,
+            "process_generation_sha256": "6" * 64,
+        }
+        old_identity = {
+            **cached_identity,
             "process_generation_sha256": "7" * 64,
         }
         replacement_identity = {
@@ -2466,7 +2519,9 @@ class SymmetricTopologyTest(unittest.TestCase):
 
         adapter.replace = replace
         operations.adapter = adapter
-        operations._target_readiness_identities = {second.instance_id: old_identity}
+        operations._target_readiness_identities = {
+            second.instance_id: cached_identity
+        }
         operations._selected_established_target = mock.Mock(
             side_effect=(first, second)
         )
@@ -2476,7 +2531,9 @@ class SymmetricTopologyTest(unittest.TestCase):
                 "source_target_id": first.instance_id,
             }
         )
-        operations._verify_target = mock.Mock(return_value=replacement_identity)
+        operations._verify_target = mock.Mock(
+            side_effect=(old_identity, replacement_identity)
+        )
         operations._target_health = mock.Mock(return_value="healthy")
         operations._verify_target_group_registrations = mock.Mock(
             return_value={
@@ -2516,6 +2573,11 @@ class SymmetricTopologyTest(unittest.TestCase):
             result["transport"]["failed_ids"],
             {"tcp": first.instance_id, "udp": second.instance_id},
         )
+        self.assertEqual(
+            result["recovery"]["old_process_generation_sha256"],
+            old_identity["process_generation_sha256"],
+        )
+        self.assertEqual(operations._verify_target.call_count, 2)
         install_wire_inspector.assert_called_once_with(operations._remote(replacement))
         self.assertIn("replace", adapter.calls)
 
@@ -2902,8 +2964,51 @@ class SymmetricTopologyTest(unittest.TestCase):
             ):
                 self.calls.append("target-instance")
                 alternate = deployment.topology.site(failed.site).target_fleet[1]
-                return deployment, {
-                    "recovery": {"kind": "target-instance", "site": failed.site, "failed_id": failed.instance_id, "alternate_id": alternate.instance_id, "replacement_id": "i-ff23456789abcdef", "replacement_ready": True, "old_process_generation_sha256": "7" * 64, "replacement_process_generation_sha256": "8" * 64, "target_group_arn": failed.target_group_arn, "registration_port": 6081, "drain_state": "draining", "drain_duration_ms": 5, "new_flow_succeeded": True, "new_flows": self.new_flows(deployment, new_tcp_flow, new_flow, source_target_id=alternate.instance_id), "recovery_duration_ms": 20},
+                replacement_id = "i-ff23456789abcdef"
+                replacement = dataclasses.replace(
+                    failed,
+                    instance_id=replacement_id,
+                )
+                site = deployment.topology.site(failed.site)
+                updated_site = dataclasses.replace(
+                    site,
+                    target_fleet=tuple(
+                        replacement if member == failed else member
+                        for member in site.target_fleet
+                    ),
+                )
+                updated_topology = dataclasses.replace(
+                    deployment.topology,
+                    **{failed.site: updated_site},
+                )
+                updated_deployment = dataclasses.replace(
+                    deployment,
+                    topology=updated_topology,
+                )
+                return updated_deployment, {
+                    "recovery": {
+                        "kind": "target-instance",
+                        "site": failed.site,
+                        "failed_id": failed.instance_id,
+                        "alternate_id": alternate.instance_id,
+                        "replacement_id": replacement_id,
+                        "replacement_az_key": replacement.az_key,
+                        "replacement_ready": True,
+                        "old_process_generation_sha256": "8" * 64,
+                        "replacement_process_generation_sha256": "9" * 64,
+                        "target_group_arn": failed.target_group_arn,
+                        "registration_port": 6081,
+                        "drain_state": "draining",
+                        "drain_duration_ms": 5,
+                        "new_flow_succeeded": True,
+                        "new_flows": self.new_flows(
+                            deployment,
+                            new_tcp_flow,
+                            new_flow,
+                            source_target_id=alternate.instance_id,
+                        ),
+                        "recovery_duration_ms": 20,
+                    },
                     "health_transition": {"kind": "target-instance", "member_id": failed.instance_id, "states": ["healthy", "draining", "replaced"]},
                     "transport": legacy_e2e_test.failure_transport_evidence(
                         failed.instance_id, "target-instance"
@@ -2944,6 +3049,16 @@ class SymmetricTopologyTest(unittest.TestCase):
                 assert abrupt_failed.gwlbe_route_table_id is not None
                 assert abrupt_failed.network_interface_id is not None
                 assert abrupt_alternate.network_interface_id is not None
+                replacement_target = next(
+                    member
+                    for member in deployment.topology.west.target_fleet
+                    if member.instance_id == "i-ff23456789abcdef"
+                )
+                surviving_target = next(
+                    member
+                    for member in deployment.topology.west.target_fleet
+                    if member != replacement_target
+                )
 
                 def snapshot(network_interface_id):
                     return {
@@ -2975,6 +3090,14 @@ class SymmetricTopologyTest(unittest.TestCase):
                     abrupt_flow,
                     source_transport_router_id=abrupt_alternate.instance_id,
                     source_transport_eni_id=abrupt_alternate.network_interface_id,
+                    source_target_id=surviving_target.instance_id,
+                )
+                abrupt_new_flows["udp"]["path"] = self.path(
+                    deployment,
+                    abrupt_flow,
+                    source_transport_router_id=abrupt_alternate.instance_id,
+                    source_transport_eni_id=abrupt_alternate.network_interface_id,
+                    source_target_id=replacement_target.instance_id,
                 )
                 abrupt_probe = {
                     **abrupt_new_flows["udp"]["path"],
@@ -3032,6 +3155,7 @@ class SymmetricTopologyTest(unittest.TestCase):
                     graceful_new_tcp_flow,
                     graceful_flow,
                     destination_transport_router_id=graceful_alternate.instance_id,
+                    source_target_id=surviving_target.instance_id,
                 )
                 graceful_probe = {
                     **graceful_new_flows["udp"]["path"],
@@ -3114,6 +3238,41 @@ class SymmetricTopologyTest(unittest.TestCase):
             rewritten_persisted = e2e.load_evidence(evidence_path)
         self.assertTrue(result.passed, result.error)
         self.assertEqual(persisted["schema"], 3)
+        instance_recovery = next(
+            item
+            for item in persisted["recoveries"]
+            if item["kind"] == "target-instance"
+        )
+        initial_topology = e2e.parse_symmetric_topology_v2(persisted["topology"])
+        self.assertNotIn(
+            instance_recovery["replacement_id"],
+            {
+                member.instance_id
+                for site in e2e.SITES
+                for member in initial_topology.site(site).target_fleet
+            },
+        )
+        self.assertEqual(
+            persisted["transport_router"]["abrupt"]["new_flows"]["udp"][
+                "path"
+            ]["source_target_id"],
+            instance_recovery["replacement_id"],
+        )
+        self.assertEqual(
+            persisted["transport_router"]["abrupt"]["new_flows"]["tcp"][
+                "path"
+            ]["source_target_id"],
+            instance_recovery["alternate_id"],
+        )
+        self.assertTrue(
+            all(
+                flow["path"]["source_target_id"]
+                != instance_recovery["replacement_id"]
+                for flow in persisted["transport_router"]["graceful"][
+                    "new_flows"
+                ].values()
+            )
+        )
         self.assertEqual(rewritten.exit_code, e2e.EXIT_CLEANUP_FAILED)
         self.assertEqual(rewritten.evidence["status"], "failed")
         self.assertEqual(

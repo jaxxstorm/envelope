@@ -90,6 +90,8 @@ Failed protected run `ha49` proved controlled completion and both abrupt alterna
 
 Failed protected run `ha50` proved that DNS correction and abrupt restoration, then exposed endpoint-sensitive resumed-stream analysis. One TCP loss episode began during mutation, crossed the sampled endpoint by 274 milliseconds, and resumed at the next marker; the previous all-missing-sends rule treated that single episode as unrelated post-mutation loss. Analysis now attributes each bounded contiguous episode by its first missing successful send, retains its complete duration and exact counts, and still rejects any separately starting post-mutation episode. Cleanup passed in one attempt with zero residuals, but the run did not pass acceptance.
 
+Failed protected run `ha51` proved that stream correction and completed every live recovery, both route restorations, final no-drift verification, and zero-residual cleanup. Final evidence validation then rejected a later UDP path through the target replacement because its target lookup still used only the initial topology. Evidence now keeps that initial topology for earlier observations and derives one exact post-replacement fleet by removing the victim and substituting its globally distinct same-site, same-AZ, same-target-group successor. The run did not pass acceptance.
+
 Terraform emits the host contract separately as `transport_router_readiness_expectations`, including each site's exact CIDRs, forwarding, policy, firewall, MSS, IPv6, no-NAT expectations, and contract hash. That output is an expectation consumed by credentialed protected readiness, not a user input and not proof that a deployed router is ready.
 
 ## Topology Rules

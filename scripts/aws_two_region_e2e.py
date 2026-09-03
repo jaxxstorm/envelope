@@ -3286,7 +3286,16 @@ class SymmetricFleetMember:
         if not _INSTANCE_ID_RE.fullmatch(self.instance_id):
             raise DeploymentError("symmetric fleet member instance ID is invalid")
         if self.role == "target":
-            if not isinstance(self.target_group_arn, str) or _TARGET_GROUP_ARN_RE.fullmatch(self.target_group_arn) is None:
+            target_match = (
+                _TARGET_GROUP_ARN_RE.fullmatch(self.target_group_arn)
+                if isinstance(self.target_group_arn, str)
+                else None
+            )
+            if (
+                target_match is None
+                or target_match.group(1) != self.region
+                or not self.target_group_arn.startswith("arn:aws:")
+            ):
                 raise DeploymentError("symmetric target has no valid regional target group")
             if (
                 self.network_interface_id is not None
@@ -3367,6 +3376,10 @@ class SymmetricSiteTopology:
                 raise DeploymentError(f"{self.site} {role} fleet contains a foreign member")
             if len({member.instance_id for member in fleet}) != len(fleet) or len({member.az_key for member in fleet}) < 2:
                 raise DeploymentError(f"{self.site} {role} fleet must have distinct members across two AZs")
+        if len({member.target_group_arn for member in self.target_fleet}) != 1:
+            raise DeploymentError(
+                f"{self.site} target fleet must use one exact regional target group"
+            )
         router_enis = {member.network_interface_id for member in self.transport_router_fleet}
         router_tables = {member.gwlbe_route_table_id for member in self.transport_router_fleet}
         if len(router_enis) != len(self.transport_router_fleet) or len(router_tables) != len(
@@ -3685,6 +3698,8 @@ class SymmetricTopologyV2:
     def __post_init__(self) -> None:
         if not _RUN_ID_RE.fullmatch(self.run_id):
             raise DeploymentError("symmetric topology run ID is invalid")
+        if self.west.region == self.east.region:
+            raise DeploymentError("symmetric topology sites must use distinct regions")
         if set(self.west.remote_site_cidrs) != set(self.east.local_site_cidrs) or set(self.east.remote_site_cidrs) != set(self.west.local_site_cidrs):
             raise DeploymentError("symmetric remote site CIDRs must exactly equal the peer local site CIDRs")
         identities = [
@@ -3694,6 +3709,15 @@ class SymmetricTopologyV2:
         ]
         if len(identities) != len(set(identities)):
             raise DeploymentError("symmetric target and transport-router identities must be globally unique")
+        target_group_accounts = {
+            cast(str, member.target_group_arn).split(":", 5)[4]
+            for site in (self.west, self.east)
+            for member in site.target_fleet
+        }
+        if len(target_group_accounts) != 1:
+            raise DeploymentError(
+                "symmetric target groups must belong to one AWS account"
+            )
         router_enis = [
             member.network_interface_id
             for site in (self.west, self.east)
@@ -3747,10 +3771,20 @@ def parse_symmetric_topology_v2(value: Any) -> SymmetricTopologyV2:
         {"config_version", "run_id", "route_failover", "sites"},
         "symmetric topology",
     )
-    if document["config_version"] != 2:
+    if (
+        isinstance(document["config_version"], bool)
+        or not isinstance(document["config_version"], int)
+        or document["config_version"] != 2
+    ):
         raise DeploymentError("symmetric topology config_version must be 2")
     sites = _mapping(document["sites"], "symmetric topology.sites")
     _exact_keys(sites, set(SITES), "symmetric topology.sites")
+
+    def string_field(source: Mapping[str, Any], key: str, path: str) -> str:
+        field = source[key]
+        if not isinstance(field, str):
+            raise DeploymentError(f"{path}.{key} must be a string")
+        return field
 
     def parse_site(site: Site) -> SymmetricSiteTopology:
         item = _mapping(sites[site], f"symmetric topology.sites.{site}")
@@ -3786,23 +3820,26 @@ def parse_symmetric_topology_v2(value: Any) -> SymmetricTopologyV2:
             )
             parsed: list[SymmetricFleetMember] = []
             for index, member in enumerate(members):
-                member_value = _mapping(member, f"symmetric topology.sites.{site}.{name}[{index}]")
-                _exact_keys(member_value, expected, f"symmetric topology.sites.{site}.{name}[{index}]")
+                path = f"symmetric topology.sites.{site}.{name}[{index}]"
+                member_value = _mapping(member, path)
+                _exact_keys(member_value, expected, path)
                 parsed.append(
                     SymmetricFleetMember(
                         site,
                         role,
-                        str(member_value["region"]),
-                        str(member_value["az_key"]),
-                        str(member_value["instance_id"]),
-                        str(member_value["target_group_arn"]) if role == "target" else None,
-                        str(member_value["network_interface_id"])
+                        string_field(member_value, "region", path),
+                        string_field(member_value, "az_key", path),
+                        string_field(member_value, "instance_id", path),
+                        string_field(member_value, "target_group_arn", path)
+                        if role == "target"
+                        else None,
+                        string_field(member_value, "network_interface_id", path)
                         if role == "transport-router"
                         else None,
-                        str(member_value["gwlbe_route_table_id"])
+                        string_field(member_value, "gwlbe_route_table_id", path)
                         if role == "transport-router"
                         else None,
-                        str(member_value["advertised_prefix"])
+                        string_field(member_value, "advertised_prefix", path)
                         if role == "transport-router"
                         else None,
                     )
@@ -3814,7 +3851,7 @@ def parse_symmetric_topology_v2(value: Any) -> SymmetricTopologyV2:
             raise DeploymentError(f"symmetric topology.sites.{site} CIDRs must be string lists")
         return SymmetricSiteTopology(
             site,
-            str(item["region"]),
+            string_field(item, "region", f"symmetric topology.sites.{site}"),
             tuple(local),
             tuple(remote),
             fleet("target_fleet", "target"),
@@ -3844,7 +3881,14 @@ def parse_symmetric_topology_v2(value: Any) -> SymmetricTopologyV2:
             raw_selections[site],
             f"symmetric topology.route_failover.initial_transport_router_az_by_gwlbe_az.{site}",
         )
-        selections[site] = {str(key): str(selected) for key, selected in value.items()}
+        if not all(
+            isinstance(key, str) and isinstance(selected, str)
+            for key, selected in value.items()
+        ):
+            raise DeploymentError(
+                "symmetric topology route-failover selections must be strings"
+            )
+        selections[site] = dict(value)
     failover = SymmetricRouteFailover(
         mutation_timeout_seconds=raw_failover["mutation_timeout_seconds"],
         restoration_timeout_seconds=raw_failover["restoration_timeout_seconds"],
@@ -3852,7 +3896,10 @@ def parse_symmetric_topology_v2(value: Any) -> SymmetricTopologyV2:
         initial_transport_router_az_by_gwlbe_az=selections,
     )
     return SymmetricTopologyV2(
-        str(document["run_id"]), parse_site("west"), parse_site("east"), failover
+        string_field(document, "run_id", "symmetric topology"),
+        parse_site("west"),
+        parse_site("east"),
+        failover,
     )
 
 
@@ -4766,7 +4813,12 @@ def validate_symmetric_preflight(
     if "config_version" in document:
         expected_keys.add("config_version")
     _exact_keys(document, expected_keys, "symmetric readiness")
-    if document.get("config_version", 2) != 2:
+    config_version = document.get("config_version", 2)
+    if (
+        isinstance(config_version, bool)
+        or not isinstance(config_version, int)
+        or config_version != 2
+    ):
         raise ReadinessError("symmetric readiness config_version must be 2")
     if document["tailnet_policy_valid"] is not True:
         raise ReadinessError("symmetric Tailnet policy validation did not pass")
@@ -4843,6 +4895,11 @@ def validate_symmetric_preflight(
         }
         for member in expected.target_fleet:
             identity = targets[member.instance_id]
+            process_generation = (
+                identity.get("process_generation_sha256")
+                if isinstance(identity, Mapping)
+                else None
+            )
             if (
                 not isinstance(identity, Mapping)
                 or set(identity)
@@ -4854,18 +4911,22 @@ def validate_symmetric_preflight(
                 }
                 or identity.get("ready") is not True
                 or identity.get("target_group_arn") != member.target_group_arn
+                or isinstance(identity.get("registration_port"), bool)
+                or not isinstance(identity.get("registration_port"), int)
                 or identity.get("registration_port") != 6081
-                or re.fullmatch(
-                    r"[0-9a-f]{64}",
-                    str(identity.get("process_generation_sha256", "")),
-                )
-                is None
+                or not isinstance(process_generation, str)
+                or re.fullmatch(r"[0-9a-f]{64}", process_generation) is None
             ):
                 raise ReadinessError(
                     f"{name} target readiness is not bound to its service generation and registration"
                 )
         for member in expected.transport_router_fleet:
             identity = routers[member.instance_id]
+            node_hash = (
+                identity.get("tailnet_node_id_sha256")
+                if isinstance(identity, Mapping)
+                else None
+            )
             if (
                 not isinstance(identity, Mapping)
                 or set(identity)
@@ -4885,10 +4946,8 @@ def validate_symmetric_preflight(
                 or identity.get("advertised_prefix") != member.advertised_prefix
                 or identity.get("local_gwlbes") != expected_local_gwlbes
                 or identity.get("contract_sha256") != contract_hashes[name]
-                or re.fullmatch(
-                    r"[0-9a-f]{64}", str(identity.get("tailnet_node_id_sha256", ""))
-                )
-                is None
+                or not isinstance(node_hash, str)
+                or re.fullmatch(r"[0-9a-f]{64}", node_hash) is None
             ):
                 raise ReadinessError(
                     f"{name} transport readiness is not bound to its ENI, Tailnet node, and destination-prefix GWLBE routes"
@@ -5552,6 +5611,7 @@ def _validate_transport_router_evidence(
     endpoint_ids: Mapping[Site, Mapping[str, str]],
     recovery: Mapping[str, Any],
     node_hashes_by_instance: Mapping[str, str],
+    target_replacement: tuple[SymmetricFleetMember, str],
 ) -> None:
     if not isinstance(value, Mapping) or set(value) != {"graceful", "abrupt"}:
         raise EvidenceError("transport-router evidence must separate graceful and abrupt transactions")
@@ -5631,6 +5691,7 @@ def _validate_transport_router_evidence(
             exercise.get("new_flows"),
             topology=topology,
             endpoint_ids=endpoint_ids,
+            target_replacement=target_replacement,
         )
         if set(probe) != set(new_flow_paths["udp"]) | {
             "succeeded",
@@ -6236,6 +6297,7 @@ def _validate_new_flow_matrix(
     *,
     topology: SymmetricTopologyV2,
     endpoint_ids: Mapping[Site, Mapping[str, str]],
+    target_replacement: tuple[SymmetricFleetMember, str] | None = None,
 ) -> dict[str, Mapping[str, Any]]:
     if not isinstance(value, Mapping) or set(value) != set(TRANSPORT_PROTOCOLS):
         raise EvidenceError("failure evidence does not contain exact TCP and UDP new flows")
@@ -6265,6 +6327,19 @@ def _validate_new_flow_matrix(
         for site in SITES
         for member in topology.site(site).target_fleet
     }
+    if target_replacement is not None:
+        failed, replacement_id = target_replacement
+        if (
+            targets.get(failed.instance_id) != failed
+            or replacement_id in targets
+            or replacement_id in routers
+        ):
+            raise EvidenceError("post-replacement target binding is invalid")
+        del targets[failed.instance_id]
+        targets[replacement_id] = dataclasses.replace(
+            failed,
+            instance_id=replacement_id,
+        )
     paths: dict[str, Mapping[str, Any]] = {}
     for protocol in TRANSPORT_PROTOCOLS:
         item = value.get(protocol)
@@ -6495,7 +6570,13 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
         raise EvidenceError("unsafe evidence rejected: " + "; ".join(findings))
     if not isinstance(document, Mapping) or set(document) != _SYMMETRIC_EVIDENCE_KEYS:
         raise EvidenceError("symmetric evidence has missing or unsupported top-level keys")
-    if document.get("schema") != SYMMETRIC_EVIDENCE_SCHEMA or document.get("kind") != SYMMETRIC_EVIDENCE_KIND:
+    schema = document.get("schema")
+    if (
+        isinstance(schema, bool)
+        or not isinstance(schema, int)
+        or schema != SYMMETRIC_EVIDENCE_SCHEMA
+        or document.get("kind") != SYMMETRIC_EVIDENCE_KIND
+    ):
         raise EvidenceError("symmetric evidence schema or kind is invalid")
     _validate_generated_at(document.get("generated_at"))
     status = document.get("status")
@@ -6773,10 +6854,15 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
     recoveries = document.get("recoveries")
     if not isinstance(recoveries, list) or len(recoveries) != 3:
         raise EvidenceError("symmetric evidence requires process, instance, and transport-router recovery records")
-    expected_recovery_kinds = {"target-process", "target-instance", "transport-router"}
+    expected_recovery_order = (
+        "target-process",
+        "target-instance",
+        "transport-router",
+    )
+    expected_recovery_kinds = set(expected_recovery_order)
     seen_kinds: set[str] = set()
     recovery_records: dict[str, Mapping[str, Any]] = {}
-    for item in recoveries:
+    for recovery_index, item in enumerate(recoveries):
         kind = item.get("kind") if isinstance(item, Mapping) else None
         expected_keys = {
             "kind",
@@ -6791,6 +6877,7 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
             expected_keys.update(
                 {
                     "replacement_id",
+                    "replacement_az_key",
                     "replacement_ready",
                     "drain_state",
                     "drain_duration_ms",
@@ -6807,9 +6894,10 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
             not isinstance(kind, str)
             or kind not in expected_recovery_kinds
             or kind in seen_kinds
+            or kind != expected_recovery_order[recovery_index]
             or site not in SITES
         ):
-            raise EvidenceError("symmetric recovery kind or site is invalid")
+            raise EvidenceError("symmetric recovery kind, site, or order is invalid")
         fleet = (
             topology.site(cast(Site, site)).transport_router_fleet
             if kind == "transport-router"
@@ -6831,10 +6919,14 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
             or not 1 <= duration <= 7_200_000
         ):
             raise EvidenceError("symmetric recovery does not prove bounded alternate-path new-flow recovery")
-        new_flow_paths = _validate_new_flow_matrix(
-            item.get("new_flows"),
-            topology=topology,
-            endpoint_ids=endpoint_ids,
+        new_flow_paths = (
+            _validate_new_flow_matrix(
+                item.get("new_flows"),
+                topology=topology,
+                endpoint_ids=endpoint_ids,
+            )
+            if kind != "transport-router"
+            else {}
         )
         if kind in {"target-process", "target-instance"}:
             all_routers = {
@@ -6870,30 +6962,40 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
                 )
         if kind == "target-instance":
             replacement_id = item.get("replacement_id")
+            failed_target = next(
+                member for member in fleet if member.instance_id == failed_id
+            )
             drain_duration = item.get("drain_duration_ms")
+            old_generation = item.get("old_process_generation_sha256")
+            replacement_generation = item.get(
+                "replacement_process_generation_sha256"
+            )
+            all_original_ids = {
+                member.instance_id
+                for candidate_site in SITES
+                for member in (
+                    *topology.site(candidate_site).target_fleet,
+                    *topology.site(candidate_site).transport_router_fleet,
+                )
+            }
             if (
                 not isinstance(replacement_id, str)
                 or _INSTANCE_ID_RE.fullmatch(replacement_id) is None
-                or replacement_id in identifiers
+                or replacement_id in all_original_ids
+                or item.get("replacement_az_key") != failed_target.az_key
                 or item.get("replacement_ready") is not True
                 or item.get("drain_state") not in {"draining", "unused", "deregistered"}
                 or isinstance(drain_duration, bool)
                 or not isinstance(drain_duration, int)
                 or drain_duration < 1
-                or re.fullmatch(
-                    r"[0-9a-f]{64}",
-                    str(item.get("old_process_generation_sha256", "")),
-                )
-                is None
-                or re.fullmatch(
-                    r"[0-9a-f]{64}",
-                    str(item.get("replacement_process_generation_sha256", "")),
-                )
-                is None
-                or item.get("old_process_generation_sha256")
-                == item.get("replacement_process_generation_sha256")
-                or _TARGET_GROUP_ARN_RE.fullmatch(str(item.get("target_group_arn", "")))
-                is None
+                or not isinstance(old_generation, str)
+                or re.fullmatch(r"[0-9a-f]{64}", old_generation) is None
+                or not isinstance(replacement_generation, str)
+                or re.fullmatch(r"[0-9a-f]{64}", replacement_generation) is None
+                or old_generation == replacement_generation
+                or item.get("target_group_arn") != failed_target.target_group_arn
+                or isinstance(item.get("registration_port"), bool)
+                or not isinstance(item.get("registration_port"), int)
                 or item.get("registration_port") != 6081
             ):
                 raise EvidenceError("symmetric target replacement lacks exact drain or replacement readiness proof")
@@ -6901,12 +7003,23 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
         recovery_records[cast(str, kind)] = item
     if seen_kinds != expected_recovery_kinds:
         raise EvidenceError("symmetric evidence omits a recovery class")
+    instance_recovery = recovery_records["target-instance"]
+    replaced_target = next(
+        member
+        for member in topology.site(cast(Site, instance_recovery["site"])).target_fleet
+        if member.instance_id == instance_recovery["failed_id"]
+    )
+    target_replacement = (
+        replaced_target,
+        cast(str, instance_recovery["replacement_id"]),
+    )
     _validate_transport_router_evidence(
         document.get("transport_router"),
         topology=topology,
         endpoint_ids=endpoint_ids,
         recovery=recovery_records["transport-router"],
         node_hashes_by_instance=node_hashes_by_instance,
+        target_replacement=target_replacement,
     )
 
     transport = document.get("transport")
@@ -6927,7 +7040,25 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
         raise EvidenceError(
             "target-process UDP stream is not bound to the recovered target"
         )
-    instance_site = cast(Site, recovery_records["target-instance"]["site"])
+    instance_site = cast(Site, instance_recovery["site"])
+    instance_failed_id = cast(str, instance_recovery["failed_id"])
+    initial_process_generation = validated_preflight["sites"][instance_site][
+        "targets"
+    ][instance_failed_id]["process_generation_sha256"]
+    replacement_old_generation = instance_recovery[
+        "old_process_generation_sha256"
+    ]
+    process_touched_victim = instance_failed_id in set(process_failed_ids.values())
+    if (
+        process_touched_victim
+        and replacement_old_generation == initial_process_generation
+    ) or (
+        not process_touched_victim
+        and replacement_old_generation != initial_process_generation
+    ):
+        raise EvidenceError(
+            "target-instance victim generation contradicts preceding process recovery"
+        )
     instance_ids = {
         member.instance_id for member in topology.site(instance_site).target_fleet
     }
@@ -6936,7 +7067,7 @@ def validate_symmetric_evidence(document: Any) -> dict[str, Any]:
         allowed_failed_ids=instance_ids,
         allow_right_censored=True,
     )
-    if instance_failed_ids["udp"] != recovery_records["target-instance"]["failed_id"]:
+    if instance_failed_ids["udp"] != instance_failed_id:
         raise EvidenceError("target-instance UDP stream is not bound to the replaced target")
     router_transport = transport.get("transport_router")
     if not isinstance(router_transport, Mapping) or set(router_transport) != {
@@ -22812,8 +22943,9 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
             or isinstance(value.get("pid"), bool)
             or not isinstance(value.get("pid"), int)
             or value["pid"] <= 1
+            or not isinstance(value.get("process_generation_sha256"), str)
             or re.fullmatch(
-                r"[0-9a-f]{64}", str(value.get("process_generation_sha256", ""))
+                r"[0-9a-f]{64}", value["process_generation_sha256"]
             )
             is None
         ):
@@ -23400,13 +23532,11 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
                 timeout_seconds=max(8, min(timeout_seconds, 30)),
             )
             selected_failed = udp_selected
-            old_identity = identities.get(selected_failed.instance_id)
-            if not isinstance(old_identity, Mapping):
-                old_identity = self._verify_target(
-                    deployment,
-                    selected_failed,
-                    timeout_seconds=max(30, min(timeout_seconds, 120)),
-                )
+            old_identity = self._verify_target(
+                deployment,
+                selected_failed,
+                timeout_seconds=max(30, min(timeout_seconds, 120)),
+            )
             controller.quiesce_target(selected_failed)
             drain = controller.drain_target(selected_failed)
             paths = {
@@ -23497,6 +23627,7 @@ printf '{{"envelope_active":true,"geneve_receive_ready":true,"geneve_validation_
                     "source_target_id"
                 ],
                 "replacement_id": replacement.instance_id,
+                "replacement_az_key": replacement.az_key,
                 "replacement_ready": True,
                 "old_process_generation_sha256": old_identity[
                     "process_generation_sha256"

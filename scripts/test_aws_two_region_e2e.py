@@ -733,7 +733,11 @@ def symmetric_route_evidence() -> dict[str, Any]:
             for member in peer.transport_router_fleet
             if member.az_key == destination_az_key
         )
-        source_target = source.target_fleet[0]
+        source_target = (
+            next(member for member in source.target_fleet if member.az_key == "b")
+            if site == "west" and role == "initiator"
+            else source.target_fleet[0]
+        )
         destination_target = peer.target_fleet[0]
         return {
             "protocol": protocol,
@@ -775,8 +779,19 @@ def symmetric_route_evidence() -> dict[str, Any]:
             result[protocol] = {"succeeded": True, "path": path}
         return result
 
+    def set_source_target(path: dict[str, Any], target_id: str) -> None:
+        path["source_target_id"] = target_id
+        path["geneve_return_proof"]["source"] = turnaround(target_id)
+
     current, alternate = topology.west.transport_router_fleet
     graceful_failed, graceful_alternate = topology.east.transport_router_fleet
+    target = next(
+        member for member in topology.west.target_fleet if member.az_key == "b"
+    )
+    target_alternate = next(
+        member for member in topology.west.target_fleet if member != target
+    )
+    replacement_target_id = "i-ff23456789abcdef"
     assert current.gwlbe_route_table_id is not None
     assert current.network_interface_id is not None
     assert alternate.network_interface_id is not None
@@ -821,11 +836,16 @@ def symmetric_route_evidence() -> dict[str, Any]:
         source_transport_router_id=alternate.instance_id,
         source_transport_eni_id=alternate.network_interface_id,
     )
+    set_source_target(
+        abrupt_new_flows["tcp"]["path"], target_alternate.instance_id
+    )
+    set_source_target(abrupt_new_flows["udp"]["path"], replacement_target_id)
     abrupt_probe = {
         **abrupt_new_flows["udp"]["path"],
         "succeeded": True,
         "new_flows": abrupt_new_flows,
     }
+
     def owner_observation(
         owner_site: e2e.SymmetricSiteTopology,
         owners: Mapping[str, str],
@@ -991,8 +1011,6 @@ def symmetric_route_evidence() -> dict[str, Any]:
     abrupt_route_replacement = route_replacement(
         current, alternate, abrupt_probe, "abrupt"
     )
-    target = topology.west.target_fleet[0]
-    target_alternate = topology.west.target_fleet[1]
     readiness = {
         "config_version": 2,
         "tailnet_policy_valid": True,
@@ -1109,10 +1127,11 @@ def symmetric_route_evidence() -> dict[str, Any]:
                 "site": "west",
                 "failed_id": target.instance_id,
                 "alternate_id": target_alternate.instance_id,
-                "replacement_id": "i-ff23456789abcdef",
+                "replacement_id": replacement_target_id,
+                "replacement_az_key": target.az_key,
                 "replacement_ready": True,
-                "old_process_generation_sha256": "7" * 64,
-                "replacement_process_generation_sha256": "8" * 64,
+                "old_process_generation_sha256": "8" * 64,
+                "replacement_process_generation_sha256": "9" * 64,
                 "target_group_arn": target.target_group_arn,
                 "registration_port": 6081,
                 "drain_state": "draining",
@@ -4811,7 +4830,247 @@ class SymmetricRouteEvidenceTest(unittest.TestCase):
                 graceful_path["destination_az_key"]
             ],
         )
+        instance_recovery = next(
+            item
+            for item in validated["recoveries"]
+            if item["kind"] == "target-instance"
+        )
+        initial_target_ids = {
+            member.instance_id
+            for site in e2e.SITES
+            for member in topology.site(site).target_fleet
+        }
+        self.assertNotIn(instance_recovery["replacement_id"], initial_target_ids)
+        self.assertEqual(
+            validated["transport_router"]["abrupt"]["new_flows"]["udp"][
+                "path"
+            ]["source_target_id"],
+            instance_recovery["replacement_id"],
+        )
+        self.assertEqual(instance_recovery["replacement_az_key"], "b")
+        self.assertEqual(
+            validated["transport_router"]["abrupt"]["new_flows"]["tcp"][
+                "path"
+            ]["source_target_id"],
+            instance_recovery["alternate_id"],
+        )
+        self.assertTrue(
+            all(
+                flow["path"]["source_target_id"]
+                != instance_recovery["replacement_id"]
+                for flow in validated["transport_router"]["graceful"][
+                    "new_flows"
+                ].values()
+            )
+        )
         self.assertEqual(e2e.verify_live_evidence(document), document)
+
+    def test_post_replacement_paths_reject_victim_unknown_and_premature_target(
+        self,
+    ) -> None:
+        def instance_recovery(value: dict[str, Any]) -> dict[str, Any]:
+            return next(
+                item
+                for item in value["recoveries"]
+                if item["kind"] == "target-instance"
+            )
+
+        def set_path_target(
+            path: dict[str, Any],
+            *,
+            side: str,
+            target_id: str,
+        ) -> None:
+            path[f"{side}_target_id"] = target_id
+            proof = path["geneve_return_proof"][side]
+            proof["target_id"] = target_id
+            proof["fidelity"]["target_id"] = target_id
+
+        def rewrite_transport_source_target(
+            value: Any,
+            *,
+            old_target_id: str,
+            new_target_id: str,
+        ) -> None:
+            if isinstance(value, dict):
+                if value.get("source_target_id") == old_target_id:
+                    value["source_target_id"] = new_target_id
+                    proof = value.get("geneve_return_proof", {}).get("source")
+                    if isinstance(proof, dict):
+                        proof["target_id"] = new_target_id
+                        fidelity = proof.get("fidelity")
+                        if isinstance(fidelity, dict):
+                            fidelity["target_id"] = new_target_id
+                for child in value.values():
+                    rewrite_transport_source_target(
+                        child,
+                        old_target_id=old_target_id,
+                        new_target_id=new_target_id,
+                    )
+            elif isinstance(value, list):
+                for child in value:
+                    rewrite_transport_source_target(
+                        child,
+                        old_target_id=old_target_id,
+                        new_target_id=new_target_id,
+                    )
+
+        for name, replacement_target in (
+            (
+                "destroyed victim",
+                lambda document: instance_recovery(document)["failed_id"],
+            ),
+            ("undeclared target", lambda _document: "i-ee23456789abcdef"),
+        ):
+            document = symmetric_route_evidence()
+            declared = instance_recovery(document)["replacement_id"]
+            rewrite_transport_source_target(
+                document["transport_router"],
+                old_target_id=declared,
+                new_target_id=replacement_target(document),
+            )
+            recovery = next(
+                item
+                for item in document["recoveries"]
+                if item["kind"] == "transport-router"
+            )
+            recovery["new_flows"] = document["transport_router"]["abrupt"][
+                "new_flows"
+            ]
+            with self.subTest(name=name), self.assertRaisesRegex(
+                e2e.EvidenceError,
+                "invalid endpoint, target, or router identity",
+            ):
+                e2e.validate_symmetric_evidence(document)
+
+        document = symmetric_route_evidence()
+        replacement_id = instance_recovery(document)["replacement_id"]
+        process = next(
+            item
+            for item in document["recoveries"]
+            if item["kind"] == "target-process"
+        )
+        path = process["new_flows"]["tcp"]["path"]
+        set_path_target(path, side="source", target_id=replacement_id)
+        with self.assertRaisesRegex(
+            e2e.EvidenceError,
+            "invalid endpoint, target, or router identity",
+        ):
+            e2e.validate_symmetric_evidence(document)
+
+        for name in (
+            "west traversal source",
+            "east traversal destination",
+            "target-instance new flow",
+        ):
+            document = symmetric_route_evidence()
+            replacement_id = instance_recovery(document)["replacement_id"]
+            if name == "west traversal source":
+                traversal = next(
+                    item
+                    for item in document["traversals"]
+                    if item["source_site"] == "west"
+                )
+                path = traversal["probes"][0]
+                side = "source"
+            elif name == "east traversal destination":
+                traversal = next(
+                    item
+                    for item in document["traversals"]
+                    if item["source_site"] == "east"
+                )
+                path = traversal["probes"][0]
+                side = "destination"
+            else:
+                recovery = instance_recovery(document)
+                path = recovery["new_flows"]["tcp"]["path"]
+                side = "source"
+            set_path_target(path, side=side, target_id=replacement_id)
+            with self.subTest(name=name), self.assertRaises(e2e.EvidenceError):
+                e2e.validate_symmetric_evidence(document)
+
+    def test_replacement_metadata_and_recovery_order_are_exact(self) -> None:
+        document = symmetric_route_evidence()
+        self.assertEqual(e2e.validate_symmetric_evidence(document), document)
+        out_of_order = copy.deepcopy(document)
+        out_of_order["recoveries"][:2] = reversed(out_of_order["recoveries"][:2])
+        with self.assertRaisesRegex(e2e.EvidenceError, "order"):
+            e2e.validate_symmetric_evidence(out_of_order)
+
+        topology = e2e.parse_symmetric_topology_v2(document["topology"])
+        metadata_mutations = {
+            "wrong AZ": lambda value: value.update(
+                {"replacement_az_key": "b" if value["replacement_az_key"] == "a" else "a"}
+            ),
+            "wrong target group": lambda value: value.update(
+                {"target_group_arn": topology.east.target_fleet[0].target_group_arn}
+            ),
+            "global identity collision": lambda value: value.update(
+                {"replacement_id": topology.east.target_fleet[0].instance_id}
+            ),
+            "numeric process generation": lambda value: value.update(
+                {"old_process_generation_sha256": int("7" * 64)}
+            ),
+        }
+        for name, mutate in metadata_mutations.items():
+            candidate = copy.deepcopy(document)
+            recovery = next(
+                item
+                for item in candidate["recoveries"]
+                if item["kind"] == "target-instance"
+            )
+            mutate(recovery)
+            with self.subTest(name=name), self.assertRaisesRegex(
+                e2e.EvidenceError,
+                "drain or replacement readiness proof",
+            ):
+                e2e.validate_symmetric_evidence(candidate)
+
+        stale_generation = symmetric_route_evidence()
+        stale_recovery = next(
+            item
+            for item in stale_generation["recoveries"]
+            if item["kind"] == "target-instance"
+        )
+        initial_generation = stale_generation["preflight"]["sites"][
+            stale_recovery["site"]
+        ]["targets"][stale_recovery["failed_id"]][
+            "process_generation_sha256"
+        ]
+        stale_recovery["old_process_generation_sha256"] = initial_generation
+        with self.assertRaisesRegex(e2e.EvidenceError, "process recovery"):
+            e2e.validate_symmetric_evidence(stale_generation)
+
+    def test_evidence_rejects_coercive_scalar_types(self) -> None:
+        def target_identity(value: dict[str, Any]) -> dict[str, Any]:
+            topology = e2e.parse_symmetric_topology_v2(value["topology"])
+            target = topology.west.target_fleet[0]
+            return value["preflight"]["sites"]["west"]["targets"][
+                target.instance_id
+            ]
+
+        mutations = {
+            "schema": lambda value: value.update({"schema": 3.0}),
+            "topology version": lambda value: value["topology"].update(
+                {"config_version": 2.0}
+            ),
+            "preflight version": lambda value: value["preflight"].update(
+                {"config_version": 2.0}
+            ),
+            "preflight process generation": lambda value: target_identity(
+                value
+            ).update({"process_generation_sha256": int("7" * 64)}),
+            "registration port": lambda value: next(
+                item
+                for item in value["recoveries"]
+                if item["kind"] == "target-instance"
+            ).update({"registration_port": 6081.0}),
+        }
+        for name, mutate in mutations.items():
+            document = symmetric_route_evidence()
+            mutate(document)
+            with self.subTest(name=name), self.assertRaises(e2e.EvidenceError):
+                e2e.validate_symmetric_evidence(document)
 
     def test_transport_recovery_summary_exactly_matches_serialized_abrupt_exercise(
         self,
@@ -5222,15 +5481,19 @@ class SymmetricRoleReadinessTest(unittest.TestCase):
             )
 
         operations = object.__new__(e2e.AwsSymmetricLiveOperations)
-        before = {"i-6123456789abcdef0": snapshot(10, 10, 0)}
-        after = {"i-6123456789abcdef0": snapshot(11, 11, 0)}
-        fidelity = symmetric_route_evidence()["traversals"][0]["probes"][0][
-            "geneve_return_proof"
-        ]["source"]["fidelity"]
+        target_id = "i-6123456789abcdef0"
+        before = {target_id: snapshot(10, 10, 0)}
+        after = {target_id: snapshot(11, 11, 0)}
+        probes = symmetric_route_evidence()["traversals"][0]["probes"]
+        fidelity = next(
+            probe["geneve_return_proof"]["source"]["fidelity"]
+            for probe in probes
+            if probe["source_target_id"] == target_id
+        )
         proof = operations._geneve_return_proof(
             before,
             after,
-            "i-6123456789abcdef0",
+            target_id,
             fidelity,
         )
         self.assertEqual(
@@ -5240,16 +5503,16 @@ class SymmetricRoleReadinessTest(unittest.TestCase):
         self.assertTrue(proof["fidelity"]["observed"])
         self.assertTrue(proof["fidelity"]["raw_pcap_deleted"])
 
-        failed = {"i-6123456789abcdef0": snapshot(11, 11, 1)}
+        failed = {target_id: snapshot(11, 11, 1)}
         with self.assertRaises(e2e.MetricAssertionError):
             operations._geneve_return_proof(
-                before, failed, "i-6123456789abcdef0", fidelity
+                before, failed, target_id, fidelity
             )
 
-        non_finite = {"i-6123456789abcdef0": snapshot(11, 11, float("inf"))}
+        non_finite = {target_id: snapshot(11, 11, float("inf"))}
         with self.assertRaisesRegex(e2e.MetricAssertionError, "non-finite"):
             operations._geneve_return_proof(
-                before, non_finite, "i-6123456789abcdef0", fidelity
+                before, non_finite, target_id, fidelity
             )
 
     def test_target_requires_source_dest_check_and_current_packet_return_metrics(self) -> None:
@@ -5641,14 +5904,38 @@ class RouteRestorationCleanupPrecedenceTest(unittest.TestCase):
                 timeout_seconds,
             ):
                 alternate = current.topology.site(failed.site).target_fleet[1]
-                return current, {
+                replacement = dataclasses.replace(
+                    failed,
+                    instance_id="i-ff23456789abcdef",
+                )
+                site = current.topology.site(failed.site)
+                updated_site = dataclasses.replace(
+                    site,
+                    target_fleet=tuple(
+                        replacement if member == failed else member
+                        for member in site.target_fleet
+                    ),
+                )
+                updated = dataclasses.replace(
+                    current,
+                    topology=dataclasses.replace(
+                        current.topology,
+                        **{failed.site: updated_site},
+                    ),
+                )
+                return updated, {
                     "recovery": {
                         "kind": "target-instance",
                         "site": failed.site,
                         "failed_id": failed.instance_id,
                         "alternate_id": alternate.instance_id,
-                        "replacement_id": "i-ff23456789abcdef",
+                        "replacement_id": replacement.instance_id,
+                        "replacement_az_key": replacement.az_key,
                         "replacement_ready": True,
+                        "old_process_generation_sha256": "8" * 64,
+                        "replacement_process_generation_sha256": "9" * 64,
+                        "target_group_arn": replacement.target_group_arn,
+                        "registration_port": 6081,
                         "drain_state": "draining",
                         "drain_duration_ms": 1,
                         "new_flow_succeeded": True,
