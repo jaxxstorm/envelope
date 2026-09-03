@@ -3126,16 +3126,15 @@ def analyze_stream_markers(
             window.start_monotonic_ns >= mutation.start_monotonic_ns - maximum_loss_ns
             and window.end_monotonic_ns <= mutation.end_monotonic_ns + maximum_loss_ns
         )
-        missing_attempts_inside_mutation = all(
+        loss_started_inside_mutation = (
             mutation.start_monotonic_ns
-            <= attempts[sequence]
+            <= attempts[window.first_missing_sequence]
             <= mutation.end_monotonic_ns
-            for sequence in range(previous.sequence + 1, current.sequence)
         )
         if (
             not overlaps_mutation
             or not inside_expanded_interval
-            or not missing_attempts_inside_mutation
+            or not loss_started_inside_mutation
         ):
             raise StreamAnalysisError("stream loss occurred outside the declared mutation interval")
         if window.duration_ns > maximum_loss_ns:

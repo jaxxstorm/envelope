@@ -7723,6 +7723,111 @@ class StreamAnalyzerTest(unittest.TestCase):
         self.assertEqual(analysis.loss_windows[0].duration_ns, 120)
         self.assertEqual(analysis.connection_id, "flow:c0001")
 
+    def test_mutation_started_loss_can_resume_after_interval(self) -> None:
+        mutation = e2e.MutationInterval(
+            2_315_685_438_725,
+            2_583_114_116_623,
+            "transport-router-abrupt-failure-tcp",
+        )
+        attempts = (
+            2_312_399_008_032,
+            2_333_263_572_454,
+            2_354_100_170_009,
+            2_374_940_251_776,
+            2_395_794_574_404,
+            2_416_638_333_653,
+            2_437_482_293_388,
+            2_458_326_020_379,
+            2_479_169_794_768,
+            2_500_010_164_326,
+            2_520_857_274_949,
+            2_541_700_809_540,
+            2_562_540_065_814,
+            2_583_388_315_288,
+            2_604_220_239_909,
+            2_625_076_062_450,
+            2_645_919_796_500,
+            2_666_760_166_850,
+            2_687_607_304_695,
+            2_708_440_285_951,
+        )
+        received = {
+            0: 2_312_472_105_968,
+            1: 2_333_337_230_760,
+            2: 2_354_174_261_194,
+            5: 2_416_726_122_073,
+            6: 2_437_583_381_404,
+            7: 2_458_403_935_636,
+            8: 2_479_247_661_249,
+            9: 2_500_109_139_623,
+            14: 2_604_294_117_662,
+            15: 2_625_150_404_626,
+            16: 2_645_994_213_580,
+            17: 2_666_834_112_610,
+            18: 2_687_681_549_012,
+            19: 2_708_513_396_873,
+        }
+
+        analysis = e2e.analyze_stream_markers(
+            [
+                marker(sequence, attempts[sequence], observed)
+                for sequence, observed in received.items()
+            ],
+            mutation,
+            maximum_loss_ns=2_735_000_000_000,
+            attempted_monotonic_ns=attempts,
+            expected_first_sequence=0,
+            expected_last_sequence=19,
+        )
+
+        self.assertEqual(analysis.missing_sequences, (3, 4, 10, 11, 12, 13))
+        self.assertEqual(len(analysis.loss_windows), 2)
+        self.assertEqual(
+            (
+                analysis.loss_windows[1].first_missing_sequence,
+                analysis.loss_windows[1].last_missing_sequence,
+                analysis.loss_windows[1].duration_ns,
+            ),
+            (10, 13, 104_184_978_039),
+        )
+        self.assertGreater(attempts[13], mutation.end_monotonic_ns)
+        self.assertLessEqual(attempts[10], mutation.end_monotonic_ns)
+
+    def test_loss_episode_starting_before_interval_still_fails(self) -> None:
+        markers = [
+            marker(0, 40, 45),
+            marker(3, 120, 130),
+            marker(4, 220, 225),
+        ]
+
+        with self.assertRaisesRegex(e2e.StreamAnalysisError, "outside"):
+            e2e.analyze_stream_markers(
+                markers,
+                self.mutation,
+                maximum_loss_ns=100,
+                attempted_monotonic_ns=(40, 60, 110, 120, 220),
+                expected_first_sequence=0,
+                expected_last_sequence=4,
+            )
+
+    def test_new_loss_episode_after_interval_still_fails(self) -> None:
+        markers = [
+            marker(0, 40, 45),
+            marker(1, 180, 195),
+            marker(3, 220, 225),
+            marker(4, 240, 245),
+        ]
+
+        with self.assertRaisesRegex(e2e.StreamAnalysisError, "outside"):
+            e2e.analyze_stream_markers(
+                markers,
+                self.mutation,
+                maximum_loss_ns=100,
+                attempted_monotonic_ns=(40, 180, 205, 220, 240),
+                expected_first_sequence=0,
+                expected_last_sequence=4,
+            )
+
     def test_loss_outside_interval_or_over_bound_fails(self) -> None:
         outside = [
             marker(0, 40, 45),
