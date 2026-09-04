@@ -91,6 +91,17 @@ The deployment SHALL expose bounded transport-router readiness for backend, sing
 - **WHEN** protected readiness or diagnostics are collected
 - **THEN** site, router and ENI identifiers, exact prefixes, selected interfaces, route targets, and bounded reasons are reported without secrets
 
+### Requirement: Routing performance regression gate
+The system SHALL define a reviewed benchmark profile for transport-router readiness and the bidirectional no-NAT packet path, with allocation and latency thresholds before implementation performance is accepted.
+
+#### Scenario: Benchmark within threshold
+- **WHEN** transport-router readiness and bidirectional no-NAT datapath benchmarks run on the documented Linux profile
+- **THEN** measured allocations and latency remain within the pre-approved thresholds recorded with the change evidence
+
+#### Scenario: Benchmark regression
+- **WHEN** a benchmark exceeds a pre-approved threshold
+- **THEN** the change remains incomplete until the regression is fixed or the threshold change is reviewed before rerun
+
 ## REMOVED Requirements
 
 ### Requirement: Envelope and tailscaled co-residency

@@ -56,6 +56,25 @@ The deployment SHALL persist forwarding, reverse-path, no-NAT firewall, and TCP 
 - **WHEN** a required router sysctl, route, source/destination check, firewall, no-NAT, or MSS assertion is invalid
 - **THEN** the router is ineligible for GWLBE route selection and acceptance remains unready
 
+### Requirement: Fresh-state Terraform convergence
+The deployment SHALL support a clean Terraform plan and one non-targeted apply from empty state, followed by a no-change plan and complete destroy.
+
+#### Scenario: Fresh-state plan
+- **WHEN** Terraform plans from empty state with valid inputs
+- **THEN** all resource instance keys are known during planning and the plan completes without `-target`
+
+#### Scenario: Single-pass apply
+- **WHEN** the reviewed fresh-state plan is applied
+- **THEN** all infrastructure, Envelope target services, and transport-router services converge without a second targeted apply
+
+#### Scenario: Idempotent plan
+- **WHEN** Terraform plans again after successful convergence with unchanged inputs
+- **THEN** the plan reports no changes
+
+#### Scenario: Complete destroy
+- **WHEN** the destroy plan is applied from the same state
+- **THEN** no test-owned AWS resources remain in state or in either region
+
 ## ADDED Requirements
 
 ### Requirement: Multi-AZ symmetric site deployment

@@ -1,55 +1,37 @@
 ## Purpose
 
-Define the GWLB-oriented GENEVE <-> TUN datapath optimized for Tailscale, including flow-based return-path symmetry, MTU handling, and required health/metrics endpoints.
+Define the GWLB-oriented GENEVE datapath for immediate packet-scoped GWLB turnaround, including AWS profile validation, opaque metadata preservation, bounded MTU handling, and required health/metrics endpoints.
+
 ## Requirements
-### Requirement: Ingress GENEVE decapsulation to TUN
-The system SHALL accept UDP/6081 packets, parse a minimal GENEVE header, and write the inner L3 IP payload to the `envelope0` TUN device.
+### Requirement: Immediate packet-scoped GENEVE turnaround
+The version-2 target datapath SHALL validate each AWS GENEVE ingress packet and immediately emit exactly one AWS-compliant GENEVE return containing the same inner packet and the current packet's VNI, protocol metadata, and ordered options. It SHALL NOT write the inner packet to TUN, wait for a reverse packet, route the inner packet, or retain metadata for another packet.
 
-#### Scenario: Valid GENEVE packet
-- **WHEN** a UDP/6081 packet with a valid GENEVE header and an inner IP payload is received
-- **THEN** the inner IP payload is written to the TUN device without an Ethernet header
+#### Scenario: Valid packet turnaround
+- **WHEN** a healthy target receives one valid AWS GENEVE packet
+- **THEN** it returns the same inner bytes with that packet's AWS tuple and GENEVE metadata before discarding the packet-scoped identity
 
-#### Scenario: Malformed GENEVE packet
-- **WHEN** a UDP/6081 packet has an invalid or unsupported GENEVE header
-- **THEN** the packet is dropped and `decap_errors` is incremented
+#### Scenario: Independent packet processing
+- **WHEN** a later packet has the same inner tuple or arrives after target restart
+- **THEN** its result depends only on its own validation and metadata and not on earlier processing
 
-### Requirement: Egress TUN encapsulation to GENEVE
-The system SHALL read supported L3 IP packets from the `envelope0` TUN device, match them to an unambiguous GWLB return context, encapsulate them in GENEVE, and emit them using the AWS-compliant outer tuple.
-
-#### Scenario: TUN packet with return context
-- **WHEN** a supported L3 IP packet is read from TUN and an unambiguous matching return context exists
-- **THEN** the system emits an AWS-compliant GENEVE packet using that context
-
-#### Scenario: No return context available
-- **WHEN** an L3 IP packet is read from TUN and no matching return context exists
-- **THEN** the packet is dropped, `drops` is incremented, and a missing-context reason is counted
-
-#### Scenario: Conflicted return context
-- **WHEN** an L3 IP packet is read from TUN and its return context is conflicted
-- **THEN** the packet is dropped and collision and drop metrics identify the reason
+#### Scenario: No target inner forwarding
+- **WHEN** the destination belongs to either configured site
+- **THEN** the target returns the packet to GWLB and neither a TUN nor a Tailscale or VPC forwarding path receives the inner packet directly
 
 ### Requirement: Minimal GENEVE header handling
-The system SHALL validate the GENEVE base header and complete TLV structure and SHALL preserve the complete ordered options block associated with a flow as opaque bytes. Configured read-only value parsing MUST NOT mutate, normalize, reorder, insert, or remove option bytes.
+The system SHALL validate the GENEVE base header and complete TLV structure and SHALL preserve the current packet's complete ordered options block as opaque bytes. Configured read-only parsing MUST NOT mutate, normalize, reorder, insert, or remove option bytes, and no option bytes SHALL be stored for a later packet.
 
-#### Scenario: Matching return packet preserves options
-- **WHEN** a valid GENEVE packet contains options and a later return packet matches that flow
-- **THEN** the exact ordered options bytes are emitted on the matching return packet
+#### Scenario: Current packet preserves options
+- **WHEN** a valid GENEVE packet contains ordered options
+- **THEN** its immediate return contains the exact same ordered option bytes
 
-#### Scenario: Structurally malformed options
-- **WHEN** the aggregate option length or an internal TLV length is inconsistent with the received packet
-- **THEN** the packet is dropped and a specific options-validation error is incremented
-
-#### Scenario: Reserved option bits
-- **WHEN** an option length byte has non-zero reserved high bits and a valid low five-bit length
-- **THEN** generic structural validation ignores the reserved bits and uses only the low five bits for data length, without promising AWS-profile return transmission for that packet
+#### Scenario: Structurally malformed or unknown critical option
+- **WHEN** the aggregate option length, internal TLV length, or critical-option semantics are invalid
+- **THEN** the packet is dropped and no return is emitted
 
 #### Scenario: Unknown non-critical option
-- **WHEN** a structurally valid unknown option does not have its critical bit set
-- **THEN** the packet remains valid and the unknown option bytes are preserved unchanged
-
-#### Scenario: Unknown critical option
-- **WHEN** a packet contains an unknown option with its critical bit set
-- **THEN** the packet is dropped and a critical-option validation reason is incremented
+- **WHEN** a structurally valid unknown option is non-critical
+- **THEN** the current packet remains valid and the unknown bytes are returned unchanged
 
 ### Requirement: Optional allocation-free TLV value parsing
 The system SHALL structurally validate all option headers and SHALL expose configured option values for observability through an iterator that does not allocate per packet when value logging is disabled.
@@ -97,76 +79,37 @@ The system SHALL enforce a configurable maximum total options size no greater th
 - **THEN** the packet is dropped and `decap_errors` is incremented
 
 ### Requirement: AWS-compatible option fixtures
-The test suite SHALL include sanitized AWS captures or wire-identical fixtures that cover valid ordered metadata with zero reserved transmit bits, parser-only reserved-bit tolerance, malformed lengths, option cardinality, and critical-option behavior.
+The test suite SHALL include sanitized AWS captures or wire-identical fixtures that cover valid ordered metadata with zero reserved transmit bits, malformed lengths, option cardinality, and critical-option behavior using immediate per-packet turnaround.
 
-#### Scenario: Valid fixture round trip
-- **WHEN** a fixture with multiple AWS GWLB options is decoded and emitted for its matching flow
-- **THEN** an independent comparison confirms the complete option block is byte-identical
+#### Scenario: Valid fixture packet round trip
+- **WHEN** a fixture with multiple AWS GWLB options is processed
+- **THEN** an independent comparison confirms that one immediate return has the complete byte-identical inner packet and ordered option block
 
 #### Scenario: Invalid fixture matrix
 - **WHEN** malformed and unknown-critical fixtures are processed
-- **THEN** each packet is rejected for the expected specific reason
+- **THEN** each packet is rejected for the expected specific reason and produces no return
 
 ### Requirement: Return path symmetry (GWLB)
-The system SHALL maintain a bounded, protocol-aware return-context table keyed by the supported ingress inner flow tuple and SHALL use reverse-orientation TUN traffic to return packets through the same GWLB flow-selected port, peer, local address, VNI, and options that were learned on ingress.
+The system SHALL complete the appliance leg for every individually valid packet by returning it to the GWLB that sent it, using only packet-scoped metadata. Inter-site symmetry SHALL come from both sites routing each direction through their GWLBE and GWLB, not from an Envelope return-context table or direct target inner forwarding.
 
-#### Scenario: Return-context update
-- **WHEN** a valid AWS GWLB packet is received for a supported flow
-- **THEN** the flow context is installed or refreshed with the complete outer and GENEVE return metadata
+#### Scenario: Any flow orientation reaches a target
+- **WHEN** GWLB delivers a forward- or reverse-orientation packet to a healthy target that did not receive an earlier packet for that flow
+- **THEN** the target validates and immediately returns that packet without a missing-context decision
 
-#### Scenario: Reverse-flow egress
-- **WHEN** a TUN packet contains the reverse tuple of an unambiguous live context
-- **THEN** it is emitted with that context's AWS-compliant outer tuple and GENEVE metadata
-
-#### Scenario: No flow mapping
-- **WHEN** a TUN packet's reverse tuple has no live context
-- **THEN** it is dropped and missing-context observability is updated
-
-#### Scenario: Forward-orientation TUN packet
-- **WHEN** a TUN packet has the same orientation as an ingress context instead of the required reverse orientation
-- **THEN** it is dropped as a possible routing loop and is not re-encapsulated through that context
-
-#### Scenario: Flow mapping expiration
-- **WHEN** a return context is idle beyond its configured protocol timeout
-- **THEN** it is expired and no longer used for egress
-
-#### Scenario: Flow mapping collision
-- **WHEN** one inner key maps to conflicting live GWLB contexts
-- **THEN** return traffic fails closed until the ambiguity is removed
+#### Scenario: Target restart
+- **WHEN** an Envelope target restarts and later becomes healthy
+- **THEN** it can return a valid post-restart packet without restoring pre-restart flow state
 
 ### Requirement: MTU-aware handling
-The system SHALL enforce the configured inner MTU, SHALL integrate with host TCP MSS policy so valid TCP streams do not become persistent silent blackholes, and SHALL receive every complete legal IPv4 UDP payload so unsupported oversized traffic is dropped with an explicit MTU reason. The GWLB profile MUST NOT claim PMTU signalling until related ICMP-to-context behavior is specified and proven.
+The target SHALL receive every complete packet up to the configured AWS-profile bound, validate declared lengths before return, and either return the complete byte-identical inner packet or drop it with an explicit bounded-size reason. It SHALL NOT truncate a packet or depend on a target TUN MTU. Transport-router forwarding and MSS policy SHALL enforce the Tailscale path MTU separately.
 
-#### Scenario: Tailscale-safe TCP flow
-- **WHEN** traffic crosses a configured 1280-byte Tailscale path
-- **THEN** host routing constrains TCP MSS to a value that prevents packets larger than the Envelope inner MTU
+#### Scenario: Largest accepted packet
+- **WHEN** a complete valid packet is at the configured target receive bound
+- **THEN** the immediate return contains the complete untruncated inner packet
 
-#### Scenario: Every directed Tailscale TCP path
-- **WHEN** IPv4 or IPv6 TCP traffic crosses underlay to Tailscale, Tailscale to underlay, Envelope to Tailscale, or Tailscale to Envelope
-- **THEN** the SYN advertises the derived safe MSS and a full-sized TCP transfer completes without a silent drop
-
-#### Scenario: Oversized packet
-- **WHEN** an inner packet exceeds the configured Envelope MTU
-- **THEN** it is dropped with an MTU-specific reason and counter rather than an undifferentiated drop
-
-#### Scenario: Maximum-options one-byte oversize ingress
-- **WHEN** a complete UDP datagram contains 252 bytes of valid options and an inner packet exactly one byte above the configured MTU
-- **THEN** receive capacity preserves the complete datagram and reports an ingress MTU drop rather than UDP truncation
-
-#### Scenario: Arbitrarily oversized valid ingress
-- **WHEN** a complete legal UDP datagram contains a valid GENEVE packet whose inner packet is two or substantially more bytes above the configured MTU
-- **THEN** receive capacity preserves the complete datagram and reports the appropriate IPv4 or IPv6 ingress MTU reason rather than generic truncation
-
-#### Scenario: Real-TUN one-byte oversize egress
-- **WHEN** a real TUN returns an inner frame exactly one byte above the configured Envelope MTU
-- **THEN** Envelope observes and drops it without encapsulating truncated or stale buffer contents
-
-### Requirement: Tailscale-optimized MTU defaults
-The system SHALL default the TUN MTU to 1280 to match Tailscale’s fixed tunnel MTU, and it MUST remain configurable for environments with different path MTUs.
-
-#### Scenario: Default MTU
-- **WHEN** the system starts without an explicit `--tun-mtu`
-- **THEN** the TUN MTU is set to 1280
+#### Scenario: Oversized or truncated packet
+- **WHEN** a datagram exceeds the receive bound or its declared lengths are incomplete
+- **THEN** it is dropped with the specific receive-boundary reason and no partial return is emitted
 
 ### Requirement: GENEVE protocol type validation
 The system SHALL accept only GENEVE packets with protocol type set to IPv4 (`0x0800`) or IPv6 (`0x86DD`) and drop others without modifying any options.
@@ -175,62 +118,20 @@ The system SHALL accept only GENEVE packets with protocol type set to IPv4 (`0x0
 - **WHEN** a GENEVE packet has a protocol type other than IPv4 or IPv6
 - **THEN** the packet is dropped and `decap_errors` is incremented
 
-### Requirement: Tailscale-optimized flow timeout
-The system SHALL use configurable protocol-aware GWLB return-context timeouts, defaulting to 350 seconds for TCP and 120 seconds for UDP and other protocols, and SHALL refresh activity on valid ingress and successful mapped egress.
-
-#### Scenario: Protocol timeout defaults
-- **WHEN** the system starts without explicit context timeout overrides
-- **THEN** TCP uses 350 seconds and UDP and other protocols use 120 seconds
-
-#### Scenario: Active return-only traffic
-- **WHEN** mapped return traffic is emitted successfully before timeout
-- **THEN** the context activity timestamp is refreshed
-
 ### Requirement: Metrics exposure
-The system SHALL expose all GWLB datapath and context metrics plus routing apply attempts and failures, effective-path failures by reason, drift repairs, ownership decisions, Tailscale readiness failures, MTU-specific drops, and current routing readiness.
+The system SHALL expose AWS profile and receive drops, valid packet receipt, packet-scoped return success and failure, MTU-specific drops, liveness transitions, and target readiness. Version-2 target metrics SHALL NOT require context, TUN, host-routing, or Tailscale state.
 
-#### Scenario: Datapath-only metrics scrape
-- **WHEN** a client requests `:9090/metrics` in routing mode `off`
-- **THEN** the response includes all required GWLB datapath and context metrics
-
-#### Scenario: Routing-integrated metrics scrape
-- **WHEN** a client requests `:9090/metrics` in routing mode `verify` or `manage`
-- **THEN** the response additionally includes all routing and host-path metrics with reason labels or bounded reason-specific counters
+#### Scenario: Datapath metrics scrape
+- **WHEN** a client requests `:9090/metrics` from a version-2 target
+- **THEN** packet-turnaround counters and current receiver/sender readiness are present without normal-path context or TUN counters
 
 ### Requirement: Health endpoint
-The system SHALL return HTTP 200 from `:9090/healthz` only when the live GWLB datapath is healthy and, in `verify` or `manage` mode, the Tailscale backend, effective forward and return routes, host forwarding, reverse-path filtering, firewall, MSS policy, and managed state are ready.
+The system SHALL return HTTP 200 from `:9090/healthz` only while AWS packet validation, receive, and packet-scoped compliant-send components are initialized and below persistent-error thresholds. A TUN, local/remote route, forwarding sysctl, firewall transit rule, MSS rule, or Tailscale backend SHALL NOT be a target health prerequisite.
 
-#### Scenario: Datapath-only readiness
-- **WHEN** routing mode is `off` and the live datapath is healthy
-- **THEN** `:9090/healthz` returns HTTP 200
+#### Scenario: Packet-turnaround target ready
+- **WHEN** receive, validation, and compliant-send components are healthy
+- **THEN** `:9090/healthz` returns HTTP 200 without TUN or Tailscale readiness
 
-#### Scenario: Routing-integrated readiness
-- **WHEN** routing mode is `verify` or `manage` and every effective routing prerequisite is valid
-- **THEN** `:9090/healthz` returns HTTP 200
-
-#### Scenario: Routing prerequisite missing
-- **WHEN** any required backend, route, rule, sysctl, reverse-path, firewall, MSS, or ownership condition is invalid
+#### Scenario: Persistent packet-turnaround failure
+- **WHEN** receive or compliant-send failure exceeds its persistent-error threshold
 - **THEN** `:9090/healthz` returns HTTP 503 with a bounded component-specific reason
-
-#### Scenario: Persistent datapath failure
-- **WHEN** the GWLB receive, TUN, or compliant-send path exceeds its persistent-error threshold
-- **THEN** routing state cannot mask the failure and `:9090/healthz` returns HTTP 503
-
-#### Scenario: Unexpected loop termination
-- **WHEN** the receive or TUN-read loop closes without process cancellation or explicit shutdown
-- **THEN** the component becomes immediately unhealthy, sibling loops are cancelled, resources close once, and the process supervisor receives an error
-
-### Requirement: Envelope datapath ownership boundary
-The system SHALL terminate and originate GENEVE on the Envelope-owned TUN device and MUST NOT share that TUN with `tailscaled`; host routing SHALL connect the Envelope and Tailscale interfaces according to explicit CIDR roles.
-
-#### Scenario: Co-resident tailscaled deployment
-- **WHEN** Envelope runs with an active `tailscaled`
-- **THEN** each process retains its configured interface and packets move between them only through verified host routing
-
-#### Scenario: Pre-existing Envelope TUN
-- **WHEN** the configured Envelope TUN name already identifies a persistent or attached device
-- **THEN** exclusive TUN creation fails startup rather than sharing or reconfiguring that device
-
-#### Scenario: Local-delivery Tailnet packet
-- **WHEN** a cold Tailnet packet is destined for a configured local-delivery CIDR
-- **THEN** host routing bypasses `envelope0`, so the packet is not subjected to a nonexistent local GWLB return context
