@@ -84,6 +84,6 @@ For host networking, the harness extracts, renders, executes, and hash-checks th
 
 ## Protected AWS Runs
 
-The AWS profile is billable and requires a protected environment. Protected run `ha53` is the first documented passing corrected version-2 result; it does not make these local instructions a live-run procedure. Do not adapt old configuration files, state, evidence, or commands for the topology.
+The AWS profile is billable and requires a protected environment. Protected run `ha54` is the documented passing result from the exact final corrected version-2 revision; it does not make these local instructions a live-run procedure. Do not adapt old configuration files, state, evidence, or commands for the topology.
 
 The checked-in acceptance planning values are a `$4.00/hour` fixed estimate and a `$5.00/hour` fixed ceiling for the two-site, two-AZ HA profile. They exclude variable charges and are not current-price or spending approval. The profile has one shared NAT in each site's single management subnet, so private management and bootstrap egress is not multi-AZ even though the inspected transit topology spans two AZs. Use the [AWS appliance runbook](aws-appliance-runbook.md) and [two-region E2E runbook](aws-two-region-e2e-runbook.md) to understand the required route graph, protected-runner ENI failover and restoration, current cost review, and non-hitless availability boundary.

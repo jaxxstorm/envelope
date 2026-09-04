@@ -1,6 +1,6 @@
 # Envelope
 
-> **Experimental.** Envelope is a Linux-only, Layer 3 packet-turnaround target for a symmetric inline GWLB topology. Protected run `ha53` passed the corrected multi-AZ version-2 acceptance lifecycle, but the project remains under development and is not a production deployment offering.
+> **Experimental.** Envelope is a Linux-only, Layer 3 packet-turnaround target for a symmetric inline GWLB topology. Protected run `ha54` passed the final corrected multi-AZ version-2 acceptance lifecycle, but the project remains under development and is not a production deployment offering.
 
 For each valid AWS GENEVE ingress packet, an Envelope target immediately sends exactly one return to its GWLB using only that packet's outer tuple and metadata. It preserves the complete inner packet, VNI, protocol metadata, ordered options, and flow cookie. A target has no `envelope0` or `tailscale0` path: it does not inject into a TUN, directly forward inner traffic, choose a site route, or retain identity for another packet.
 
@@ -54,7 +54,7 @@ Graceful and abrupt router failover use one durable CAS/lease transaction ordere
 
 Restoration restarts the original singleton baseline with Tailnet DNS acceptance disabled while the alternate covers, removes the transferred prefix from the alternate, waits for opposite-site baseline owner-graph convergence and continued absence of local Tailnet routes, then restores and quietly verifies the original ENI routes. No terminal result or cleanup handoff is allowed until advertisements, ownership, and routes are all restored; after lease expiry, successor recovery acquires the transaction by CAS. Targets and transport routers cannot mutate these AWS routes, and this exercise is not a production failover controller.
 
-Protected packet-fidelity evidence is hash-only after inspection. Bounded Linux `AF_PACKET` captures are reduced to frame, inner-packet, ordered-option, and flow-cookie SHA-256 values plus protocol-field assertions, then the raw PCAP is deleted. Transfer evidence includes the source prefix, fenced forward and restore generations, stable-node hashes bound to protected instance IDs, before/transferred/restored opposite-site owner graphs, absence of local Tailnet routes and claims, ENI transitions, and verified all-component restoration. Raw payload bytes, ordered-option bytes, and flow-cookie values are not retained. Fresh protected run `ha53` passed this boundary; the two-region E2E runbook records its measured recovery, cost, evidence, and cleanup result.
+Protected packet-fidelity evidence is hash-only after inspection. Bounded Linux `AF_PACKET` captures are reduced to frame, inner-packet, ordered-option, and flow-cookie SHA-256 values plus protocol-field assertions, then the raw PCAP is deleted. Transfer evidence includes the source prefix, fenced forward and restore generations, stable-node hashes bound to protected instance IDs, before/transferred/restored opposite-site owner graphs, absence of local Tailnet routes and claims, ENI transitions, and verified all-component restoration. Raw payload bytes, ordered-option bytes, and flow-cookie values are not retained. Fresh protected run `ha54` passed this boundary from the exact final implementation revision; the two-region E2E runbook records its measured recovery, cost, evidence, and cleanup result.
 
 ## Version And Migration
 

@@ -3,7 +3,7 @@
 > [!WARNING]
 > **Experimental WIP: this does not currently work as a production service.**
 >
-> Envelope, its Terraform profile, and the protected acceptance workflow remain experimental. Protected run `ha53` passed the corrected version-2 acceptance boundary, but this is still an engineering prototype rather than a production service or deployment guide.
+> Envelope, its Terraform profile, and the protected acceptance workflow remain experimental. Protected run `ha54` passed the final corrected version-2 acceptance boundary, but this is still an engineering prototype rather than a production service or deployment guide.
 
 Envelope is a Linux-only Layer 3 packet-turnaround target for symmetric inline AWS Gateway Load Balancer (GWLB) inspection between two sites. For each valid AWS IPv4 GENEVE packet received on UDP/6081, a target immediately sends exactly one AWS-compliant return to the GWLB using only that packet's outer tuple and GENEVE metadata. The return preserves the inner packet byte-for-byte, including its VNI, protocol metadata, ordered options, and AWS flow cookie.
 
@@ -97,7 +97,7 @@ Failed protected run `ha48` proved that separated deadline and completed the gra
 
 Failed protected run `ha49` proved controlled completion and both abrupt alternate-path probes, then the restarted original router reported three Tailscale health conditions while its DNS forwarder logged that no upstream resolvers were available. Strict readiness withheld original-route restoration. Transport bootstrap and restoration now keep `accept-dns=false`, and host plus protected readiness verify `CorpDNS` false without weakening the empty-health requirement. Cleanup reconciled both advertisements, ownership, and original ENI routes before one-attempt zero-residual teardown; that run did not pass acceptance.
 
-Fresh protected run `ha53` from exact revision `edd33dc8693c381f7ba8428f445c7b7bc512a866` passed the complete schema-3 symmetric acceptance and one-attempt cleanup. Target, replacement, graceful-router, and abrupt-router recovery paths all produced successful fresh flows; every temporary advertisement and route mutation restored; target-fleet readiness returned after replacement; strict evidence verification and scans passed; the $4.09/hour fixed estimate stayed within the $5.00/hour ceiling; and independent authoritative checks found no live run residuals. The [two-region E2E runbook](docs/aws-two-region-e2e-runbook.md) records the measured results and evidence digest.
+Fresh protected run `ha54` from exact revision `90dca2dc857720090d0c10f452afd640b4e96a3f` passed the complete schema-3 symmetric acceptance, including the final stricter host readiness gate, and one-attempt cleanup. Target, replacement, graceful-router, and abrupt-router recovery paths all produced successful fresh flows; every temporary advertisement and route mutation restored; target-fleet readiness returned after replacement; strict evidence verification and scans passed; the $4.09/hour fixed estimate stayed within the $5.00/hour ceiling; and independent authoritative checks found no live run residuals. The [two-region E2E runbook](docs/aws-two-region-e2e-runbook.md) records the measured results and evidence digest.
 
 ## Availability And Failover
 
