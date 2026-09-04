@@ -92,6 +92,8 @@ Failed protected run `ha50` proved that DNS correction and abrupt restoration, t
 
 Failed protected run `ha51` proved that stream correction and completed every live recovery, both route restorations, final no-drift verification, and zero-residual cleanup. Final evidence validation then rejected a later UDP path through the target replacement because its target lookup still used only the initial topology. Evidence now keeps that initial topology for earlier observations and derives one exact post-replacement fleet by removing the victim and substituting its globally distinct same-site, same-AZ, same-target-group successor. The run did not pass acceptance.
 
+Failed protected run `ha52` proved that temporal correction through readiness, cold and traversal traffic, and the first target-process mutation/restoration. Its fixed TCP stream sent 158 markers, but the receiver duration had started before client dispatch and expired roughly 0.3 seconds before the final sequence arrived. The strict analyzer correctly rejected that unbounded post-mutation tail. The bounded receiver now starts its full observation duration at the first valid stream marker rather than consuming that duration during server-to-client startup. Cleanup again passed in one attempt with zero residuals; the run did not pass acceptance.
+
 Terraform emits the host contract separately as `transport_router_readiness_expectations`, including each site's exact CIDRs, forwarding, policy, firewall, MSS, IPv6, no-NAT expectations, and contract hash. That output is an expectation consumed by credentialed protected readiness, not a user input and not proof that a deployed router is ready.
 
 ## Topology Rules

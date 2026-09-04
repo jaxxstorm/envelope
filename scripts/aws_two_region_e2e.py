@@ -15977,6 +15977,7 @@ def stream_server(args):
     buffer = b""
     stop_observed = False
     tcp_ended = False
+    stream_started = False
     try:
         if tcp:
             sock.settimeout(max(0.01, deadline - time.monotonic()))
@@ -16035,6 +16036,11 @@ def stream_server(args):
             sequence = request["sequence"]
             if not isinstance(sequence, int) or sequence < 0:
                 raise RuntimeError("stream sequence invalid")
+            if not stream_started:
+                # Server dispatch precedes the client; give the accepted stream
+                # its full bounded observation window after the first marker.
+                deadline = time.monotonic() + args.duration
+                stream_started = True
             if sequence in seen:
                 duplicates += 1
             seen.add(sequence)

@@ -13756,10 +13756,12 @@ class ProtectedExecutionTest(unittest.TestCase):
 
                 class Clock:
                     def __init__(self) -> None:
-                        self.values = iter((0.0, 0.1, 0.2, 2.0))
+                        self.value = 0.0
 
                     def monotonic(self) -> float:
-                        return next(self.values, 2.0)
+                        return self.value
+
+                clock = Clock()
 
                 class Connection:
                     def settimeout(self, _seconds: float) -> None:
@@ -13771,6 +13773,7 @@ class ProtectedExecutionTest(unittest.TestCase):
 
                     def sendall(self, _payload: bytes) -> None:
                         events.append("connection-send")
+                        clock.value = 2.0
 
                     def close(self) -> None:
                         events.append("connection-close")
@@ -13792,10 +13795,12 @@ class ProtectedExecutionTest(unittest.TestCase):
 
                     def accept(self) -> tuple[Connection, tuple[str, int]]:
                         events.append("listener-accept")
+                        clock.value = 0.1
                         return connection, peer
 
                     def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
                         events.append("udp-recvfrom")
+                        clock.value = 0.1
                         return namespace["encode"](marker), peer
 
                     def connect(self, value: tuple[str, int]) -> None:
@@ -13803,6 +13808,7 @@ class ProtectedExecutionTest(unittest.TestCase):
 
                     def send(self, payload: bytes) -> int:
                         events.append("udp-send")
+                        clock.value = 2.0
                         return len(payload)
 
                     def sendto(self, _payload: bytes, _peer: tuple[str, int]) -> None:
@@ -13821,7 +13827,7 @@ class ProtectedExecutionTest(unittest.TestCase):
                     timeout=socket.timeout,
                     socket=lambda *_args: listener,
                 )
-                namespace["time"] = Clock()
+                namespace["time"] = clock
                 namespace["emit"] = emitted.append
 
                 namespace["stream_server"](
@@ -13847,6 +13853,125 @@ class ProtectedExecutionTest(unittest.TestCase):
                     self.assertIn(("udp-connect", peer), events)
                     self.assertIn("udp-send", events)
                     self.assertNotIn("udp-sendto", events)
+
+    def test_embedded_stream_server_duration_starts_with_first_marker(self) -> None:
+        flow_id = "fixture-stream"
+        peer = ("192.0.2.10", 41000)
+
+        for protocol in ("tcp", "udp"):
+            with self.subTest(protocol=protocol):
+                namespace: dict[str, Any] = {"__name__": "remote_agent_fixture"}
+                exec(e2e.REMOTE_AGENT_SOURCE, namespace)
+                emitted: list[dict[str, Any]] = []
+
+                class Clock:
+                    def __init__(self) -> None:
+                        self.value = 0.0
+
+                    def monotonic(self) -> float:
+                        return self.value
+
+                    def sleep(self, seconds: float) -> None:
+                        self.value += seconds
+
+                clock = Clock()
+
+                def marker(sequence: int, *, tcp: bool) -> bytes:
+                    return namespace["encode"](
+                        {
+                            "connection_id": f"{flow_id}:c0001",
+                            "flow_id": flow_id,
+                            "kind": "marker",
+                            "sequence": sequence,
+                        },
+                        tcp,
+                    )
+
+                class Connection:
+                    def __init__(self) -> None:
+                        self.reads = 0
+
+                    def settimeout(self, _seconds: float) -> None:
+                        pass
+
+                    def recv(self, _size: int) -> bytes:
+                        value = marker(self.reads, tcp=True)
+                        self.reads += 1
+                        return value
+
+                    def sendall(self, _payload: bytes) -> None:
+                        clock.value = 12.0 if self.reads == 1 else 16.0
+
+                    def close(self) -> None:
+                        pass
+
+                connection = Connection()
+
+                class Listener:
+                    def __init__(self) -> None:
+                        self.reads = 0
+
+                    def setsockopt(self, *_args: object) -> None:
+                        pass
+
+                    def bind(self, _address: tuple[str, int]) -> None:
+                        pass
+
+                    def listen(self, _backlog: int) -> None:
+                        pass
+
+                    def settimeout(self, _seconds: float) -> None:
+                        pass
+
+                    def accept(self):
+                        clock.value = 5.0
+                        return connection, peer
+
+                    def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+                        clock.value = 5.0
+                        self.reads += 1
+                        return marker(0, tcp=False), peer
+
+                    def recv(self, _size: int) -> bytes:
+                        self.reads += 1
+                        return marker(1, tcp=False)
+
+                    def connect(self, _peer: tuple[str, int]) -> None:
+                        pass
+
+                    def send(self, payload: bytes) -> int:
+                        clock.value = 12.0 if self.reads == 1 else 16.0
+                        return len(payload)
+
+                    def close(self) -> None:
+                        pass
+
+                namespace["socket"] = SimpleNamespace(
+                    AF_INET=socket.AF_INET,
+                    SOCK_STREAM=socket.SOCK_STREAM,
+                    SOCK_DGRAM=socket.SOCK_DGRAM,
+                    SOL_SOCKET=socket.SOL_SOCKET,
+                    SO_REUSEADDR=socket.SO_REUSEADDR,
+                    timeout=socket.timeout,
+                    socket=lambda *_args: Listener(),
+                )
+                namespace["time"] = clock
+                namespace["emit"] = emitted.append
+                namespace["private_stop_requested"] = lambda *_args: False
+
+                namespace["stream_server"](
+                    SimpleNamespace(
+                        bind="192.0.2.20",
+                        duration=10.0,
+                        flow_id=flow_id,
+                        port=5201,
+                        protocol=protocol,
+                        stop_path=None,
+                        stop_token=None,
+                    )
+                )
+
+                self.assertEqual(emitted[-1]["receives"], 2)
 
     def test_controlled_tcp_receiver_waits_for_stop_after_client_eof(self) -> None:
         namespace: dict[str, Any] = {"__name__": "remote_agent_fixture"}
