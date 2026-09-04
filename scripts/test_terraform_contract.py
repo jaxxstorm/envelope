@@ -457,6 +457,25 @@ class SymmetricTerraformContractTest(unittest.TestCase):
                 self.user_data,
             )
 
+    def test_transport_host_readiness_rejects_local_tailnet_routes(self) -> None:
+        network = heredoc(
+            self.transport_router,
+            "/usr/local/sbin/envelope-transport-router-network",
+        )
+        self.assertNotIn("assert_optional_local_tailnet_route", network)
+        self.assertEqual(
+            network.count('assert_no_route_intersection "$remote_route_table" "$prefix"'),
+            1,
+        )
+        self.assertIn(
+            '''for prefix in "$${local_site_cidrs[@]}"; do
+    assert_no_route_intersection local "$prefix"
+    assert_no_route_intersection "$remote_route_table" "$prefix"
+    assert_local_main_route "$prefix"
+  done''',
+            network,
+        )
+
     def test_transport_advertisement_mutation_is_generation_fenced(self) -> None:
         for value in (
             "/usr/local/sbin/envelope-transport-advertisements",

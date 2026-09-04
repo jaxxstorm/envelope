@@ -388,25 +388,6 @@ assert_no_route_intersection() {
     fail 'route-table state intersects a protected prefix before its reviewed decision'
 }
 
-assert_optional_local_tailnet_route() {
-  local prefix=$1 descendants covering
-  descendants=$(route_query "$remote_route_table" root "$prefix") ||
-    fail 'cannot inspect local-prefix descendants in the Tailscale route table'
-  covering=$(route_query "$remote_route_table" match "$prefix") ||
-    fail 'cannot inspect local-prefix covering routes in the Tailscale route table'
-  for routes in "$descendants" "$covering"; do
-    /usr/bin/jq -e --arg prefix "$prefix" --arg interface "$tailscale" '
-      length <= 1 and all(.[];
-        (.dst // "") == $prefix and
-        (.dev // "") == $interface and
-        (.type // "unicast") == "unicast" and
-        (.from // "all") == "all"
-      )
-    ' <<<"$routes" >/dev/null ||
-      fail 'local prefix has an unreviewed Tailscale route-table intersection'
-  done
-}
-
 assert_local_main_route() {
   local prefix=$1 descendants covering
   descendants=$(route_query "$local_route_table" root "$prefix") ||
@@ -464,7 +445,7 @@ validate_protected_routes() {
   local prefix
   for prefix in "$${local_site_cidrs[@]}"; do
     assert_no_route_intersection local "$prefix"
-    assert_optional_local_tailnet_route "$prefix"
+    assert_no_route_intersection "$remote_route_table" "$prefix"
     assert_local_main_route "$prefix"
   done
   for prefix in "$${remote_site_cidrs[@]}"; do

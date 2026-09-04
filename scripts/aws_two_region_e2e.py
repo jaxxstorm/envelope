@@ -22669,30 +22669,7 @@ print(json.dumps({"payload":payload,"success":True},sort_keys=True,separators=("
             )
 
         try:
-            try:
-                validated_transport_state = validate_transport_state(transport_state)
-            except StandaloneTransportReadinessError as error:
-                if str(error) != (
-                    "table-52 local selections must contain every sibling prefix "
-                    "and exclude the self-owned prefix"
-                ):
-                    raise
-                # Reuse the standalone checks after replacing its sibling-route
-                # model with the protected remote-only check above.
-                standalone_state = copy.deepcopy(transport_state)
-                standalone_state["table52_routes"] = [
-                    *table52_routes,
-                    *[
-                        {
-                            "dst": prefix,
-                            "dev": contract["tailscale_interface"],
-                            "type": "unicast",
-                        }
-                        for prefix in expected.local_site_cidrs
-                        if prefix != member.advertised_prefix
-                    ],
-                ]
-                validated_transport_state = validate_transport_state(standalone_state)
+            validated_transport_state = validate_transport_state(transport_state)
         except StandaloneTransportReadinessError as error:
             raise ReadinessError(
                 f"transport-router effective readiness failed: {error}"

@@ -170,6 +170,7 @@ def verify_transport_contract(text: str, unit: str) -> None:
             '.recovery_marker == "/var/lib/envelope/transport-router-network.configured"',
             'reconcile_policy_rules',
             "remote_routes_ready || fail 'exact remote-site routes are not live in Tailscale table 52'",
+            'assert_no_route_intersection "$remote_route_table" "$prefix"',
             '-i "$underlay" -o "$tailscale" -s "$local_cidr" -d "$remote_cidr" -j ACCEPT',
             '-i "$tailscale" -o "$underlay" -s "$remote_cidr" -d "$local_cidr" -j ACCEPT',
             "unrelated $binary $table FORWARD state exists; refusing to flush it",
@@ -208,6 +209,7 @@ def verify_transport_contract(text: str, unit: str) -> None:
             "network_interface_id",
             "VpcEndpointId",
             "PingSucceeded",
+            "assert_optional_local_tailnet_route",
         ),
         "transport network script contains a broad mutation or protected-readiness check",
     )
