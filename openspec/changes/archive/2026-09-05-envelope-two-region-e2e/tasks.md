@@ -1,3 +1,5 @@
+> Archived incomplete: `add-symmetric-gwlb-ha` superseded this directional-lane design before completion. The unchecked tasks and unsynced delta are retained as historical context rather than reported as completed work.
+
 ## 1. Runner, Isolation, and Preflight
 
 - [ ] 1.0 Verify all four prerequisite changes are implemented, synced to canonical specs, archived, and pass their verification gates. Acceptance: E2E contains no unresolved production behavior and consumes final artifact/routing/wire contracts. Test: OpenSpec list/show and strict validation. Spec: prerequisite for `aws-two-region-e2e`.

@@ -5,9 +5,9 @@ Envelope's README is a detailed technical reference, but a new operator has no g
 ## What Changes
 
 - Add a Docsify site rooted in `docs/` with a concise newcomer-oriented landing page and navigation.
-- Explain Envelope's role between AWS Gateway Load Balancer, GENEVE, a Linux TUN device, and Tailscale, including supported directional-lane behavior and explicit non-goals.
+- Explain Envelope's role across AWS Gateway Load Balancer, packet-turnaround targets, GWLBE post-inspection routing, and dedicated Tailscale transport routers, including the supported symmetric path and explicit non-goals.
 - Document local build and component-smoke commands separately from the protected, billable AWS workflow.
-- Add a reviewed example Terraform configuration that illustrates the required directional CIDR, region, Tailnet, and artifact inputs without including credentials or a runnable operator configuration.
+- Add a reviewed Terraform fragment that illustrates the version-2 symmetric topology, regional route domains, failover shape, and cost boundary without including credentials or a runnable operator configuration.
 
 ## Capabilities
 

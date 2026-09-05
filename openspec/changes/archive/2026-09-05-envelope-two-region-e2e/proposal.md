@@ -2,6 +2,10 @@
 
 Envelope has no test that traverses real GWLBs, two authenticated Tailscale appliances, and workloads in both AWS regions. Existing harnesses can pass with a dummy interface and validate the same incorrect UDP reply model, so they cannot establish that Envelope works.
 
+## Supersession
+
+This change was superseded before completion by `add-symmetric-gwlb-ha`, which replaced its directional lanes, target TUN forwarding, and cross-packet GWLB return context with packet-scoped target turnaround, GWLBE post-inspection routing, and dedicated symmetric Tailscale transport routers. Its tasks remain unchecked intentionally, and its obsolete `aws-two-region-e2e` delta is archived without being synced to canonical specifications.
+
 ## What Changes
 
 - Add a full two-region Terraform acceptance profile with separate initiator and responder workload lanes in each region.

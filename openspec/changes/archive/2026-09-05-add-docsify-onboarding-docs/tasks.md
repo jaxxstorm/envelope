@@ -6,13 +6,13 @@
 
 ## 2. Newcomer Guidance
 
-- [x] 2.1 Write the landing page explaining the AWS GWLB, GENEVE, `envelope0`, host-routing, and `tailscale0` packet path.
+- [x] 2.1 Write the landing page explaining AWS GWLB/GWLBE traversal, immediate target packet turnaround, post-inspection routing, and dedicated Tailscale transport.
 - [x] 2.2 Add setup guidance covering local build, component smoke checks, Linux capability boundaries, and the distinction between local and protected live validation.
-- [x] 2.3 State the experimental, Linux-only, L3-only, directional initiator/responder topology limits and link to authoritative detailed documentation.
+- [x] 2.3 State the experimental, Linux-only, L3-only, symmetric packet-turnaround and non-hitless HA boundaries and link to authoritative detailed documentation.
 
 ## 3. Terraform Example
 
-- [x] 3.1 Add a redacted, non-executable Terraform acceptance configuration example with directional CIDRs, regional inputs, artifact manifest, Tailnet environment-variable references, and approval fields.
+- [x] 3.1 Add a redacted, non-executable version-2 symmetric topology fragment with regional route domains, route-failover inputs, cost fields, invalid placeholders, and explicit protected-lifecycle omissions.
 - [x] 3.2 Explain required replacements and direct AWS operators to the protected lifecycle/runbook instead of raw Terraform apply.
 
 ## 4. Documentation Validation
