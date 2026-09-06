@@ -21,6 +21,8 @@ class DocsContractTest(unittest.TestCase):
         cls.terraform_example = (DOCS / "terraform-example.md").read_text()
         cls.appliance_runbook = (DOCS / "aws-appliance-runbook.md").read_text()
         cls.e2e_runbook = (DOCS / "aws-two-region-e2e-runbook.md").read_text()
+        cls.production_controller = (DOCS / "production-controller.md").read_text()
+        cls.application_resilience = (DOCS / "application-resilience.md").read_text()
         cls.root_readme = (ROOT / "README.md").read_text()
         cls.wire_wrapper = (ROOT / "scripts" / "component_wire_smoke.sh").read_text()
         cls.wire_smoke = (ROOT / "scripts" / "component_wire_smoke.py").read_text()
@@ -66,6 +68,350 @@ class DocsContractTest(unittest.TestCase):
         for target in targets:
             with self.subTest(target=target):
                 self.assertTrue((DOCS / target).resolve().is_file())
+
+    def test_production_guides_are_linked_from_navigation_and_onboarding(self) -> None:
+        self.assert_contains_all(
+            self.sidebar,
+            (
+                "production-controller.md",
+                "application-resilience.md",
+                "Controller Architecture and Operations",
+                "Application Resilience",
+            ),
+            case_sensitive=True,
+        )
+        for name, document in (
+            ("README.md", self.root_readme),
+            ("docs/README.md", self.home),
+            ("docs/getting-started.md", self.getting_started),
+        ):
+            with self.subTest(page=name):
+                self.assertIn("production-controller.md", document)
+                self.assertIn("application-resilience.md", document)
+        self.assert_contains_all(
+            self.home,
+            (
+                "runner-coordinated singleton advertisements",
+                "overlapping exact-prefix native Tailscale HA",
+                "controller-owned protected evidence is still pending",
+                "packet targets: packet turnaround only",
+                "transport routers:",
+                "controllers:",
+            ),
+        )
+
+    def test_production_controller_architecture_contract_is_complete(self) -> None:
+        self.assert_contains_all(
+            self.production_controller,
+            (
+                "standalone control-plane process",
+                "at least three disposable replicas",
+                "outside Envelope packet-target instances",
+                "outside Tailscale transport-router instances",
+                "embedded, pinned `tsnet` observer",
+                "overlapping exact-prefix advertisements",
+                "native Tailscale HA",
+                "strongly consistent DynamoDB",
+                "monotonically increasing fencing terms",
+                "regional authority",
+                "strict-majority quorum",
+                "Health Hysteresis",
+                "`ReplaceRoute`",
+                "complete before-snapshot",
+                "ordered route progress",
+                "authoritatively",
+                "durable `stable` state",
+                "Automatic failback",
+                "longer `failback_stability`",
+                "`degraded` is fail-closed",
+                "IAM And Secrets",
+                "Rollback",
+                "Regional Authority Limit",
+            ),
+            case_sensitive=True,
+        )
+        self.assert_contains_all(
+            self.production_controller,
+            (
+                "does not require or invoke repository test scripts",
+                "SSM commands",
+                "acceptance manifests",
+                "router-side control agent",
+                "read-only Go router attestor",
+                "no remote mutation HTTP endpoint",
+                "does not use embedded Raft",
+                "TTL applies only to stale observation garbage collection",
+                "never decides lease correctness",
+            ),
+        )
+
+    def test_controller_checkpoint_separates_offline_implementation_from_live_approval(self) -> None:
+        self.assert_contains_all(
+            self.production_controller,
+            (
+                "Task 7.5 has a complete native inspection and immutable enrollment path",
+                "split acceptance implementation includes mocked phase integration",
+                "Task 7.6 has implemented, tested lifecycle operations",
+                "Live billable execution has not been approved or performed",
+                "active reconciliation no longer initializes missing journals",
+                "legacy iptables",
+                "Exact-instance enrollment uses configured public-key authority",
+                "CAP_NET_ADMIN",
+                "configuration_sha256",
+                "boot-only Go enrollment",
+                "Initialization grants no activation",
+                "separately labeled simulated evidence",
+                "Do not enable the old runner by changing unavailable capabilities to true",
+            ),
+        )
+        self.assertRegex(
+            self.production_controller,
+            r"(?is)persist the transaction ID.{0,240}before any external mutation",
+        )
+        self.assertRegex(
+            self.production_controller,
+            r"(?is)alternate becomes normal durable `stable` state.{0,300}"
+            r"new transaction.{0,240}longer `failback_stability`",
+        )
+
+    def test_split_acceptance_external_iam_and_retained_lock_runbook(self) -> None:
+        runbook = (ROOT / "deploy/terraform/controller-acceptance/README.md").read_text()
+        self.assert_contains_all(runbook, (
+            "Task 9.5 remains", "include_claim_keys", "run_attempt",
+            "envelope-production-deployment", "envelope-production-observation",
+            "acceptance-boundary", "observer_sessions_until", "unconditional",
+            "same account", "ExternalId", "TF_DATA_DIR", "two consecutive",
+            "non-expiring", "no automatic adoption", "claim version last",
+            "Manual recovery", "not a deployable configuration",
+        ))
+
+    def test_controller_topology_deployment_health_and_iam_are_explicit(self) -> None:
+        self.assert_contains_all(
+            self.production_controller,
+            (
+                "`schema_version`",
+                "`deployment_id`",
+                "`controller_ids[]`",
+                "`policy`",
+                "`dynamodb`",
+                "`tailnet`",
+                "`sites[]`",
+                "`routers[]`",
+                "`domains[]`",
+                "canonical document hash",
+                "private persistent `tsnet` state",
+                "--read-only",
+                "--dry-run",
+                "GET /healthz",
+                "GET /readyz",
+                "GET /metrics",
+                "DynamoDB",
+                "`GetItem`",
+                "conditional `PutItem`",
+                "one bounded read per configured observer partition",
+                "No shared-partition `Query` is granted",
+                "exact table/account encryption context",
+                "`DescribeInstances`",
+                "`DescribeInstanceStatus`",
+                "`DescribeNetworkInterfaces`",
+                "`DescribeRouteTables`",
+                "`ReplaceRoute`",
+                "break-glass",
+                "one full lease duration",
+            ),
+            case_sensitive=True,
+        )
+        self.assertRegex(
+            self.production_controller,
+            r"(?is)packet-target and transport-router roles.{0,100}"
+            r"no route-mutation permission",
+        )
+        self.assertRegex(
+            self.production_controller,
+            r"(?is)rollback is a quiescent ownership transfer.{0,1200}"
+            r"revoke the controller's `ReplaceRoute` authority",
+        )
+
+    def test_protected_controller_conformance_runbook_is_fail_closed(self) -> None:
+        self.assert_contains_all(
+            self.production_controller,
+            (
+                "Protected Controller Conformance",
+                "envelope-production-deployment",
+                "envelope-production-observation",
+                "private endpoint reachability",
+                "ENVELOPE_PRODUCTION_CONTROLLER_SPLIT_CONFIG_TEMPLATE_B64",
+                "two consecutive zero-residual audits",
+                "Do not dispatch the workflow without separate task 9.5 approval",
+                "external IAM setup and inspected recovery runbook",
+                "scripts/test_controller_acceptance_phases.py",
+                "ENVELOPE_PRODUCTION_CONTROLLER_CONFIG_TEMPLATE_B64",
+                "scripts/aws_production_controller_e2e.py",
+                "explicit legacy-v2 runner",
+                "explicitly denies every route and route-table-association actuator",
+                "ENVELOPE_RUNNER_ROUTE_MUTATION_DENIED=true",
+                "ENVELOPE_CONTROLLER_TSNET_AUTH_KEY",
+                "ENVELOPE_CONTROLLER_ADMIN_API_KEY",
+                "invocation-tagged run-owned SecureString parameters",
+                "bounded stable invocation-tagged visibility",
+                "temporary AWS session credential",
+                "Scanner-rejected evidence is never written or uploaded",
+                "Remote SSM commands are allowlisted to the dedicated workload instances",
+                "read-only mode",
+                "at most 32 domains",
+                "higher fence",
+                "durable alternate",
+                "stability-gated failback",
+                "aws-production-controller-v3",
+                "zero-residual",
+                "task 9.5",
+                "--hard-timeout-seconds 10800",
+                "must not add a competing destroy trap",
+                "stop at capability preflight",
+                "cannot produce passing task 9.5 evidence",
+                "separate deployment, observation, quiescence, and cleanup jobs",
+                "automatically recoverable",
+                "single exact object version",
+                "repeated exact reads prove the instance running",
+                "forensic state",
+                "six-hour role session",
+                "Only after sanitized evidence upload succeeds",
+                "independently require the exact cleanup sequence",
+            ),
+            case_sensitive=True,
+        )
+        self.assertRegex(
+            self.production_controller,
+            r"(?is)rolls active controllers back to read-only.{0,700}"
+            r"only then deletes both backend state keys",
+        )
+
+    def test_proposed_controller_slo_clocks_are_separate_and_unproven(self) -> None:
+        self.assertGreaterEqual(
+            self.production_controller.lower().count(
+                "initial objectives pending protected controller evidence"
+            ),
+            2,
+        )
+        self.assert_contains_all(
+            self.production_controller,
+            (
+                "not current production SLOs",
+                "is not evidence for this controller profile",
+                "Measure per failover domain at p99",
+                "Failure detection",
+                "15 seconds",
+                "Native ownership",
+                "45 seconds",
+                "Exact route convergence",
+                "30 seconds",
+                "Fresh-flow recovery",
+                "composite detection-to-recovery",
+                "105 seconds",
+                "Established TCP outcome",
+                "0% minimum",
+                "100% may require reconnect",
+                "Permitted raw UDP loss",
+                "100% of unacknowledged datagrams",
+                "no lossless UDP objective",
+                "separate clocks",
+            ),
+            case_sensitive=True,
+        )
+        self.assert_patterns_in_order(
+            self.production_controller,
+            (
+                r"Failure detection.{0,300}15 seconds",
+                r"Native ownership.{0,300}45 seconds",
+                r"Exact route convergence.{0,300}30 seconds",
+                r"Fresh-flow recovery.{0,360}105 seconds",
+                r"Established TCP outcome.{0,360}0% minimum",
+                r"Permitted raw UDP loss.{0,360}100% of unacknowledged datagrams",
+            ),
+        )
+
+    def test_application_resilience_contract_covers_tcp_and_retryable_udp(self) -> None:
+        self.assert_contains_all(
+            self.application_resilience,
+            (
+                "does not transparently repair an established flow",
+                "application responsibilities",
+                "fresh TCP connections",
+                "idempotency key",
+                "same key and request body on every reconnect",
+                "bounded context",
+                "exponential backoff with jitter",
+                "135-second deadline",
+                "`net.Conn`",
+                "net.Dialer",
+                "IdempotencyKey",
+                "transactional boundary",
+                "MessageID",
+                "Sequence",
+                "ACK",
+                "(ClientID, MessageID)",
+                "deduplication window",
+                "retransmission horizon",
+                "durable outbox",
+                "drop the first ACK",
+                "one side effect",
+                "not prove Envelope route convergence",
+            ),
+        )
+        self.assertRegex(
+            self.application_resilience,
+            r"(?is)for attempt := 0; attempt < 32; attempt\+\+.{0,1800}"
+            r"DialContext.{0,1800}waitContext\(ctx, jitter\(backoff\)\)",
+        )
+        self.assertRegex(
+            self.application_resilience,
+            r"(?is)for attempt in 1\.\.32:.{0,1200}frame\.kind == ACK.{0,1000}"
+            r"rto = min\(2 \* rto, 5s\)",
+        )
+        self.assertRegex(
+            self.application_resilience,
+            r"(?is)prior = lookup\(client_id, message_id\).{0,900}"
+            r"store dedup record and ack.{0,300}authenticate_and_send\(ack\)",
+        )
+
+    def test_docs_reject_unsafe_controller_and_continuity_claims(self) -> None:
+        forbidden = (
+            r"(?i)\bcontrollers?\s+(?:uses?|runs?|embeds?|requires?|"
+            r"depends?\s+on|is backed by)\s+(?:an?\s+)?(?:embedded\s+)?Raft\b",
+            r"(?i)\b(?:Envelope\s+)?(?:packet\s+)?targets?\s+"
+            r"(?:run|runs|host|hosts|embed|embeds)\s+(?:an?\s+|the\s+)?"
+            r"(?:production\s+)?(?:failover\s+)?controller\b",
+            r"(?i)\bcontrollers?\s+(?:is|are)\s+"
+            r"(?:run|hosted|embedded)\s+(?:inside|on)\s+(?:an?\s+|the\s+)?"
+            r"(?:Envelope\s+)?(?:packet\s+)?targets?\b",
+            r"(?i)\b(?:Envelope\s+)?(?:packet\s+)?targets?\s+"
+            r"(?:has|have|receive|receives|retain|retains)\s+(?:AWS\s+|EC2\s+)?"
+            r"route[- ]mutation authority\b",
+            r"(?i)\b(?:production\s+)?controllers?\s+"
+            r"(?:requires?|depends?\s+on|invokes?|executes?|uses?)\s+(?:the\s+)?"
+            r"(?:protected|acceptance|test)[- ]runner\b",
+            r"(?i)\b(?:production\s+)?controllers?\s+"
+            r"(?:requires?|depends?\s+on|invokes?|executes?|uses?)\s+.{0,80}"
+            r"(?:repository\s+)?(?:Python|shell|test) scripts?\b",
+            r"(?i)\b(?:production\s+)?controllers?\s+"
+            r"(?:requires?|depends?\s+on|invokes?|executes?|uses?)\s+.{0,80}"
+            r"SSM(?:\s+commands?)?\b",
+            r"(?i)\b(?:production\s+)?runtime\s+requires?\s+.{0,100}"
+            r"router[- ]side (?:Envelope\s+)?agents?\b",
+            r"(?i)\b(?:Envelope|controller|failover|recovery|topology)\s+"
+            r"(?:is|are|provides?|guarantees?|promises?|achieves?|delivers?)\s+"
+            r"(?:fully\s+)?hitless\b",
+            r"(?i)\bUDP\s+(?:is|remains|will be)\s+lossless\b",
+            r"(?i)\b(?:Envelope|controller|failover|recovery)\s+"
+            r"(?:has|guarantees?|provides?|promises?|ensures?|achieves?|delivers?)\s+"
+            r"(?:zero|no)\s+"
+            r"(?:packet|UDP|datagram)?[- ]?loss\b",
+            r"(?i)\bEnvelope\s+(?:transparently\s+)?"
+            r"(?:repairs?|restores?|preserves?)\s+(?:established\s+)?flows?\b",
+        )
+        for pattern in forbidden:
+            with self.subTest(pattern=pattern):
+                self.assertNotRegex(self.all_content, pattern)
 
     def test_local_validation_documents_current_packet_wire_smoke(self) -> None:
         documented_commands = (

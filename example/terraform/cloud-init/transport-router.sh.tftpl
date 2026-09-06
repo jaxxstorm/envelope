@@ -21,7 +21,7 @@ if ! /usr/sbin/iptables --version | grep -Fq '(legacy)' || ! /usr/sbin/ip6tables
   printf '%s\n' 'legacy iptables and ip6tables are required' >&2
   exit 1
 fi
-for binary in /usr/bin/flock /usr/bin/jq /usr/bin/mktemp /usr/bin/mv /usr/bin/rm /usr/bin/sleep /usr/sbin/ip \
+for binary in /usr/bin/flock /usr/bin/jq /usr/bin/mktemp /usr/bin/mv /usr/bin/python3 /usr/bin/rm /usr/bin/sleep /usr/sbin/ip \
   /usr/sbin/iptables /usr/sbin/ip6tables /usr/sbin/iptables-save \
   /usr/sbin/ip6tables-save /usr/sbin/nft /usr/sbin/sysctl; do
   test -x "$binary"
@@ -75,13 +75,24 @@ fail_closed_on_error() {
 trap fail_closed_on_error EXIT
 /usr/bin/rm -f "$readiness_marker" "$runtime_state"
 
+local_policy_input=$(/usr/bin/jq -er '
+  [.local_policy_rules[].input] as $inputs |
+  if ($inputs | length) == 0 or ($inputs | unique | length) != 1 then
+    error("local policy inputs are not uniform")
+  else
+    $inputs[0]
+  end
+' <<<"$readiness_expectations_json") || fail 'local policy input contract is invalid'
+readonly local_policy_input
+[[ "$local_policy_input" == all || "$local_policy_input" == "$tailscale" ]] ||
+  fail 'local policy input contract is unsupported'
 /usr/bin/jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' \
   <<<"$local_site_cidrs_json" >/dev/null || fail 'local-site CIDR contract is invalid'
 /usr/bin/jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' \
   <<<"$remote_site_cidrs_json" >/dev/null || fail 'remote-site CIDR contract is invalid'
 expected_owned_policy_rules=$(/usr/bin/jq -cn \
   --argjson cidrs "$local_site_cidrs_json" \
-  --arg interface "$tailscale" \
+  --arg interface "$local_policy_input" \
   --argjson base "$policy_rule_priority_base" \
   '$cidrs | to_entries | map({priority: ($base + .key), input: $interface, source: "all", destination: .value, fwmark: 0, table: "main", action: "lookup"})')
 expected_ipv4_policy_rules=$(/usr/bin/jq -cn \
@@ -361,8 +372,16 @@ reconcile_policy_rules() {
     count=$(/usr/bin/jq -r --argjson priority "$priority" \
       '[.[] | select(.priority == $priority)] | length' <<<"$rules_json")
     if (( count == 0 )); then
+      if [[ "$local_policy_input" == "$tailscale" ]]; then
+# %{ if legacy_acceptance_profile }
       /usr/sbin/ip -4 rule add priority "$priority" iif "$tailscale" \
         to "$${local_site_cidrs[$index]}" lookup main
+# %{ else }
+      else
+      /usr/sbin/ip -4 rule add priority "$priority" \
+        to "$${local_site_cidrs[$index]}" lookup main
+# %{ endif }
+      fi
     elif (( count != 1 )); then
       fail "owned IPv4 policy priority is ambiguous: $priority"
     fi
@@ -419,6 +438,55 @@ assert_local_main_route() {
   ' <<<"$covering" >/dev/null || fail 'main-table route does not select the underlay for a complete local protected prefix'
 }
 
+assert_shadowed_local_tailnet_route() {
+  local prefix=$1 descendants covering routes
+  descendants=$(route_query "$remote_route_table" root "$prefix") ||
+    fail 'cannot inspect local-prefix descendants in Tailscale table 52'
+  covering=$(route_query "$remote_route_table" match "$prefix") ||
+    fail 'cannot inspect local-prefix covering routes in Tailscale table 52'
+  routes=$(/usr/bin/jq -cn \
+    --argjson descendants "$descendants" \
+    --argjson covering "$covering" \
+    '$descendants + $covering | unique_by([(.dst // "default"), (.dev // ""), (.from // "all"), (.type // "unicast")])')
+  /usr/bin/jq -e --arg prefix "$prefix" --arg interface "$tailscale" '
+    length <= 1 and all(.[];
+      (.dst // "default") == $prefix and
+      (.from // "all") == "all" and
+      (.dev // "") == $interface and
+      (.type // "unicast") == "unicast"
+    )
+  ' <<<"$routes" >/dev/null ||
+    fail 'local table-52 overlap is not one exact safely shadowed Tailscale route'
+}
+
+assert_local_main_lookups() {
+  local prefix=$1 address lookup
+  local -a addresses=()
+  mapfile -t addresses < <(/usr/bin/python3 - "$prefix" <<'PYTHON'
+import ipaddress
+import sys
+
+network = ipaddress.ip_network(sys.argv[1], strict=True)
+for offset in sorted({0, network.num_addresses // 2, network.num_addresses - 1}):
+    print(network.network_address + offset)
+PYTHON
+  )
+  (( $${#addresses[@]} >= 1 )) || fail 'local-prefix route probes are empty'
+  for address in "$${addresses[@]}"; do
+    lookup=$(/usr/sbin/ip -j -details -4 route get "$address") ||
+      fail 'cannot resolve a local-prefix policy route probe'
+    /usr/bin/jq -e --arg address "$address" --arg interface "$underlay" '
+      length == 1 and
+      (.[0].dst // "") == $address and
+      (.[0].dev // "") == $interface and
+      (.[0].type // "unicast") == "unicast" and
+      ((.[0].table // "main" | tostring) == "main" or
+       (.[0].table // "main" | tostring) == "254")
+    ' <<<"$lookup" >/dev/null ||
+      fail "local-prefix policy did not select main and the underlay for $address"
+  done
+}
+
 remote_routes_ready() {
   local prefix descendants covering
   for prefix in "$${remote_site_cidrs[@]}"; do
@@ -445,8 +513,18 @@ validate_protected_routes() {
   local prefix
   for prefix in "$${local_site_cidrs[@]}"; do
     assert_no_route_intersection local "$prefix"
+    if [[ "$local_policy_input" == "$tailscale" ]]; then
+# %{ if legacy_acceptance_profile }
     assert_no_route_intersection "$remote_route_table" "$prefix"
+# %{ else }
+    else
+    assert_shadowed_local_tailnet_route "$prefix"
+# %{ endif }
+    fi
     assert_local_main_route "$prefix"
+    if [[ "$local_policy_input" == all ]]; then
+      assert_local_main_lookups "$prefix"
+    fi
   done
   for prefix in "$${remote_site_cidrs[@]}"; do
     assert_no_route_intersection local "$prefix"
@@ -584,6 +662,7 @@ trap - EXIT
 HOST_NETWORK
 chmod 0755 /usr/local/sbin/envelope-transport-router-network
 
+%{ if legacy_acceptance_profile ~}
 advertisement_epoch_file=/var/lib/envelope/transport-advertisements.epoch
 [[ ! -L "$advertisement_epoch_file" ]]
 if [[ ! -e "$advertisement_epoch_file" ]]; then
@@ -779,6 +858,7 @@ write_state "$requested_generation" "$desired_routes" "$desired_service" "$desir
 /usr/bin/jq -c '{success: true, payload: .}' "$state"
 HOST_ADVERTISEMENTS
 chmod 0755 /usr/local/sbin/envelope-transport-advertisements
+%{ endif ~}
 
 cat >/etc/sysctl.d/90-envelope-transport-router.conf <<'SYSCTL'
 net.ipv4.ip_forward = 0

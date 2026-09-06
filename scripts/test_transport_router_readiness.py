@@ -40,6 +40,7 @@ def contract_fixture() -> dict:
         UNDERLAY,
         TAILSCALE,
         readiness.MAX_TCP_MSS,
+        config_version=3,
     )
     return {
         **contract,
@@ -58,7 +59,8 @@ def status_fixture() -> dict:
             "Expired": False,
             "KeyExpiry": SELF_KEY_EXPIRY,
             "KeyExpiryDisabled": False,
-            "AdvertisedRoutes": [LOCAL[0]],
+            "AdvertisedRoutes": list(LOCAL),
+            "EnabledRoutes": list(LOCAL),
             "AcceptedRoutes": list(REMOTE),
             "NoSNAT": True,
             "CorpDNS": False,
@@ -184,7 +186,7 @@ def transport_fixture() -> dict:
         "local_policy_rules": [
             {
                 "priority": readiness.POLICY_PRIORITY_BASE + index,
-                "input": TAILSCALE,
+                "input": "all",
                 "source": "all",
                 "destination": prefix,
                 "fwmark": 0,
@@ -198,7 +200,8 @@ def transport_fixture() -> dict:
         "local_route_table": "main",
         "remote_route_table": 52,
         "table52_routes": [
-            {"dst": prefix, "dev": TAILSCALE, "type": "unicast"} for prefix in REMOTE
+            {"dst": prefix, "dev": TAILSCALE, "type": "unicast"}
+            for prefix in [*REMOTE, *LOCAL]
         ],
         "main_routes": [
             {"dst": "10.10.0.0/15", "dev": UNDERLAY, "type": "unicast"}
@@ -229,7 +232,7 @@ def validate(
         route_fixture() if routes is None else routes,
         LOCAL,
         REMOTE,
-        LOCAL[0],
+        LOCAL,
         LOCAL_GWLBES if local_gwlbes is None else local_gwlbes,
         ENI,
         SUBNET,
@@ -249,7 +252,7 @@ class TransportRouterReadinessTest(unittest.TestCase):
         self.assertTrue(result["ready"])
         self.assertEqual(result["local_gwlbes"], LOCAL_GWLBES)
         self.assertEqual(result["local_site_cidrs"], LOCAL)
-        self.assertEqual(result["advertised_prefix"], LOCAL[0])
+        self.assertEqual(result["advertised_prefixes"], LOCAL)
         self.assertEqual(result["network_interface_id"], ENI)
         self.assertEqual(result["subnet_id"], SUBNET)
         self.assertEqual(result["route_table_id"], ROUTE_TABLE)
@@ -275,11 +278,12 @@ class TransportRouterReadinessTest(unittest.TestCase):
             REMOTE,
         )
         self.assertEqual(
-            [
-                value["prefix"]
-                for value in result["prefix_chains"]["local_tailnet_selection"]
-            ],
-            [],
+            [value["prefix"] for value in result["prefix_chains"]["local_tailnet_selection"]],
+            LOCAL,
+        )
+        self.assertIn(
+            "10.10.128.0",
+            result["prefix_chains"]["local_underlay"][0]["checked_addresses"],
         )
         self.assertEqual(
             [value["gwlbe"] for value in result["prefix_chains"]["local_vpc_gwlbe"]],
@@ -305,10 +309,12 @@ class TransportRouterReadinessTest(unittest.TestCase):
             UNDERLAY,
             TAILSCALE,
             readiness.MAX_TCP_MSS,
+            config_version=3,
         )
         contract["contract_sha256"] = readiness.readiness_contract_sha256(contract)
         status = status_fixture()
-        status["Self"]["AdvertisedRoutes"] = [local[0]]
+        status["Self"]["AdvertisedRoutes"] = list(local)
+        status["Self"]["EnabledRoutes"] = list(local)
         status["Self"]["AcceptedRoutes"] = list(remote)
         for peer, prefix in zip(status["Self"]["RoutePeers"], remote, strict=True):
             peer["Prefix"] = prefix
@@ -323,7 +329,7 @@ class TransportRouterReadinessTest(unittest.TestCase):
         transport["ipv4_policy_rules"] = copy.deepcopy(contract["ipv4_policy_rules"])
         transport["table52_routes"] = [
             {"dst": prefix, "dev": TAILSCALE, "type": "unicast"}
-            for prefix in remote
+            for prefix in [*remote, *local]
         ]
         transport["main_routes"] = [
             {"dst": "10.10.0.0/16", "dev": UNDERLAY, "type": "unicast"}
@@ -344,7 +350,7 @@ class TransportRouterReadinessTest(unittest.TestCase):
             routes,
             local,
             remote,
-            local[0],
+            local,
             dict(zip(local, (GWLBE_A, GWLBE_B), strict=True)),
             ENI,
             SUBNET,
@@ -363,7 +369,10 @@ class TransportRouterReadinessTest(unittest.TestCase):
             [entry["prefix"] for entry in result["prefix_chains"]["remote_tailnet"]],
             remote,
         )
-        self.assertEqual(result["prefix_chains"]["local_tailnet_selection"], [])
+        self.assertEqual(
+            [entry["prefix"] for entry in result["prefix_chains"]["local_tailnet_selection"]],
+            local,
+        )
         self.assertEqual(
             [entry["prefix"] for entry in result["prefix_chains"]["local_underlay"]],
             local,
@@ -560,7 +569,7 @@ class TransportRouterReadinessTest(unittest.TestCase):
     def test_local_advertisements_must_be_exact_without_snat_or_tailnet_dns(self) -> None:
         cases = {
             "missing": [],
-            "wrong assignment": [LOCAL[1]],
+            "incomplete": [LOCAL[1]],
             "broader": ["10.10.0.0/15", LOCAL[1]],
             "extra": [*LOCAL, "10.12.0.0/16"],
             "duplicate": [LOCAL[0], LOCAL[0], LOCAL[1]],
@@ -574,6 +583,11 @@ class TransportRouterReadinessTest(unittest.TestCase):
                     "advertisement|duplicate|non-empty",
                 ):
                     validate(status=status)
+
+        disabled = status_fixture()
+        disabled["Self"]["EnabledRoutes"] = [LOCAL[0]]
+        with self.assertRaisesRegex(readiness.ReadinessError, "enabled routes"):
+            validate(status=disabled)
 
         status = status_fixture()
         status["Self"]["NoSNAT"] = False
@@ -721,9 +735,9 @@ class TransportRouterReadinessTest(unittest.TestCase):
         cases.append(("remote bypass", remote_bypass, "isolated exact table-52"))
         local_bypass = transport_fixture()
         local_bypass["main_routes"].append(
-            {"dst": "10.10.1.0/24", "dev": TAILSCALE, "type": "unicast"}
+            {"dst": "10.10.128.0/25", "dev": TAILSCALE, "type": "unicast"}
         )
-        cases.append(("local bypass", local_bypass, "more-specific"))
+        cases.append(("interior local bypass", local_bypass, "more-specific"))
         interior_blackhole = transport_fixture()
         interior_blackhole["table52_routes"].append(
             {"dst": "10.20.128.0/25", "type": "blackhole"}
@@ -748,18 +762,27 @@ class TransportRouterReadinessTest(unittest.TestCase):
             with self.subTest(name=name), self.assertRaisesRegex(readiness.ReadinessError, message):
                 validate(transport=transport)
 
-    def test_rejects_every_local_table52_intersection(self) -> None:
+    def test_allows_only_exact_safely_shadowed_local_table52_routes(self) -> None:
+        result = validate()
+        self.assertEqual(
+            [entry["prefix"] for entry in result["prefix_chains"]["local_tailnet_selection"]],
+            LOCAL,
+        )
+        remote_only = transport_fixture()
+        remote_only["table52_routes"] = [
+            route for route in remote_only["table52_routes"] if route["dst"] in REMOTE
+        ]
+        self.assertEqual(
+            validate(transport=remote_only)["prefix_chains"]["local_tailnet_selection"],
+            [],
+        )
+
         cases = []
-        sibling = transport_fixture()
-        sibling["table52_routes"].append(
+        duplicate = transport_fixture()
+        duplicate["table52_routes"].append(
             {"dst": LOCAL[1], "dev": TAILSCALE, "type": "unicast"}
         )
-        cases.append(("sibling", sibling))
-        self_owned = transport_fixture()
-        self_owned["table52_routes"].append(
-            {"dst": LOCAL[0], "dev": TAILSCALE, "type": "unicast"}
-        )
-        cases.append(("self owned", self_owned))
+        cases.append(("duplicate", duplicate))
         narrower = transport_fixture()
         narrower["table52_routes"].append(
             {"dst": "10.10.1.0/24", "dev": TAILSCALE, "type": "unicast"}
@@ -771,28 +794,17 @@ class TransportRouterReadinessTest(unittest.TestCase):
         )
         cases.append(("broader", broader))
         wrong_device = transport_fixture()
-        wrong_device["table52_routes"].append(
-            {"dst": LOCAL[0], "dev": UNDERLAY, "type": "unicast"}
-        )
+        wrong_device["table52_routes"][-2]["dev"] = UNDERLAY
         cases.append(("wrong device", wrong_device))
         blackhole = transport_fixture()
-        blackhole["table52_routes"].append(
-            {"dst": LOCAL[0], "type": "blackhole"}
-        )
+        blackhole["table52_routes"][-2] = {"dst": LOCAL[0], "type": "blackhole"}
         cases.append(("blackhole", blackhole))
         source_specific = transport_fixture()
-        source_specific["table52_routes"].append(
-            {
-                "dst": LOCAL[0],
-                "from": REMOTE[0],
-                "dev": TAILSCALE,
-                "type": "unicast",
-            }
-        )
+        source_specific["table52_routes"][-2]["from"] = REMOTE[0]
         cases.append(("source specific", source_specific))
         for name, transport in cases:
             with self.subTest(name=name), self.assertRaisesRegex(
-                readiness.ReadinessError, "intersects protected local prefixes"
+                readiness.ReadinessError, "exact safely shadowed"
             ):
                 validate(transport=transport)
 
@@ -801,9 +813,9 @@ class TransportRouterReadinessTest(unittest.TestCase):
         missing = transport_fixture()
         missing["local_policy_rules"].pop()
         cases.append(("missing", missing, "exactly one"))
-        wrong_input = transport_fixture()
-        wrong_input["local_policy_rules"][0]["input"] = UNDERLAY
-        cases.append(("wrong input", wrong_input, "bypass"))
+        interface_scoped = transport_fixture()
+        interface_scoped["local_policy_rules"][0]["input"] = TAILSCALE
+        cases.append(("interface-scoped", interface_scoped, "bypass"))
         wrong_table = transport_fixture()
         wrong_table["local_policy_rules"][0]["table"] = 52
         cases.append(("wrong table", wrong_table, "bypass"))
@@ -855,6 +867,68 @@ class TransportRouterReadinessTest(unittest.TestCase):
                 readiness.ReadinessError, message
             ):
                 validate(transport=transport)
+
+    def test_legacy_singleton_profile_is_explicitly_versioned(self) -> None:
+        contract = readiness.build_readiness_contract(
+            LOCAL,
+            REMOTE,
+            UNDERLAY,
+            TAILSCALE,
+            readiness.MAX_TCP_MSS,
+            config_version=2,
+        )
+        contract["contract_sha256"] = readiness.readiness_contract_sha256(contract)
+        status = status_fixture()
+        status["Self"].pop("EnabledRoutes")
+        status["Self"]["AdvertisedRoutes"] = [LOCAL[0]]
+        transport = transport_fixture()
+        transport["local_policy_rules"] = copy.deepcopy(contract["local_policy_rules"])
+        transport["ipv4_policy_rules"] = copy.deepcopy(contract["ipv4_policy_rules"])
+        transport["table52_routes"] = [
+            route
+            for route in transport["table52_routes"]
+            if route["dst"] in REMOTE
+        ]
+
+        result = readiness.validate_readiness(
+            status,
+            transport,
+            route_fixture(),
+            LOCAL,
+            REMOTE,
+            [LOCAL[0]],
+            LOCAL_GWLBES,
+            ENI,
+            SUBNET,
+            ROUTE_TABLE,
+            AZ,
+            UNDERLAY,
+            TAILSCALE,
+            contract,
+        )
+        self.assertEqual(result["advertised_prefix"], LOCAL[0])
+        self.assertNotIn("advertised_prefixes", result)
+
+        transport["table52_routes"].append(
+            {"dst": LOCAL[1], "dev": TAILSCALE, "type": "unicast"}
+        )
+        with self.assertRaisesRegex(readiness.ReadinessError, "intersects"):
+            readiness.validate_readiness(
+                status,
+                transport,
+                route_fixture(),
+                LOCAL,
+                REMOTE,
+                [LOCAL[0]],
+                LOCAL_GWLBES,
+                ENI,
+                SUBNET,
+                ROUTE_TABLE,
+                AZ,
+                UNDERLAY,
+                TAILSCALE,
+                contract,
+            )
 
     def test_requires_exact_ec2_eni_route_table_and_source_dest_check(self) -> None:
         enabled = transport_fixture()
@@ -937,7 +1011,12 @@ class TransportRouterReadinessTest(unittest.TestCase):
     def test_rejects_overlapping_site_route_domains(self) -> None:
         remote = ["10.10.128.0/17"]
         contract = readiness.build_readiness_contract(
-            LOCAL, remote, UNDERLAY, TAILSCALE, readiness.MAX_TCP_MSS
+            LOCAL,
+            remote,
+            UNDERLAY,
+            TAILSCALE,
+            readiness.MAX_TCP_MSS,
+            config_version=3,
         )
         contract["contract_sha256"] = readiness.readiness_contract_sha256(contract)
         with self.assertRaisesRegex(readiness.ReadinessError, "overlap"):
@@ -947,7 +1026,7 @@ class TransportRouterReadinessTest(unittest.TestCase):
                 route_fixture(),
                 LOCAL,
                 remote,
-                LOCAL[0],
+                LOCAL,
                 LOCAL_GWLBES,
                 ENI,
                 SUBNET,
@@ -993,6 +1072,8 @@ class TransportRouterReadinessTest(unittest.TestCase):
                     REMOTE[1],
                     "--advertised-prefix",
                     LOCAL[0],
+                    "--advertised-prefix",
+                    LOCAL[1],
                     "--local-gwlbes-file",
                     str(gwlbes_path),
                     "--network-interface-id",

@@ -253,17 +253,17 @@ variable "e2e_load_profile" {
 }
 
 variable "symmetric_topology" {
-  description = "Exact unshipped version-2 symmetric topology; extra legacy or draft fields are rejected"
+  description = "Exact symmetric topology; version 3 is production native HA and version 2 is the isolated legacy acceptance profile"
   type        = any
 
   validation {
     condition = try(
-      var.symmetric_topology.version == 2 &&
+      contains([2, 3], var.symmetric_topology.version) &&
       toset(keys(var.symmetric_topology)) == toset(["version", "sites", "route_failover"]) &&
       toset(keys(var.symmetric_topology.sites)) == toset(["west", "east"]),
       false,
     )
-    error_message = "symmetric_topology must be version 2 with exactly sites and route_failover."
+    error_message = "symmetric_topology must be production version 3 or legacy-acceptance version 2 with exactly sites and route_failover."
   }
 
   validation {
@@ -286,7 +286,7 @@ variable "symmetric_topology" {
         "transport_router_az_keys",
       ])
     ]), false)
-    error_message = "Each site must contain exactly the reviewed version-2 fields; compatibility and obsolete draft fields are unsupported."
+    error_message = "Each site must contain exactly the reviewed symmetric topology fields; compatibility and obsolete draft fields are unsupported."
   }
 
   validation {
@@ -395,11 +395,13 @@ locals {
   }
   initial_transport_router_advertise_routes = {
     for site, topology in local.sites : site => {
-      for transport_az in topology.transport_router_az_keys : transport_az => sort([
-        for gwlbe_az, selected_transport_az in local.route_failover.initial_transport_router_az_by_gwlbe_az[site] :
-        topology.workload_subnet_cidrs[gwlbe_az]
-        if selected_transport_az == transport_az
-      ])
+      for transport_az in topology.transport_router_az_keys : transport_az => (
+        var.symmetric_topology.version == 2 ? sort([
+          for gwlbe_az, selected_transport_az in local.route_failover.initial_transport_router_az_by_gwlbe_az[site] :
+          topology.workload_subnet_cidrs[gwlbe_az]
+          if selected_transport_az == transport_az
+        ]) : sort(topology.local_site_cidrs)
+      )
     }
   }
   site_subnet_cidrs = {
@@ -441,6 +443,6 @@ locals {
     EnvelopeRun = var.name
     ExpiresAt   = var.expires_at
     ManagedBy   = "terraform"
-    Profile     = "symmetric-gwlb-ha-v2"
+    Profile     = var.symmetric_topology.version == 2 ? "legacy-symmetric-acceptance-v2" : "production-native-ha-v3"
   })
 }

@@ -1,0 +1,216 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+
+readonly topology_region='${topology_region}'
+readonly artifact_region='${artifact_region}'
+readonly artifact_sha256='${artifact_sha256}'
+readonly topology_document_sha256='${topology_document_sha256}'
+readonly topology_tool_region='${topology_tool_region}'
+readonly topology_tool_sha256='${topology_tool_sha256}'
+readonly observer_volume_id='${observer_volume_id}'
+readonly deployment_mode='${deployment_mode}'
+readonly metrics_port='${metrics_port}'
+readonly log_level='${log_level}'
+readonly tsnet_env_name='${tsnet_env_name}'
+readonly admin_env_name='${admin_env_name}'
+
+decode() {
+  printf '%s' "$1" | /usr/bin/base64 --decode
+}
+
+readonly artifact_bucket="$(decode '${artifact_bucket_b64}')"
+readonly artifact_key="$(decode '${artifact_key_b64}')"
+readonly artifact_version="$(decode '${artifact_version_b64}')"
+readonly topology_tool_bucket="$(decode '${topology_tool_bucket_b64}')"
+readonly topology_tool_key="$(decode '${topology_tool_key_b64}')"
+readonly topology_tool_version="$(decode '${topology_tool_version_b64}')"
+readonly controller_id="$(decode '${controller_id_b64}')"
+readonly state_base_dir="$(decode '${state_base_dir_b64}')"
+readonly topology_parameter="$(decode '${topology_parameter_b64}')"
+readonly tsnet_parameter="$(decode '${tsnet_parameter_name_b64}')"
+readonly admin_parameter="$(decode '${admin_parameter_name_b64}')"
+
+for command in /usr/bin/aws /usr/bin/base64 /usr/bin/curl /usr/bin/mount /usr/bin/mountpoint /usr/bin/sha256sum /usr/bin/systemctl /usr/sbin/blkid /usr/sbin/mkfs.ext4; do
+  [[ -x "$command" ]] || { printf 'required controller bootstrap command is missing: %s\n' "$command" >&2; exit 1; }
+done
+
+retry() {
+  local attempt
+  for attempt in $(/usr/bin/seq 1 30); do
+    if "$@"; then return 0; fi
+    /usr/bin/sleep 2
+  done
+  return 1
+}
+
+fetch_secret() {
+  local parameter=$1 value='' attempt
+  for attempt in $(/usr/bin/seq 1 30); do
+    if value=$(/usr/bin/aws ssm get-parameter \
+      --region "$topology_region" \
+      --name "$parameter" \
+      --with-decryption \
+      --query 'Parameter.Value' \
+      --output text \
+      --cli-connect-timeout 2 \
+      --cli-read-timeout 5 \
+      --no-cli-pager); then
+      break
+    fi
+    value=''
+    /usr/bin/sleep 2
+  done
+  [[ -n "$value" && $${#value} -le 4096 && "$value" =~ ^[A-Za-z0-9._:/+=,@%-]+$ ]] || {
+    printf 'controller secret parameter is empty or contains unsafe environment-file characters\n' >&2
+    return 1
+  }
+  printf '%s' "$value"
+}
+
+if ! /usr/bin/getent group envelope-controller >/dev/null; then
+  /usr/sbin/groupadd --system envelope-controller
+fi
+if ! /usr/bin/id envelope-controller >/dev/null 2>&1; then
+  /usr/sbin/useradd --system --gid envelope-controller --home-dir /var/lib/envelope-controller --shell /usr/sbin/nologin envelope-controller
+fi
+
+/usr/bin/install -d -o root -g root -m 0755 /etc/envelope /usr/local/lib/envelope-controller
+
+topology_value=''
+for attempt in $(/usr/bin/seq 1 30); do
+  if topology_value=$(/usr/bin/aws ssm get-parameter \
+    --region "$topology_region" \
+    --name "$topology_parameter" \
+    --query 'Parameter.Value' \
+    --output text \
+    --cli-connect-timeout 2 \
+    --cli-read-timeout 5 \
+    --no-cli-pager); then
+    break
+  fi
+  topology_value=''
+  /usr/bin/sleep 2
+done
+[[ -n "$topology_value" ]] || { printf 'controller topology could not be retrieved\n' >&2; exit 1; }
+topology_tmp=$(/usr/bin/mktemp /etc/envelope/controller-topology.json.XXXXXX)
+printf '%s' "$topology_value" >"$topology_tmp"
+unset topology_value
+printf '%s  %s\n' "$topology_document_sha256" "$topology_tmp" | /usr/bin/sha256sum --check --status
+
+topology_tool_tmp=$(/usr/bin/mktemp /usr/local/lib/envelope-controller/envelope-controller-topology.XXXXXX)
+retry /usr/bin/aws s3api get-object \
+  --region "$topology_tool_region" \
+  --bucket "$topology_tool_bucket" \
+  --key "$topology_tool_key" \
+  --version-id "$topology_tool_version" \
+  --cli-connect-timeout 2 \
+  --cli-read-timeout 15 \
+  --no-cli-pager \
+  "$topology_tool_tmp" >/dev/null
+printf '%s  %s\n' "$topology_tool_sha256" "$topology_tool_tmp" | /usr/bin/sha256sum --check --status
+/usr/bin/chmod 0500 "$topology_tool_tmp"
+"$topology_tool_tmp" verify --input "$topology_tmp" --sha256 "$topology_document_sha256"
+/usr/bin/install -o root -g root -m 0555 "$topology_tool_tmp" /usr/local/lib/envelope-controller/envelope-controller-topology
+/usr/bin/rm -f "$topology_tool_tmp"
+
+/usr/bin/chown root:root "$topology_tmp"
+/usr/bin/chmod 0444 "$topology_tmp"
+/usr/bin/mv -f "$topology_tmp" /etc/envelope/controller-topology.json
+
+router_trust_parameter="$(decode '${router_trust_parameter_b64}')"
+router_trust_value=$(/usr/bin/aws ssm get-parameter --region "$topology_region" \
+  --name "$router_trust_parameter" --query 'Parameter.Value' --output text \
+  --cli-connect-timeout 2 --cli-read-timeout 5 --no-cli-pager)
+router_trust_tmp=$(/usr/bin/mktemp /etc/envelope/controller-router-trust.json.XXXXXX)
+printf '%s' "$router_trust_value" >"$router_trust_tmp"
+printf '%s  %s\n' '${router_trust_sha256}' "$router_trust_tmp" | /usr/bin/sha256sum --check --status
+/usr/bin/chown root:root "$router_trust_tmp"
+/usr/bin/chmod 0444 "$router_trust_tmp"
+/usr/bin/mv -f "$router_trust_tmp" /etc/envelope/controller-router-trust.json
+unset router_trust_value
+
+artifact_tmp=$(/usr/bin/mktemp /usr/local/lib/envelope-controller/envelope-controller.XXXXXX)
+retry /usr/bin/aws s3api get-object \
+  --region "$artifact_region" \
+  --bucket "$artifact_bucket" \
+  --key "$artifact_key" \
+  --version-id "$artifact_version" \
+  --cli-connect-timeout 2 \
+  --cli-read-timeout 15 \
+  --no-cli-pager \
+  "$artifact_tmp" >/dev/null
+printf '%s  %s\n' "$artifact_sha256" "$artifact_tmp" | /usr/bin/sha256sum --check --status
+/usr/bin/install -o root -g root -m 0755 "$artifact_tmp" /usr/local/bin/envelope-controller
+/usr/bin/rm -f "$artifact_tmp"
+
+volume_serial="$${observer_volume_id//-/}"
+state_device=''
+for attempt in $(/usr/bin/seq 1 300); do
+  for candidate in \
+    "/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$volume_serial" \
+    /dev/xvdh \
+    /dev/sdh; do
+    if [[ -b "$candidate" ]]; then
+      state_device="$candidate"
+      break 2
+    fi
+  done
+  /usr/bin/sleep 2
+done
+[[ -n "$state_device" ]] || { printf 'persistent observer state volume was not attached\n' >&2; exit 1; }
+
+filesystem_type=$(/usr/sbin/blkid -p -s TYPE -o value "$state_device" 2>/dev/null || true)
+if [[ -z "$filesystem_type" ]]; then
+  /usr/sbin/mkfs.ext4 -F -L envelope-controller-state "$state_device" >/dev/null
+elif [[ "$filesystem_type" != ext4 ]]; then
+  printf 'persistent observer state volume has unexpected filesystem: %s\n' "$filesystem_type" >&2
+  exit 1
+fi
+readonly state_mount=/var/lib/envelope-controller
+/usr/bin/install -d -o root -g root -m 0755 "$state_mount"
+state_uuid=$(/usr/sbin/blkid -s UUID -o value "$state_device")
+if ! /usr/bin/grep -Fq "UUID=$state_uuid " /etc/fstab; then
+  printf 'UUID=%s %s ext4 defaults,nodev,noexec,nosuid 0 2\n' "$state_uuid" "$state_mount" >>/etc/fstab
+fi
+if ! /usr/bin/mountpoint --quiet "$state_mount"; then
+  /usr/bin/mount "$state_mount"
+fi
+/usr/bin/install -d -o envelope-controller -g envelope-controller -m 0700 "$state_base_dir"
+
+case "$deployment_mode" in
+  read-only) controller_read_only=true ;;
+  active) controller_read_only=false ;;
+  *) printf 'unsupported controller deployment mode\n' >&2; exit 1 ;;
+esac
+
+imds_token=$(/usr/bin/curl --fail --silent --show-error --max-time 2 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)
+private_ip=$(/usr/bin/curl --fail --silent --show-error --max-time 2 -H "X-aws-ec2-metadata-token: $imds_token" http://169.254.169.254/latest/meta-data/local-ipv4)
+unset imds_token
+[[ "$private_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { printf 'IMDS returned an invalid private address\n' >&2; exit 1; }
+
+tsnet_auth_key="$(fetch_secret "$tsnet_parameter")"
+admin_api_key="$(fetch_secret "$admin_parameter")"
+environment_tmp=$(/usr/bin/mktemp /etc/envelope/controller.env.XXXXXX)
+{
+  printf 'ENVELOPE_CONTROLLER_ID=%s\n' "$controller_id"
+  printf 'ENVELOPE_CONTROLLER_TOPOLOGY_PATH=/etc/envelope/controller-topology.json\n'
+  printf 'ENVELOPE_CONTROLLER_METRICS_ADDR=%s:%s\n' "$private_ip" "$metrics_port"
+  printf 'ENVELOPE_CONTROLLER_LOG_LEVEL=%s\n' "$log_level"
+  printf 'ENVELOPE_CONTROLLER_READ_ONLY=%s\n' "$controller_read_only"
+  printf '%s=%s\n' "$tsnet_env_name" "$tsnet_auth_key"
+  printf '%s=%s\n' "$admin_env_name" "$admin_api_key"
+} >"$environment_tmp"
+unset tsnet_auth_key admin_api_key
+/usr/bin/chown root:root "$environment_tmp"
+/usr/bin/chmod 0400 "$environment_tmp"
+/usr/bin/mv -f "$environment_tmp" /etc/envelope/controller.env
+
+/usr/bin/base64 --decode > /etc/systemd/system/envelope-controller.service <<'UNIT_BASE64'
+${systemd_unit_b64}
+UNIT_BASE64
+/usr/bin/chown root:root /etc/systemd/system/envelope-controller.service
+/usr/bin/chmod 0644 /etc/systemd/system/envelope-controller.service
+
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl enable --now envelope-controller.service

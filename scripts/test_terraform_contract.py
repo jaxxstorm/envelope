@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
 import unittest
 
 
@@ -76,6 +79,9 @@ class SymmetricTerraformContractTest(unittest.TestCase):
             / "setup_tailscale.sh.tftpl"
         ).read_text()
         cls.tests = (TF / "tests" / "appliance.tftest.hcl").read_text()
+        cls.headscale_integration = (
+            ROOT / "scripts" / "integration_headscale_two_peer.sh"
+        ).read_text()
 
     def assert_literal_set(
         self, text: str, anchor: str, expected: set[str]
@@ -109,7 +115,9 @@ class SymmetricTerraformContractTest(unittest.TestCase):
             "obsolete ingress-router template name must not coexist with transport naming",
         )
         self.assertIn('variable "symmetric_topology"', self.variables)
-        self.assertIn("var.symmetric_topology.version == 2", self.variables)
+        self.assertIn("contains([2, 3], var.symmetric_topology.version)", self.variables)
+        self.assertIn("version 3 is production native HA", self.variables)
+        self.assertIn("version 2 is the isolated legacy acceptance profile", self.variables)
         self.assert_literal_set(
             self.variables,
             "toset(keys(var.symmetric_topology)) == toset(",
@@ -201,6 +209,13 @@ class SymmetricTerraformContractTest(unittest.TestCase):
             "route_failover must map every GWLBE AZ to the same transport-router AZ and contain whole-second mutation, restoration, and recovery bounds from 1 through 7200.",
             self.variables,
         )
+        for production_advertisement_contract in (
+            "var.symmetric_topology.version == 2 ? sort([",
+            "]) : sort(topology.local_site_cidrs)",
+            "Production transport routers must all advertise the complete exact local workload-prefix set",
+            'Profile     = var.symmetric_topology.version == 2 ? "legacy-symmetric-acceptance-v2" : "production-native-ha-v3"',
+        ):
+            self.assertIn(production_advertisement_contract, "\n".join((self.variables, self.topology)))
 
         current_contract = "\n".join(
             (self.variables, self.topology, self.user_data, self.tests)
@@ -279,10 +294,7 @@ class SymmetricTerraformContractTest(unittest.TestCase):
             route = braced_block(
                 self.topology, f'resource "aws_route" "gwlbe_to_remote_{site}"'
             )
-            selection = (
-                "local.route_failover."
-                f"initial_transport_router_az_by_gwlbe_az.{site}[each.value.az_key]"
-            )
+            selection = f"local.gwlbe_initial_owners.{site}[each.value.az_key]"
             self.assertIn(
                 f"route_table_id         = aws_route_table.gwlbe_{site}[each.value.az_key].id",
                 route,
@@ -312,6 +324,19 @@ class SymmetricTerraformContractTest(unittest.TestCase):
                 f"local.sites.{site}.workload_subnet_cidrs[each.value.az_key]",
                 route,
             )
+            self.assertEqual(route.count("ignore_changes = [network_interface_id]"), 1)
+            self.assertIn(
+                f"self.route_table_id == aws_route_table.gwlbe_{site}[each.value.az_key].id",
+                route,
+            )
+            self.assertIn("self.destination_cidr_block == each.value.cidr", route)
+            self.assertIn("self.network_interface_id", route)
+            self.assertIn(
+                f"[for instance in values(aws_instance.transport_router_{site}) : instance.primary_network_interface_id]",
+                route,
+            )
+            self.assertIn("controller-owned route shape drifted", route)
+            self.assertIn("outside its eligible transport-router set", route)
 
     def test_route_failover_and_readiness_outputs_are_exact(self) -> None:
         symmetric_output = braced_block(
@@ -320,7 +345,13 @@ class SymmetricTerraformContractTest(unittest.TestCase):
         self.assert_assignment_set(
             symmetric_output,
             4,
-            {"config_version", "run_id", "route_failover", "sites"},
+            {
+                "config_version",
+                "run_id",
+                "route_failover",
+                "sites",
+                "transport_router_profile",
+            },
         )
         self.assertIn("route_failover = local.route_failover", symmetric_output)
 
@@ -335,6 +366,7 @@ class SymmetricTerraformContractTest(unittest.TestCase):
                 "recovery_timeout_seconds",
                 "same_az_preferred",
                 "sites",
+                "target_ownership",
             },
         )
         for site in ("west", "east"):
@@ -361,6 +393,11 @@ class SymmetricTerraformContractTest(unittest.TestCase):
                 f"source_workload_prefix          = local.sites.{site}.workload_subnet_cidrs[gwlbe_az]",
                 failover_output,
             )
+            self.assertIn(
+                f"eligible_network_interface_ids = sort([for instance in values(aws_instance.transport_router_{site}) : instance.primary_network_interface_id])",
+                failover_output,
+            )
+        self.assertIn('target_ownership = "envelope-controller"', failover_output)
         self.assertIn(
             "site => alltrue([for gwlbe_az, transport_az in selections : gwlbe_az == transport_az])",
             failover_output,
@@ -380,6 +417,41 @@ class SymmetricTerraformContractTest(unittest.TestCase):
             "contract_sha256 = local.transport_router_contract_sha256[site]",
             readiness_output,
         )
+        self.assertIn(
+            "config_version = var.symmetric_topology.version", readiness_output
+        )
+
+        seed_output = braced_block(
+            self.topology, 'output "production_controller_topology_seed"'
+        )
+        for required in (
+            "var.symmetric_topology.version == 3",
+            "config_version = 3",
+            "deployment_id  = var.name",
+            "expected_hostname",
+            "aws_instance.transport_router_west[key].primary_network_interface_id",
+            "aws_instance.transport_router_east[key].primary_network_interface_id",
+            "aws_subnet.transport_west[key].id",
+            "aws_subnet.transport_east[key].id",
+            "aws_route_table.gwlbe_west[gwlbe_az].id",
+            "aws_route_table.gwlbe_east[gwlbe_az].id",
+            "aws_subnet.gwlbe_west[gwlbe_az].id",
+            "aws_subnet.gwlbe_east[gwlbe_az].id",
+            "aws_route_table_association.gwlbe_west[gwlbe_az].id",
+            "aws_route_table_association.gwlbe_east[gwlbe_az].id",
+            "local_main_rule_priority_base",
+            "tailscale_route_rule_priority",
+            "preferred_owner",
+        ):
+            self.assertIn(required, seed_output)
+        self.assertIn(
+            "version 3 must emit complete route-table, GWLBE subnet, explicit association",
+            self.tests,
+        )
+        legacy = braced_block(
+            self.tests, 'run "legacy_singleton_acceptance_profile_is_explicit"'
+        )
+        self.assertIn("output.production_controller_topology_seed == null", legacy)
 
         readiness_contract = braced_block(
             self.user_data, "transport_router_contracts ="
@@ -451,13 +523,21 @@ class SymmetricTerraformContractTest(unittest.TestCase):
         self.assertEqual(self.topology.count("source_dest_check           = false"), 2)
         self.assertIn("snat_subnet_routes = false", self.user_data)
         self.assertNotIn("advertise_routes   = []", self.user_data)
+        self.assertIn(
+            'config_version           = var.symmetric_topology.version',
+            self.user_data,
+        )
+        self.assertIn(
+            'input       = var.symmetric_topology.version == 2 ? var.envelope_tailscale_iface : "all"',
+            self.user_data,
+        )
         for site in ("west", "east"):
             self.assertIn(
                 f"advertise_routes   = local.initial_transport_router_advertise_routes.{site}[each.key]",
                 self.user_data,
             )
 
-    def test_transport_host_readiness_rejects_local_tailnet_routes(self) -> None:
+    def test_transport_host_readiness_safely_shadows_local_tailnet_routes(self) -> None:
         network = heredoc(
             self.transport_router,
             "/usr/local/sbin/envelope-transport-router-network",
@@ -467,16 +547,147 @@ class SymmetricTerraformContractTest(unittest.TestCase):
             network.count('assert_no_route_intersection "$remote_route_table" "$prefix"'),
             1,
         )
-        self.assertIn(
-            '''for prefix in "$${local_site_cidrs[@]}"; do
-    assert_no_route_intersection local "$prefix"
-    assert_no_route_intersection "$remote_route_table" "$prefix"
-    assert_local_main_route "$prefix"
-  done''',
-            network,
+        for required in (
+            "assert_shadowed_local_tailnet_route()",
+            "assert_local_main_lookups()",
+            'assert_shadowed_local_tailnet_route "$prefix"',
+            'assert_local_main_lookups "$prefix"',
+            "network.num_addresses // 2",
+            '/usr/sbin/ip -j -details -4 route get "$address"',
+            "local table-52 overlap is not one exact safely shadowed Tailscale route",
+            "local-prefix policy did not select main and the underlay",
+        ):
+            self.assertIn(required, network)
+        self.assertLess(
+            network.index('assert_shadowed_local_tailnet_route "$prefix"'),
+            network.index('assert_local_main_route "$prefix"'),
+        )
+        self.assertLess(
+            network.index('assert_local_main_route "$prefix"'),
+            network.index('assert_local_main_lookups "$prefix"'),
         )
 
-    def test_transport_advertisement_mutation_is_generation_fenced(self) -> None:
+    def test_transport_host_network_template_remains_bash_valid_for_both_profiles(
+        self,
+    ) -> None:
+        network = heredoc(
+            self.transport_router,
+            "/usr/local/sbin/envelope-transport-router-network",
+        )
+        replacements = {
+            "${underlay_interface}": "eth0",
+            "${tailscale_interface}": "tailscale0",
+            "${local_site_cidrs_json}": '["10.10.0.0/16"]',
+            "${remote_site_cidrs_json}": '["10.20.0.0/16"]',
+            "${approved_maximum_tcp_mss}": "1240",
+            "${policy_rule_priority_base}": "100",
+            "${readiness_expectations_json}": "{}",
+            "${contract_sha256}": "a" * 64,
+        }
+        for placeholder, value in replacements.items():
+            network = network.replace(placeholder, value)
+        network = network.replace("$${", "${")
+
+        result = subprocess.run(
+            ["bash", "-n"], input=network, text=True, capture_output=True
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_headscale_integration_renders_only_the_production_v3_profile(self) -> None:
+        harness_syntax = subprocess.run(
+            ["bash", "-n", str(ROOT / "scripts" / "integration_headscale_two_peer.sh")],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(harness_syntax.returncode, 0, harness_syntax.stderr)
+        python_blocks = re.findall(
+            r"(?ms)<<'PY'\n(.*?)^PY$", self.headscale_integration
+        )
+        self.assertGreaterEqual(len(python_blocks), 7)
+        for index, source in enumerate(python_blocks):
+            compile(source, f"headscale-heredoc-{index}.py", "exec")
+
+        renderer = heredoc(
+            self.headscale_integration,
+            '"$work_dir/render-transport-contract.py"',
+        )
+        local = ["10.10.0.0/24", "10.11.0.0/24"]
+        remote = ["10.20.0.0/24", "10.21.0.0/24"]
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            renderer_path = directory / "render.py"
+            output_path = directory / "transport-network"
+            renderer_path.write_text(renderer)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(renderer_path),
+                    str(self.transport_router_path),
+                    str(output_path),
+                    "eth0",
+                    "tailscale0",
+                    ",".join(local),
+                    ",".join(remote),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            rendered = output_path.read_text()
+
+        contract_match = re.search(
+            r"(?m)^readonly readiness_expectations_json='(?P<contract>\{.*\})'$",
+            rendered,
+        )
+        self.assertIsNotNone(contract_match)
+        contract = json.loads(contract_match.group("contract"))
+        self.assertEqual(contract["config_version"], 3)
+        self.assertEqual(contract["local_site_cidrs"], local)
+        self.assertEqual(contract["remote_site_cidrs"], remote)
+        self.assertEqual(
+            [rule["input"] for rule in contract["local_policy_rules"]],
+            ["all", "all"],
+        )
+        self.assertTrue(
+            all("iif" not in rule for rule in contract["local_policy_rules"])
+        )
+        self.assertEqual(len(contract["forward_rules"]), 8)
+        self.assertEqual(len(contract["mss_rules"]), 8)
+
+        syntax = subprocess.run(
+            ["bash", "-n"], input=rendered, text=True, capture_output=True
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        for required in (
+            'site_a_cidrs=\'10.10.0.0/24,10.11.0.0/24\'',
+            'site_b_cidrs=\'10.20.0.0/24,10.21.0.0/24\'',
+            'rule.get("iif") not in (None, "", "all")',
+            "assert_safe_local_table52_overlap",
+            "agreed_primary_owner",
+            'docker stop -t 1 "$failed_b_router"',
+            "run_fresh_recovery_pair",
+            "fresh protocol {protocol} did not use the converged native owner",
+        ):
+            self.assertIn(required, self.headscale_integration)
+        self.assertNotIn("config_version=2", self.headscale_integration)
+        self.assertNotIn(
+            "envelope-transport-advertisements", self.headscale_integration
+        )
+
+    def test_legacy_transport_advertisement_mutation_is_explicitly_isolated(self) -> None:
+        self.assertIn("%{ if legacy_acceptance_profile ~}", self.transport_router)
+        helper = self.transport_router.index(
+            "/usr/local/sbin/envelope-transport-advertisements"
+        )
+        legacy_guard = self.transport_router.rindex(
+            "%{ if legacy_acceptance_profile ~}", 0, helper
+        )
+        legacy_end = self.transport_router.index("%{ endif ~}", helper)
+        self.assertLess(legacy_guard, helper)
+        self.assertLess(helper, legacy_end)
         for value in (
             "/usr/local/sbin/envelope-transport-advertisements",
             "/usr/bin/flock -x 9",
@@ -922,6 +1133,7 @@ verify_actual '["10.10.1.0/24"]' running normal
             '$cidrs | to_entries | map({priority: ($base + .key), input: $interface, source: "all", destination: .value, fwmark: 0, table: "main", action: "lookup"})',
             host_network,
         )
+        self.assertIn('--arg interface "$local_policy_input"', host_network)
         for exact_selector in (
             '["priority", "src", "srclen", "dst", "dstlen", "fwmark", "fwmask", "iif", "table", "action", "protocol"] as $allowed',
             "if all(.[]; ((keys - $allowed) | length) == 0)",
@@ -932,12 +1144,30 @@ verify_actual '["10.10.1.0/24"]' running normal
         ):
             self.assertIn(exact_selector, host_network)
         self.assertEqual(
-            host_network.count("/usr/sbin/ip -4 rule add priority"), 1
+            host_network.count("/usr/sbin/ip -4 rule add priority"), 2
         )
         self.assertIn(
             '/usr/sbin/ip -4 rule add priority "$priority" iif "$tailscale" \\\n'
             '        to "$${local_site_cidrs[$index]}" lookup main',
             host_network,
+        )
+        self.assertIn(
+            '/usr/sbin/ip -4 rule add priority "$priority" \\\n'
+            '        to "$${local_site_cidrs[$index]}" lookup main',
+            host_network,
+        )
+        legacy_rule = host_network.index(
+            '/usr/sbin/ip -4 rule add priority "$priority" iif "$tailscale"'
+        )
+        production_rule = host_network.index(
+            '/usr/sbin/ip -4 rule add priority "$priority" \\\n'
+        )
+        self.assertLess(
+            host_network.rindex("%{ if legacy_acceptance_profile }", 0, legacy_rule),
+            legacy_rule,
+        )
+        self.assertLess(
+            host_network.rindex("%{ else }", 0, production_rule), production_rule
         )
         self.assertNotIn("from all lookup main", host_network)
 
@@ -1296,6 +1526,7 @@ verify_actual '["10.10.1.0/24"]' running normal
             set(runs),
             {
                 "symmetric_two_az_paths",
+                "production_attestor_bootstrap_is_immutable_and_reference_only",
                 "reject_incomplete_target_fleet",
                 "reject_incomplete_transport_fleet",
                 "reject_obsolete_target_routing_field",
@@ -1312,12 +1543,17 @@ verify_actual '["10.10.1.0/24"]' running normal
                 "reject_cross_az_route_failover_selection",
                 "reject_unbounded_route_failover",
                 "reject_route_failover_compatibility_alias",
-                "distinct_transport_enis_and_same_az_initial_routes",
+                "distinct_transport_enis_and_controller_route_boundary",
                 "reject_duplicate_target_fleet_az",
                 "reject_duplicate_transport_fleet_az",
                 "reject_too_short_restoration_timeout",
                 "reject_recovery_not_exceeding_quiet_window",
                 "reject_duplicate_transport_enis",
+                "legacy_singleton_acceptance_profile_is_explicit",
+                "reject_unsupported_topology_version",
+                "seed_controller_owned_route_target",
+                "plan_preserves_controller_owned_route_target",
+                "plan_rejects_ineligible_controller_owned_route_target",
             },
         )
 
@@ -1338,6 +1574,7 @@ verify_actual '["10.10.1.0/24"]' running normal
             "reject_cross_az_route_failover_selection": "var.symmetric_topology",
             "reject_unbounded_route_failover": "var.symmetric_topology",
             "reject_route_failover_compatibility_alias": "var.symmetric_topology",
+            "reject_unsupported_topology_version": "var.symmetric_topology",
         }
         for run, expected_failure in negative_failures.items():
             run_block = braced_block(self.tests, f'run "{run}"')
@@ -1355,6 +1592,7 @@ verify_actual '["10.10.1.0/24"]' running normal
                 "reject_route_failover_compatibility_alias",
                 "initial_transport_router_az_keys =",
             ),
+            ("reject_unsupported_topology_version", "version = 4"),
         ):
             self.assertIn(mutation, braced_block(self.tests, f'run "{run}"'))
 
@@ -1370,7 +1608,8 @@ verify_actual '["10.10.1.0/24"]' running normal
             "transport readiness output must expose exact built-in policies, complete live IPv4 policy expectations, selected route tables, CIDRs, prefix-pair firewall selectors, MSS ceiling, recovery gate, and disabled IPv6/NAT state",
             "packet-return targets must have no Tailnet, firewall-transit, forwarding, or routing-manager bootstrap",
             "target diagnostics must allowlist every exact current Go metric and no obsolete datapath metric",
-            "every GWLBE remote route must resolve its explicit same-AZ initial transport ENI",
+            "GWLBE routes must expose a preferred baseline and each complete controller-eligible ENI set",
+            "version 2 must remain an explicitly isolated singleton advertisement-mutation acceptance profile",
         ):
             self.assertIn(expectation, self.tests)
         self.assertNotIn(
@@ -1398,7 +1637,7 @@ verify_actual '["10.10.1.0/24"]' running normal
                 "instance_id",
                 "network_interface_id",
                 "gwlbe_route_table_id",
-                "advertised_prefix",
+                "advertised_prefixes",
             },
         )
         self.assertIn("transport_router_fleet", self.tests)

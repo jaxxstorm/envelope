@@ -2,6 +2,11 @@
 - [Build and Try It](getting-started.md)
 - [Terraform Example](terraform-example.md)
 
+## Production Control Plane
+
+- [Controller Architecture and Operations](production-controller.md)
+- [Application Resilience](application-resilience.md)
+
 ## Reference
 
 - [Technical README](../README.md)

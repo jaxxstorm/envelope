@@ -3,6 +3,8 @@
 ## Purpose
 Define the reproducible, secure deployment and protected acceptance contract for a two-site, multi-AZ AWS GWLB appliance topology in which Envelope targets perform packet-scoped GENEVE turnaround and separate Tailscale transport routers provide inter-site transit and failover.
 
+Legacy-v2 protected acceptance uses singleton advertisements and runner-owned temporary failover. Approved production-v3 uses complete overlapping advertisements, native Tailscale ownership, and standalone controller-owned route reconciliation. These profiles are distinct; production-v3 does not change the version-2 Envelope packet-turnaround runtime contract. Requirements describe approved behavior, not a live acceptance receipt.
+
 ## Requirements
 ### Requirement: Reproducible Envelope artifact
 The deployment SHALL build a versioned static Linux Envelope binary for the selected EC2 architecture, record its source revision and SHA-256, and install only an artifact whose checksum matches the reviewed Terraform input.
@@ -110,6 +112,8 @@ The deployment SHALL pin tested Terraform, provider, module, AMI, and artifact i
 - **THEN** protected preflight queries the selected AWS image and instance-type metadata and fails before planning resources
 
 ### Requirement: Multi-AZ symmetric site deployment
+The version-2 topology restriction and deterministic initial-owner baseline below apply to legacy-v2 protected acceptance. Approved production-v3 SHALL preserve the same symmetric route domains and AZ coverage while using controller-owned dynamic route targets after handoff; its topology is not restricted to version 2. The obsolete target-field rejection remains applicable to version-2 packet-turnaround configuration.
+
 The protected deployment SHALL keep topology and runtime configuration version 2 and create at least two enabled AZs per site, a GWLBE in every enabled workload and transport-router AZ, and at least one Envelope target in every enabled target AZ. Each workload route table SHALL send exact remote-site CIDRs to its same-AZ GWLBE; every transport-router route table SHALL send each exact local-site CIDR to the GWLBE in that destination workload prefix's AZ, independent of the router AZ; and each GWLBE route table SHALL send local-site traffic through VPC local delivery and remote-site traffic to the ENI of the deterministic initial owner of that GWLBE AZ's workload prefix. Target subnets SHALL carry no inner site route.
 
 #### Scenario: Both sites have symmetric paths
@@ -125,6 +129,10 @@ The protected deployment SHALL keep topology and runtime configuration version 2
 - **THEN** preflight rejects it without translation, compatibility resources, or a version change
 
 ### Requirement: Redundant Tailscale transport routers
+For approved production-v3, the production deployment SHALL create at least two independent Tailscale transport routers per site, spread across enabled AZs. Every router SHALL advertise and have enabled the same complete set of exact local workload prefixes for Tailscale native failover. Every router SHALL accept all exact remote-site routes, disable subnet-route SNAT and Tailnet DNS acceptance, preserve the VPC resolver and workload source addresses, and forward in both site-transit directions. Readiness SHALL verify healthy backend and peers, exact advertisements, sole per-prefix primary ownership from the controller observers, higher-priority full-prefix local-main policy, effective destination-prefix GWLBE routing, and distinct eligible ENIs. Envelope targets SHALL not join Tailscale or act as route advertisers.
+
+The following singleton-advertisement paragraph and the scenarios without a production designation apply only to legacy-v2 protected acceptance.
+
 The deployment SHALL create at least two independent Tailscale transport routers per site, spread across enabled AZs. Each router's baseline enabled advertisement SHALL be its non-empty singleton assigned workload prefix; those assignments SHALL be pairwise disjoint and their exact union SHALL equal all local-site CIDRs. Every router SHALL accept all exact remote-site routes, remain capable of forwarding every site prefix during failover, disable subnet-route SNAT and Tailnet DNS acceptance, preserve the VPC resolver and workload source addresses, and forward in both site-transit directions. Readiness SHALL require table 52 to contain exactly the opposite site's exact workload routes, bind each route to its configured stable owner on every opposite-site observer, reject every same-site protected local `PrimaryRoutes` claim or table-52 route, verify the live `CorpDNS` preference is false, and reject every Tailscale health condition. Every local prefix, whether its singleton advertiser is self or sibling, SHALL remain on the main/VPC underlay, and the higher-priority `iif tailscale0` rules SHALL make every router capable of delivering all local prefixes during normal and takeover paths. The deployment SHALL expose each router's primary ENI and advertised prefix; source-prefix owner/ENI coupling SHALL be derived from singleton advertisements, control-plane stable identities, and opposite-site observations. Envelope targets SHALL not join Tailscale or act as route advertisers.
 
 #### Scenario: Redundant local-site advertisements
@@ -143,8 +151,25 @@ The deployment SHALL create at least two independent Tailscale transport routers
 - **WHEN** one transport router advertises a broader, narrower, or missing local-site prefix, lacks a remote route, enables SNAT or Tailnet DNS acceptance, reports a Tailscale health condition, or cannot forward one direction
 - **THEN** protected readiness fails before acceptance traffic or GWLBE route eligibility
 
-- **WHEN** a configured local-site prefix contains the VPC DNS resolver address and would therefore have an unavoidable narrower main-table route
+#### Scenario: Legacy local prefix contains the VPC resolver
+- **WHEN** a configured legacy-v2 local-site prefix contains the VPC DNS resolver address and would therefore have an unavoidable narrower main-table route
 - **THEN** protected configuration validation fails before AWS resources are created
+
+#### Scenario: Production redundant local-site advertisements
+- **WHEN** a production site is deployed successfully
+- **THEN** at least two ready AZ-spread transport routers each advertise every exact local-site prefix without NAT and expose distinct controller-eligible primary ENIs
+
+#### Scenario: Production local prefix uses the underlay
+- **WHEN** a packet on any production transport router targets a local-site prefix
+- **THEN** the higher-priority full-prefix rule selects `main`, the VPC underlay, and the destination workload prefix's AZ GWLBE even if table 52 contains an overlapping local route
+
+#### Scenario: Production incomplete router contract
+- **WHEN** one production router advertises a broader, narrower, or incomplete local prefix set, lacks a remote route, enables SNAT or Tailnet DNS acceptance, reports a Tailscale health condition, lacks the local-main policy, or cannot forward one direction
+- **THEN** production readiness excludes that router and the controller cannot select its ENI
+
+#### Scenario: Production local prefix contains the VPC resolver
+- **WHEN** a configured production local-site prefix contains the VPC DNS resolver address and cannot satisfy deterministic full-prefix routing
+- **THEN** configuration validation fails before AWS resources are created
 
 ### Requirement: Packet-turnaround target readiness and drain
 The deployment SHALL register an Envelope target healthy only after its AWS GENEVE receiver, validation, and packet-scoped compliant-return sender are ready. TUN, target host forwarding, site routes, and Tailscale SHALL not be target prerequisites. Both GWLB target groups SHALL use an explicit 10-second health interval, 5-second timeout, healthy threshold 5, and unhealthy threshold 2, and the protected saved-plan validator SHALL reject any different or implicit timing. A planned target stop SHALL prove the service and `/healthz` are unavailable and observe the exact AWS `unhealthy` transition before alternate-flow evidence; an unrelated `unused` state SHALL not satisfy process-failure evidence. A replacement SHALL wait for documented deregistration and drain evidence. Both workflows SHALL retain redacted diagnostics.
@@ -158,6 +183,8 @@ The deployment SHALL register an Envelope target healthy only after its AWS GENE
 - **THEN** it records the unready transition, AWS target drain evidence, replacement readiness, and the succeeding target identity
 
 ### Requirement: Protected ENI route failover lifecycle
+This requirement and its scenarios apply only to legacy-v2 runner-owned acceptance and recovery. Approved production-v3 SHALL instead use the standalone controller's durable reconciliation and the split-identity production conformance contract; its acceptance observer SHALL NOT transfer advertisements or mutate routes.
+
 The active failover reservation SHALL include worst-case durable restoration checkpoints and stream headroom. The cleanup reservation SHALL separately include successor preflight, every bounded CAS checkpoint and finalization, backend finalization, receipt promotion, lock release, output, and the complete 900-second resource cleanup under the same outer alarm; the active and cleanup reservations SHALL fit the complete protected lifecycle envelope. The initial route journal SHALL have an exact envelope and stable host/boot owner, every update SHALL preserve immutable authority and monotonic progress, a fresh restoration attempt SHALL require a separately persisted recovery claim, and finalization SHALL match the exact retained terminal status and timestamp.
 
 The protected runner SHALL be the only component authorized to coordinate temporary transport-prefix advertisement transfer and GWLBE remote-route replacement between eligible same-site routers during acceptance. Version 2 SHALL accept exactly explicit per-GWLBE-AZ initial selections plus mutation, restoration, and recovery bounds. Before acquiring resource authority, run-all SHALL derive both failover transaction reservations and worst-case restoration from those inputs and reject configurations that exceed the active-run, per-stream, or cleanup bounds. The runner SHALL verify run ownership, exact source-prefix owner, stable Tailnet identities and opposite-site observer graph, absence of same-site local Tailnet ownership, advertisement sets, route-table and prefix allowlists, current and alternate readiness, and cleanup authority; persist stable node hashes in a separate pre-transaction CAS; persist both control planes' prior state and an expiring owner lease through the CAS-protected durable manifest before mutation; use bounded mutation, ambiguous-result settlement, and convergence waits; record before and after state; and restore advertisements and every original route target with independent deadlines on every exit path. A terminal E2E claim SHALL be prohibited while either control plane remains active in the transaction. After normal run expiry, a recovery-only invocation MAY accept that expiry only when the exact retained deployment contains an abandoned active route transaction or its verified cleanup-pending handoff. It SHALL validate the output hash and every immutable topology, VPC, route-table, prefix, router, ENI, stable-node, snapshot, progress, and generation binding before CAS adoption; SHALL NOT replay acceptance; SHALL prevent marker takeover while another fresh cleanup claim exists; SHALL retain cleanup authority across terminal and incomplete-cleanup phases; and SHALL retain success only after verified restoration, an exact integer-zero final residual audit, durable private receipt persistence, and backend finalization. Targets and transport routers SHALL not receive EC2 route-mutation permission.
@@ -187,6 +214,8 @@ The protected runner SHALL be the only component authorized to coordinate tempor
 - **THEN** a later invocation resumes from the leased cleanup marker or private pending receipt, performs no acceptance replay, and cannot report success before exact backend finalization
 
 ### Requirement: Symmetric HA acceptance evidence
+The runner-owned transport mutation, restoration, and stream scheduling below describe legacy-v2 acceptance. Packet-turnaround, symmetric inspection, redaction, and bounded continuity evidence remain applicable to both profiles. Approved production-v3 transport and leader failure evidence SHALL follow Production controller conformance evidence rather than granting the acceptance observer route-mutation authority.
+
 Target-instance and transport-router TCP/UDP streams SHALL run concurrently around one shared mutation interval and retain the complete admitted transaction reservation plus bounded paired-control headroom as their command watchdog. The mutation callback SHALL execute on the protected main thread so active timeout or termination control flow can transition directly to cleanup. Every receiver SHALL start before its client, retain a bounded initial wait, and begin its full bounded observation duration exactly once when it accepts the first valid marker so dispatch startup cannot consume the client's final acknowledgement window. Both client stops SHALL be requested after the mutation-end clock sample and before either client result is awaited; each client SHALL complete at least 20 successful sends and a final post-mutation send, and both client results SHALL complete before either receiver stop is requested. Analysis SHALL validate every successful-send completion timestamp and acknowledged marker without post-hoc truncation, while schema evidence SHALL retain exact sent, acknowledged, and lost counts rather than raw timestamp arrays. Each bounded contiguous resumed loss episode SHALL have its first missing successful send complete during the mutation; later missing sends in that same episode MAY cross the mutation endpoint before its trailing acknowledgement, but every separately starting out-of-interval episode SHALL invalidate the observation. A right-censored result SHALL likewise require the first unacknowledged successful send to complete during the mutation; an isolated unacknowledged post-mutation final send, local send error, short UDP marker write, or short UDP acknowledgement write SHALL invalidate the observation. Ambiguous SSM dispatch ownership or unconfirmed termination SHALL suppress managed-responder restoration. Target-process streams SHALL retain their fixed post-restoration observation behavior. Before resource authority, admission SHALL require both sequential route-transaction reservations and the symmetric non-route acceptance reservations, including fixed target-process durations and the paired target-instance watchdog, to fit the active-run deadline. Earlier run-all provisioning and readiness SHALL remain bounded by that outer active deadline without an unsupported static liveness claim.
 
 The protected acceptance SHALL install and checksum-verify the bounded wire inspector on every packet-return target before traffic; prove new bidirectional TCP, UDP, and ICMP flows without directional CIDR partitioning; prove packet-scoped target return with identical inner bytes, VNI, ordered options and cookie, and AWS tuple using bounded independent AF_PACKET ingress/return captures; prove both site GWLBE/GWLB traversals; and execute target-process, target-instance, transport-router, and protected ENI-route failover exercises. Target metric proofs SHALL aggregate every finite reason-labeled series in each exact required failure-counter family and SHALL reject absent or non-finite metrics. Long-lived TCP continuity agents SHALL preserve bounded trailing bytes when one read contains multiple newline-delimited frames, and their command execution and wait deadlines SHALL leave fixed reporting headroom beyond the measured stream. Every target-process continuity stream SHALL reserve bounded mutation overhead before its post-mutation observation window and SHALL retain a marker after the measured mutation interval. Remote marker output SHALL remain below the SSM inline-result bound by storing shared identities once and compact timestamp tuples, and the runner SHALL reconstruct the full schema while rejecting malformed or truncated output without coercing topology identities. The initial topology SHALL use distinct site regions and exact string identities, with one target group per site whose ARN matches that site region and one AWS account across both sites. Target-instance replacement SHALL drain and replace the UDP stream's packet-correlated target, record each protocol's actual selected target without requiring cross-protocol co-selection, treat a differently selected TCP stream only as a measured control, require both new-flow paths to exclude the replaced target, refresh the victim's process generation immediately before mutation, and retain the replacement's exact AZ. Passing evidence SHALL keep the initial topology for all pre-replacement observations and SHALL validate later transport-router paths against one exact substitution that removes the victim and binds a globally distinct replacement to that victim's site, AZ, and target group. Raw captures, payloads, and cookie values SHALL be deleted after inspection; evidence SHALL retain only redacted decoded identities and hashes, while failures SHALL retain the redacted underlying inspection command error. Evidence SHALL record endpoint, target, router, ENI and route identities, health and route transitions, recovery duration, established TCP outcome, UDP loss, restoration, and post-cleanup residual audit.
@@ -248,3 +277,56 @@ The deployment SHALL expose a reviewed resource-count and hourly-cost profile an
 #### Scenario: Reviewed cost profile
 - **WHEN** a saved plan is approved
 - **THEN** NAT gateways, GWLBE endpoints, GWLBs, public IPv4 addresses, instances, and other fixed-cost resources match the pre-approved count and TTL
+
+### Requirement: Standalone controller deployment boundary
+The production deployment SHALL run at least three `envelope-controller` replicas across independent failure domains outside Envelope targets and transport routers. It SHALL provide an encrypted strongly consistent DynamoDB authority with point-in-time recovery and deletion protection, persistent private state for each embedded Tailnet observer identity, resilient management egress, and a dedicated controller IAM role. The role SHALL be scoped to the configured table and required read APIs plus EC2 route replacement for only the configured route tables; target and router roles SHALL retain no route-mutation permission.
+
+#### Scenario: One controller replica fails
+- **WHEN** a replica or its availability zone becomes unavailable
+- **THEN** another replica can acquire a higher fenced lease after the prior record version remains unchanged for one lease duration and continue from durable state
+
+#### Scenario: Controller role is overprivileged
+- **WHEN** a plan grants controller packet privileges, grants target or router route mutation, or permits controller mutation outside configured route tables
+- **THEN** static policy validation rejects the deployment
+
+#### Scenario: Controller Region is unavailable
+- **WHEN** the regional strongly consistent authority cannot be reached
+- **THEN** replicas fail closed and do not claim multi-Region control-plane availability
+
+### Requirement: Controller-owned dynamic route targets
+Terraform SHALL own each GWLBE route's table, exact GWLBE subnet and explicit route-table association identities, site VPC, exact destination prefix, and eligible target set while treating the current ENI target as controller-owned dynamic state after handoff. Subnet and association identities SHALL be unique across domains. A saved plan SHALL resolve the subnet and table in their configured Region, require both to belong to the site's VPC, and require exactly one non-main table association matching the configured subnet, association ID, and table ID. It SHALL reject route or association deletion, association replacement, prefix changes, unknown eligible ENIs, or a topology-hash mismatch but SHALL NOT revert a legitimate controller-selected ENI merely because it differs from the preferred baseline.
+
+#### Scenario: Terraform runs after failover
+- **WHEN** the controller has durably converged a route domain to an eligible alternate
+- **THEN** a subsequent plan preserves that target while validating the route shape and controller authority
+
+#### Scenario: Route target is unknown
+- **WHEN** an exact route points to an ENI outside its configured same-site candidate set
+- **THEN** controller readiness fails and the plan or reconciliation reports the unauthorized target without silently adopting it
+
+#### Scenario: GWLBE association drifts
+- **WHEN** a managed route table is main, is associated with a different subnet or association ID, has multiple active non-main associations, or its table or subnet is outside the configured site VPC
+- **THEN** Terraform planning and controller reconciliation fail closed without adopting the changed association or mutating a route
+
+### Requirement: Production controller conformance evidence
+Protected acceptance SHALL inject controller-relevant failures while the production Go controller, rather than the test runner, owns route reconciliation. Live evidence SHALL cover observer quorum, lease renewal and real leader loss/recovery, real router failure/recovery, stable native Tailscale owner selection, exact AWS route convergence, durable alternate state, stability-gated failback, new TCP and UDP flow recovery, established-flow outcome, and cleanup. Deterministic observer disagreement, stale-fence rejection, ambiguous API settlement, and precise crash checkpoints MAY remain in the integration harness and SHALL be labeled simulated, not live capabilities or live receipts. The controller SHALL remain independent of the acceptance runner and its run files.
+
+The route graph deployment and cleanup identity SHALL be distinct from the acceptance-observer identity. Before fault injection, the deployment identity SHALL be removed and the acceptance identity SHALL have an explicit deny for every EC2 route and route-table-association mutation API. A local command ledger SHALL NOT substitute for that credential boundary. Until the split identity and ownership-checked handoff exist, protected controller conformance SHALL fail before backend claim acquisition or resource creation.
+
+Run-owned SecureString creation, deletion, and residual audit SHALL reconcile bounded stable invocation-tagged visibility or stable absence and SHALL fail cleanup while the result is uncertain. A lost conditional backend-claim response SHALL authorize cleanup only when the immediately attempted invocation reads one exact object version whose complete body matches its claim; a later invocation SHALL NOT adopt that claim. Fault restoration SHALL retain stop intent through EC2 transitional states until repeated exact reads prove the instance running. Readiness and failure bodies SHALL be reduced to allowlisted or redacted values before truncation, and evidence scanning SHALL include every Tailnet, controller, and temporary AWS session credential. Local protected run data SHALL be removed only after successful evidence upload and an independent check of the exact cleanup sequence, every completion flag, ordered zero-residual audits, backend finalization, and an empty error set, or an exact not-required result before claim acquisition.
+
+#### Scenario: Router fails under controller ownership
+- **WHEN** protected acceptance makes the selected transport router unavailable
+- **THEN** Tailscale selects an eligible exact-prefix alternate, the controller quorum converges the corresponding GWLBE routes, and fresh TCP and UDP retries succeed with measured recovery and loss
+
+#### Scenario: Leader exits during route progress
+- **WHEN** the lease holder exits after persisting intent or after an ambiguous route call
+- **THEN** a successor with a higher fence settles observed state and completes safe reconciliation without replaying an unjournaled mutation
+
+#### Scenario: Established flow does not resume
+- **WHEN** an established TCP or UDP tuple remains interrupted after route convergence
+- **THEN** evidence may record that bounded outcome only when a fresh retry succeeds and no hitless or lossless claim is emitted
+
+#### Scenario: Mutable cleanup outcome is ambiguous
+- **WHEN** a SecureString or conditional backend-claim operation loses its response, EC2 remains transitional during fault restoration, or cleanup evidence contradicts its completion status
+- **THEN** the runner reconciles only invocation-bound state within its cleanup budget and retains forensic state rather than reporting not-required or complete cleanup on uncertainty

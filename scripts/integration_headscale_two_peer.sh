@@ -5,6 +5,10 @@ trap 'printf "harness command failed at line %s: %s\n" "$LINENO" "$BASH_COMMAND"
 HEADSCALE_IMAGE='headscale/headscale:0.25.1@sha256:a7a8ae9616bb964a3eed8101ebb020213f73668142a84806ec37a5eeb2c1fceb'
 TAILSCALE_IMAGE='tailscale/tailscale:v1.80.3@sha256:af6026ed3e5892c5d4966962618a09685198111507df16803b2aec7066046582'
 PLATFORM=${ENVELOPE_INTEGRATION_PLATFORM:-linux/amd64}
+site_a_cidrs='10.10.0.0/24,10.11.0.0/24'
+site_b_cidrs='10.20.0.0/24,10.21.0.0/24'
+site_a_active_cidr='10.10.0.0/24'
+site_b_active_cidr='10.20.0.0/24'
 
 for command in docker go python3; do
   if ! command -v "$command" >/dev/null 2>&1; then
@@ -183,178 +187,26 @@ import re
 import sys
 
 
-template_path, output_path, underlay, tailscale, local_cidr, remote_cidr = sys.argv[1:]
-priority_base = 100
-maximum_mss = 1240
-contract = {
-    "config_version": 2,
-    "local_site_cidrs": [local_cidr],
-    "remote_site_cidrs": [remote_cidr],
-    "underlay_interface": underlay,
-    "tailscale_interface": tailscale,
-    "approved_maximum_tcp_mss": maximum_mss,
-    "ipv4_forwarding": True,
-    "ipv6_forwarding": False,
-    "filter_forward_policy": "DROP",
-    "mangle_forward_policy": "ACCEPT",
-    "filter_forward_rules": [
-        {"chain": "FORWARD", "action": "JUMP", "target": "ENVELOPE-TRANSPORT-FORWARD"}
-    ],
-    "mangle_forward_rules": [
-        {"chain": "FORWARD", "action": "JUMP", "target": "ENVELOPE-TRANSPORT-MSS"}
-    ],
-    "mss_terminal_rules": [
-        {"chain": "ENVELOPE-TRANSPORT-MSS", "action": "RETURN"}
-    ],
-    "nat_rules": [],
-    "ipv6_filter_forward_policy": "DROP",
-    "ipv6_mangle_forward_policy": "ACCEPT",
-    "ipv6_filter_forward_rules": [
-        {"chain": "FORWARD", "action": "JUMP", "target": "ENVELOPE-TRANSPORT-FORWARD"}
-    ],
-    "ipv6_forward_rules": [],
-    "ipv6_mangle_forward_rules": [],
-    "readiness_marker": "/var/lib/envelope/transport-router-network.ready",
-    "runtime_state": "/var/lib/envelope/transport-router-network.state.json",
-    "recovery_marker": "/var/lib/envelope/transport-router-network.configured",
-    "mss_formula": "min(min(underlay_mtu,tailscale_mtu)-40,approved_maximum_tcp_mss)",
-    "policy_rule_priority_base": priority_base,
-    "local_route_table": "main",
-    "remote_route_table": 52,
-    "local_policy_rules": [
-        {
-            "priority": priority_base,
-            "input": tailscale,
-            "source": "all",
-            "destination": local_cidr,
-            "fwmark": 0,
-            "table": "main",
-            "action": "lookup",
-        }
-    ],
-    "ipv4_policy_rules": [
-        {
-            "priority": 0,
-            "input": "all",
-            "source": "all",
-            "destination": "all",
-            "fwmark": 0,
-            "fwmask": 0,
-            "table": "local",
-            "action": "lookup",
-        },
-        {
-            "priority": priority_base,
-            "input": tailscale,
-            "source": "all",
-            "destination": local_cidr,
-            "fwmark": 0,
-            "fwmask": 0,
-            "table": "main",
-            "action": "lookup",
-        },
-        {
-            "priority": 5210,
-            "input": "all",
-            "source": "all",
-            "destination": "all",
-            "fwmark": 524288,
-            "fwmask": 16711680,
-            "table": "main",
-            "action": "lookup",
-        },
-        {
-            "priority": 5230,
-            "input": "all",
-            "source": "all",
-            "destination": "all",
-            "fwmark": 524288,
-            "fwmask": 16711680,
-            "table": "default",
-            "action": "lookup",
-        },
-        {
-            "priority": 5250,
-            "input": "all",
-            "source": "all",
-            "destination": "all",
-            "fwmark": 524288,
-            "fwmask": 16711680,
-            "table": "none",
-            "action": "unreachable",
-        },
-        {
-            "priority": 5270,
-            "input": "all",
-            "source": "all",
-            "destination": "all",
-            "fwmark": 0,
-            "fwmask": 0,
-            "table": "52",
-            "action": "lookup",
-        },
-        {
-            "priority": 32766,
-            "input": "all",
-            "source": "all",
-            "destination": "all",
-            "fwmark": 0,
-            "fwmask": 0,
-            "table": "main",
-            "action": "lookup",
-        },
-        {
-            "priority": 32767,
-            "input": "all",
-            "source": "all",
-            "destination": "all",
-            "fwmark": 0,
-            "fwmask": 0,
-            "table": "default",
-            "action": "lookup",
-        },
-    ],
-    "forward_rules": [
-        {
-            "chain": "ENVELOPE-TRANSPORT-FORWARD",
-            "input": underlay,
-            "output": tailscale,
-            "source": local_cidr,
-            "destination": remote_cidr,
-            "action": "ACCEPT",
-        },
-        {
-            "chain": "ENVELOPE-TRANSPORT-FORWARD",
-            "input": tailscale,
-            "output": underlay,
-            "source": remote_cidr,
-            "destination": local_cidr,
-            "action": "ACCEPT",
-        },
-    ],
-    "mss_rules": [
-        {
-            "chain": "ENVELOPE-TRANSPORT-MSS",
-            "input": underlay,
-            "output": tailscale,
-            "source": local_cidr,
-            "destination": remote_cidr,
-            "protocol": "tcp",
-            "tcp_flags": "SYN,RST SYN",
-            "action": "TCPMSS",
-        },
-        {
-            "chain": "ENVELOPE-TRANSPORT-MSS",
-            "input": tailscale,
-            "output": underlay,
-            "source": remote_cidr,
-            "destination": local_cidr,
-            "protocol": "tcp",
-            "tcp_flags": "SYN,RST SYN",
-            "action": "TCPMSS",
-        },
-    ],
-}
+template_path, output_path, underlay, tailscale, local_csv, remote_csv = sys.argv[1:]
+root = pathlib.Path(template_path).resolve().parents[3]
+sys.path.insert(0, str(root / "scripts"))
+from transport_router_readiness import (  # noqa: E402
+    build_readiness_contract,
+    readiness_contract_sha256,
+)
+
+local_cidrs = local_csv.split(",")
+remote_cidrs = remote_csv.split(",")
+if any(not cidr for cidr in (*local_cidrs, *remote_cidrs)):
+    raise SystemExit("production transport CIDR sets must be non-empty")
+contract = build_readiness_contract(
+    local_cidrs,
+    remote_cidrs,
+    underlay,
+    tailscale,
+    1240,
+    config_version=3,
+)
 contract_json = json.dumps(contract, sort_keys=True, separators=(",", ":"))
 template = pathlib.Path(template_path).read_text(encoding="utf-8")
 match = re.search(
@@ -368,12 +220,12 @@ script = match.group(1) + "\n"
 replacements = {
     "${underlay_interface}": underlay,
     "${tailscale_interface}": tailscale,
-    "${local_site_cidrs_json}": json.dumps([local_cidr], separators=(",", ":")),
-    "${remote_site_cidrs_json}": json.dumps([remote_cidr], separators=(",", ":")),
-    "${approved_maximum_tcp_mss}": str(maximum_mss),
-    "${policy_rule_priority_base}": str(priority_base),
+    "${local_site_cidrs_json}": json.dumps(local_cidrs, separators=(",", ":")),
+    "${remote_site_cidrs_json}": json.dumps(remote_cidrs, separators=(",", ":")),
+    "${approved_maximum_tcp_mss}": "1240",
+    "${policy_rule_priority_base}": "100",
     "${readiness_expectations_json}": contract_json,
-    "${contract_sha256}": hashlib.sha256(contract_json.encode()).hexdigest(),
+    "${contract_sha256}": readiness_contract_sha256(contract),
 }
 for placeholder, value in replacements.items():
     script = script.replace(placeholder, value)
@@ -1152,10 +1004,10 @@ start_target "$target_b" target-b "$b_target_underlay"
 for helper in "$gwlbe_a" "$gwlbe_b" "$post_a" "$post_b" "$workload_a" "$workload_b"; do
   start_helper "$helper"
 done
-start_transport_router "$transport_a1" "$work_dir/key-transport-router-a1" '10.10.0.0/24'
-start_transport_router "$transport_a2" "$work_dir/key-transport-router-a2" '10.10.0.0/24'
-start_transport_router "$transport_b1" "$work_dir/key-transport-router-b1" '10.20.0.0/24'
-start_transport_router "$transport_b2" "$work_dir/key-transport-router-b2" '10.20.0.0/24'
+start_transport_router "$transport_a1" "$work_dir/key-transport-router-a1" "$site_a_cidrs"
+start_transport_router "$transport_a2" "$work_dir/key-transport-router-a2" "$site_a_cidrs"
+start_transport_router "$transport_b1" "$work_dir/key-transport-router-b1" "$site_b_cidrs"
+start_transport_router "$transport_b2" "$work_dir/key-transport-router-b2" "$site_b_cidrs"
 
 for helper in "$gwlbe_a" "$gwlbe_b"; do
   docker exec "$helper" apk add --no-cache curl iproute2 python3 >/dev/null
@@ -1380,13 +1232,17 @@ for _ in $(seq 1 120); do
   route_ids=$(python3 -c '
 import json, sys
 routes = json.load(sys.stdin)
-expected = {"10.10.0.0/24": 2, "10.20.0.0/24": 2}
+expected = {
+    prefix: 2
+    for value in sys.argv[1:]
+    for prefix in value.split(",")
+}
 found = {}
 for route in routes:
     found[route["prefix"]] = found.get(route["prefix"], 0) + 1
-if all(found.get(prefix) == count for prefix, count in expected.items()):
+if found == expected:
     print(" ".join(str(route["id"]) for route in routes))
-' <<<"$route_json")
+' "$site_a_cidrs" "$site_b_cidrs" <<<"$route_json")
   if [[ -n "$route_ids" ]]; then
     for route_id in $route_ids; do
       docker exec "$headscale" headscale routes enable --route "$route_id" >/dev/null
@@ -1450,10 +1306,14 @@ print(*matches[0], sep="\t")
   exit 1
 }
 for node in "$transport_a1" "$transport_a2"; do
-  wait_remote_route "$node" '10.20.0.0/24' "$transport_b1" "$transport_b2"
+  for remote in ${site_b_cidrs//,/ }; do
+    wait_remote_route "$node" "$remote" "$transport_b1" "$transport_b2"
+  done
 done
 for node in "$transport_b1" "$transport_b2"; do
-  wait_remote_route "$node" '10.10.0.0/24' "$transport_a1" "$transport_a2"
+  for remote in ${site_a_cidrs//,/ }; do
+    wait_remote_route "$node" "$remote" "$transport_a1" "$transport_a2"
+  done
 done
 
 verify_transport_router_control_plane() {
@@ -1474,10 +1334,10 @@ if (
   docker exec "$node" tailscale debug prefs | python3 -c '
 import json
 import sys
-expected = {sys.argv[1]}
+expected = set(sys.argv[1].split(","))
 prefs = json.load(sys.stdin)
 if set(prefs.get("AdvertiseRoutes", [])) != expected:
-    raise SystemExit("transport-router does not advertise the exact local prefix")
+    raise SystemExit("transport-router does not advertise the complete exact local prefix set")
 if (
     prefs.get("RouteAll") is not True
     or prefs.get("NoSNAT") is not True
@@ -1487,10 +1347,10 @@ if (
 ' "$expected_local"
 }
 for node in "$transport_a1" "$transport_a2"; do
-  verify_transport_router_control_plane "$node" '10.10.0.0/24'
+  verify_transport_router_control_plane "$node" "$site_a_cidrs"
 done
 for node in "$transport_b1" "$transport_b2"; do
-  verify_transport_router_control_plane "$node" '10.20.0.0/24'
+  verify_transport_router_control_plane "$node" "$site_b_cidrs"
 done
 
 tailscale_peer_ip() {
@@ -1571,27 +1431,40 @@ if len(items) != 1 or "metainfo" not in items[0]:
 }
 
 assert_transport_firewall() {
-  local node=$1 underlay=$2 local_cidr=$3 remote_cidr=$4
+  local node=$1 underlay=$2 local_csv=$3 remote_csv=$4
   local filter_forward ipv6_forward ipv6_chain ipv6_mangle ipv4_nat ipv6_nat
+  local local_cidr remote_cidr expected_direction_rules
+  local -a local_cidrs remote_cidrs
+  IFS=, read -r -a local_cidrs <<<"$local_csv"
+  IFS=, read -r -a remote_cidrs <<<"$remote_csv"
+  expected_direction_rules=$((${#local_cidrs[@]} * ${#remote_cidrs[@]} * 2))
   filter_forward=$(docker exec "$node" iptables -S FORWARD)
   grep -Fqx -- '-P FORWARD DROP' <<<"$filter_forward"
   [[ $(docker exec "$node" iptables -S FORWARD | grep -c '^-A ') == 1 ]]
   docker exec "$node" iptables -C FORWARD -j ENVELOPE-TRANSPORT-FORWARD
-  [[ $(docker exec "$node" iptables -S ENVELOPE-TRANSPORT-FORWARD | grep -c '^-A ') == 2 ]]
-  docker exec "$node" iptables -C ENVELOPE-TRANSPORT-FORWARD \
-    -i "$underlay" -o tailscale0 -s "$local_cidr" -d "$remote_cidr" -j ACCEPT
-  docker exec "$node" iptables -C ENVELOPE-TRANSPORT-FORWARD \
-    -i tailscale0 -o "$underlay" -s "$remote_cidr" -d "$local_cidr" -j ACCEPT
+  [[ $(docker exec "$node" iptables -S ENVELOPE-TRANSPORT-FORWARD | grep -c '^-A ') == "$expected_direction_rules" ]]
+  for local_cidr in "${local_cidrs[@]}"; do
+    for remote_cidr in "${remote_cidrs[@]}"; do
+      docker exec "$node" iptables -C ENVELOPE-TRANSPORT-FORWARD \
+        -i "$underlay" -o tailscale0 -s "$local_cidr" -d "$remote_cidr" -j ACCEPT
+      docker exec "$node" iptables -C ENVELOPE-TRANSPORT-FORWARD \
+        -i tailscale0 -o "$underlay" -s "$remote_cidr" -d "$local_cidr" -j ACCEPT
+    done
+  done
 
   [[ $(docker exec "$node" iptables -t mangle -S FORWARD | grep -c '^-A ') == 1 ]]
   docker exec "$node" iptables -t mangle -C FORWARD -j ENVELOPE-TRANSPORT-MSS
-  [[ $(docker exec "$node" iptables -t mangle -S ENVELOPE-TRANSPORT-MSS | grep -c '^-A ') == 3 ]]
-  docker exec "$node" iptables -t mangle -C ENVELOPE-TRANSPORT-MSS \
-    -i "$underlay" -o tailscale0 -s "$local_cidr" -d "$remote_cidr" \
-    -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240
-  docker exec "$node" iptables -t mangle -C ENVELOPE-TRANSPORT-MSS \
-    -i tailscale0 -o "$underlay" -s "$remote_cidr" -d "$local_cidr" \
-    -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240
+  [[ $(docker exec "$node" iptables -t mangle -S ENVELOPE-TRANSPORT-MSS | grep -c '^-A ') == $((expected_direction_rules + 1)) ]]
+  for local_cidr in "${local_cidrs[@]}"; do
+    for remote_cidr in "${remote_cidrs[@]}"; do
+      docker exec "$node" iptables -t mangle -C ENVELOPE-TRANSPORT-MSS \
+        -i "$underlay" -o tailscale0 -s "$local_cidr" -d "$remote_cidr" \
+        -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240
+      docker exec "$node" iptables -t mangle -C ENVELOPE-TRANSPORT-MSS \
+        -i tailscale0 -o "$underlay" -s "$remote_cidr" -d "$local_cidr" \
+        -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240
+    done
+  done
   docker exec "$node" iptables -t mangle -C ENVELOPE-TRANSPORT-MSS -j RETURN
 
   ipv6_forward=$(docker exec "$node" ip6tables -S FORWARD)
@@ -1621,20 +1494,26 @@ assert_transport_firewall() {
 }
 
 setup_transport_router() {
-  local node=$1 local_cidr=$2 remote_cidr=$3 underlay=$4 gwlbe_ip=$5
-  local contract contract_hash observed_hash state_contract local_probe remote_probe local_route remote_route
+  local node=$1 local_csv=$2 remote_csv=$3 underlay=$4 gwlbe_ip=$5
+  local contract contract_hash observed_hash state_contract local_json remote_json
+  local local_cidr remote_cidr local_probe remote_probe local_route local_route_all remote_route
   local ipv4_nat firewall_dump
-  local_probe=$(python3 -c 'import ipaddress,sys; print(ipaddress.ip_network(sys.argv[1]).network_address + 10)' "$local_cidr")
-  remote_probe=$(python3 -c 'import ipaddress,sys; print(ipaddress.ip_network(sys.argv[1]).network_address + 10)' "$remote_cidr")
+  local -a local_cidrs remote_cidrs
+  IFS=, read -r -a local_cidrs <<<"$local_csv"
+  IFS=, read -r -a remote_cidrs <<<"$remote_csv"
+  local_json=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1].split(","), separators=(",", ":")))' "$local_csv")
+  remote_json=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1].split(","), separators=(",", ":")))' "$remote_csv")
 
   # The local underlay route models the VPC route table. The exact production
   # service executable owns policy rules, sysctls, firewall, and MSS state.
-  docker exec "$node" ip route replace "$local_cidr" via "$gwlbe_ip" dev "$underlay"
+  for local_cidr in "${local_cidrs[@]}"; do
+    docker exec "$node" ip route replace "$local_cidr" via "$gwlbe_ip" dev "$underlay"
+  done
 
   contract="$work_dir/transport-contract-$node.sh"
   contract_hash=$(python3 "$work_dir/render-transport-contract.py" \
     example/terraform/cloud-init/transport-router.sh.tftpl "$contract" "$underlay" tailscale0 \
-    "$local_cidr" "$remote_cidr")
+    "$local_csv" "$remote_csv")
   docker cp "$contract" "$node:/run/envelope-transport-router-network" >/dev/null
   remove_docker_dns_nft_state "$node"
   docker exec "$node" /run/envelope-transport-router-network stage
@@ -1651,14 +1530,15 @@ setup_transport_router() {
     printf 'transport contract hash changed in %s\n' "$node" >&2
     exit 1
   fi
+  grep -Fq '"config_version":3' "$contract"
   docker exec "$node" jq -e \
-    --arg local "$local_cidr" --arg remote "$remote_cidr" \
+    --argjson local "$local_json" --argjson remote "$remote_json" \
     '.ready == true and .ipv4_forwarding == true and .ipv6_forwarding == false and
-     .no_nat == true and .tcp_mss == 1240 and .local_site_cidrs == [$local] and
-     .remote_site_cidrs == [$remote] and .local_policy_rules == [{
-       priority: 100, input: "tailscale0", source: "all", destination: $local,
+     .no_nat == true and .tcp_mss == 1240 and .local_site_cidrs == $local and
+     .remote_site_cidrs == $remote and .local_policy_rules == ($local | to_entries | map({
+       priority: (100 + .key), input: "all", source: "all", destination: .value,
        fwmark: 0, table: "main", action: "lookup"
-     }]' /var/lib/envelope/transport-router-network.state.json >/dev/null
+     }))' /var/lib/envelope/transport-router-network.state.json >/dev/null
   state_contract=$(docker exec "$node" jq -r .contract_sha256 /var/lib/envelope/transport-router-network.state.json)
   [[ -n "$state_contract" ]]
   [[ $(docker exec "$node" cat /var/lib/envelope/transport-router-firewall.owner) == "$state_contract" ]]
@@ -1666,16 +1546,25 @@ setup_transport_router() {
   docker exec "$node" test -f /var/lib/envelope/transport-router-network.ready
   printf '%s\t%s\n' "$node" "$contract_hash" >>"$work_dir/transport-contract-hashes.tsv"
 
-  remote_route=$(docker exec "$node" ip route get "$remote_probe")
-  if [[ "$remote_route" != *"dev tailscale0"* ]]; then
-    printf 'remote route on %s bypasses tailscale0: %s\n' "$node" "$remote_route" >&2
-    exit 1
-  fi
-  local_route=$(docker exec "$node" ip route get "$local_probe" from "$remote_probe" iif tailscale0)
-  if [[ "$local_route" != *"via $gwlbe_ip dev $underlay"* ]]; then
-    printf 'Tailnet-arriving local route on %s bypasses GWLBE: %s\n' "$node" "$local_route" >&2
-    exit 1
-  fi
+  for remote_cidr in "${remote_cidrs[@]}"; do
+    remote_probe=$(python3 -c 'import ipaddress,sys; print(ipaddress.ip_network(sys.argv[1]).network_address + 10)' "$remote_cidr")
+    remote_route=$(docker exec "$node" ip route get "$remote_probe")
+    if [[ "$remote_route" != *"dev tailscale0"* ]]; then
+      printf 'remote route on %s bypasses tailscale0: %s\n' "$node" "$remote_route" >&2
+      exit 1
+    fi
+  done
+  remote_probe=$(python3 -c 'import ipaddress,sys; print(ipaddress.ip_network(sys.argv[1]).network_address + 10)' "${remote_cidrs[0]}")
+  for local_cidr in "${local_cidrs[@]}"; do
+    local_probe=$(python3 -c 'import ipaddress,sys; print(ipaddress.ip_network(sys.argv[1]).network_address + 10)' "$local_cidr")
+    local_route_all=$(docker exec "$node" ip route get "$local_probe")
+    local_route=$(docker exec "$node" ip route get "$local_probe" from "$remote_probe" iif tailscale0)
+    if [[ "$local_route_all" != *"via $gwlbe_ip dev $underlay"* || "$local_route" != *"via $gwlbe_ip dev $underlay"* ]]; then
+      printf 'destination-only local route on %s bypasses GWLBE: ordinary=%s tailnet=%s\n' \
+        "$node" "$local_route_all" "$local_route" >&2
+      exit 1
+    fi
+  done
   ipv4_nat=$(docker exec "$node" iptables-save -t nat)
   if grep -Eq -- '-j (SNAT|MASQUERADE)( |$)' <<<"$ipv4_nat"; then
     printf 'transport-router %s contains NAT\n' "$node" >&2
@@ -1686,22 +1575,23 @@ setup_transport_router() {
     printf 'transport-router %s firewall references target-only envelope0\n' "$node" >&2
     exit 1
   fi
-  assert_transport_firewall "$node" "$underlay" "$local_cidr" "$remote_cidr"
+  assert_transport_firewall "$node" "$underlay" "$local_csv" "$remote_csv"
 }
 
-setup_transport_router "$transport_a1" '10.10.0.0/24' '10.20.0.0/24' "$a_transport_a1_if" "$a_gwlbe_transport_ip"
-setup_transport_router "$transport_a2" '10.10.0.0/24' '10.20.0.0/24' "$a_transport_a2_if" "$a_gwlbe_transport_ip"
-setup_transport_router "$transport_b1" '10.20.0.0/24' '10.10.0.0/24' "$b_transport_b1_if" "$b_gwlbe_transport_ip"
-setup_transport_router "$transport_b2" '10.20.0.0/24' '10.10.0.0/24' "$b_transport_b2_if" "$b_gwlbe_transport_ip"
+setup_transport_router "$transport_a1" "$site_a_cidrs" "$site_b_cidrs" "$a_transport_a1_if" "$a_gwlbe_transport_ip"
+setup_transport_router "$transport_a2" "$site_a_cidrs" "$site_b_cidrs" "$a_transport_a2_if" "$a_gwlbe_transport_ip"
+setup_transport_router "$transport_b1" "$site_b_cidrs" "$site_a_cidrs" "$b_transport_b1_if" "$b_gwlbe_transport_ip"
+setup_transport_router "$transport_b2" "$site_b_cidrs" "$site_a_cidrs" "$b_transport_b2_if" "$b_gwlbe_transport_ip"
 
 assert_local_policy_rule() {
-  local node=$1 prefix=$2
+  local node=$1 prefix=$2 priority=$3
   docker exec "$node" ip -j -details -4 rule show | python3 -c '
 import ipaddress
 import json
 import sys
 
 expected = ipaddress.ip_network(sys.argv[1])
+expected_priority = int(sys.argv[2])
 matches = []
 rules = json.load(sys.stdin)
 for rule in rules:
@@ -1720,12 +1610,12 @@ if len(matches) != 1:
     raise SystemExit(f"{expected} does not have one exact local inspection policy rule")
 rule = matches[0]
 if (
-    rule.get("priority") != 100
-    or rule.get("iif") != "tailscale0"
+    rule.get("priority") != expected_priority
+    or rule.get("iif") not in (None, "", "all")
     or str(rule.get("table")) not in {"254", "main"}
     or str(rule.get("action", "to_tbl")) not in {"to_tbl", "lookup"}
 ):
-    raise SystemExit(f"{expected} local policy rule bypasses the main underlay table")
+    raise SystemExit(f"{expected} is not a destination-only main-table policy rule")
 
 for candidate in rules:
     if candidate is rule:
@@ -1734,7 +1624,7 @@ for candidate in rules:
         priority = int(candidate.get("priority"))
     except (TypeError, ValueError):
         raise SystemExit("local policy state contains an invalid priority")
-    if priority <= 0 or priority > 100:
+    if priority <= 0 or priority > expected_priority:
         continue
     if candidate.get("iif") not in (None, "", "all", "tailscale0"):
         continue
@@ -1753,13 +1643,21 @@ for candidate in rules:
     action = str(candidate.get("action", "to_tbl"))
     if table not in {"254", "main"} or action not in {"to_tbl", "lookup"}:
         raise SystemExit(f"{expected} has an earlier interior policy bypass")
-' "$prefix"
+ ' "$prefix" "$priority"
 }
 for node in "$transport_a1" "$transport_a2"; do
-  assert_local_policy_rule "$node" '10.10.0.0/24'
+  priority=100
+  for prefix in ${site_a_cidrs//,/ }; do
+    assert_local_policy_rule "$node" "$prefix" "$priority"
+    ((priority += 1))
+  done
 done
 for node in "$transport_b1" "$transport_b2"; do
-  assert_local_policy_rule "$node" '10.20.0.0/24'
+  priority=100
+  for prefix in ${site_b_cidrs//,/ }; do
+    assert_local_policy_rule "$node" "$prefix" "$priority"
+    ((priority += 1))
+  done
 done
 
 assert_tailnet_route_domain() {
@@ -1778,42 +1676,150 @@ for route in json.load(sys.stdin):
     network = ipaddress.ip_network(destination, strict=False)
     if network.version == prefix.version:
         parsed.append((route, network))
-exact = [route for route, network in parsed if network == prefix]
-if (
-    len(exact) != 1
-    or exact[0].get("dev") != "tailscale0"
-    or exact[0].get("type", "unicast") != "unicast"
-    or exact[0].get("from") not in (None, "all")
-):
-    raise SystemExit(f"{prefix} does not have one exact accepted tailscale0 route")
-children = [
-    str(network)
+intersections = [
+    (route, network)
     for route, network in parsed
-    if network != prefix
-    and network.subnet_of(prefix)
-    and (
-        route.get("dev") != "tailscale0"
-        or route.get("type", "unicast") != "unicast"
-        or route.get("from") not in (None, "all")
-    )
+    if network.overlaps(prefix)
 ]
-if children:
-    raise SystemExit(f"{prefix} has a more-specific Tailnet route bypass: {sorted(children)}")
+if (
+    len(intersections) != 1
+    or intersections[0][1] != prefix
+    or intersections[0][0].get("dev") != "tailscale0"
+    or intersections[0][0].get("type", "unicast") != "unicast"
+    or intersections[0][0].get("from") not in (None, "all")
+):
+    raise SystemExit(f"{prefix} does not have one isolated exact accepted tailscale0 route")
 ' "$prefix"
 }
+
+primary_route_owner() {
+  local observer=$1 prefix=$2 expected_a=$3 expected_b=$4
+  docker exec "$observer" tailscale status --json | python3 -c '
+import json
+import sys
+
+prefix, expected_a, expected_b = sys.argv[1:]
+matches = [
+    peer.get("HostName")
+    for peer in json.load(sys.stdin).get("Peer", {}).values()
+    if prefix in peer.get("PrimaryRoutes", [])
+    and peer.get("Online") is True
+    and peer.get("HostName") in {expected_a, expected_b}
+]
+if len(matches) != 1:
+    raise SystemExit(f"{prefix} does not have one online configured native owner")
+print(matches[0])
+' "$prefix" "$expected_a" "$expected_b"
+}
+
+agreed_primary_owner() {
+  local observer_a=$1 observer_b=$2 prefix=$3 expected_a=$4 expected_b=$5 required=${6:-}
+  local owner_a owner_b previous='' stable=0
+  for _ in $(seq 1 240); do
+    owner_a=$(primary_route_owner "$observer_a" "$prefix" "$expected_a" "$expected_b" 2>/dev/null || true)
+    owner_b=$(primary_route_owner "$observer_b" "$prefix" "$expected_a" "$expected_b" 2>/dev/null || true)
+    if [[ -n "$owner_a" && "$owner_a" == "$owner_b" && ( -z "$required" || "$owner_a" == "$required" ) ]]; then
+      if [[ "$owner_a" == "$previous" ]]; then
+        ((stable += 1))
+      else
+        previous=$owner_a
+        stable=1
+      fi
+      if (( stable >= 6 )); then
+        printf '%s\n' "$owner_a"
+        return
+      fi
+    else
+      previous=''
+      stable=0
+    fi
+    sleep 0.5
+  done
+  printf 'observers %s and %s did not agree on native owner %s for %s\n' \
+    "$observer_a" "$observer_b" "${required:-from the configured pair}" "$prefix" >&2
+  return 1
+}
+
+assert_safe_local_table52_overlap() {
+  local node=$1 prefix=$2 underlay=$3 gwlbe_ip=$4 remote_source=$5
+  local probe ordinary_lookup tailnet_lookup
+  assert_tailnet_route_domain "$node" "$prefix"
+  probe=$(python3 -c 'import ipaddress,sys; network=ipaddress.ip_network(sys.argv[1]); print(network.network_address + network.num_addresses // 2)' "$prefix")
+  ordinary_lookup=$(docker exec "$node" ip route get "$probe")
+  tailnet_lookup=$(docker exec "$node" ip route get "$probe" from "$remote_source" iif tailscale0)
+  if [[ "$ordinary_lookup" != *"via $gwlbe_ip dev $underlay"* || "$tailnet_lookup" != *"via $gwlbe_ip dev $underlay"* ]]; then
+    printf 'local table-52 overlap on %s is not safely shadowed for %s: ordinary=%s tailnet=%s\n' \
+      "$node" "$prefix" "$ordinary_lookup" "$tailnet_lookup" >&2
+    exit 1
+  fi
+}
+
+baseline_a_owner=''
+baseline_b_owner=''
+for prefix in ${site_a_cidrs//,/ }; do
+  owner=$(agreed_primary_owner "$transport_b1" "$transport_b2" "$prefix" "$transport_a1" "$transport_a2")
+  if [[ "$prefix" == "$site_a_active_cidr" ]]; then
+    baseline_a_owner=$owner
+  fi
+  if [[ "$owner" == "$transport_a1" ]]; then
+    standby=$transport_a2
+    standby_underlay=$a_transport_a2_if
+  else
+    standby=$transport_a1
+    standby_underlay=$a_transport_a1_if
+  fi
+  assert_safe_local_table52_overlap "$standby" "$prefix" "$standby_underlay" "$a_gwlbe_transport_ip" '10.20.0.10'
+done
+for prefix in ${site_b_cidrs//,/ }; do
+  owner=$(agreed_primary_owner "$transport_a1" "$transport_a2" "$prefix" "$transport_b1" "$transport_b2")
+  if [[ "$prefix" == "$site_b_active_cidr" ]]; then
+    baseline_b_owner=$owner
+  fi
+  if [[ "$owner" == "$transport_b1" ]]; then
+    standby=$transport_b2
+    standby_underlay=$b_transport_b2_if
+  else
+    standby=$transport_b1
+    standby_underlay=$b_transport_b1_if
+  fi
+  assert_safe_local_table52_overlap "$standby" "$prefix" "$standby_underlay" "$b_gwlbe_transport_ip" '10.10.0.10'
+done
+[[ "$baseline_a_owner" == "$transport_a1" || "$baseline_a_owner" == "$transport_a2" ]]
+[[ "$baseline_b_owner" == "$transport_b1" || "$baseline_b_owner" == "$transport_b2" ]]
+if [[ "$baseline_a_owner" == "$transport_a1" ]]; then
+  a_selected_transport_ip=$a_transport_a1_ip
+else
+  a_selected_transport_ip=$a_transport_a2_ip
+fi
+if [[ "$baseline_b_owner" == "$transport_b1" ]]; then
+  b_selected_transport_ip=$b_transport_b1_ip
+else
+  b_selected_transport_ip=$b_transport_b2_ip
+fi
+for prefix in ${site_b_cidrs//,/ }; do
+  docker exec "$post_a" ip route replace "$prefix" via "$a_selected_transport_ip" dev "$a_post_transport_if"
+done
+for prefix in ${site_a_cidrs//,/ }; do
+  docker exec "$post_b" ip route replace "$prefix" via "$b_selected_transport_ip" dev "$b_post_transport_if"
+done
+
 for node in "$transport_a1" "$transport_a2"; do
-  assert_tailnet_route_domain "$node" '10.20.0.0/24'
+  for prefix in ${site_b_cidrs//,/ }; do
+    assert_tailnet_route_domain "$node" "$prefix"
+  done
 done
 for node in "$transport_b1" "$transport_b2"; do
-  assert_tailnet_route_domain "$node" '10.10.0.0/24'
+  for prefix in ${site_a_cidrs//,/ }; do
+    assert_tailnet_route_domain "$node" "$prefix"
+  done
 done
 
 for node in "$transport_a1" "$transport_a2" "$transport_b1" "$transport_b2"; do
   [[ $(docker exec "$node" sysctl -n net.ipv4.ip_forward) == 1 ]]
   [[ $(docker exec "$node" sysctl -n net.ipv4.conf.all.rp_filter) == 0 ]]
   [[ $(docker exec "$node" sysctl -n net.ipv4.conf.tailscale0.rp_filter) == 0 ]]
-  [[ $(docker exec "$node" iptables -S ENVELOPE-TRANSPORT-FORWARD | grep -c '^-A ') == 2 ]]
-  [[ $(docker exec "$node" iptables -t mangle -S ENVELOPE-TRANSPORT-MSS | grep -c -- '--set-mss 1240') == 2 ]]
+  [[ $(docker exec "$node" iptables -S ENVELOPE-TRANSPORT-FORWARD | grep -c '^-A ') == 8 ]]
+  [[ $(docker exec "$node" iptables -t mangle -S ENVELOPE-TRANSPORT-MSS | grep -c -- '--set-mss 1240') == 8 ]]
 done
 
 wait_target_healthy() {
@@ -1924,9 +1930,13 @@ if children:
 assert_exact_route "$workload_a" '10.20.0.0/24' "$a_gwlbe_workload_ip" "$a_workload_pre_if"
 assert_exact_route "$workload_b" '10.10.0.0/24' "$b_gwlbe_workload_ip" "$b_workload_pre_if"
 assert_exact_route "$post_a" '10.10.0.0/24' "$a_workload_post_ip" "$a_post_workload_if"
-assert_exact_route "$post_a" '10.20.0.0/24' "$a_transport_a1_ip" "$a_post_transport_if"
 assert_exact_route "$post_b" '10.20.0.0/24' "$b_workload_post_ip" "$b_post_workload_if"
-assert_exact_route "$post_b" '10.10.0.0/24' "$b_transport_b1_ip" "$b_post_transport_if"
+for prefix in ${site_b_cidrs//,/ }; do
+  assert_exact_route "$post_a" "$prefix" "$a_selected_transport_ip" "$a_post_transport_if"
+done
+for prefix in ${site_a_cidrs//,/ }; do
+  assert_exact_route "$post_b" "$prefix" "$b_selected_transport_ip" "$b_post_transport_if"
+done
 assert_exact_route "$transport_a1" '10.10.0.0/24' "$a_gwlbe_transport_ip" "$a_transport_a1_if"
 assert_exact_route "$transport_a2" '10.10.0.0/24' "$a_gwlbe_transport_ip" "$a_transport_a2_if"
 assert_exact_route "$transport_b1" '10.20.0.0/24' "$b_gwlbe_transport_ip" "$b_transport_b1_if"
@@ -2156,10 +2166,10 @@ b_mss_in=$((
 ))
 (( a_mss_out > 0 && b_mss_out > 0 && a_mss_in > 0 && b_mss_in > 0 ))
 
-assert_transport_firewall "$transport_a1" "$a_transport_a1_if" '10.10.0.0/24' '10.20.0.0/24'
-assert_transport_firewall "$transport_a2" "$a_transport_a2_if" '10.10.0.0/24' '10.20.0.0/24'
-assert_transport_firewall "$transport_b1" "$b_transport_b1_if" '10.20.0.0/24' '10.10.0.0/24'
-assert_transport_firewall "$transport_b2" "$b_transport_b2_if" '10.20.0.0/24' '10.10.0.0/24'
+assert_transport_firewall "$transport_a1" "$a_transport_a1_if" "$site_a_cidrs" "$site_b_cidrs"
+assert_transport_firewall "$transport_a2" "$a_transport_a2_if" "$site_a_cidrs" "$site_b_cidrs"
+assert_transport_firewall "$transport_b1" "$b_transport_b1_if" "$site_b_cidrs" "$site_a_cidrs"
+assert_transport_firewall "$transport_b2" "$b_transport_b2_if" "$site_b_cidrs" "$site_a_cidrs"
 
 events_verified=false
 for _ in $(seq 1 50); do
@@ -2253,5 +2263,134 @@ run_blocked_pair() {
 run_blocked_pair "$target_a" target-a "$gwlbe_a" 23001 23002
 run_blocked_pair "$target_b" target-b "$gwlbe_b" 23003 23004
 
+run_fresh_recovery_pair() {
+  local expected_destination_router=$1 cutoff_ns start_at
+  for workload in "$workload_a" "$workload_b"; do
+    docker exec "$workload" rm -f \
+      /tmp/ready-tcp-25002 /tmp/ready-udp-25003 \
+      /tmp/result-tcp-server-25002 /tmp/result-tcp-client-25002 \
+      /tmp/result-udp-server-25003 /tmp/result-udp-client-25003
+  done
+  docker exec -d "$workload_b" python3 /run/envelope-test/probe.py \
+    tcp server 10.20.0.10 10.10.0.10 25002 recovered-a-to-b-tcp 0
+  docker exec -d "$workload_b" python3 /run/envelope-test/probe.py \
+    udp server 10.20.0.10 10.10.0.10 25003 recovered-a-to-b-udp 0
+  wait_file "$workload_b" /tmp/ready-tcp-25002
+  wait_file "$workload_b" /tmp/ready-udp-25003
+
+  cutoff_ns=$(python3 -c 'import time; print(time.time_ns())')
+  start_at=$(python3 -c 'import time; print(time.time() + 1)')
+  docker exec -d "$workload_a" python3 /run/envelope-test/probe.py \
+    tcp client 10.10.0.10 10.20.0.10 25002 recovered-a-to-b-tcp "$start_at"
+  docker exec -d "$workload_a" python3 /run/envelope-test/probe.py \
+    udp client 10.10.0.10 10.20.0.10 25003 recovered-a-to-b-udp "$start_at"
+
+  for spec in \
+    "$workload_b:/tmp/result-tcp-server-25002:10.10.0.10" \
+    "$workload_a:/tmp/result-tcp-client-25002:10.20.0.10" \
+    "$workload_b:/tmp/result-udp-server-25003:10.10.0.10" \
+    "$workload_a:/tmp/result-udp-client-25003:10.20.0.10"; do
+    container=${spec%%:*}
+    remainder=${spec#*:}
+    path=${remainder%%:*}
+    expected=${remainder##*:}
+    wait_file "$container" "$path"
+    [[ $(docker exec "$container" cat "$path") == "$expected" ]]
+  done
+
+  sleep 0.5
+  docker cp "$gwlbe_a:/tmp/gwlb-events.jsonl" "$work_dir/recovery-events-a.jsonl" >/dev/null
+  docker cp "$gwlbe_b:/tmp/gwlb-events.jsonl" "$work_dir/recovery-events-b.jsonl" >/dev/null
+  python3 - "$work_dir/recovery-events-a.jsonl" "$work_dir/recovery-events-b.jsonl" \
+    "$cutoff_ns" "$expected_destination_router" <<'PY'
+import json
+import pathlib
+import sys
+
+source_path, destination_path, raw_cutoff, expected_router = sys.argv[1:]
+cutoff = int(raw_cutoff)
+
+
+def returned(path):
+    return [
+        event
+        for line in pathlib.Path(path).read_text(encoding="utf-8").splitlines()
+        if line
+        for event in [json.loads(line)]
+        if event.get("phase") == "return" and event.get("timestamp_ns", 0) >= cutoff
+    ]
+
+
+source_events = returned(source_path)
+destination_events = returned(destination_path)
+for protocol in (6, 17):
+    source_matches = [
+        event
+        for event in source_events
+        if event.get("source") == "10.10.0.10"
+        and event.get("destination") == "10.20.0.10"
+        and event.get("role") == "workload"
+        and event.get("protocol") == protocol
+    ]
+    destination_matches = [
+        event
+        for event in destination_events
+        if event.get("source") == "10.10.0.10"
+        and event.get("destination") == "10.20.0.10"
+        and event.get("role") == "transport-router"
+        and event.get("protocol") == protocol
+    ]
+    if not source_matches or not destination_matches:
+        raise SystemExit(f"fresh protocol {protocol} did not traverse both inspection paths")
+    source_correlations = {
+        event.get("packet_correlation_sha256") for event in source_matches
+    }
+    correlated_destination = [
+        event
+        for event in destination_matches
+        if event.get("packet_correlation_sha256") in source_correlations
+    ]
+    if not correlated_destination:
+        raise SystemExit(f"fresh protocol {protocol} was not correlated across both sites")
+    if any(
+        event.get("observed_transport_router_id") != expected_router
+        for event in correlated_destination
+    ):
+        raise SystemExit(f"fresh protocol {protocol} did not use the converged native owner")
+PY
+}
+
+# Fail the currently observed owner, require both independent opposite-site
+# observers to converge on the survivor, then align the fake GWLBE route just
+# as the production controller would before testing entirely new sockets.
+agreed_primary_owner "$transport_a1" "$transport_a2" "$site_b_active_cidr" \
+  "$transport_b1" "$transport_b2" "$baseline_b_owner" >/dev/null
+if [[ "$baseline_b_owner" == "$transport_b1" ]]; then
+  failed_b_router=$transport_b1
+  surviving_b_router=$transport_b2
+  surviving_b_router_ip=$b_transport_b2_ip
+  surviving_b_underlay=$b_transport_b2_if
+else
+  failed_b_router=$transport_b2
+  surviving_b_router=$transport_b1
+  surviving_b_router_ip=$b_transport_b1_ip
+  surviving_b_underlay=$b_transport_b1_if
+fi
+docker stop -t 1 "$failed_b_router" >/dev/null
+for prefix in ${site_b_cidrs//,/ }; do
+  for observer in "$transport_a1" "$transport_a2"; do
+    wait_remote_route "$observer" "$prefix" "$transport_b1" "$transport_b2"
+  done
+  agreed_primary_owner "$transport_a1" "$transport_a2" "$prefix" \
+    "$transport_b1" "$transport_b2" "$surviving_b_router" >/dev/null
+done
+verify_transport_router_control_plane "$surviving_b_router" "$site_b_cidrs"
+assert_transport_firewall "$surviving_b_router" "$surviving_b_underlay" "$site_b_cidrs" "$site_a_cidrs"
+for prefix in ${site_a_cidrs//,/ }; do
+  docker exec "$post_b" ip route replace "$prefix" via "$surviving_b_router_ip" dev "$b_post_transport_if"
+  assert_exact_route "$post_b" "$prefix" "$surviving_b_router_ip" "$b_post_transport_if"
+done
+run_fresh_recovery_pair "$surviving_b_router"
+
 [[ $(wc -l <"$work_dir/transport-contract-hashes.tsv") -eq 4 ]]
-printf '%s\n' 'headscale separated-role six-flow/fragment integration ok; production host-network script executed'
+printf '%s\n' 'headscale production-v3 native-HA integration ok; source-preserving fresh TCP/UDP recovered after owner loss'

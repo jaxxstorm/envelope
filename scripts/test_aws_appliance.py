@@ -425,6 +425,8 @@ def symmetric_deployment_document(config: appliance.RunConfig) -> dict:
         "route_failover": {
             "value": fixture_route_failover_output(config, topology)
         },
+        "production_controller_topology_seed": {"value": None},
+        "router_attestor_enrollment_seed": {"value": None},
         "symmetric_topology": {"value": topology},
         "transport_router_readiness_expectations": {
             "value": fixture_transport_router_readiness_expectations(config)
@@ -444,6 +446,8 @@ def split_plan_unknowns(
 ) -> tuple[object, object, bool]:
     if () in unknown_paths:
         return _PLAN_VALUE_MISSING, True, True
+    if not unknown_paths:
+        return copy.deepcopy(value), False, False
     if isinstance(value, dict):
         after = {}
         unknown = {}
@@ -583,6 +587,46 @@ def symmetric_output_references() -> dict[str, list[str]]:
             "aws_route_table.gwlbe_east",
             "local.sites.east.remote_site_cidrs",
             "aws_instance.transport_router_east",
+        ],
+        "production_controller_topology_seed": [
+            "var.symmetric_topology.version",
+            "var.name",
+            "aws_vpc.west.id",
+            "var.west_region",
+            "local.sites.west.local_site_cidrs",
+            "local.transport_router_contracts.west.policy_rule_priority_base",
+            "aws_vpc.east.id",
+            "var.east_region",
+            "local.sites.east.local_site_cidrs",
+            "local.transport_router_contracts.east.policy_rule_priority_base",
+            "aws_instance.transport_router_west",
+            "aws_subnet.transport_west",
+            "local.sites.west.azs",
+            "aws_instance.transport_router_east",
+            "aws_subnet.transport_east",
+            "local.sites.east.azs",
+            "aws_route_table.gwlbe_west",
+            "local.sites.west.workload_subnet_cidrs",
+            "aws_subnet.gwlbe_west",
+            "aws_route_table_association.gwlbe_west",
+            "local.sites.west.remote_site_cidrs",
+            "local.route_failover.initial_transport_router_az_by_gwlbe_az",
+            "aws_route_table.gwlbe_east",
+            "local.sites.east.workload_subnet_cidrs",
+            "aws_subnet.gwlbe_east",
+            "aws_route_table_association.gwlbe_east",
+            "local.sites.east.remote_site_cidrs",
+        ],
+        "router_attestor_enrollment_seed": [
+            "var.symmetric_topology.version", "var.envelope_underlay_interface",
+            "var.e2e_load_profile.maximum_tcp_mss", "local.sites",
+            "aws_instance.transport_router_west", "aws_instance.transport_router_east",
+            "aws_iam_role.transport_west.name", "aws_iam_role.transport_east.name",
+            "aws_security_group.transport_west.id", "aws_security_group.transport_east.id",
+            "aws_route_table.transport_west", "aws_route_table.transport_east",
+            "aws_route_table_association.transport_west", "aws_route_table_association.transport_east",
+            "aws_subnet.workload_west", "aws_subnet.workload_east",
+            "aws_vpc_endpoint.west", "aws_vpc_endpoint.east",
         ],
         "cost_profile": [
             "var.estimated_fixed_hourly_usd",
@@ -1944,7 +1988,15 @@ class ConfigAndPathTest(unittest.TestCase):
                 flags=re.MULTILINE,
             )
         }
-        self.assertEqual(appliance.symmetric_managed_resource_addresses(), actual)
+        # Native controller enrollment is deliberately not authorized by the
+        # legacy runner's saved-plan boundary. Its separate Terraform/Go path
+        # validates these opt-in resources; do not broaden legacy credentials.
+        native_only = {
+            "terraform_data.attestor_bootstrap_contract",
+            "aws_iam_role_policy.attestor_binary",
+        }
+        self.assertTrue(native_only.issubset(actual))
+        self.assertEqual(appliance.symmetric_managed_resource_addresses(), actual - native_only)
 
     def test_complete_output_fixture_matches_every_terraform_output_block(self):
         actual = {

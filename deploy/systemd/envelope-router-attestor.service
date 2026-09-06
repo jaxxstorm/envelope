@@ -1,0 +1,44 @@
+[Unit]
+Description=Envelope read-only router attestation
+After=network-online.target tailscaled.service envelope-transport-router-network.service
+Requires=tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/envelope-router-attestor --listen=0.0.0.0:9443
+Restart=on-failure
+RestartSec=5s
+RuntimeMaxSec=12h
+TimeoutStopSec=10s
+MemoryMax=256M
+TasksMax=64
+LimitNOFILE=256
+UMask=0077
+NoNewPrivileges=yes
+# Linux legacy GET_INFO/GET_ENTRIES and nftables dumps require NET_ADMIN.
+# The binary exposes no setters; compromise would still expose this host privilege.
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @reboot @swap @module @raw-io @privileged
+# Exact private ingress is enforced by the router security group. AWS Describe
+# APIs require HTTPS egress; IMDS uses the fixed link-local endpoint.
+
+[Install]
+WantedBy=multi-user.target

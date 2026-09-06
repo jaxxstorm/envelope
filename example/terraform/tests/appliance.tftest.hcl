@@ -1,3 +1,34 @@
+run "production_attestor_bootstrap_is_immutable_and_reference_only" {
+  command = plan
+  variables {
+    router_attestor_bootstrap = {
+      authority_region = "us-west-2"
+      artifact         = { region = "us-west-2", bucket = "reviewed-attestor-artifacts", key = "attestor/envelope-router-attestor-linux-amd64", version_id = "reviewed-version", sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+      artifact_manifest_json = jsonencode({
+        schema    = 1, component = "envelope-controller", source_dirty = false, version = "test.1", revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        artifacts = [{ component = "envelope-router-attestor", architecture = "amd64", goarch = "amd64", goos = "linux", file = "envelope-router-attestor-linux-amd64", sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", version = "test.1", vcs_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", vcs_modified = false, go_version = "go1.26.2" }]
+      })
+      routers = { for id in ["east-a", "east-b", "west-a", "west-b"] : id => {
+        ed25519_public_key          = sha256(id)
+        configuration_parameter_arn = "arn:aws:ssm:us-west-2:123456789012:parameter/envelope/test/${id}/enrollment-one"
+        seed_parameter_arn          = "arn:aws:ssm:us-west-2:123456789012:parameter/envelope/test/${id}/seed-one"
+        seed_version                = 1
+      } }
+    }
+  }
+  assert {
+    condition = (
+      length(local.attestor_bootstrap_scripts) == 4 &&
+      strcontains(local.attestor_bootstrap_scripts["west-a"], "--version-id") &&
+      strcontains(local.attestor_bootstrap_scripts["west-a"], "-m 0555") &&
+      strcontains(local.attestor_bootstrap_scripts["west-a"], "ExecStart=/usr/local/bin/envelope-router-attestor enroll") &&
+      jsondecode(aws_iam_role_policy.attestor_binary["west"].policy).Statement[0].Condition.StringEquals["s3:VersionId"] == "reviewed-version" &&
+      jsondecode(aws_iam_role_policy.attestor_binary["west"].policy).Statement[0].Action == ["s3:GetObjectVersion"]
+    )
+    error_message = "Every production router must install an immutable binary and reference-only native boot enrollment, with no broad S3 grant."
+  }
+}
+
 mock_provider "aws" {
   mock_data "aws_caller_identity" {
     defaults = { account_id = "123456789012" }
@@ -95,7 +126,7 @@ variables {
     maximum_p99_latency_ms         = 250.0
   }
   symmetric_topology = {
-    version = 2
+    version = 3
     route_failover = {
       initial_transport_router_az_by_gwlbe_az = {
         west = { a = "a", b = "b" }
@@ -156,7 +187,7 @@ run "symmetric_two_az_paths" {
     error_message = "each site must have one workload per AZ with explicit initiator and responder roles."
   }
   assert {
-    condition     = output.workload_instances.west.initiator.cidr == local.workload_roles.west.initiator.cidr && output.workload_instances.east.responder.cidr == local.workload_roles.east.responder.cidr && output.artifact_identity.sha256 == var.artifact_sha256 && output.e2e_load_profile == var.e2e_load_profile && output.route_failover.mutation_timeout_seconds == 120 && output.route_failover.restoration_timeout_seconds == 120 && output.route_failover.recovery_timeout_seconds == 300
+    condition     = output.workload_instances.west.initiator.cidr == local.workload_roles.west.initiator.cidr && output.workload_instances.east.responder.cidr == local.workload_roles.east.responder.cidr && output.artifact_identity.sha256 == var.artifact_sha256 && output.e2e_load_profile == var.e2e_load_profile && output.route_failover.config_version == 3 && output.route_failover.mutation_timeout_seconds == 120 && output.route_failover.restoration_timeout_seconds == 120 && output.route_failover.recovery_timeout_seconds == 300 && output.route_failover.target_ownership == "envelope-controller"
     error_message = "protected lifecycle workload, artifact, load-profile, and route-failover outputs must be emitted."
   }
   assert {
@@ -295,21 +326,43 @@ run "symmetric_two_az_paths" {
       for site in ["west", "east"] :
       alltrue([
         for router in output.symmetric_topology.sites[site].transport_router_fleet :
-        toset(keys(router)) == toset(["region", "az_key", "instance_id", "network_interface_id", "gwlbe_route_table_id", "advertised_prefix"]) &&
-        router.advertised_prefix == local.sites[site].workload_subnet_cidrs[router.az_key]
+        toset(keys(router)) == toset(["region", "az_key", "instance_id", "network_interface_id", "gwlbe_route_table_id", "advertised_prefixes"]) &&
+        toset(router.advertised_prefixes) == toset(local.sites[site].local_site_cidrs)
       ]) &&
-      toset([for router in output.symmetric_topology.sites[site].transport_router_fleet : router.advertised_prefix]) == toset(local.sites[site].local_site_cidrs) &&
+      output.symmetric_topology.transport_router_profile == "production-native-ha-v3" &&
+      alltrue([for routes in values(local.initial_transport_router_advertise_routes[site]) : toset(routes) == toset(local.sites[site].local_site_cidrs)]) &&
       alltrue([
         for gwlbe_az, route in output.route_failover.sites[site] :
         route.source_workload_prefix == local.sites[site].workload_subnet_cidrs[gwlbe_az] &&
-        route.source_workload_prefix == one([
+        contains(one([
           for router in output.symmetric_topology.sites[site].transport_router_fleet :
-          router.advertised_prefix
+          router.advertised_prefixes
           if router.az_key == route.initial_transport_router_az_key
+        ]), route.source_workload_prefix) &&
+        toset(route.eligible_network_interface_ids) == toset([
+          for router in output.symmetric_topology.sites[site].transport_router_fleet : router.network_interface_id
         ])
       ])
     ])
-    error_message = "the protected topology output must expose a disjoint source-prefix owner for every transit ENI and GWLBE route table."
+    error_message = "the production topology must expose every router as a complete exact-prefix candidate and every route domain's eligible ENI set."
+  }
+  assert {
+    condition = (
+      output.production_controller_topology_seed.config_version == 3 &&
+      output.production_controller_topology_seed.deployment_id == var.name &&
+      toset(keys(output.production_controller_topology_seed.sites)) == toset(["west", "east"]) &&
+      length(output.production_controller_topology_seed.routers) == 4 &&
+      length(output.production_controller_topology_seed.domains) == 4 &&
+      alltrue([
+        for domain in output.production_controller_topology_seed.domains :
+        domain.route_table_id != "" &&
+        domain.gwlbe_subnet_id != "" &&
+        domain.route_table_association_id != "" &&
+        domain.source_prefix != "" &&
+        length(domain.remote_prefixes) == 2
+      ])
+    )
+    error_message = "version 3 must emit complete route-table, GWLBE subnet, explicit association, source, and destination identities for controller topology generation."
   }
   assert {
     condition     = toset(flatten([for rule in aws_security_group.transport_west.ingress : rule.cidr_blocks])) == toset(var.symmetric_topology.sites.west.local_site_cidrs) && toset(flatten([for rule in aws_security_group.transport_east.ingress : rule.cidr_blocks])) == toset(var.symmetric_topology.sites.east.local_site_cidrs)
@@ -335,9 +388,13 @@ run "symmetric_two_az_paths" {
       !strcontains(local.transport_router_bootstrap.west, "ip6tables --wait 10 -P FORWARD ACCEPT") &&
       strcontains(local.transport_router_bootstrap.west, "/usr/sbin/sysctl -q -w net.ipv4.ip_forward=0") &&
       strcontains(local.transport_router_bootstrap.west, "net.ipv4.ip_forward = 0") &&
-      strcontains(local.transport_router_bootstrap.west, "iif \"$tailscale\"") &&
+      !strcontains(local.transport_router_bootstrap.west, "rule add priority \"$priority\" iif \"$tailscale\"") &&
       strcontains(local.transport_router_bootstrap.west, "to \"${local.sites.west.local_site_cidrs[0]}\" lookup main") == false &&
       strcontains(local.transport_router_bootstrap.west, "to \"$${local_site_cidrs[$index]}\" lookup main") &&
+      strcontains(local.transport_router_bootstrap.west, "assert_shadowed_local_tailnet_route \"$prefix\"") &&
+      strcontains(local.transport_router_bootstrap.west, "assert_local_main_lookups \"$prefix\"") &&
+      strcontains(local.transport_router_bootstrap.west, "network.num_addresses // 2") &&
+      !strcontains(local.transport_router_bootstrap.west, "/usr/local/sbin/envelope-transport-advertisements") &&
       strcontains(local.transport_router_bootstrap.west, "-s \"$local_cidr\" -d \"$remote_cidr\" -j ACCEPT") &&
       strcontains(local.transport_router_bootstrap.west, "-s \"$remote_cidr\" -d \"$local_cidr\" -j ACCEPT") &&
       strcontains(local.transport_router_bootstrap.west, "-j TCPMSS --set-mss \"$ipv4_mss\"") &&
@@ -368,6 +425,8 @@ run "symmetric_two_az_paths" {
   assert {
     condition = (
       output.transport_router_readiness_expectations.sites.west.local_site_cidrs == sort(local.sites.west.local_site_cidrs) &&
+      output.transport_router_readiness_expectations.config_version == 3 &&
+      output.transport_router_readiness_expectations.sites.west.config_version == 3 &&
       output.transport_router_readiness_expectations.sites.west.remote_site_cidrs == sort(local.sites.west.remote_site_cidrs) &&
       output.transport_router_readiness_expectations.sites.west.approved_maximum_tcp_mss == var.e2e_load_profile.maximum_tcp_mss &&
       output.transport_router_readiness_expectations.sites.west.filter_forward_policy == "DROP" &&
@@ -381,7 +440,7 @@ run "symmetric_two_az_paths" {
       length(output.transport_router_readiness_expectations.sites.west.local_policy_rules) == length(local.sites.west.local_site_cidrs) &&
       alltrue([
         for index, rule in output.transport_router_readiness_expectations.sites.west.local_policy_rules :
-        rule.priority == 100 + index && rule.input == var.envelope_tailscale_iface && rule.source == "all" && rule.destination == sort(local.sites.west.local_site_cidrs)[index] && rule.fwmark == 0 && rule.table == "main" && rule.action == "lookup"
+        rule.priority == 100 + index && rule.input == "all" && rule.source == "all" && rule.destination == sort(local.sites.west.local_site_cidrs)[index] && rule.fwmark == 0 && rule.table == "main" && rule.action == "lookup"
       ]) &&
       length(output.transport_router_readiness_expectations.sites.west.ipv4_policy_rules) == 7 + length(local.sites.west.local_site_cidrs) &&
       length(distinct([for rule in output.transport_router_readiness_expectations.sites.west.ipv4_policy_rules : rule.priority])) == length(output.transport_router_readiness_expectations.sites.west.ipv4_policy_rules) &&
@@ -453,9 +512,51 @@ run "symmetric_two_az_paths" {
     error_message = "target diagnostics must allowlist every exact current Go metric and no obsolete datapath metric."
   }
   assert {
-    condition     = output.cost_profile.profile == "symmetric-gwlb-ha-v2" && output.cost_profile.estimated_fixed_hourly_usd <= output.cost_profile.approved_max_hourly_usd && output.cost_profile.resource_counts.gwlbe_endpoints == 4 && output.cost_profile.resource_counts.target_instances == { west = 2, east = 2 } && output.cost_profile.resource_counts.transport_routers == { west = 2, east = 2 } && output.cost_profile.resource_counts.workload_instances == 4 && output.cost_profile.resource_counts.nat_gateways == 2 && output.cost_profile.resource_counts.gateway_load_balancers == 2 && output.cost_profile.resource_counts.flow_log_iam_roles == 1 && output.cost_profile.resource_counts.iam_roles.workload == 2 && output.cost_profile.nat_topology_limit.gateways_per_site == 1 && output.cost_profile.nat_topology_limit.expanded_for_ha == false
+    condition     = output.cost_profile.profile == "production-native-ha-v3" && output.cost_profile.estimated_fixed_hourly_usd <= output.cost_profile.approved_max_hourly_usd && output.cost_profile.resource_counts.gwlbe_endpoints == 4 && output.cost_profile.resource_counts.target_instances == { west = 2, east = 2 } && output.cost_profile.resource_counts.transport_routers == { west = 2, east = 2 } && output.cost_profile.resource_counts.workload_instances == 4 && output.cost_profile.resource_counts.nat_gateways == 2 && output.cost_profile.resource_counts.gateway_load_balancers == 2 && output.cost_profile.resource_counts.flow_log_iam_roles == 1 && output.cost_profile.resource_counts.iam_roles.workload == 2 && output.cost_profile.nat_topology_limit.gateways_per_site == 1 && output.cost_profile.nat_topology_limit.expanded_for_ha == false
     error_message = "the reviewed HA, separate workload profile, and unchanged one-NAT-per-site topology must remain inside the approved fixed-cost ceiling."
   }
+}
+
+run "legacy_singleton_acceptance_profile_is_explicit" {
+  command = plan
+
+  variables {
+    symmetric_topology = merge(var.symmetric_topology, { version = 2 })
+  }
+
+  assert {
+    condition = (
+      output.symmetric_topology.config_version == 2 &&
+      !can(output.symmetric_topology.transport_router_profile) &&
+      alltrue([
+        for site, assignments in local.initial_transport_router_advertise_routes :
+        alltrue([for routes in values(assignments) : length(routes) == 1]) &&
+        toset(flatten(values(assignments))) == toset(local.sites[site].local_site_cidrs)
+      ]) &&
+      alltrue(flatten([
+        for site in ["west", "east"] : [
+          for router in output.symmetric_topology.sites[site].transport_router_fleet :
+          can(router.advertised_prefix) && !can(router.advertised_prefixes)
+        ]
+      ])) &&
+      strcontains(local.transport_router_bootstrap.west, "rule add priority \"$priority\" iif \"$tailscale\"") &&
+      strcontains(local.transport_router_bootstrap.west, "/usr/local/sbin/envelope-transport-advertisements") &&
+      output.cost_profile.profile == "legacy-symmetric-acceptance-v2" &&
+      !can(output.route_failover.target_ownership) &&
+      output.production_controller_topology_seed == null
+    )
+    error_message = "version 2 must remain an explicitly isolated singleton advertisement-mutation acceptance profile."
+  }
+}
+
+run "reject_unsupported_topology_version" {
+  command = plan
+
+  variables {
+    symmetric_topology = merge(var.symmetric_topology, { version = 4 })
+  }
+
+  expect_failures = [var.symmetric_topology]
 }
 
 run "reject_incomplete_target_fleet" {
@@ -693,7 +794,7 @@ run "reject_route_failover_compatibility_alias" {
   expect_failures = [var.symmetric_topology]
 }
 
-run "distinct_transport_enis_and_same_az_initial_routes" {
+run "distinct_transport_enis_and_controller_route_boundary" {
   command = apply
 
   override_resource {
@@ -728,7 +829,6 @@ run "distinct_transport_enis_and_same_az_initial_routes" {
     target = aws_instance.transport_router_east["b"]
     values = { primary_network_interface_id = "eni-3123456789abcdef0" }
   }
-
   assert {
     condition     = length(toset([for router in values(aws_instance.transport_router_west) : router.primary_network_interface_id])) == 2 && length(toset([for router in values(aws_instance.transport_router_east) : router.primary_network_interface_id])) == 2
     error_message = "each site's transport routers must expose distinct eligible ENIs."
@@ -737,10 +837,12 @@ run "distinct_transport_enis_and_same_az_initial_routes" {
     condition = (
       alltrue([for key, route in aws_route.gwlbe_to_remote_west : route.network_interface_id == aws_instance.transport_router_west[local.route_failover.initial_transport_router_az_by_gwlbe_az.west[split(":", key)[0]]].primary_network_interface_id]) &&
       alltrue([for key, route in aws_route.gwlbe_to_remote_east : route.network_interface_id == aws_instance.transport_router_east[local.route_failover.initial_transport_router_az_by_gwlbe_az.east[split(":", key)[0]]].primary_network_interface_id]) &&
+      alltrue([for domain in values(output.route_failover.sites.west) : toset(domain.eligible_network_interface_ids) == toset([for router in values(aws_instance.transport_router_west) : router.primary_network_interface_id])]) &&
+      alltrue([for domain in values(output.route_failover.sites.east) : toset(domain.eligible_network_interface_ids) == toset([for router in values(aws_instance.transport_router_east) : router.primary_network_interface_id])]) &&
       output.route_failover.same_az_preferred.west == true &&
       output.route_failover.same_az_preferred.east == true
     )
-    error_message = "every GWLBE remote route must resolve its explicit same-AZ initial transport ENI."
+    error_message = "GWLBE routes must expose a preferred baseline and each complete controller-eligible ENI set."
   }
   assert {
     condition = (
@@ -776,4 +878,63 @@ run "reject_duplicate_transport_enis" {
   }
 
   expect_failures = [aws_route.gwlbe_to_remote_west]
+}
+
+run "seed_controller_owned_route_target" {
+  command = apply
+
+  module {
+    source = "./tests/fixtures/controller-owned-route"
+  }
+
+  variables {
+    configured_target = "eni-controller-selected"
+    eligible_targets = [
+      "eni-controller-selected",
+      "eni-terraform-configured",
+    ]
+  }
+
+  assert {
+    condition     = terraform_data.route.output.network_interface_id == "eni-controller-selected"
+    error_message = "The stateful ownership test must seed the controller-selected target."
+  }
+}
+
+run "plan_preserves_controller_owned_route_target" {
+  command = plan
+
+  module {
+    source = "./tests/fixtures/controller-owned-route"
+  }
+
+  variables {
+    configured_target = "eni-terraform-configured"
+    eligible_targets = [
+      "eni-controller-selected",
+      "eni-terraform-configured",
+    ]
+  }
+
+  assert {
+    condition     = terraform_data.route.output.network_interface_id == "eni-controller-selected"
+    error_message = "A Terraform plan must not overwrite the controller-selected target."
+  }
+}
+
+run "plan_rejects_ineligible_controller_owned_route_target" {
+  command = plan
+
+  module {
+    source = "./tests/fixtures/controller-owned-route"
+  }
+
+  variables {
+    configured_target = "eni-terraform-configured"
+    eligible_targets  = ["eni-terraform-configured"]
+  }
+
+  expect_failures = [
+    terraform_data.route,
+  ]
 }

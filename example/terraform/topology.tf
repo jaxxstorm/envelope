@@ -13,13 +13,19 @@ resource "terraform_data" "input_validation" {
       error_message = "Local and remote site CIDRs must be duplicate-free, exactly cover local workloads, and equal the peer contract."
     }
     precondition {
-      condition = alltrue([
+      condition = var.symmetric_topology.version == 2 ? alltrue([
         for site, assignments in local.initial_transport_router_advertise_routes :
         alltrue([for routes in values(assignments) : length(routes) == 1]) &&
         length(flatten(values(assignments))) == length(distinct(flatten(values(assignments)))) &&
         toset(flatten(values(assignments))) == toset(local.sites[site].local_site_cidrs)
+        ]) : alltrue([
+        for site, assignments in local.initial_transport_router_advertise_routes :
+        length(assignments) >= 2 && alltrue([
+          for routes in values(assignments) :
+          toset(routes) == toset(local.sites[site].local_site_cidrs)
+        ])
       ])
-      error_message = "Initial transport-router advertisements must assign every local workload prefix to exactly one router."
+      error_message = "Production transport routers must all advertise the complete exact local workload-prefix set; only explicit version 2 retains singleton legacy acceptance assignments."
     }
     precondition {
       condition = alltrue([
@@ -571,31 +577,48 @@ resource "aws_route" "gwlbe_to_remote_west" {
   route_table_id         = aws_route_table.gwlbe_west[each.value.az_key].id
   destination_cidr_block = each.value.cidr
   network_interface_id = aws_instance.transport_router_west[
-    local.route_failover.initial_transport_router_az_by_gwlbe_az.west[each.value.az_key]
+    local.gwlbe_initial_owners.west[each.value.az_key]
   ].primary_network_interface_id
 
   lifecycle {
+    # Terraform owns route shape; the controller owns the refreshed current ENI.
+    ignore_changes = [network_interface_id]
+
     precondition {
       condition = contains(
         local.sites.west.transport_router_az_keys,
-        local.route_failover.initial_transport_router_az_by_gwlbe_az.west[each.value.az_key],
+        local.gwlbe_initial_owners.west[each.value.az_key],
         ) && (
-        local.route_failover.initial_transport_router_az_by_gwlbe_az.west[each.value.az_key] == each.value.az_key
+        local.gwlbe_initial_owners.west[each.value.az_key] == each.value.az_key || var.symmetric_topology.version == 3
       )
       error_message = "West GWLBE routes must select the transport router in the same AZ."
     }
     precondition {
       condition = contains(
         local.initial_transport_router_advertise_routes.west[
-          local.route_failover.initial_transport_router_az_by_gwlbe_az.west[each.value.az_key]
+          local.gwlbe_initial_owners.west[each.value.az_key]
         ],
         local.sites.west.workload_subnet_cidrs[each.value.az_key],
       )
-      error_message = "West GWLBE routes must select the Tailnet owner of their source workload prefix."
+      error_message = "West GWLBE routes must start on an eligible exact-prefix transport router."
     }
     precondition {
       condition     = length(toset([for instance in values(aws_instance.transport_router_west) : instance.primary_network_interface_id])) == length(aws_instance.transport_router_west)
       error_message = "West transport routers must expose distinct eligible primary ENIs."
+    }
+    postcondition {
+      condition = (
+        self.route_table_id == aws_route_table.gwlbe_west[each.value.az_key].id &&
+        self.destination_cidr_block == each.value.cidr
+      )
+      error_message = "West controller-owned route shape drifted from its exact table and destination prefix."
+    }
+    postcondition {
+      condition = contains(
+        [for instance in values(aws_instance.transport_router_west) : instance.primary_network_interface_id],
+        self.network_interface_id,
+      )
+      error_message = "West controller-owned route selects an ENI outside its eligible transport-router set."
     }
   }
 }
@@ -608,31 +631,48 @@ resource "aws_route" "gwlbe_to_remote_east" {
   route_table_id         = aws_route_table.gwlbe_east[each.value.az_key].id
   destination_cidr_block = each.value.cidr
   network_interface_id = aws_instance.transport_router_east[
-    local.route_failover.initial_transport_router_az_by_gwlbe_az.east[each.value.az_key]
+    local.gwlbe_initial_owners.east[each.value.az_key]
   ].primary_network_interface_id
 
   lifecycle {
+    # Terraform owns route shape; the controller owns the refreshed current ENI.
+    ignore_changes = [network_interface_id]
+
     precondition {
       condition = contains(
         local.sites.east.transport_router_az_keys,
-        local.route_failover.initial_transport_router_az_by_gwlbe_az.east[each.value.az_key],
+        local.gwlbe_initial_owners.east[each.value.az_key],
         ) && (
-        local.route_failover.initial_transport_router_az_by_gwlbe_az.east[each.value.az_key] == each.value.az_key
+        local.gwlbe_initial_owners.east[each.value.az_key] == each.value.az_key || var.symmetric_topology.version == 3
       )
       error_message = "East GWLBE routes must select the transport router in the same AZ."
     }
     precondition {
       condition = contains(
         local.initial_transport_router_advertise_routes.east[
-          local.route_failover.initial_transport_router_az_by_gwlbe_az.east[each.value.az_key]
+          local.gwlbe_initial_owners.east[each.value.az_key]
         ],
         local.sites.east.workload_subnet_cidrs[each.value.az_key],
       )
-      error_message = "East GWLBE routes must select the Tailnet owner of their source workload prefix."
+      error_message = "East GWLBE routes must start on an eligible exact-prefix transport router."
     }
     precondition {
       condition     = length(toset([for instance in values(aws_instance.transport_router_east) : instance.primary_network_interface_id])) == length(aws_instance.transport_router_east)
       error_message = "East transport routers must expose distinct eligible primary ENIs."
+    }
+    postcondition {
+      condition = (
+        self.route_table_id == aws_route_table.gwlbe_east[each.value.az_key].id &&
+        self.destination_cidr_block == each.value.cidr
+      )
+      error_message = "East controller-owned route shape drifted from its exact table and destination prefix."
+    }
+    postcondition {
+      condition = contains(
+        [for instance in values(aws_instance.transport_router_east) : instance.primary_network_interface_id],
+        self.network_interface_id,
+      )
+      error_message = "East controller-owned route selects an ENI outside its eligible transport-router set."
     }
   }
 }
@@ -894,6 +934,7 @@ resource "aws_instance" "transport_router_west" {
   volume_tags = merge(local.common_tags, { Name = "${var.name}-west-transport-${each.key}", Site = "west", Role = "transport-router", ZoneKey = each.key })
   depends_on = [
     aws_iam_role_policy.transport_west,
+    aws_iam_role_policy.attestor_binary,
     aws_route_table_association.transport_west,
     aws_route.transport_default_west,
     aws_route.transport_to_local_west,
@@ -928,6 +969,7 @@ resource "aws_instance" "transport_router_east" {
   volume_tags = merge(local.common_tags, { Name = "${var.name}-east-transport-${each.key}", Site = "east", Role = "transport-router", ZoneKey = each.key })
   depends_on = [
     aws_iam_role_policy.transport_east,
+    aws_iam_role_policy.attestor_binary,
     aws_route_table_association.transport_east,
     aws_route.transport_default_east,
     aws_route.transport_to_local_east,
@@ -1084,7 +1126,7 @@ output "e2e_load_profile" {
   value = var.e2e_load_profile
 }
 output "symmetric_topology" {
-  value = {
+  value = merge({
     config_version = var.symmetric_topology.version
     run_id         = var.name
     route_failover = local.route_failover
@@ -1095,14 +1137,17 @@ output "symmetric_topology" {
         remote_site_cidrs = local.sites.west.remote_site_cidrs
         target_fleet      = [for key in sort(keys(aws_instance.envelope_target_west)) : { region = var.west_region, az_key = key, instance_id = aws_instance.envelope_target_west[key].id, target_group_arn = aws_lb_target_group.west.arn }]
         transport_router_fleet = [
-          for key in sort(keys(aws_instance.transport_router_west)) : {
+          for key in sort(keys(aws_instance.transport_router_west)) : merge({
             region               = var.west_region
             az_key               = key
             instance_id          = aws_instance.transport_router_west[key].id
             network_interface_id = aws_instance.transport_router_west[key].primary_network_interface_id
             gwlbe_route_table_id = aws_route_table.gwlbe_west[key].id
-            advertised_prefix    = one(local.initial_transport_router_advertise_routes.west[key])
-          }
+            }, jsondecode(var.symmetric_topology.version == 2 ? jsonencode({
+              advertised_prefix = one(local.initial_transport_router_advertise_routes.west[key])
+              }) : jsonencode({
+              advertised_prefixes = local.initial_transport_router_advertise_routes.west[key]
+          })))
         ]
       }
       east = {
@@ -1111,18 +1156,23 @@ output "symmetric_topology" {
         remote_site_cidrs = local.sites.east.remote_site_cidrs
         target_fleet      = [for key in sort(keys(aws_instance.envelope_target_east)) : { region = var.east_region, az_key = key, instance_id = aws_instance.envelope_target_east[key].id, target_group_arn = aws_lb_target_group.east.arn }]
         transport_router_fleet = [
-          for key in sort(keys(aws_instance.transport_router_east)) : {
+          for key in sort(keys(aws_instance.transport_router_east)) : merge({
             region               = var.east_region
             az_key               = key
             instance_id          = aws_instance.transport_router_east[key].id
             network_interface_id = aws_instance.transport_router_east[key].primary_network_interface_id
             gwlbe_route_table_id = aws_route_table.gwlbe_east[key].id
-            advertised_prefix    = one(local.initial_transport_router_advertise_routes.east[key])
-          }
+            }, jsondecode(var.symmetric_topology.version == 2 ? jsonencode({
+              advertised_prefix = one(local.initial_transport_router_advertise_routes.east[key])
+              }) : jsonencode({
+              advertised_prefixes = local.initial_transport_router_advertise_routes.east[key]
+          })))
         ]
       }
     }
-  }
+    }, var.symmetric_topology.version == 2 ? {} : {
+    transport_router_profile = "production-native-ha-v3"
+  })
 }
 
 output "envelope_runtime_config" {
@@ -1132,7 +1182,7 @@ output "envelope_runtime_config" {
 }
 output "transport_router_readiness_expectations" {
   value = {
-    config_version = 2
+    config_version = var.symmetric_topology.version
     sites = {
       for site, contract in local.transport_router_contracts : site => merge(contract, {
         contract_sha256 = local.transport_router_contract_sha256[site]
@@ -1141,8 +1191,8 @@ output "transport_router_readiness_expectations" {
   }
 }
 output "route_failover" {
-  value = {
-    config_version              = 2
+  value = merge({
+    config_version              = var.symmetric_topology.version
     mutation_timeout_seconds    = local.route_failover.mutation_timeout_seconds
     restoration_timeout_seconds = local.route_failover.restoration_timeout_seconds
     recovery_timeout_seconds    = local.route_failover.recovery_timeout_seconds
@@ -1153,30 +1203,105 @@ output "route_failover" {
     sites = {
       west = {
         for gwlbe_az, transport_az in local.route_failover.initial_transport_router_az_by_gwlbe_az.west :
-        gwlbe_az => {
+        gwlbe_az => merge({
           route_table_id                  = aws_route_table.gwlbe_west[gwlbe_az].id
           source_workload_prefix          = local.sites.west.workload_subnet_cidrs[gwlbe_az]
           remote_site_cidrs               = sort(local.sites.west.remote_site_cidrs)
           initial_transport_router_az_key = transport_az
           initial_network_interface_id    = aws_instance.transport_router_west[transport_az].primary_network_interface_id
-        }
+          }, var.symmetric_topology.version == 2 ? {} : {
+          eligible_network_interface_ids = sort([for instance in values(aws_instance.transport_router_west) : instance.primary_network_interface_id])
+        })
       }
       east = {
         for gwlbe_az, transport_az in local.route_failover.initial_transport_router_az_by_gwlbe_az.east :
-        gwlbe_az => {
+        gwlbe_az => merge({
           route_table_id                  = aws_route_table.gwlbe_east[gwlbe_az].id
           source_workload_prefix          = local.sites.east.workload_subnet_cidrs[gwlbe_az]
           remote_site_cidrs               = sort(local.sites.east.remote_site_cidrs)
           initial_transport_router_az_key = transport_az
           initial_network_interface_id    = aws_instance.transport_router_east[transport_az].primary_network_interface_id
-        }
+          }, var.symmetric_topology.version == 2 ? {} : {
+          eligible_network_interface_ids = sort([for instance in values(aws_instance.transport_router_east) : instance.primary_network_interface_id])
+        })
       }
     }
-  }
+    }, var.symmetric_topology.version == 2 ? {} : {
+    target_ownership = "envelope-controller"
+  })
+}
+output "production_controller_topology_seed" {
+  description = "Version-3-only nonsecret authority seed consumed by the protected production-controller runner."
+  value = var.symmetric_topology.version == 3 ? {
+    config_version = 3
+    deployment_id  = var.name
+    sites = {
+      west = {
+        vpc_id                        = aws_vpc.west.id
+        region                        = var.west_region
+        local_prefixes                = sort(local.sites.west.local_site_cidrs)
+        local_main_rule_priority_base = local.transport_router_contracts.west.policy_rule_priority_base
+        tailscale_route_rule_priority = 5270
+      }
+      east = {
+        vpc_id                        = aws_vpc.east.id
+        region                        = var.east_region
+        local_prefixes                = sort(local.sites.east.local_site_cidrs)
+        local_main_rule_priority_base = local.transport_router_contracts.east.policy_rule_priority_base
+        tailscale_route_rule_priority = 5270
+      }
+    }
+    routers = concat(
+      [for key in sort(keys(aws_instance.transport_router_west)) : {
+        id                = "west-${key}"
+        expected_hostname = "${var.name}-west-transport-${key}"
+        site_id           = "west"
+        instance_id       = aws_instance.transport_router_west[key].id
+        eni_id            = aws_instance.transport_router_west[key].primary_network_interface_id
+        vpc_id            = aws_vpc.west.id
+        subnet_id         = aws_subnet.transport_west[key].id
+        availability_zone = local.sites.west.azs[key]
+        region            = var.west_region
+      }],
+      [for key in sort(keys(aws_instance.transport_router_east)) : {
+        id                = "east-${key}"
+        expected_hostname = "${var.name}-east-transport-${key}"
+        site_id           = "east"
+        instance_id       = aws_instance.transport_router_east[key].id
+        eni_id            = aws_instance.transport_router_east[key].primary_network_interface_id
+        vpc_id            = aws_vpc.east.id
+        subnet_id         = aws_subnet.transport_east[key].id
+        availability_zone = local.sites.east.azs[key]
+        region            = var.east_region
+      }],
+    )
+    domains = concat(
+      [for gwlbe_az in sort(keys(local.sites.west.azs)) : {
+        id                         = "west-${gwlbe_az}"
+        site_id                    = "west"
+        source_prefix              = local.sites.west.workload_subnet_cidrs[gwlbe_az]
+        route_table_id             = aws_route_table.gwlbe_west[gwlbe_az].id
+        gwlbe_subnet_id            = aws_subnet.gwlbe_west[gwlbe_az].id
+        route_table_association_id = aws_route_table_association.gwlbe_west[gwlbe_az].id
+        remote_prefixes            = sort(local.sites.west.remote_site_cidrs)
+        preferred_owner            = "west-${local.route_failover.initial_transport_router_az_by_gwlbe_az.west[gwlbe_az]}"
+      }],
+      [for gwlbe_az in sort(keys(local.sites.east.azs)) : {
+        id                         = "east-${gwlbe_az}"
+        site_id                    = "east"
+        source_prefix              = local.sites.east.workload_subnet_cidrs[gwlbe_az]
+        route_table_id             = aws_route_table.gwlbe_east[gwlbe_az].id
+        gwlbe_subnet_id            = aws_subnet.gwlbe_east[gwlbe_az].id
+        route_table_association_id = aws_route_table_association.gwlbe_east[gwlbe_az].id
+        remote_prefixes            = sort(local.sites.east.remote_site_cidrs)
+        preferred_owner            = "east-${local.route_failover.initial_transport_router_az_by_gwlbe_az.east[gwlbe_az]}"
+      }],
+    )
+  } : null
 }
 output "cost_profile" {
   value = {
-    profile                    = "symmetric-gwlb-ha-v2"
+    profile                    = var.symmetric_topology.version == 2 ? "legacy-symmetric-acceptance-v2" : "production-native-ha-v3"
     estimated_fixed_hourly_usd = var.estimated_fixed_hourly_usd
     approved_max_hourly_usd    = var.approved_max_fixed_hourly_usd
     resource_counts = {

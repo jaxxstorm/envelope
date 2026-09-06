@@ -50,7 +50,7 @@ sudo ./bin/envelope \
 
 This component validates each accepted AWS-profile packet and immediately returns it to the sending GWLB identity. It does not create a TUN, run Tailscale, enable Linux forwarding, or configure a local-versus-remote route path. Local startup alone is not a useful end-to-end traffic test.
 
-## Target And Transport Roles
+## Legacy Version-2 Target And Transport Roles
 
 The target parser retains version `2` and rejects obsolete target forwarding inputs, including directional fields, target site CIDRs, TUN settings, Tailscale settings, and routing modes. There is no compatibility mode or alternate version-2 behavior.
 
@@ -87,3 +87,9 @@ For host networking, the harness extracts, renders, executes, and hash-checks th
 The AWS profile is billable and requires a protected environment. Protected run `ha54` is the documented passing result from the exact final corrected version-2 revision; it does not make these local instructions a live-run procedure. Do not adapt old configuration files, state, evidence, or commands for the topology.
 
 The checked-in acceptance planning values are a `$4.00/hour` fixed estimate and a `$5.00/hour` fixed ceiling for the two-site, two-AZ HA profile. They exclude variable charges and are not current-price or spending approval. The profile has one shared NAT in each site's single management subnet, so private management and bootstrap egress is not multi-AZ even though the inspected transit topology spans two AZs. Use the [AWS appliance runbook](aws-appliance-runbook.md) and [two-region E2E runbook](aws-two-region-e2e-runbook.md) to understand the required route graph, protected-runner ENI failover and restoration, current cost review, and non-hitless availability boundary.
+
+## Production Controller Orientation
+
+Building or starting the packet target does not start a failover controller. The proposed production profile runs at least three standalone `envelope-controller` replicas outside target and transport-router instances. Every same-site transport router uses overlapping exact-prefix native Tailscale HA; embedded observers, regional DynamoDB fenced state, health hysteresis, and exact AWS route reconciliation align each GWLBE route domain with Tailscale's selected owner.
+
+Read [Production Failover Controller](production-controller.md) before deployment or operations. Its initial SLO objectives remain pending protected controller evidence, and its runtime does not depend on repository test scripts, SSM, the protected runner, or a router-side agent. Application teams must also implement the [Application Resilience](application-resilience.md) contract because Envelope does not transparently repair established TCP or provide lossless UDP.

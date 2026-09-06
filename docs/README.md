@@ -4,6 +4,8 @@
 
 For each valid AWS GENEVE ingress packet, an Envelope target immediately sends exactly one return to its GWLB using only that packet's outer tuple and metadata. It preserves the complete inner packet, VNI, protocol metadata, ordered options, and flow cookie. A target has no `envelope0` or `tailscale0` path: it does not inject into a TUN, directly forward inner traffic, choose a site route, or retain identity for another packet.
 
+Two availability profiles are documented. The accepted `ha54` evidence and the historical sections below describe runner-coordinated singleton advertisements. The proposed production profile instead uses standalone controller replicas and normal overlapping exact-prefix native Tailscale HA. Its controller-owned protected evidence is still pending; see [Production Failover Controller](production-controller.md).
+
 ## The Packet Path
 
 ```text
@@ -16,7 +18,26 @@ site A workload -> site A GWLBE -> site A GWLB -> site A target
 
 Site B can initiate a new flow to site A through the equivalent reverse path. Both directions traverse both sites' GWLBE and GWLB paths without NAT. Packet symmetry comes from the route graph, not target flow state or direct target forwarding.
 
-## Supported Topology
+## Production Control Plane
+
+The production profile preserves the packet path above while separating all control-plane authority:
+
+```text
+                  +-- controller A (embedded observer) --+
+Tailscale control +-- controller B (embedded observer) --+--> regional DynamoDB
+and PrimaryRoutes +-- controller C (embedded observer) --+    fenced durable state
+                                      |
+                                      +--> exact GWLBE route reconciliation
+                                           to the selected router ENI
+
+packet targets: packet turnaround only; no controller or route authority
+transport routers: overlapping exact-prefix Tailscale HA and no-NAT forwarding
+controllers: observation, fenced ownership, and AWS route reconciliation only
+```
+
+At least three replicas run outside target and router instances. Every same-site router continuously advertises the complete exact local workload-prefix set, allowing native Tailscale HA to select a sole primary for each prefix. A fresh embedded-observer quorum, health hysteresis, cloud eligibility, and exact route readback gate AWS changes. The runtime has no dependency on test scripts, SSM, a protected runner, or router-side agents. Start with the [controller architecture and operations guide](production-controller.md), then apply the [application resilience contract](application-resilience.md); Envelope does not transparently repair established flows.
+
+## Legacy Version-2 Topology
 
 Each site separates three responsibilities:
 
@@ -58,7 +79,7 @@ Protected packet-fidelity evidence is hash-only after inspection. Bounded Linux 
 
 ## Version And Migration
 
-The unshipped direct-forwarding draft is replaced in place while retaining version `2`. There is no compatibility mode, translation layer, dual behavior, or version 3. Directional-lane and obsolete draft-v2 target CIDR, TUN, Tailscale, and host-routing fields are rejected before mutation.
+The legacy runner-coordinated profile replaced the unshipped direct-forwarding draft in place while retaining version `2`. It has no compatibility mode, translation layer, or dual behavior. The production controller is a separate fresh version-3 topology; it does not reinterpret or reuse version-2 state. Directional-lane and obsolete draft-v2 target CIDR, TUN, Tailscale, and host-routing fields are rejected before mutation.
 
 Create a fresh version-2 topology with separate workload, transport-router, GWLBE, target, and management route domains. Do not combine prior state, plans, resources, configuration, or evidence with this route model. Topology `local-site-cidrs` and `remote-site-cidrs` describe VPC and transport routes; they are not target forwarding settings.
 
@@ -70,4 +91,6 @@ The checked-in planning profile models two sites, two AZs per site, two GWLBs, f
 
 - [Build and validate locally](getting-started.md) for development-only checks.
 - [Review the Terraform input shape](terraform-example.md) for the version-2 topology model.
+- Read [Production Failover Controller](production-controller.md) for the standalone production profile and its initial SLO objectives pending protected evidence.
+- Read [Application Resilience](application-resilience.md) for TCP reconnect/idempotency and retryable UDP message semantics.
 - Read the [AWS appliance runbook](aws-appliance-runbook.md) and [two-region E2E runbook](aws-two-region-e2e-runbook.md) for protected-run safety, failover, restoration, evidence, and cost boundaries. They intentionally do not provide a direct live infrastructure command sequence.

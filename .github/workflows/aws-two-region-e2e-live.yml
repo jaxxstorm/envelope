@@ -1,233 +1,268 @@
-name: Protected AWS two-region E2E
-run-name: Protected E2E ${{ inputs.run_id || format('e2e-{0}', github.run_id) }}
+name: Protected split controller acceptance
+run-name: Controller acceptance ${{ inputs.run_id }}
 
 on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: Unique 4-19 character lowercase run ID
+        description: Unique lowercase run ID
         required: true
         type: string
       approved_run_id:
-        description: Retype the exact run ID to approve billable live execution
+        description: Retype the run ID to approve billable execution
         required: true
         type: string
-  schedule:
-    - cron: "17 6 * * 1"
 
 permissions: {}
-
 concurrency:
   group: envelope-two-region-e2e-live
   cancel-in-progress: false
 
+env:
+  AWS_EC2_METADATA_DISABLED: "true"
+  AWS_PAGER: ""
+  ENVELOPE_E2E_APPROVED_RUN_ID: ${{ inputs.approved_run_id }}
+  GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+  GITHUB_HEAD_REPO_FORK: "false"
+  RUN_ID: ${{ inputs.run_id }}
+
 jobs:
   authorize:
-    name: Validate protected invocation
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    permissions: {}
-    outputs:
-      run_id: ${{ steps.approval.outputs.run_id }}
     steps:
-      - name: Require protected repository, ref, and exact approval
-        id: approval
+      - name: Require protected ref and exact approval
         env:
-          MANUAL_RUN_ID: ${{ inputs.run_id }}
-          MANUAL_APPROVED_RUN_ID: ${{ inputs.approved_run_id }}
-          REF_PROTECTED: ${{ github.ref_protected }}
-          REPOSITORY_IS_FORK: ${{ github.event.repository.fork }}
-        shell: bash
+          APPROVED: ${{ inputs.approved_run_id }}
+          IS_FORK: ${{ github.event.repository.fork }}
         run: |
           set -euo pipefail
-          [[ "$REPOSITORY_IS_FORK" == "false" ]]
-          [[ "$REF_PROTECTED" == "true" ]]
+          [[ "$IS_FORK" == false && "$GITHUB_REF_PROTECTED" == true ]]
+          [[ "$RUN_ID" =~ ^[a-z][a-z0-9-]{2,17}[a-z0-9]$ ]]
+          [[ "$APPROVED" == "$RUN_ID" ]]
 
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            run_id=$MANUAL_RUN_ID
-            [[ "$MANUAL_APPROVED_RUN_ID" == "$run_id" ]]
-          elif [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
-            run_id="e2e-${GITHUB_RUN_ID}"
-          else
-            exit 1
-          fi
-
-          [[ "$run_id" =~ ^[a-z][a-z0-9-]{2,17}[a-z0-9]$ ]]
-          printf 'run_id=%s\n' "$run_id" >> "$GITHUB_OUTPUT"
-
-  live:
-    name: Approved live acceptance
+  deploy:
     needs: authorize
-    runs-on: ubuntu-24.04
-    timeout-minutes: 270
-    environment:
-      name: envelope-two-region-e2e
+    environment: envelope-controller-deployment
+    runs-on:
+      group: envelope-production-deployment
+      labels: [self-hosted, linux, x64]
+    timeout-minutes: 360
     permissions:
       contents: read
       id-token: write
-    env:
-      AWS_EC2_METADATA_DISABLED: "true"
-      AWS_PAGER: ""
-      RUN_ID: ${{ needs.authorize.outputs.run_id }}
-      CONFIG_PATH: .run/${{ needs.authorize.outputs.run_id }}/config.json
-      RUN_ALL_RESULT_PATH: .run/${{ needs.authorize.outputs.run_id }}/run-all-result.json
-      EVIDENCE_PATH: .run/${{ needs.authorize.outputs.run_id }}/aws-two-region-e2e-evidence.json
-      DIAGNOSTICS_PATH: .run/${{ needs.authorize.outputs.run_id }}/diagnostics.json
-      ENVELOPE_E2E_APPROVED_RUN_ID: ${{ needs.authorize.outputs.run_id }}
-      GITHUB_HEAD_REPO_FORK: "false"
+    outputs:
+      handoff: ${{ steps.deploy.outputs.handoff }}
+      observe_role: ${{ steps.deploy.outputs.observe_role }}
+      quiesce_role: ${{ steps.deploy.outputs.quiesce_role }}
+      integration: ${{ steps.integration.outputs.report }}
     steps:
-      - name: Check out protected revision
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
           fetch-depth: 0
-
-      - name: Set up reviewed Go
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+          clean: false
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
           go-version: 1.26.2
           cache: true
-
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          python-version: "3.11"
-
-      - name: Set up pinned Terraform
-        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
           terraform_version: 1.10.5
           terraform_wrapper: false
-
-      - name: Generate ignored protected config
+      - name: Create a new private invocation directory
         env:
-          CONFIG_TEMPLATE_B64: ${{ secrets.ENVELOPE_E2E_CONFIG_TEMPLATE_B64 }}
-        shell: bash
+          TEMPLATE_B64: ${{ secrets.ENVELOPE_PRODUCTION_CONTROLLER_SPLIT_CONFIG_TEMPLATE_B64 }}
         run: |
           set -euo pipefail
           umask 077
-          [[ -n "$CONFIG_TEMPLATE_B64" ]]
-          install -d -m 0700 ".run/${RUN_ID}"
-
-          template=$(mktemp "${RUNNER_TEMP}/envelope-e2e-config.XXXXXX")
-          trap 'rm -f "$template"' EXIT
-          printf '%s' "$CONFIG_TEMPLATE_B64" | base64 --decode > "$template"
-          expires_at=$(date -u -d '5 hours' '+%Y-%m-%dT%H:%M:%SZ')
-
-          jq --exit-status \
-            --arg run_id "$RUN_ID" \
-            --arg expires_at "$expires_at" '
-              if (.backend | type) != "object" then error("backend must be an object") else . end
-              | if .tailnet.name != "_lbr_sandbox" then error("live E2E is restricted to _lbr_sandbox") else . end
-              | if (.e2e_load_profile.approved_at | type) != "string" then error("load profile approval is required") else . end
-              | .run_id = $run_id
-              | .expires_at = $expires_at
-              | .backend.state_key = ("runs/" + $run_id + "/terraform.tfstate")
-            ' "$template" > "$CONFIG_PATH"
-          chmod 0600 "$CONFIG_PATH"
-
-      - name: Acquire short-lived AWS credentials
-        id: aws_credentials
-        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
-        with:
-          role-to-assume: ${{ secrets.AWS_E2E_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_E2E_REGION }}
-          role-session-name: envelope-e2e-${{ github.run_id }}
-          role-duration-seconds: 14400
-          mask-aws-account-id: true
-          unset-current-credentials: true
-          output-env-credentials: false
-          output-credentials: true
-
-      # run-all arms and owns cleanup before creation. Do not add a competing
-      # workflow-level destroy or cleanup trap.
-      - name: Run complete protected lifecycle
-        id: live_run
+          [[ ! -L .run ]]
+          mkdir -p .run
+          mkdir ".run/$RUN_ID"
+          printf '%s' "$TEMPLATE_B64" | base64 --decode > ".run/$RUN_ID/template.json"
+          python3 scripts/aws_controller_acceptance.py prepare-config \
+            --template ".run/$RUN_ID/template.json" --run-id "$RUN_ID" \
+            --output ".run/$RUN_ID/split-config.json"
+      - name: Record integration-only deterministic evidence
+        id: integration
+        run: |
+          set -euo pipefail
+          go test -count=1 -json ./internal/controller/integration > ".run/$RUN_ID/integration.jsonl"
+          python3 scripts/aws_controller_acceptance.py record-integration \
+            --input ".run/$RUN_ID/integration.jsonl" --revision "$GITHUB_SHA" \
+            --output ".run/$RUN_ID/integration.json"
+          printf 'report=%s\n' "$(jq -c . ".run/$RUN_ID/integration.json")" >> "$GITHUB_OUTPUT"
+      - name: Deploy production dependencies and revoke deployment authority
+        id: deploy
         env:
-          AWS_ACCESS_KEY_ID: ${{ steps.aws_credentials.outputs.aws-access-key-id }}
-          AWS_SECRET_ACCESS_KEY: ${{ steps.aws_credentials.outputs.aws-secret-access-key }}
-          AWS_SESSION_TOKEN: ${{ steps.aws_credentials.outputs.aws-session-token }}
-          AWS_REGION: ${{ secrets.AWS_E2E_REGION }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_E2E_REGION }}
           TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           TS_OAUTH_CLIENT_SECRET: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
-        shell: bash
+          ENVELOPE_CONTROLLER_TSNET_AUTH_KEY: ${{ secrets.ENVELOPE_CONTROLLER_TSNET_AUTH_KEY }}
+          ENVELOPE_CONTROLLER_ADMIN_API_KEY: ${{ secrets.ENVELOPE_CONTROLLER_ADMIN_API_KEY }}
+        run: |
+          set -euo pipefail
+          python3 scripts/aws_controller_acceptance.py deploy \
+            --config ".run/$RUN_ID/split-config.json" --directory ".run/$RUN_ID/deploy" \
+            --reference ".run/$RUN_ID/handoff-ref.json"
+          printf 'handoff=%s\n' "$(jq -c . ".run/$RUN_ID/handoff-ref.json")" >> "$GITHUB_OUTPUT"
+          printf 'observe_role=%s\n' "$(jq -r .observe ".run/$RUN_ID/deploy/phase-roles.json")" >> "$GITHUB_OUTPUT"
+          printf 'quiesce_role=%s\n' "$(jq -r .quiesce ".run/$RUN_ID/deploy/phase-roles.json")" >> "$GITHUB_OUTPUT"
+      - name: Retain failed deployment forensic pointer
+        if: failure()
+        run: |
+          set -euo pipefail
+          if [[ -f ".run/$RUN_ID/deploy/failure.json" ]]; then
+            python3 scripts/secret_scan.py --root . --extra ".run/$RUN_ID/deploy/failure.json"
+          fi
+          printf 'Private recovery state and claims are retained; do not reuse this run ID.\n'
+
+  observe:
+    needs: deploy
+    environment: envelope-controller-observation
+    # This group must be isolated from deployment hosts, disks, and process namespaces.
+    runs-on:
+      group: envelope-production-observation
+      labels: [self-hosted, linux, x64]
+    timeout-minutes: 65
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      live: ${{ steps.measure.outputs.live }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          clean: false
+      - name: Measure under the exact route-denied observation identity
+        id: measure
+        env:
+          HANDOFF: ${{ needs.deploy.outputs.handoff }}
+          ROLE: ${{ needs.deploy.outputs.observe_role }}
         run: |
           set -uo pipefail
+          umask 077
+          [[ ! -L .run ]] || exit 1
+          mkdir -p .run
+          mkdir ".run/$RUN_ID" || exit 1
+          printf '%s' "$HANDOFF" > ".run/$RUN_ID/handoff-ref.json"
           status=0
-          python3 scripts/aws_two_region_e2e.py run-all \
-            --config "$CONFIG_PATH" \
-            --terraform-dir example/terraform \
-            --hard-timeout-seconds 10800 || status=$?
-          printf 'exit_code=%s\n' "$status" >> "$GITHUB_OUTPUT"
-
-      - name: Scan and stage sanitized evidence
-        id: evidence
+          python3 scripts/aws_controller_acceptance.py observe \
+            --handoff-reference ".run/$RUN_ID/handoff-ref.json" --role-arn "$ROLE" \
+            --directory ".run/$RUN_ID/observe" --reference ".run/$RUN_ID/live-ref.json" || status=$?
+          if [[ -f ".run/$RUN_ID/live-ref.json" ]]; then
+            printf 'live=%s\n' "$(jq -c . ".run/$RUN_ID/live-ref.json")" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$status"
+      - name: Scan retained observation evidence
         if: always()
-        env:
-          RUN_EXIT_CODE: ${{ steps.live_run.outputs.exit_code }}
-        shell: bash
         run: |
           set -euo pipefail
-          printf 'safe=false\n' >> "$GITHUB_OUTPUT"
-          [[ "$RUN_EXIT_CODE" =~ ^[0-9]+$ ]]
-          [[ -f "$RUN_ALL_RESULT_PATH" && ! -L "$RUN_ALL_RESULT_PATH" ]]
-
-          retained=("$RUN_ALL_RESULT_PATH")
-          python3 scripts/aws_two_region_e2e.py scan-evidence "$RUN_ALL_RESULT_PATH"
-
-          if [[ -e "$EVIDENCE_PATH" || -L "$EVIDENCE_PATH" ]]; then
-            [[ -f "$EVIDENCE_PATH" && ! -L "$EVIDENCE_PATH" ]]
-            python3 scripts/aws_two_region_e2e.py scan-evidence "$EVIDENCE_PATH"
-            # This workflow is the symmetric-v2 gate; legacy live bundles fail closed.
-            jq --exit-status \
-              '.schema == 3 and .kind == "aws-symmetric-gwlb-ha-v2"' \
-              "$EVIDENCE_PATH" >/dev/null
-            python3 scripts/aws_two_region_e2e.py validate-evidence "$EVIDENCE_PATH"
-            retained+=("$EVIDENCE_PATH")
+          if [[ -f ".run/$RUN_ID/observe/live.json" ]]; then
+            python3 scripts/secret_scan.py --root . --extra ".run/$RUN_ID/observe/live.json"
           fi
 
-          if [[ -e "$DIAGNOSTICS_PATH" || -L "$DIAGNOSTICS_PATH" ]]; then
-            [[ -f "$DIAGNOSTICS_PATH" && ! -L "$DIAGNOSTICS_PATH" ]]
-            python3 scripts/aws_two_region_e2e.py scan-evidence "$DIAGNOSTICS_PATH"
-            retained+=("$DIAGNOSTICS_PATH")
+  quiesce:
+    needs: [deploy, observe]
+    if: always() && needs.deploy.result == 'success'
+    environment: envelope-controller-quiescence
+    runs-on:
+      group: envelope-production-deployment
+      labels: [self-hosted, linux, x64]
+    timeout-minutes: 110
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      proof: ${{ steps.quiesce.outputs.proof }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          clean: false
+      - name: Expire observer authority and prove stopped/drained controllers
+        id: quiesce
+        env:
+          HANDOFF: ${{ needs.deploy.outputs.handoff }}
+          ROLE: ${{ needs.deploy.outputs.quiesce_role }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ ! -L .run ]]
+          mkdir -p ".run/$RUN_ID"
+          printf '%s' "$HANDOFF" > ".run/$RUN_ID/quiesce-handoff-ref.json"
+          python3 scripts/aws_controller_acceptance.py quiesce \
+            --handoff-reference ".run/$RUN_ID/quiesce-handoff-ref.json" --role-arn "$ROLE" \
+            --directory ".run/$RUN_ID/quiesce" --reference ".run/$RUN_ID/quiescence-ref.json"
+          printf 'proof=%s\n' "$(jq -c . ".run/$RUN_ID/quiescence-ref.json")" >> "$GITHUB_OUTPUT"
+
+  cleanup:
+    needs: [deploy, observe, quiesce]
+    if: always() && needs.quiesce.result == 'success'
+    environment: envelope-controller-cleanup
+    runs-on:
+      group: envelope-production-deployment
+      labels: [self-hosted, linux, x64]
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          clean: false
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: 1.26.2
+          cache: true
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+      - name: Recheck quiescence before acquiring cleanup credentials
+        env:
+          HANDOFF: ${{ needs.deploy.outputs.handoff }}
+          QUIESCENCE: ${{ needs.quiesce.outputs.proof }}
+          LIVE: ${{ needs.observe.outputs.live }}
+          INTEGRATION: ${{ needs.deploy.outputs.integration }}
+          ROLE: ${{ needs.deploy.outputs.quiesce_role }}
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_CLIENT_SECRET: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ ! -L .run ]]
+          mkdir -p ".run/$RUN_ID"
+          printf '%s' "$HANDOFF" > ".run/$RUN_ID/cleanup-handoff-ref.json"
+          printf '%s' "$QUIESCENCE" > ".run/$RUN_ID/cleanup-quiescence-ref.json"
+          printf '%s' "$INTEGRATION" > ".run/$RUN_ID/cleanup-integration.json"
+          args=()
+          if [[ -n "$LIVE" ]]; then
+            printf '%s' "$LIVE" > ".run/$RUN_ID/cleanup-live-ref.json"
+            args+=(--live-reference ".run/$RUN_ID/cleanup-live-ref.json")
           fi
-
-          if [[ "$RUN_EXIT_CODE" == "0" ]]; then
-            [[ -f "$EVIDENCE_PATH" && ! -L "$EVIDENCE_PATH" ]]
-            python3 scripts/aws_two_region_e2e.py verify-evidence "$EVIDENCE_PATH"
-          fi
-
-          secret_scan_args=(--root .)
-          for path in "${retained[@]}"; do
-            secret_scan_args+=(--extra "$path")
-          done
-          python3 scripts/secret_scan.py "${secret_scan_args[@]}"
-
-          staging_dir=$(mktemp -d "${RUNNER_TEMP}/envelope-e2e-sanitized.XXXXXX")
-          chmod 0700 "$staging_dir"
-          for path in "${retained[@]}"; do
-            install -m 0600 "$path" "$staging_dir/$(basename "$path")"
-          done
-
-          printf 'staging_dir=%s\n' "$staging_dir" >> "$GITHUB_OUTPUT"
+          python3 scripts/aws_controller_acceptance.py cleanup \
+            --handoff-reference ".run/$RUN_ID/cleanup-handoff-ref.json" --role-arn "$ROLE" \
+            --quiescence-reference ".run/$RUN_ID/cleanup-quiescence-ref.json" \
+            --integration ".run/$RUN_ID/cleanup-integration.json" "${args[@]}" \
+            --directory ".run/$RUN_ID/cleanup" --reference ".run/$RUN_ID/bundle-ref.json"
+      - name: Scan sanitized bundle before upload
+        id: scan
+        if: always()
+        run: |
+          set -euo pipefail
+          [[ -f ".run/$RUN_ID/cleanup/bundle.json" && ! -L ".run/$RUN_ID/cleanup/bundle.json" ]]
+          python3 scripts/secret_scan.py --root . --extra ".run/$RUN_ID/cleanup/bundle.json"
           printf 'safe=true\n' >> "$GITHUB_OUTPUT"
-
-      - name: Upload sanitized evidence only
-        if: always() && steps.evidence.outputs.safe == 'true'
+      - name: Retain sanitized live/integration/cleanup evidence
+        if: always() && steps.scan.outputs.safe == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: aws-two-region-e2e-${{ needs.authorize.outputs.run_id }}
-          path: ${{ steps.evidence.outputs.staging_dir }}
+          name: controller-acceptance-${{ inputs.run_id }}
+          path: .run/${{ inputs.run_id }}/cleanup/bundle.json
           if-no-files-found: error
-          include-hidden-files: false
           retention-days: 14
-
-      - name: Propagate live acceptance result
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          status='${{ steps.live_run.outputs.exit_code }}'
-          [[ "$status" =~ ^[0-9]+$ ]]
-          [[ "$status" == "0" ]]
+      # No blanket rm/git-clean: failed or interrupted cleanup retains claims,
+      # local evidence, and encrypted private recovery snapshots for inspection.

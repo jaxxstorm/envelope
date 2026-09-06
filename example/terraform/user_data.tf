@@ -30,7 +30,7 @@ locals {
     artifact_architecture = var.architecture
   })
   packet_return_runtime = {
-    config_version        = var.symmetric_topology.version
+    config_version        = 2
     mode                  = "packet-return"
     udp_bind              = "0.0.0.0:6081"
     max_inner_packet_size = 1280
@@ -48,7 +48,7 @@ locals {
   transport_policy_rule_priority_base = 100
   transport_router_contracts = {
     for site, topology in local.sites : site => {
-      config_version           = 2
+      config_version           = var.symmetric_topology.version
       local_site_cidrs         = sort(topology.local_site_cidrs)
       remote_site_cidrs        = sort(topology.remote_site_cidrs)
       underlay_interface       = var.envelope_underlay_interface
@@ -83,7 +83,7 @@ locals {
       local_policy_rules = [
         for index, cidr in sort(topology.local_site_cidrs) : {
           priority    = local.transport_policy_rule_priority_base + index
-          input       = var.envelope_tailscale_iface
+          input       = var.symmetric_topology.version == 2 ? var.envelope_tailscale_iface : "all"
           source      = "all"
           destination = cidr
           fwmark      = 0
@@ -98,7 +98,7 @@ locals {
         [
           for index, cidr in sort(topology.local_site_cidrs) : {
             priority    = local.transport_policy_rule_priority_base + index
-            input       = var.envelope_tailscale_iface
+            input       = var.symmetric_topology.version == 2 ? var.envelope_tailscale_iface : "all"
             source      = "all"
             destination = cidr
             fwmark      = 0
@@ -179,6 +179,7 @@ locals {
       policy_rule_priority_base   = local.transport_policy_rule_priority_base
       readiness_expectations_json = jsonencode(local.transport_router_contracts[site])
       contract_sha256             = local.transport_router_contract_sha256[site]
+      legacy_acceptance_profile   = var.symmetric_topology.version == 2
     })
   }
   transport_router_activation = <<-SCRIPT
@@ -251,9 +252,11 @@ module "tailscale_transport_west" {
     { filename = "15-transport-router.sh", content_type = "text/x-shellscript", content = local.transport_router_bootstrap.west },
   ]
   pre_setup_gate = "/var/lib/envelope/transport-router-network.installed"
-  additional_parts = [
+  additional_parts = concat([
     { filename = "30-activate-transport-router.sh", content_type = "text/x-shellscript", content = local.transport_router_activation },
-  ]
+    ], var.router_attestor_bootstrap == null ? [] : [
+    { filename = "40-router-attestor.sh", content_type = "text/x-shellscript", content = local.attestor_bootstrap_scripts["west-${each.key}"] },
+  ])
 }
 module "tailscale_transport_east" {
   source             = "./modules/tailscale-cloudinit"
@@ -276,7 +279,9 @@ module "tailscale_transport_east" {
     { filename = "15-transport-router.sh", content_type = "text/x-shellscript", content = local.transport_router_bootstrap.east },
   ]
   pre_setup_gate = "/var/lib/envelope/transport-router-network.installed"
-  additional_parts = [
+  additional_parts = concat([
     { filename = "30-activate-transport-router.sh", content_type = "text/x-shellscript", content = local.transport_router_activation },
-  ]
+    ], var.router_attestor_bootstrap == null ? [] : [
+    { filename = "40-router-attestor.sh", content_type = "text/x-shellscript", content = local.attestor_bootstrap_scripts["east-${each.key}"] },
+  ])
 }

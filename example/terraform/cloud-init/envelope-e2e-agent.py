@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
+import os
 import queue
 import re
 import socket
@@ -21,13 +23,21 @@ MAX_FRAME_BYTES = 4096
 MAX_MESSAGES = 100_000
 MAX_TIMEOUT_SECONDS = 21_600.0
 MAX_TCP_CLIENTS = 32
+MAX_STRUCTURED_RESULT_BYTES = 24_000
 _TCP_ACCEPT_POLL_SECONDS = 0.1
 _TCP_SHUTDOWN_SECONDS = 2.0
 _FLOW_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+_ACK_BARRIER_RE = re.compile(r"/run/envelope-e2e/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\.ack\.json")
 
 
 class AgentError(RuntimeError):
     pass
+
+
+class AgentTimeout(AgentError):
+    def __init__(self, category: str):
+        super().__init__("operation timed out")
+        self.category = category
 
 
 def _protocol(value: str) -> ProtocolName:
@@ -64,7 +74,7 @@ def _message_count(value: int) -> int:
 def _remaining(deadline: float) -> float:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise AgentError("operation timed out")
+        raise AgentTimeout("deadline-exceeded")
     return remaining
 
 
@@ -132,7 +142,7 @@ class _FrameReader:
             try:
                 chunk = self.sock.recv(min(1024, MAX_FRAME_BYTES + 1 - len(self.buffer)))
             except socket.timeout as error:
-                raise AgentError("operation timed out") from error
+                raise AgentTimeout("socket-timeout") from error
             if not chunk:
                 if self.buffer:
                     raise AgentError("TCP protocol frame ended without a delimiter")
@@ -145,7 +155,7 @@ def _send_tcp(sock: socket.socket, value: dict[str, Any], deadline: float) -> No
     try:
         sock.sendall(_encode_frame(value, newline=True))
     except socket.timeout as error:
-        raise AgentError("operation timed out") from error
+        raise AgentTimeout("socket-timeout") from error
 
 
 def _send_udp(sock: socket.socket, value: dict[str, Any], deadline: float) -> None:
@@ -153,7 +163,7 @@ def _send_udp(sock: socket.socket, value: dict[str, Any], deadline: float) -> No
     try:
         sent = sock.send(_encode_frame(value, newline=False))
     except socket.timeout as error:
-        raise AgentError("operation timed out") from error
+        raise AgentTimeout("socket-timeout") from error
     if sent <= 0:
         raise AgentError("UDP protocol frame was not sent")
 
@@ -163,7 +173,7 @@ def _receive_udp(sock: socket.socket, deadline: float) -> bytes:
     try:
         data = sock.recv(MAX_FRAME_BYTES + 1)
     except socket.timeout as error:
-        raise AgentError("operation timed out") from error
+        raise AgentTimeout("socket-timeout") from error
     if len(data) > MAX_FRAME_BYTES:
         raise AgentError("UDP protocol frame exceeds the size bound")
     return data
@@ -247,6 +257,108 @@ def probe(
     }
 
 
+def _ack_barrier_path(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if _ACK_BARRIER_RE.fullmatch(value) is None:
+        raise AgentError("ack barrier path must be a bounded file under /run/envelope-e2e")
+    return value
+
+
+def _write_ack_barrier(
+    path: str, flow_id: str, connection_id: str, received_monotonic_ns: int
+) -> None:
+    value = {
+        "connection_id": connection_id,
+        "flow_id": flow_id,
+        "received_monotonic_ns": received_monotonic_ns,
+        "sequence": 0,
+    }
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        with os.fdopen(descriptor, "wb") as stream_file:
+            stream_file.write(encoded)
+    except OSError as error:
+        raise AgentError(f"could not publish acknowledgement barrier: {type(error).__name__}") from None
+
+
+def _stream_interruption(error: BaseException) -> tuple[str, str] | None:
+    if isinstance(error, AgentTimeout):
+        return "timed-out", error.category
+    if isinstance(error, socket.timeout):
+        return "timed-out", "socket-timeout"
+    if isinstance(error, EOFError):
+        return "reset", "peer-closed"
+    if isinstance(error, BrokenPipeError) or getattr(error, "errno", None) == errno.EPIPE:
+        return "reset", "broken-pipe"
+    if isinstance(error, ConnectionResetError) or getattr(error, "errno", None) == errno.ECONNRESET:
+        return "reset", "connection-reset"
+    if isinstance(error, ConnectionAbortedError) or getattr(error, "errno", None) == errno.ECONNABORTED:
+        return "reset", "connection-aborted"
+    if isinstance(error, TimeoutError) or getattr(error, "errno", None) == errno.ETIMEDOUT:
+        return "timed-out", "socket-timeout"
+    return None
+
+
+def _structured_stream_result(
+    *,
+    protocol: ProtocolName,
+    flow_id: str,
+    connection_id: str,
+    local_ip: str,
+    source_port: int,
+    expected_markers: int,
+    attempted_count: int,
+    acknowledged_count: int,
+    first_acknowledged: tuple[int, int, int],
+    last_acknowledged: tuple[int, int, int],
+    last_attempted: tuple[int, int],
+    outcome: str,
+    error_category: str | None,
+) -> dict[str, Any]:
+    result = {
+        "schema": 1,
+        "operation": "stream",
+        "protocol": protocol,
+        "success": outcome == "survived",
+        "outcome": outcome,
+        "error_category": error_category,
+        "flow_id": flow_id,
+        "connection_id": connection_id,
+        "local_ip": local_ip,
+        "source_port": source_port,
+        "socket_count": 1,
+        "expected_markers": expected_markers,
+        "sequences": {
+            "attempted": {
+                "count": attempted_count,
+                "first": 0,
+                "last": attempted_count - 1,
+            },
+            "acknowledged": {
+                "count": acknowledged_count,
+                "first": 0,
+                "last": acknowledged_count - 1,
+            },
+        },
+        "timing": {
+            "first_acknowledged": list(first_acknowledged),
+            "last_acknowledged": list(last_acknowledged),
+            "last_attempted": list(last_attempted),
+        },
+    }
+    serialized = json.dumps(
+        result, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+    if len(serialized) >= MAX_STRUCTURED_RESULT_BYTES:
+        raise AgentError("structured stream result exceeds the SSM output bound")
+    return result
+
+
 def stream(
     protocol: str,
     host: str,
@@ -258,6 +370,8 @@ def stream(
     count: int,
     interval: float,
     timeout: float,
+    structured_result: bool = False,
+    ack_barrier_path: str | None = None,
 ) -> dict[str, Any]:
     selected_protocol = _protocol(protocol)
     _port(port, "port")
@@ -266,9 +380,17 @@ def stream(
     _message_count(count)
     if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval < 0 or interval > 60:
         raise AgentError("stream interval must be between 0 and 60 seconds")
+    barrier_path = _ack_barrier_path(ack_barrier_path)
+    if barrier_path is not None and not structured_result:
+        raise AgentError("ack barrier requires the structured stream result mode")
     deadline = time.monotonic() + _timeout(timeout)
     connection_id = _flow_id(f"{flow_id}:c0001", "connection_id")
     markers: list[dict[str, Any]] = []
+    attempted_count = 0
+    acknowledged_count = 0
+    first_acknowledged: tuple[int, int, int] | None = None
+    last_acknowledged: tuple[int, int, int] | None = None
+    last_attempted: tuple[int, int] | None = None
     try:
         sock = _client_socket(selected_protocol, host, port, source_ip, source_port, deadline)
         with sock:
@@ -279,9 +401,11 @@ def stream(
                 delay = next_send - time.monotonic()
                 if delay > 0:
                     if delay >= _remaining(deadline):
-                        raise AgentError("operation timed out")
+                        raise AgentTimeout("deadline-exceeded")
                     time.sleep(delay)
                 sent_ns = time.monotonic_ns()
+                attempted_count += 1
+                last_attempted = (sequence, sent_ns)
                 request = _marker(flow_id, connection_id, sequence, "marker")
                 if selected_protocol == "tcp":
                     assert reader is not None
@@ -292,20 +416,69 @@ def stream(
                     ack = _decode_frame(_receive_udp(sock, deadline), expected_kinds={"ack"})
                 received_ns = time.monotonic_ns()
                 _validate_ack(ack, flow_id, connection_id, sequence)
-                markers.append(
-                    {
-                        "connection_id": connection_id,
-                        "flow_id": flow_id,
-                        "received_monotonic_ns": received_ns,
-                        "sent_monotonic_ns": sent_ns,
-                        "sequence": sequence,
-                    }
-                )
+                acknowledged_count += 1
+                acknowledged = (sequence, sent_ns, received_ns)
+                if first_acknowledged is None:
+                    first_acknowledged = acknowledged
+                    if barrier_path is not None:
+                        _write_ack_barrier(
+                            barrier_path, flow_id, connection_id, received_ns
+                        )
+                last_acknowledged = acknowledged
+                if not structured_result:
+                    markers.append(
+                        {
+                            "connection_id": connection_id,
+                            "flow_id": flow_id,
+                            "received_monotonic_ns": received_ns,
+                            "sent_monotonic_ns": sent_ns,
+                            "sequence": sequence,
+                        }
+                    )
                 next_send = max(next_send + interval, time.monotonic())
-    except AgentError:
-        raise
-    except (OSError, socket.timeout) as error:
+    except (AgentError, EOFError, OSError) as error:
+        interruption = _stream_interruption(error)
+        if structured_result and acknowledged_count > 0 and interruption is not None:
+            assert first_acknowledged is not None
+            assert last_acknowledged is not None
+            assert last_attempted is not None
+            return _structured_stream_result(
+                protocol=selected_protocol,
+                flow_id=flow_id,
+                connection_id=connection_id,
+                local_ip=str(local_ip),
+                source_port=int(local_port),
+                expected_markers=count,
+                attempted_count=attempted_count,
+                acknowledged_count=acknowledged_count,
+                first_acknowledged=first_acknowledged,
+                last_acknowledged=last_acknowledged,
+                last_attempted=last_attempted,
+                outcome=interruption[0],
+                error_category=interruption[1],
+            )
+        if isinstance(error, AgentError):
+            raise
         raise AgentError(f"stream socket operation failed: {type(error).__name__}") from None
+    if structured_result:
+        assert first_acknowledged is not None
+        assert last_acknowledged is not None
+        assert last_attempted is not None
+        return _structured_stream_result(
+            protocol=selected_protocol,
+            flow_id=flow_id,
+            connection_id=connection_id,
+            local_ip=str(local_ip),
+            source_port=int(local_port),
+            expected_markers=count,
+            attempted_count=attempted_count,
+            acknowledged_count=acknowledged_count,
+            first_acknowledged=first_acknowledged,
+            last_acknowledged=last_acknowledged,
+            last_attempted=last_attempted,
+            outcome="survived",
+            error_category=None,
+        )
     return {
         "connection_id": connection_id,
         "flow_id": flow_id,
@@ -701,6 +874,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_client_arguments(stream_parser)
     stream_parser.add_argument("--count", type=int, required=True)
     stream_parser.add_argument("--interval", type=float, default=0.1)
+    stream_parser.add_argument(
+        "--structured-result",
+        action="store_true",
+        help="emit the bounded complete-or-partial stream schema",
+    )
+    stream_parser.add_argument("--ack-barrier-path")
 
     subparsers.add_parser("self-test", help="run the bounded concurrent TCP loopback test")
     return parser
@@ -738,6 +917,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 count=args.count,
                 interval=args.interval,
                 timeout=args.timeout,
+                structured_result=args.structured_result,
+                ack_barrier_path=args.ack_barrier_path,
             )
         elif args.operation == "self-test":
             result = self_test()
@@ -747,7 +928,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps({"error": str(error), "success": False}, sort_keys=True), file=sys.stderr)
         return 2
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
-    return 0
+    return 2 if args.operation == "stream" and result.get("success") is False else 0
 
 
 if __name__ == "__main__":

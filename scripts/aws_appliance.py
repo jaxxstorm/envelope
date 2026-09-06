@@ -73,6 +73,8 @@ SYMMETRIC_DEPLOYMENT_OUTPUT_FIELDS = frozenset(
         "flow_log_evidence",
         "gwlb_endpoint_ids",
         "gwlb_target_group_arns",
+        "production_controller_topology_seed",
+        "router_attestor_enrollment_seed",
         "route_failover",
         "symmetric_topology",
         "transport_router_readiness_expectations",
@@ -6797,6 +6799,8 @@ def symmetric_computed_output_schemas(config: RunConfig) -> dict[str, Any]:
             },
             "sites": failover_sites,
         },
+        "production_controller_topology_seed": None,
+        "router_attestor_enrollment_seed": None,
     }
 
 
@@ -6942,6 +6946,38 @@ def symmetric_output_reference_roots() -> dict[str, set[str]]:
             "aws_instance.transport_router_west",
             "aws_instance.transport_router_east",
         },
+        "production_controller_topology_seed": {
+            "var.symmetric_topology",
+            "var.name",
+            "var.west_region",
+            "var.east_region",
+            "local.sites",
+            "local.transport_router_contracts",
+            "local.route_failover",
+            "aws_vpc.west",
+            "aws_vpc.east",
+            "aws_instance.transport_router_west",
+            "aws_instance.transport_router_east",
+            "aws_subnet.transport_west",
+            "aws_subnet.transport_east",
+            "aws_subnet.gwlbe_west",
+            "aws_subnet.gwlbe_east",
+            "aws_route_table.gwlbe_west",
+            "aws_route_table.gwlbe_east",
+            "aws_route_table_association.gwlbe_west",
+            "aws_route_table_association.gwlbe_east",
+        },
+        "router_attestor_enrollment_seed": {
+            "var.symmetric_topology", "var.envelope_underlay_interface",
+            "var.e2e_load_profile", "local.sites",
+            "aws_instance.transport_router_west", "aws_instance.transport_router_east",
+            "aws_iam_role.transport_west", "aws_iam_role.transport_east",
+            "aws_security_group.transport_west", "aws_security_group.transport_east",
+            "aws_route_table.transport_west", "aws_route_table.transport_east",
+            "aws_route_table_association.transport_west", "aws_route_table_association.transport_east",
+            "aws_subnet.workload_west", "aws_subnet.workload_east",
+            "aws_vpc_endpoint.west", "aws_vpc_endpoint.east",
+        },
         "cost_profile": {
             "var.estimated_fixed_hourly_usd",
             "var.approved_max_fixed_hourly_usd",
@@ -7027,7 +7063,7 @@ def valid_symmetric_artifact_identity(artifact: Any, config: RunConfig) -> bool:
 def validate_complete_symmetric_output_values(
     outputs: Any, config: RunConfig
 ) -> list[str]:
-    """Require the complete concrete 12-output contract after Terraform apply."""
+    """Require the complete concrete output contract after Terraform apply."""
 
     if not isinstance(outputs, dict):
         return ["saved plan omits planned outputs"]
@@ -7202,6 +7238,9 @@ def validate_symmetric_saved_plan(
             and change.get("after_sensitive") is False
             and (
                 change.get("before") is not None
+                or name in {"production_controller_topology_seed", "router_attestor_enrollment_seed"}
+                and actions_value == ["no-op"]
+                and change.get("after") is None
                 if replace_address is not None
                 else change.get("before") is None
             )

@@ -11,7 +11,7 @@ A target does not inject the inner packet into a TUN, forward it directly to the
 
 ## Documentation
 
-Start with the [Docsify onboarding guide](docs/index.html) for the symmetric topology and migration boundary. The [AWS appliance runbook](docs/aws-appliance-runbook.md) and [two-region E2E runbook](docs/aws-two-region-e2e-runbook.md) define the protected lifecycle boundary and evidence requirements.
+Start with the [Docsify onboarding guide](docs/index.html) for the symmetric topology and migration boundary. The [production controller guide](docs/production-controller.md) defines the standalone architecture, operations, IAM, rollback, and proposed SLO boundaries; the [application resilience guide](docs/application-resilience.md) defines TCP reconnect/idempotency and retryable UDP behavior. The [AWS appliance runbook](docs/aws-appliance-runbook.md) and [two-region E2E runbook](docs/aws-two-region-e2e-runbook.md) retain the protected lifecycle boundary and existing evidence history.
 
 ## Symmetric Topology
 
@@ -37,7 +37,7 @@ The reverse direction follows the same shape. Either workload may initiate a new
 
 ## Version-2 Configuration
 
-Topology and target runtime configuration remain at version `2`. The rejected direct-inner-forwarding draft never shipped or passed protected acceptance, so version 2 is corrected in place rather than adding version 3 or a compatibility mode.
+The packet-target runtime and legacy runner-coordinated topology remain at version `2`. The rejected direct-inner-forwarding draft never shipped or passed protected acceptance, so that legacy profile was corrected in place rather than adding a compatibility mode. The separate production-controller profile uses a fresh version-3 transport topology and never reuses version-2 state or evidence.
 
 Targets accept packet-turnaround settings such as `--config-version=2`, `--udp-bind`, and `--max-inner-packet-size`. Site CIDRs belong to topology, GWLBE route tables, and transport-router configuration, not to target forwarding configuration. Target parsing rejects directional-lane fields and obsolete draft-v2 target CIDR, TUN, Tailscale, and host-routing fields before host or AWS mutation. Do not reuse an older configuration, Terraform state, plan, evidence file, or protected-run input.
 

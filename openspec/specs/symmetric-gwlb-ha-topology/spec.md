@@ -3,6 +3,8 @@
 ## Purpose
 Define symmetric, highly available inter-site traffic inspection through GWLB, GWLBE route domains, redundant Tailscale transport, and bounded ENI route failover.
 
+Legacy-v2 protected acceptance retains singleton advertisements and runner-owned temporary failover. Approved production-v3 uses complete overlapping advertisements, native Tailscale ownership, and standalone controller-owned reconciliation; legacy runner authority does not extend to production-v3.
+
 ## Requirements
 ### Requirement: Symmetric inter-site GWLB traversal
 The system SHALL route every packet between configured disjoint site CIDRs through both sites' GWLBE and GWLB paths without NAT. At each site an Envelope target SHALL return the current packet to GWLB before that site's GWLBE route table selects local delivery or a same-site transport-router ENI. No target or transport router may bypass the required local GWLB traversal.
@@ -31,6 +33,10 @@ The deployment SHALL create separate workload, transport-router, GWLBE, Envelope
 - **THEN** plan validation and protected readiness fail before acceptance traffic
 
 ### Requirement: Redundant bidirectional site transport
+For approved production-v3, each site SHALL have at least two AZ-spread Tailscale transport routers that continuously advertise the same complete set of exact local-site workload prefixes for native subnet-router HA. Every router SHALL accept all exact remote-site routes, preserve source addresses with subnet-route SNAT disabled, keep Tailnet DNS acceptance disabled so the VPC resolver remains authoritative, and forward both underlay-to-Tailscale remote traffic and Tailscale-to-underlay local traffic. Higher-priority full-prefix policy rules SHALL force every local-site destination to `main` and the VPC underlay before any local route accepted into table 52; every opposite-site observer SHALL identify exactly one eligible primary owner for each prefix. Envelope targets SHALL NOT run Tailscale or serve as site transit routers.
+
+The following disjoint-advertisement paragraph and the scenarios without a production designation apply only to legacy-v2 protected acceptance.
+
 Each site SHALL have at least two AZ-spread Tailscale transport routers whose disjoint initial advertisement sets exactly cover the local-site prefixes. Every router SHALL accept all exact remote-site routes, preserve source addresses with subnet-route SNAT disabled, keep Tailnet DNS acceptance disabled so the VPC resolver remains authoritative, remain capable of every site prefix during bounded takeover, and forward both underlay-to-Tailscale remote traffic and Tailscale-to-underlay local traffic. On each router, table 52 SHALL contain exactly the opposite site's workload prefixes and no local-site prefix; no same-site observer SHALL report a protected local `PrimaryRoutes` claim. Every local prefix, whether self- or sibling-owned by the singleton advertisement map, SHALL remain on `main` and the VPC underlay, where the higher-priority `iif tailscale0` rules make every router capable of normal and takeover delivery. Envelope targets SHALL NOT run Tailscale or serve as site transit routers.
 
 #### Scenario: Remote-bound inspected packet
@@ -45,7 +51,21 @@ Each site SHALL have at least two AZ-spread Tailscale transport routers whose di
 - **WHEN** the failed protected run `ha25` route evidence is reconciled for its two-prefix-per-site profile
 - **THEN** each router's table 52 contains exactly the two opposite-site workload routes, every serving path is opposite-site, and no protected local prefix has a same-site `PrimaryRoutes` claim or Tailnet route
 
+#### Scenario: Production remote-bound inspected packet
+- **WHEN** a GWLBE subnet route delivers a remote-site packet to the ENI of the Tailscale-selected source-prefix owner
+- **THEN** that router forwards the unchanged source and destination through its accepted Tailscale route without NAT
+
+#### Scenario: Production Tailnet-arriving local packet
+- **WHEN** any production site router receives a packet from Tailscale for a local-site CIDR
+- **THEN** its higher-priority full-prefix local rule selects `main`, the VPC underlay, and the destination workload prefix's AZ GWLBE before workload delivery, independent of the receiving router AZ or a local table-52 route
+
+#### Scenario: Production native route owner fails
+- **WHEN** the selected Tailscale router disconnects and another configured router becomes the sole primary for the same exact prefix
+- **THEN** the alternate is eligible for the corresponding GWLBE routes only after controller observer quorum and cloud readiness agree
+
 ### Requirement: Protected runner owns bounded ENI route failover
+This requirement and all its scenarios apply only to legacy-v2 protected acceptance and recovery. Approved production-v3 SHALL use Autonomous production route alignment instead and SHALL NOT grant route-mutation authority to the acceptance observer.
+
 Every GWLBE remote-site route SHALL initially select the explicitly configured run-owned, ready, same-AZ transport-router ENI that owns that GWLBE AZ's workload source prefix, with at least one capable same-site alternate. That source-prefix owner/ENI coupling SHALL be derived from singleton advertisements, control-plane stable identities, and opposite-site observations. Only the protected runner SHALL transfer that exact Tailnet prefix and replace those exact routes during acceptance. It SHALL verify ownership, disabled Tailnet DNS acceptance, empty Tailscale health, and readiness; persist prior advertisements, route targets, and an expiring owner lease through the CAS-protected run claim; bound both control planes' convergence and recovery; settle ambiguous completion; restore each baseline advertisement with DNS acceptance disabled and each original target on success, failure, interruption, or recovered runner loss; and fail closed on ambiguous ownership. Targets and transport routers SHALL have no AWS route-mutation authority.
 
 #### Scenario: Selected transport router fails
@@ -69,6 +89,8 @@ Every GWLBE remote-site route SHALL initially select the explicitly configured r
 - **THEN** the leased cleanup marker and private pending receipt preserve enough exact authority for a later invocation to finish cleanup without replaying acceptance
 
 ### Requirement: Bounded high availability behavior
+The runner-owned recovery and paired-stream scheduling in this requirement apply to legacy-v2 acceptance. Approved production-v3 SHALL prove controller-owned transport ENI recovery under the production conformance contract. Both profiles retain alternate-target recovery, established-flow outcome reporting, and the prohibition on unsupported hitless or lossless claims.
+
 Each enabled site AZ SHALL have a local GWLBE and a healthy-capable Envelope target path, and each site SHALL have at least two ready transport routers. The system SHALL prove alternate-target new-flow recovery and runner-owned transport ENI route recovery and SHALL record established-flow recovery and packet loss without promising hitless continuity or requiring an original five-tuple to resume. For instance, router, or route failure, a complete observation that continues sending after the mutation MAY record an exact right-censored interruption; paired instance and router TCP/UDP observations MAY complete prospectively after at least 20 successful sends and a runner-requested final post-mutation send while their full transaction reservations plus bounded paired-control headroom remain command watchdogs. The target-process post-restoration marker requirement remains unchanged.
 
 #### Scenario: Target failure
@@ -82,3 +104,14 @@ Each enabled site AZ SHALL have a local GWLBE and a healthy-capable Envelope tar
 #### Scenario: Established transport interruption
 - **WHEN** a target, process, transport router, or ENI route fails during an established TCP or UDP flow
 - **THEN** acceptance records exact attempted, acknowledged, and lost marker counts, whether the observation resumed or ended right-censored, and does not report a hitless-continuity or bounded-interruption claim without a trailing acknowledgement
+
+### Requirement: Autonomous production route alignment
+The production topology SHALL run a separate highly available controller that continuously aligns each GWLBE route domain's exact remote-site routes with the ENI of the sole eligible Tailscale primary for that domain's source workload prefix. Each domain's immutable authority SHALL name its exact GWLBE subnet and explicit route-table association IDs, and authoritative readback SHALL require that sole active non-main association in the configured site VPC before route mutation. The controller SHALL use durable fenced state and bounded owner stability. Targets and transport routers SHALL have no AWS route-mutation authority, and production recovery SHALL not depend on the protected acceptance runner.
+
+#### Scenario: Stable alternate is selected
+- **WHEN** Tailscale converges an exact source prefix to an eligible alternate and a fresh controller quorum agrees
+- **THEN** the controller replaces only that domain's allowlisted routes with the alternate ENI and retains it as stable state
+
+#### Scenario: Ownership is ambiguous
+- **WHEN** observers disagree, no sole primary exists, or the selected primary is outside the configured router set
+- **THEN** the controller performs no route mutation and reports the domain degraded

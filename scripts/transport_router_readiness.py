@@ -55,15 +55,19 @@ def build_readiness_contract(
     underlay_interface: str,
     tailscale_interface: str,
     approved_maximum_tcp_mss: int,
+    config_version: int = 2,
 ) -> dict[str, Any]:
-    """Build the exact deployment-independent transport-router contract."""
+    """Build an exact contract; production callers explicitly select version 3."""
 
+    if isinstance(config_version, bool) or config_version not in (2, 3):
+        raise ValueError("transport-router contract version must be 2 or 3")
     local_cidrs = sorted(local_site_cidrs)
     remote_cidrs = sorted(remote_site_cidrs)
+    local_policy_input = tailscale_interface if config_version == 2 else "all"
     local_policy_rules = [
         {
             "priority": POLICY_PRIORITY_BASE + index,
-            "input": tailscale_interface,
+            "input": local_policy_input,
             "source": "all",
             "destination": cidr,
             "fwmark": 0,
@@ -146,7 +150,7 @@ def build_readiness_contract(
                     }
                 )
     return {
-        "config_version": 2,
+        "config_version": config_version,
         "local_site_cidrs": local_cidrs,
         "remote_site_cidrs": remote_cidrs,
         "underlay_interface": underlay_interface,
@@ -240,6 +244,9 @@ def _validated_readiness_contract(value: Any) -> dict[str, Any]:
     underlay = value.get("underlay_interface")
     tailscale = value.get("tailscale_interface")
     maximum_mss = value.get("approved_maximum_tcp_mss")
+    config_version = value.get("config_version")
+    if isinstance(config_version, bool) or config_version not in (2, 3):
+        raise ReadinessError("readiness contract version must be 2 or 3")
     if (
         not isinstance(underlay, str)
         or not isinstance(tailscale, str)
@@ -261,6 +268,7 @@ def _validated_readiness_contract(value: Any) -> dict[str, Any]:
         underlay,
         tailscale,
         maximum_mss,
+        config_version,
     )
     expected_keys = set(expected) | {"contract_sha256"}
     actual_contract = {key: value[key] for key in expected if key in value}
@@ -433,6 +441,13 @@ def _host_routes(value: Any, field: str) -> tuple[Mapping[str, Any], ...]:
     return tuple(value)
 
 
+def _prefix_probe_addresses(
+    prefix: ipaddress.IPv4Network | ipaddress.IPv6Network,
+) -> list[str]:
+    offsets = {0, prefix.num_addresses // 2, prefix.num_addresses - 1}
+    return [str(prefix.network_address + offset) for offset in sorted(offsets)]
+
+
 def _verify_host_route_domain(
     routes_value: Any,
     prefixes: Sequence[ipaddress.IPv4Network | ipaddress.IPv6Network],
@@ -440,7 +455,7 @@ def _verify_host_route_domain(
     field: str,
     *,
     exact: bool,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     parsed = [
         (route, _host_route_network(route, field))
         for route in _host_routes(routes_value, field)
@@ -450,7 +465,7 @@ def _verify_host_route_domain(
             if any(network.overlaps(prefix) for prefix in prefixes if network.version == prefix.version):
                 raise ReadinessError(f"{field} contains a source-specific route for an approved prefix")
 
-    summary: list[dict[str, str]] = []
+    summary: list[dict[str, Any]] = []
     for prefix in prefixes:
         intersections = [
             (route, network)
@@ -477,6 +492,7 @@ def _verify_host_route_domain(
                     "prefix": str(prefix),
                     "owner": str(owner),
                     "device": expected_device,
+                    "checked_addresses": _prefix_probe_addresses(prefix),
                 }
             )
             continue
@@ -508,11 +524,36 @@ def _verify_host_route_domain(
             raise ReadinessError(
                 f"{prefix} has a more-specific {field} route bypass: {', '.join(sorted(bypasses))}"
             )
+        for address in _prefix_probe_addresses(prefix):
+            parsed_address = ipaddress.ip_address(address)
+            candidates = [
+                (route, network)
+                for route, network in parsed
+                if network.version == parsed_address.version
+                and parsed_address in network
+            ]
+            if not candidates:
+                raise ReadinessError(
+                    f"{prefix} interior address {address} has no {field} route"
+                )
+            longest = max(network.prefixlen for _route, network in candidates)
+            address_winners = [
+                route for route, network in candidates if network.prefixlen == longest
+            ]
+            if (
+                len(address_winners) != 1
+                or address_winners[0].get("dev") != expected_device
+                or address_winners[0].get("type", "unicast") != "unicast"
+            ):
+                raise ReadinessError(
+                    f"{prefix} interior address {address} does not select {expected_device}"
+                )
         summary.append(
             {
                 "prefix": str(prefix),
                 "owner": str(owner),
                 "device": expected_device,
+                "checked_addresses": _prefix_probe_addresses(prefix),
             }
         )
     return summary
@@ -540,6 +581,49 @@ def _reject_host_route_intersections(
             f"{field} intersects protected local prefixes: "
             + ", ".join(sorted(intersections))
         )
+
+
+def _verify_shadowed_local_table52_routes(
+    routes_value: Any,
+    prefixes: Sequence[ipaddress.IPv4Network | ipaddress.IPv6Network],
+    tailscale_interface: str,
+) -> list[dict[str, Any]]:
+    parsed = [
+        (route, _host_route_network(route, "table-52 local"))
+        for route in _host_routes(routes_value, "table-52 local")
+    ]
+    protected = set(prefixes)
+    observed: dict[
+        ipaddress.IPv4Network | ipaddress.IPv6Network, Mapping[str, Any]
+    ] = {}
+    for route, network in parsed:
+        if not any(
+            network.version == prefix.version and network.overlaps(prefix)
+            for prefix in prefixes
+        ):
+            continue
+        if (
+            network not in protected
+            or network in observed
+            or route.get("from") not in (None, "all")
+            or route.get("src") not in (None, "")
+            or route.get("dev") != tailscale_interface
+            or route.get("type", "unicast") != "unicast"
+        ):
+            raise ReadinessError(
+                "table-52 local overlap is not an exact safely shadowed Tailscale route"
+            )
+        observed[network] = route
+    return [
+        {
+            "prefix": str(prefix),
+            "device": tailscale_interface,
+            "shadowed_by": "destination-only-main-policy",
+            "checked_addresses": _prefix_probe_addresses(prefix),
+        }
+        for prefix in prefixes
+        if prefix in observed
+    ]
 
 
 def _verify_firewall(
@@ -727,7 +811,7 @@ def _verify_host_network_service(
 def _verify_local_policy_rules(
     value: Any,
     prefixes: Sequence[ipaddress.IPv4Network | ipaddress.IPv6Network],
-    tailscale_interface: str,
+    expected_input: str,
 ) -> list[int]:
     if not isinstance(value, list):
         raise ReadinessError("local-site policy rules must contain exactly one rule per prefix")
@@ -756,7 +840,7 @@ def _verify_local_policy_rules(
             prefix not in prefixes
             or prefix in observed
             or priority != expected_priorities[prefix]
-            or rule.get("input") != tailscale_interface
+            or rule.get("input") != expected_input
             or rule.get("source") != "all"
             or rule.get("fwmark") != 0
             or str(rule.get("table")) not in {"254", "main"}
@@ -820,7 +904,7 @@ def validate_readiness(
     vpc_route_table: Any,
     local_site_cidrs: Sequence[str],
     remote_site_cidrs: Sequence[str],
-    expected_advertised_prefix: str,
+    expected_advertised_prefixes: Sequence[str] | str,
     local_gwlbes: Mapping[str, str],
     expected_network_interface_id: str,
     expected_subnet_id: str,
@@ -852,7 +936,7 @@ def validate_readiness(
     if status.get("Health") != []:
         raise ReadinessError("Tailscale reports an unhealthy backend condition")
     self_status = status.get("Self")
-    if not isinstance(self_status, Mapping) or set(self_status) != {
+    expected_self_fields = {
         "Online",
         "Expired",
         "KeyExpiry",
@@ -862,7 +946,10 @@ def validate_readiness(
         "NoSNAT",
         "CorpDNS",
         "RoutePeers",
-    }:
+    }
+    if contract["config_version"] == 3:
+        expected_self_fields.add("EnabledRoutes")
+    if not isinstance(self_status, Mapping) or set(self_status) != expected_self_fields:
         raise ReadinessError("status.Self has the wrong sanitized fixture shape")
     if (
         not isinstance(expected_network_interface_id, str)
@@ -958,14 +1045,29 @@ def validate_readiness(
         ):
             raise ReadinessError(f"{field} CIDRs overlap each other")
     expected_local_gwlbes = _validated_local_gwlbes(local_gwlbes, local)
-    expected_advertisements = _networks(
-        [expected_advertised_prefix], "expected advertised prefix"
+    raw_expected_advertisements = (
+        [expected_advertised_prefixes]
+        if isinstance(expected_advertised_prefixes, str)
+        else list(expected_advertised_prefixes)
     )
-    if expected_advertisements[0] not in local:
+    expected_advertisements = _networks(
+        raw_expected_advertisements, "expected advertised prefixes"
+    )
+    if contract["config_version"] == 3:
+        if set(expected_advertisements) != set(local):
+            raise ReadinessError(
+                "expected advertisements are not the complete exact local-site CIDR set"
+            )
+    elif len(expected_advertisements) != 1 or expected_advertisements[0] not in local:
         raise ReadinessError(
-            "expected advertised prefix is not an exact local-site CIDR"
+            "legacy expected advertisement is not one exact local-site CIDR"
         )
     advertised = _status_routes(status, "AdvertisedRoutes")
+    enabled = (
+        _status_routes(status, "EnabledRoutes")
+        if contract["config_version"] == 3
+        else advertised
+    )
     accepted = _status_routes(status, "AcceptedRoutes")
     if self_status.get("Online") is not True or self_status.get("Expired") is not False:
         raise ReadinessError("transport router self node is offline or expired")
@@ -983,7 +1085,11 @@ def validate_readiness(
         raise ReadinessError("Tailnet DNS acceptance is enabled or unverified")
     if set(advertised) != set(expected_advertisements):
         raise ReadinessError(
-            "transport-router advertisement is not its exact assigned local-site CIDR"
+            "transport-router advertisements are not the exact expected local-site CIDRs"
+        )
+    if set(enabled) != set(expected_advertisements):
+        raise ReadinessError(
+            "transport-router enabled routes are not the exact expected local-site CIDRs"
         )
     if set(accepted) != set(remote):
         raise ReadinessError("accepted remote routes are not the exact approved CIDRs")
@@ -1004,7 +1110,9 @@ def validate_readiness(
         contract["approved_maximum_tcp_mss"],
     )
     policy_rule_priorities = _verify_local_policy_rules(
-        transport_state["local_policy_rules"], local, tailscale_interface
+        transport_state["local_policy_rules"],
+        local,
+        tailscale_interface if contract["config_version"] == 2 else "all",
     )
     remote_prefix_chains = _verify_host_route_domain(
         transport_state["table52_routes"],
@@ -1013,11 +1121,6 @@ def validate_readiness(
         "table-52 remote",
         exact=True,
     )
-    _reject_host_route_intersections(
-        transport_state["table52_routes"],
-        local,
-        "table-52 route",
-    )
     local_prefix_chains = _verify_host_route_domain(
         transport_state["main_routes"],
         local,
@@ -1025,6 +1128,17 @@ def validate_readiness(
         "local underlay",
         exact=False,
     )
+    if contract["config_version"] == 2:
+        _reject_host_route_intersections(
+            transport_state["table52_routes"],
+            local,
+            "table-52 route",
+        )
+        local_tailnet_selection: list[dict[str, Any]] = []
+    else:
+        local_tailnet_selection = _verify_shadowed_local_table52_routes(
+            transport_state["table52_routes"], local, tailscale_interface
+        )
 
     if (
         not isinstance(vpc_route_table, Mapping)
@@ -1098,7 +1212,7 @@ def validate_readiness(
         "prefix_chains": {
             "local_underlay": local_prefix_chains,
             "remote_tailnet": remote_prefix_chains,
-            "local_tailnet_selection": [],
+            "local_tailnet_selection": local_tailnet_selection,
             "local_vpc_gwlbe": vpc_prefix_chains,
         },
         "firewall_chains": {
@@ -1119,7 +1233,15 @@ def validate_readiness(
         "tailscale_interface": tailscale_interface,
         "local_site_cidrs": [str(network) for network in local],
         "remote_site_cidrs": [str(network) for network in remote],
-        "advertised_prefix": str(expected_advertisements[0]),
+        **(
+            {"advertised_prefix": str(expected_advertisements[0])}
+            if contract["config_version"] == 2
+            else {
+                "advertised_prefixes": [
+                    str(prefix) for prefix in expected_advertisements
+                ]
+            }
+        ),
     }
 
 
@@ -1145,7 +1267,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--contract-file", type=pathlib.Path, required=True)
     parser.add_argument("--local-site-cidr", action="append", required=True)
     parser.add_argument("--remote-site-cidr", action="append", required=True)
-    parser.add_argument("--advertised-prefix", required=True)
+    parser.add_argument("--advertised-prefix", action="append", required=True)
     parser.add_argument("--local-gwlbes-file", type=pathlib.Path, required=True)
     parser.add_argument("--network-interface-id", required=True)
     parser.add_argument("--subnet-id", required=True)

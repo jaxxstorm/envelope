@@ -3,6 +3,8 @@
 ## Purpose
 This capability defines separated Envelope packet-turnaround targets and dedicated Tailscale transport routers that provide bidirectional, source-preserving, no-NAT transit through GWLB inspection.
 
+Legacy-v2 protected acceptance uses singleton advertisements, remote-only table 52, and runner-owned failover. Approved production-v3 uses complete overlapping advertisements and controller-observed native ownership, with full-prefix local-main policy protecting the inspection path. Profile-specific paragraphs and scenarios below are not interchangeable; the Envelope packet-turnaround runtime remains version 2.
+
 ## Requirements
 
 ### Requirement: Separated target and transport-router roles
@@ -17,6 +19,10 @@ Envelope targets SHALL NOT run or require `tailscaled`, own `envelope0`, adverti
 - **THEN** configuration fails before TUN, route, Tailscale, or forwarding state is inspected or mutated
 
 ### Requirement: Bidirectional no-NAT transport-router readiness
+For approved production-v3, the deployment SHALL validate every Tailscale transport router separately from Envelope targets. A ready router SHALL have a healthy Running kernel-TUN backend, advertise and have enabled the complete exact local-site CIDR set shared by every same-site failover candidate, accept every exact remote-site route, disable subnet-route SNAT and Tailnet DNS acceptance, preserve the VPC resolver and workload source addresses, enable underlay-to-Tailscale and Tailscale-to-underlay forwarding, and prove that its subnet route table sends each local-site CIDR to that destination workload prefix's AZ GWLBE independent of the router AZ. Higher-priority full-prefix local policy rules SHALL prevent any accepted same-site route in table 52 from shadowing `main`. A router ENI SHALL be eligible for a GWLBE's remote routes only while a fresh controller quorum observes that router as the sole primary owner of the GWLBE source workload prefix.
+
+The following singleton-advertisement paragraph and the scenarios without a production designation apply only to legacy-v2 protected acceptance.
+
 The deployment SHALL validate every Tailscale transport router separately from Envelope targets. A ready router SHALL have a healthy Running kernel-TUN backend, enable only its singleton assigned exact local-site CIDR advertisement in normal operation, accept every exact remote-site route, remain capable of advertising every exact local-site CIDR during bounded failover, disable subnet-route SNAT and Tailnet DNS acceptance, preserve the VPC resolver and workload source addresses, enable underlay-to-Tailscale and Tailscale-to-underlay forwarding, and prove that its subnet route table sends each local-site CIDR to that destination workload prefix's AZ GWLBE independent of the router AZ. The fleet's normal enabled advertisement sets SHALL be non-empty and pairwise disjoint and their union SHALL equal all exact local-site CIDRs. Table 52 and Tailnet serving paths SHALL contain only opposite-site workload prefixes; all local prefixes SHALL remain on the main/VPC underlay with no same-site protected `PrimaryRoutes` claim. A router ENI SHALL be eligible for a GWLBE's remote routes only while that router owns the GWLBE AZ's workload source prefix.
 
 #### Scenario: Ready transport router
@@ -31,6 +37,18 @@ The deployment SHALL validate every Tailscale transport router separately from E
 - **WHEN** a transport-router subnet can directly deliver a local-site CIDR or selects the receiving router's endpoint instead of the destination prefix's GWLBE
 - **THEN** readiness is unhealthy and identifies the affected prefix
 
+#### Scenario: Production ready transport router
+- **WHEN** the backend, complete overlapping advertisements, accepted routes, source preservation, forwarding, firewall, MSS, ENI identity, full-prefix local policy, and destination-prefix GWLBE routes all pass
+- **THEN** the router is ready for native Tailnet failover, post-inspection remote egress, and Tailnet-arriving local ingress
+
+#### Scenario: Production either transit direction is invalid
+- **WHEN** a required sysctl, reverse-path setting, source/destination check, no-NAT assertion, firewall path, MSS rule, host route, or VPC route is invalid
+- **THEN** transport-router readiness fails before acceptance traffic or controller ENI eligibility
+
+#### Scenario: Production Tailnet packet could bypass inspection
+- **WHEN** a local table-52 route, transport subnet route, or receiving-router endpoint can shadow the higher-priority local-main and destination-prefix GWLBE path
+- **THEN** readiness is unhealthy and identifies the affected prefix
+
 ### Requirement: Secretless separated-role acceptance
 The system SHALL provide a required local integration with immutable Headscale and Tailscale versions, runtime-generated credentials, dedicated transport-router namespaces, fake GWLBE/GWLB paths, and stateless packet-turnaround targets. It SHALL prove both transit directions, source preservation, and two site inspection loops without external Tailscale credentials.
 
@@ -43,6 +61,10 @@ The system SHALL provide a required local integration with immutable Headscale a
 - **THEN** the destination observes the original workload source and the harness detects no SNAT or masquerade rule
 
 ### Requirement: Effective forward route to Tailscale
+For approved production-v3, transport-router readiness SHALL prove complete configured prefixes rather than only boundary addresses. For every remote-site destination received from a selected GWLBE ENI, effective host routing SHALL select `tailscale0` and the control plane's sole primary owner for that exact prefix. For every local-site destination from any interface, a higher-priority full-prefix policy rule SHALL select `main` and the VPC underlay, and the associated VPC route table SHALL select the destination workload prefix's AZ GWLBE. More-specific, source-specific, policy, blackhole, unreachable, prohibit, wrong-device, wrong-endpoint, or local table-52 routes that bypass either effective result SHALL fail readiness.
+
+The following remote-only table-52 paragraph and the Effective local inspection route, ha25 remote-only table 52, and Local Tailnet route is present scenarios apply only to legacy-v2 protected acceptance. Effective remote route and Interior route shadowing apply to both profiles; production-specific local routing scenarios follow.
+
 Transport-router readiness SHALL prove the complete configured prefixes rather than only boundary addresses. For every remote-site destination received from a selected GWLBE ENI, effective host routing SHALL select `tailscale0` and the configured stable owner of that exact prefix. In normal operation, table 52 SHALL contain exactly one exact `tailscale0` route for each opposite-site workload prefix and no local-site prefix route. For every local-site destination received from `tailscale0`, whether its singleton advertiser is self or sibling, the higher-priority `iif tailscale0` local-prefix policy rule SHALL select `main` and the VPC underlay, and the associated VPC route table SHALL select the destination workload prefix's AZ GWLBE. More-specific, source-specific, policy, blackhole, unreachable, prohibit, duplicate, swapped-owner, wrong-device, wrong-endpoint, or local table-52 routes that bypass either result SHALL fail readiness.
 
 #### Scenario: Effective remote route
@@ -65,7 +87,17 @@ Transport-router readiness SHALL prove the complete configured prefixes rather t
 - **WHEN** a more-specific or source-specific route can bypass Tailscale or the destination-prefix GWLBE for any interior subset
 - **THEN** full-prefix readiness fails even if boundary lookups succeed
 
+#### Scenario: Production effective local inspection route
+- **WHEN** any packet on a production transport router targets a local-site CIDR
+- **THEN** every address in the destination prefix selects `main` and that workload prefix's AZ GWLBE before local delivery, independent of the receiving router AZ
+
+#### Scenario: Production accepted local route is shadowed safely
+- **WHEN** overlapping native HA causes table 52 to contain a same-site local prefix through another router
+- **THEN** the higher-priority full-prefix policy selects `main` for every address in that prefix and readiness rejects any shadowing exception
+
 ### Requirement: Linux forwarding prerequisites
+For approved production-v3, transport-router readiness SHALL additionally require a higher-priority full-prefix `main` policy for every exact local-site CIDR. The common forwarding contract below applies to both profiles; production readiness SHALL fail if any required local-main policy is absent.
+
 Transport-router readiness SHALL require persistent IPv4 forwarding, required IPv6 forwarding when enabled, disabled reverse-path filtering for `conf/all`, the underlay, and `tailscale0`, disabled EC2 source/destination checks, a deterministic underlay-to-Tailscale and Tailscale-to-underlay firewall contract, no NAT rewrite, and TCP MSS policy derived from the live Tailscale path MTU. No forwarding rule SHALL reference `envelope0`.
 
 #### Scenario: Bidirectional forwarding ready
@@ -76,7 +108,19 @@ Transport-router readiness SHALL require persistent IPv4 forwarding, required IP
 - **WHEN** strict reverse-path filtering, a blocking or extra forwarding rule, NAT, missing MSS policy, enabled source/destination checking, or an `envelope0` forwarding rule is present
 - **THEN** readiness fails closed with a bounded reason
 
+#### Scenario: Production bidirectional forwarding ready
+- **WHEN** both interface directions have the exact reviewed forwarding and MSS rules, every local prefix has the main-table policy, and no NAT rule exists
+- **THEN** host forwarding readiness succeeds with source preservation despite overlapping Tailscale advertisements
+
+#### Scenario: Production local-main policy missing
+- **WHEN** any required full-prefix local-main policy is missing
+- **THEN** readiness fails closed with a bounded reason
+
 ### Requirement: Tailscale backend and route readiness
+For approved production-v3, each transport router SHALL use the pinned supported Tailscale status and preferences schemas in kernel-TUN mode, report a healthy Running backend and online non-expired self node, report `CorpDNS` false with no Tailscale health condition, advertise and have enabled every exact local-site prefix with subnet-route SNAT disabled, and pass a bounded data-plane ping to every selected serving peer. Every controller observer SHALL select exactly one online non-expired `PrimaryRoutes` owner from the configured router set for each exact prefix. Ownership SHALL use stable node identity rather than hostname alone. At least two routers per site SHALL independently satisfy readiness as equivalent exact-prefix candidates.
+
+The following singleton-advertisement paragraph and the scenarios without a production designation apply only to legacy-v2 protected acceptance.
+
 Each transport router SHALL use the pinned supported Tailscale status and preferences schemas in kernel-TUN mode, report a healthy Running backend and online non-expired self node, report `CorpDNS` false with no Tailscale health condition, advertise its approved assigned exact local-site prefix with subnet-route SNAT disabled, and pass a bounded data-plane ping to every selected serving peer. Every opposite-site observer SHALL select exactly one online non-expired `PrimaryRoutes` owner matching the configured stable node for each exact remote-site prefix, and table 52 SHALL contain those exact remote-site routes only. Every protected local-site prefix SHALL have no same-site `PrimaryRoutes` claim and no table-52 route, whether its singleton advertiser is self or sibling. Ownership SHALL use stable node identity rather than hostname alone. At least two routers per site SHALL independently satisfy readiness, and their assigned advertisements SHALL exactly partition the site prefixes.
 
 #### Scenario: Redundant ready advertisements
@@ -87,12 +131,28 @@ Each transport router SHALL use the pinned supported Tailscale status and prefer
 - **WHEN** a backend is not Running, Tailnet DNS acceptance is enabled, any Tailscale health condition is present, a local advertisement is unapproved, a remote route is absent, a local Tailnet route or `PrimaryRoutes` claim is present, a serving peer is stale, or a bounded ping fails
 - **THEN** that router is ineligible for GWLBE ENI selection and readiness identifies the condition
 
+#### Scenario: Production redundant ready advertisements
+- **WHEN** a production site is ready
+- **THEN** at least two routers each advertise every exact local-site prefix without SNAT and every fresh controller observer agrees on one primary per prefix
+
+#### Scenario: Production backend, route, or peer unavailable
+- **WHEN** a backend is not Running, Tailnet DNS acceptance is enabled, a Tailscale health condition is present, an expected advertisement is not enabled, a remote route is absent, a serving peer is stale, a bounded ping fails, or ownership has no sole configured primary
+- **THEN** that router or failover domain is ineligible and readiness identifies the condition
+
 ### Requirement: Routing observability
+For approved production-v3, the deployment SHALL expose bounded transport-router and controller readiness for backend state, complete overlapping advertisements, per-prefix `PrimaryRoutes` ownership from every controller observer, effective local-main policy, forwarding, source preservation, MSS, host routes, associated GWLBE routes, and ENI identity. Evidence SHALL map each observed stable owner to its configured transport-router instance and ENI, prove agreement with the controller-selected GWLBE route target, and record native ownership and AWS route transitions without exposing credentials, peer keys, or flow cookies.
+
+The following singleton-advertisement paragraph and Redacted transport status scenario apply only to legacy-v2 protected acceptance.
+
 The deployment SHALL expose bounded transport-router readiness for backend, singleton assigned advertisements, opposite-site per-prefix `PrimaryRoutes` ownership, remote-only table 52, absence of local Tailnet routes and claims, forwarding, source preservation, MSS, effective host routes, associated GWLBE routes, and ENI identity. Evidence SHALL map configured and selected owners to protected transport-router instance IDs, derive the source-prefix owner from singleton advertisements, control-plane stable identities, and opposite-site observations, prove that owner agrees with protected-runner GWLBE ENI selection, record coordinated takeover and restoration separately for both control planes, and SHALL not expose credentials, peer keys, or flow cookies.
 
 #### Scenario: Redacted transport status
 - **WHEN** protected readiness or diagnostics are collected
 - **THEN** site, router and ENI identifiers, exact prefixes, selected interfaces, route targets, and bounded reasons are reported without secrets
+
+#### Scenario: Production redacted transport status
+- **WHEN** readiness, controller reconciliation, or diagnostics are collected
+- **THEN** site, domain, stable-node hash, router and ENI identifiers, exact prefixes, selected interfaces, route targets, observation quorum, and bounded reasons are reported without secrets
 
 ### Requirement: Routing performance regression gate
 The system SHALL define a reviewed benchmark profile for transport-router readiness and the bidirectional no-NAT packet path, with allocation and latency thresholds before implementation performance is accepted.

@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+# Boot-only installation. The steady-state service is a direct Go executable.
+decode() { printf '%s' "$1" | /usr/bin/base64 --decode; }
+bucket="$(decode '${artifact_bucket_b64}')"
+key="$(decode '${artifact_key_b64}')"
+version="$(decode '${artifact_version_b64}')"
+/usr/bin/install -d -o root -g root -m 0755 /etc/envelope /usr/local/bin
+temporary=$(/usr/bin/mktemp /usr/local/bin/.router-attestor.XXXXXX)
+trap '/usr/bin/rm -f "$temporary"' EXIT
+downloaded=false
+for attempt in $(/usr/bin/seq 1 30); do
+  if /usr/bin/aws s3api get-object --region '${artifact_region}' --bucket "$bucket" \
+    --key "$key" --version-id "$version" --cli-connect-timeout 2 \
+    --cli-read-timeout 30 --no-cli-pager "$temporary" >/dev/null; then
+    downloaded=true
+    break
+  fi
+  /usr/bin/sleep 2
+done
+[[ "$downloaded" == true ]]
+printf '%s  %s\n' '${artifact_sha256}' "$temporary" | /usr/bin/sha256sum --check --status
+/usr/bin/install -o root -g root -m 0555 "$temporary" /usr/local/bin/envelope-router-attestor
+decode '${bootstrap_b64}' >/etc/envelope/router-attestor-bootstrap.json
+/usr/bin/chmod 0444 /etc/envelope/router-attestor-bootstrap.json
+decode '${unit_b64}' >/etc/systemd/system/envelope-router-attestor.service
+cat >/etc/systemd/system/envelope-router-attestor-enroll.service <<'UNIT'
+[Unit]
+Description=Boot-only immutable router attestor enrollment
+After=network-online.target tailscaled.service envelope-transport-router-network.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/bin/envelope-router-attestor enroll
+TimeoutStartSec=40s
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/etc/envelope
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+UNIT
+cat >/etc/systemd/system/envelope-router-attestor-enroll.timer <<'UNIT'
+[Unit]
+Description=Retry boot enrollment until reviewed identity/configuration is available
+[Timer]
+OnBootSec=5s
+OnUnitInactiveSec=10s
+Unit=envelope-router-attestor-enroll.service
+[Install]
+WantedBy=timers.target
+UNIT
+/usr/bin/systemctl daemon-reload
+# Enrollment starts the inspector and stops its own timer after an atomic install.
+/usr/bin/systemctl enable envelope-router-attestor.service
+/usr/bin/systemctl enable --now envelope-router-attestor-enroll.timer

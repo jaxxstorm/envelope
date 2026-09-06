@@ -3763,9 +3763,14 @@ class SymmetricTopologyV2:
 
 
 def parse_symmetric_topology_v2(value: Any) -> SymmetricTopologyV2:
-    """Parse only the v2 fleet contract; directional outputs are intentionally rejected."""
+    """Parse only the isolated legacy v2 acceptance contract."""
 
     document = _mapping(value, "symmetric topology")
+    if document.get("config_version") == 3:
+        raise DeploymentError(
+            "production native-HA topology requires the controller conformance runner; "
+            "the singleton route-transfer runner accepts only legacy version 2"
+        )
     _exact_keys(
         document,
         {"config_version", "run_id", "route_failover", "sites"},
@@ -3970,6 +3975,7 @@ def _transport_router_contract(
         TRANSPORT_UNDERLAY_INTERFACE,
         TRANSPORT_TAILSCALE_INTERFACE,
         load_profile.maximum_tcp_mss,
+        config_version=2,
     )
 
 

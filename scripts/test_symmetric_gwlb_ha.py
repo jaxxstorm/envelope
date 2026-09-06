@@ -816,6 +816,15 @@ class SymmetricTopologyTest(unittest.TestCase):
             hasattr(e2e.AwsSymmetricLiveOperations, "_selected_ingress_router")
         )
 
+    def test_legacy_acceptance_parser_rejects_the_production_native_ha_profile(self) -> None:
+        production = topology_document()
+        production["config_version"] = 3
+
+        with self.assertRaisesRegex(
+            e2e.DeploymentError, "production native-HA topology.*legacy version 2"
+        ):
+            e2e.parse_symmetric_topology_v2(production)
+
     def test_symmetric_readiness_installs_wire_inspector_on_every_target(self) -> None:
         deployment = e2e.parse_symmetric_protected_deployment_output(
             symmetric_protected_output()
