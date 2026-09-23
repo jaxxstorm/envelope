@@ -37,7 +37,7 @@ The dedicated transport routers are bidirectional. A source-site router receives
 - GWLBE post-inspection local delivery and one selected same-site transport-router ENI per exact remote prefix.
 - An approved fixed-cost ceiling and short, explicit resource expiry before any future infrastructure creation.
 
-The [Terraform topology shape](terraform-example.md) is illustrative only and deliberately omits a protected configuration. It is not a deployment instruction.
+The [Terraform topology shape](../terraform-example.md) is illustrative only and deliberately omits a protected configuration. It is not a deployment instruction.
 
 ## External Failover Input
 

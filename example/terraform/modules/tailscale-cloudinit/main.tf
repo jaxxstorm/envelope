@@ -1,5 +1,5 @@
 locals {
-  upstream_release = "tailscale/tailscale/cloudinit@0.0.11"
+  upstream_release = "tailscale/terraform-cloudinit-tailscale@0.0.12"
 }
 
 data "cloudinit_config" "main" {

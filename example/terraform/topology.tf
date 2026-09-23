@@ -130,34 +130,53 @@ resource "terraform_data" "input_validation" {
   }
 }
 
-resource "aws_vpc" "west" {
-  cidr_block           = local.sites.west.vpc_cidr
-  enable_dns_hostnames = true
-  enable_dns_support   = true
-  tags                 = merge(local.common_tags, { Name = "${var.name}-west-vpc", Site = "west" })
-  depends_on           = [terraform_data.input_validation]
+module "vpc_west" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "6.7.2"
+
+  name                   = "${var.name}-west"
+  cidr                   = local.sites.west.vpc_cidr
+  azs                    = [for key in sort(keys(local.sites.west.azs)) : local.sites.west.azs[key]]
+  public_subnets         = [local.sites.west.management_subnet_cidr]
+  enable_dns_hostnames   = true
+  enable_dns_support     = true
+  create_igw             = true
+  enable_nat_gateway     = true
+  single_nat_gateway     = true
+  one_nat_gateway_per_az = false
+
+  tags               = merge(local.common_tags, { Name = "${var.name}-west-vpc", Site = "west" })
+  public_subnet_tags = merge(local.common_tags, { Name = "${var.name}-west-management", Role = "management" })
+
+  depends_on = [terraform_data.input_validation]
 }
-resource "aws_vpc" "east" {
-  provider             = aws.east
-  cidr_block           = local.sites.east.vpc_cidr
-  enable_dns_hostnames = true
-  enable_dns_support   = true
-  tags                 = merge(local.common_tags, { Name = "${var.name}-east-vpc", Site = "east" })
-  depends_on           = [terraform_data.input_validation]
-}
-resource "aws_internet_gateway" "west" {
-  vpc_id = aws_vpc.west.id
-  tags   = merge(local.common_tags, { Name = "${var.name}-west-igw" })
-}
-resource "aws_internet_gateway" "east" {
-  provider = aws.east
-  vpc_id   = aws_vpc.east.id
-  tags     = merge(local.common_tags, { Name = "${var.name}-east-igw" })
+
+module "vpc_east" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "6.7.2"
+
+  providers = { aws = aws.east }
+
+  name                   = "${var.name}-east"
+  cidr                   = local.sites.east.vpc_cidr
+  azs                    = [for key in sort(keys(local.sites.east.azs)) : local.sites.east.azs[key]]
+  public_subnets         = [local.sites.east.management_subnet_cidr]
+  enable_dns_hostnames   = true
+  enable_dns_support     = true
+  create_igw             = true
+  enable_nat_gateway     = true
+  single_nat_gateway     = true
+  one_nat_gateway_per_az = false
+
+  tags               = merge(local.common_tags, { Name = "${var.name}-east-vpc", Site = "east" })
+  public_subnet_tags = merge(local.common_tags, { Name = "${var.name}-east-management", Role = "management" })
+
+  depends_on = [terraform_data.input_validation]
 }
 
 resource "aws_subnet" "workload_west" {
   for_each          = local.sites.west.azs
-  vpc_id            = aws_vpc.west.id
+  vpc_id            = module.vpc_west.vpc_id
   availability_zone = each.value
   cidr_block        = local.sites.west.workload_subnet_cidrs[each.key]
   tags              = merge(local.common_tags, { Name = "${var.name}-west-workload-${each.key}", Role = "workload", ZoneKey = each.key })
@@ -165,14 +184,14 @@ resource "aws_subnet" "workload_west" {
 resource "aws_subnet" "workload_east" {
   provider          = aws.east
   for_each          = local.sites.east.azs
-  vpc_id            = aws_vpc.east.id
+  vpc_id            = module.vpc_east.vpc_id
   availability_zone = each.value
   cidr_block        = local.sites.east.workload_subnet_cidrs[each.key]
   tags              = merge(local.common_tags, { Name = "${var.name}-east-workload-${each.key}", Role = "workload", ZoneKey = each.key })
 }
 resource "aws_subnet" "transport_west" {
   for_each          = local.sites.west.azs
-  vpc_id            = aws_vpc.west.id
+  vpc_id            = module.vpc_west.vpc_id
   availability_zone = each.value
   cidr_block        = local.sites.west.transport_subnet_cidrs[each.key]
   tags              = merge(local.common_tags, { Name = "${var.name}-west-transport-${each.key}", Role = "transport-router", ZoneKey = each.key })
@@ -180,14 +199,14 @@ resource "aws_subnet" "transport_west" {
 resource "aws_subnet" "transport_east" {
   provider          = aws.east
   for_each          = local.sites.east.azs
-  vpc_id            = aws_vpc.east.id
+  vpc_id            = module.vpc_east.vpc_id
   availability_zone = each.value
   cidr_block        = local.sites.east.transport_subnet_cidrs[each.key]
   tags              = merge(local.common_tags, { Name = "${var.name}-east-transport-${each.key}", Role = "transport-router", ZoneKey = each.key })
 }
 resource "aws_subnet" "gwlbe_west" {
   for_each          = local.sites.west.azs
-  vpc_id            = aws_vpc.west.id
+  vpc_id            = module.vpc_west.vpc_id
   availability_zone = each.value
   cidr_block        = local.sites.west.gwlbe_subnet_cidrs[each.key]
   tags              = merge(local.common_tags, { Name = "${var.name}-west-gwlbe-${each.key}", Role = "gwlbe", ZoneKey = each.key })
@@ -195,14 +214,14 @@ resource "aws_subnet" "gwlbe_west" {
 resource "aws_subnet" "gwlbe_east" {
   provider          = aws.east
   for_each          = local.sites.east.azs
-  vpc_id            = aws_vpc.east.id
+  vpc_id            = module.vpc_east.vpc_id
   availability_zone = each.value
   cidr_block        = local.sites.east.gwlbe_subnet_cidrs[each.key]
   tags              = merge(local.common_tags, { Name = "${var.name}-east-gwlbe-${each.key}", Role = "gwlbe", ZoneKey = each.key })
 }
 resource "aws_subnet" "gwlb_west" {
   for_each          = local.sites.west.azs
-  vpc_id            = aws_vpc.west.id
+  vpc_id            = module.vpc_west.vpc_id
   availability_zone = each.value
   cidr_block        = local.sites.west.gwlb_subnet_cidrs[each.key]
   tags              = merge(local.common_tags, { Name = "${var.name}-west-gwlb-${each.key}", Role = "gwlb", ZoneKey = each.key })
@@ -210,14 +229,14 @@ resource "aws_subnet" "gwlb_west" {
 resource "aws_subnet" "gwlb_east" {
   provider          = aws.east
   for_each          = local.sites.east.azs
-  vpc_id            = aws_vpc.east.id
+  vpc_id            = module.vpc_east.vpc_id
   availability_zone = each.value
   cidr_block        = local.sites.east.gwlb_subnet_cidrs[each.key]
   tags              = merge(local.common_tags, { Name = "${var.name}-east-gwlb-${each.key}", Role = "gwlb", ZoneKey = each.key })
 }
 resource "aws_subnet" "target_west" {
   for_each          = local.sites.west.azs
-  vpc_id            = aws_vpc.west.id
+  vpc_id            = module.vpc_west.vpc_id
   availability_zone = each.value
   cidr_block        = local.sites.west.target_subnet_cidrs[each.key]
   tags              = merge(local.common_tags, { Name = "${var.name}-west-target-${each.key}", Role = "target", ZoneKey = each.key })
@@ -225,79 +244,56 @@ resource "aws_subnet" "target_west" {
 resource "aws_subnet" "target_east" {
   provider          = aws.east
   for_each          = local.sites.east.azs
-  vpc_id            = aws_vpc.east.id
+  vpc_id            = module.vpc_east.vpc_id
   availability_zone = each.value
   cidr_block        = local.sites.east.target_subnet_cidrs[each.key]
   tags              = merge(local.common_tags, { Name = "${var.name}-east-target-${each.key}", Role = "target", ZoneKey = each.key })
 }
-resource "aws_subnet" "management_west" {
-  vpc_id            = aws_vpc.west.id
-  availability_zone = local.sites.west.azs[sort(keys(local.sites.west.azs))[0]]
-  cidr_block        = local.sites.west.management_subnet_cidr
-  tags              = merge(local.common_tags, { Name = "${var.name}-west-management", Role = "management" })
-}
-resource "aws_subnet" "management_east" {
-  provider          = aws.east
-  vpc_id            = aws_vpc.east.id
-  availability_zone = local.sites.east.azs[sort(keys(local.sites.east.azs))[0]]
-  cidr_block        = local.sites.east.management_subnet_cidr
-  tags              = merge(local.common_tags, { Name = "${var.name}-east-management", Role = "management" })
-}
 
 resource "aws_route_table" "workload_west" {
   for_each = local.sites.west.azs
-  vpc_id   = aws_vpc.west.id
+  vpc_id   = module.vpc_west.vpc_id
   tags     = merge(local.common_tags, { Name = "${var.name}-west-workload-${each.key}", Role = "workload", ZoneKey = each.key })
 }
 resource "aws_route_table" "workload_east" {
   provider = aws.east
   for_each = local.sites.east.azs
-  vpc_id   = aws_vpc.east.id
+  vpc_id   = module.vpc_east.vpc_id
   tags     = merge(local.common_tags, { Name = "${var.name}-east-workload-${each.key}", Role = "workload", ZoneKey = each.key })
 }
 resource "aws_route_table" "transport_west" {
   for_each = local.sites.west.azs
-  vpc_id   = aws_vpc.west.id
+  vpc_id   = module.vpc_west.vpc_id
   tags     = merge(local.common_tags, { Name = "${var.name}-west-transport-${each.key}", Role = "transport-router", ZoneKey = each.key })
 }
 resource "aws_route_table" "transport_east" {
   provider = aws.east
   for_each = local.sites.east.azs
-  vpc_id   = aws_vpc.east.id
+  vpc_id   = module.vpc_east.vpc_id
   tags     = merge(local.common_tags, { Name = "${var.name}-east-transport-${each.key}", Role = "transport-router", ZoneKey = each.key })
 }
 resource "aws_route_table" "gwlbe_west" {
   for_each = local.sites.west.azs
-  vpc_id   = aws_vpc.west.id
+  vpc_id   = module.vpc_west.vpc_id
   tags     = merge(local.common_tags, { Name = "${var.name}-west-gwlbe-${each.key}", Role = "gwlbe", ZoneKey = each.key })
 }
 resource "aws_route_table" "gwlbe_east" {
   provider = aws.east
   for_each = local.sites.east.azs
-  vpc_id   = aws_vpc.east.id
+  vpc_id   = module.vpc_east.vpc_id
   tags     = merge(local.common_tags, { Name = "${var.name}-east-gwlbe-${each.key}", Role = "gwlbe", ZoneKey = each.key })
 }
 resource "aws_route_table" "target_west" {
   for_each = local.sites.west.azs
-  vpc_id   = aws_vpc.west.id
+  vpc_id   = module.vpc_west.vpc_id
   tags     = merge(local.common_tags, { Name = "${var.name}-west-target-${each.key}", Role = "target", ZoneKey = each.key })
 }
 resource "aws_route_table" "target_east" {
   provider = aws.east
   for_each = local.sites.east.azs
-  vpc_id   = aws_vpc.east.id
+  vpc_id   = module.vpc_east.vpc_id
   tags     = merge(local.common_tags, { Name = "${var.name}-east-target-${each.key}", Role = "target", ZoneKey = each.key })
 }
-resource "aws_route_table" "management_west" {
-  vpc_id = aws_vpc.west.id
-  tags   = merge(local.common_tags, { Name = "${var.name}-west-management", Role = "management" })
-}
-resource "aws_route_table" "management_east" {
-  provider = aws.east
-  vpc_id   = aws_vpc.east.id
-  tags     = merge(local.common_tags, { Name = "${var.name}-east-management", Role = "management" })
-}
-
 resource "aws_route_table_association" "workload_west" {
   for_each       = local.sites.west.azs
   subnet_id      = aws_subnet.workload_west[each.key].id
@@ -342,84 +338,44 @@ resource "aws_route_table_association" "target_east" {
   subnet_id      = aws_subnet.target_east[each.key].id
   route_table_id = aws_route_table.target_east[each.key].id
 }
-resource "aws_route_table_association" "management_west" {
-  subnet_id      = aws_subnet.management_west.id
-  route_table_id = aws_route_table.management_west.id
-}
-resource "aws_route_table_association" "management_east" {
-  provider       = aws.east
-  subnet_id      = aws_subnet.management_east.id
-  route_table_id = aws_route_table.management_east.id
-}
-resource "aws_eip" "nat_west" {
-  domain     = "vpc"
-  depends_on = [aws_internet_gateway.west]
-}
-resource "aws_eip" "nat_east" {
-  provider   = aws.east
-  domain     = "vpc"
-  depends_on = [aws_internet_gateway.east]
-}
-resource "aws_nat_gateway" "west" {
-  allocation_id = aws_eip.nat_west.id
-  subnet_id     = aws_subnet.management_west.id
-  depends_on    = [aws_route_table_association.management_west, aws_route.management_default_west]
-}
-resource "aws_nat_gateway" "east" {
-  provider      = aws.east
-  allocation_id = aws_eip.nat_east.id
-  subnet_id     = aws_subnet.management_east.id
-  depends_on    = [aws_route_table_association.management_east, aws_route.management_default_east]
-}
-resource "aws_route" "management_default_west" {
-  route_table_id         = aws_route_table.management_west.id
-  destination_cidr_block = "0.0.0.0/0"
-  gateway_id             = aws_internet_gateway.west.id
-}
-resource "aws_route" "management_default_east" {
-  provider               = aws.east
-  route_table_id         = aws_route_table.management_east.id
-  destination_cidr_block = "0.0.0.0/0"
-  gateway_id             = aws_internet_gateway.east.id
-}
 resource "aws_route" "target_default_west" {
   for_each               = local.sites.west.azs
   route_table_id         = aws_route_table.target_west[each.key].id
   destination_cidr_block = "0.0.0.0/0"
-  nat_gateway_id         = aws_nat_gateway.west.id
+  nat_gateway_id         = module.vpc_west.natgw_ids[0]
 }
 resource "aws_route" "target_default_east" {
   provider               = aws.east
   for_each               = local.sites.east.azs
   route_table_id         = aws_route_table.target_east[each.key].id
   destination_cidr_block = "0.0.0.0/0"
-  nat_gateway_id         = aws_nat_gateway.east.id
+  nat_gateway_id         = module.vpc_east.natgw_ids[0]
 }
 resource "aws_route" "transport_default_west" {
   for_each               = local.sites.west.azs
   route_table_id         = aws_route_table.transport_west[each.key].id
   destination_cidr_block = "0.0.0.0/0"
-  nat_gateway_id         = aws_nat_gateway.west.id
+  nat_gateway_id         = module.vpc_west.natgw_ids[0]
 }
 resource "aws_route" "transport_default_east" {
   provider               = aws.east
   for_each               = local.sites.east.azs
   route_table_id         = aws_route_table.transport_east[each.key].id
   destination_cidr_block = "0.0.0.0/0"
-  nat_gateway_id         = aws_nat_gateway.east.id
+  nat_gateway_id         = module.vpc_east.natgw_ids[0]
 }
 resource "aws_route" "workload_default_west" {
   for_each               = local.sites.west.azs
   route_table_id         = aws_route_table.workload_west[each.key].id
   destination_cidr_block = "0.0.0.0/0"
-  nat_gateway_id         = aws_nat_gateway.west.id
+  nat_gateway_id         = module.vpc_west.natgw_ids[0]
 }
 resource "aws_route" "workload_default_east" {
   provider               = aws.east
   for_each               = local.sites.east.azs
   route_table_id         = aws_route_table.workload_east[each.key].id
   destination_cidr_block = "0.0.0.0/0"
-  nat_gateway_id         = aws_nat_gateway.east.id
+  nat_gateway_id         = module.vpc_east.natgw_ids[0]
 }
 
 resource "aws_lb" "west" {
@@ -442,7 +398,7 @@ resource "aws_lb_target_group" "west" {
   port        = 6081
   protocol    = "GENEVE"
   target_type = "instance"
-  vpc_id      = aws_vpc.west.id
+  vpc_id      = module.vpc_west.vpc_id
   health_check {
     healthy_threshold   = 5
     interval            = 10
@@ -459,7 +415,7 @@ resource "aws_lb_target_group" "east" {
   port        = 6081
   protocol    = "GENEVE"
   target_type = "instance"
-  vpc_id      = aws_vpc.east.id
+  vpc_id      = module.vpc_east.vpc_id
   health_check {
     healthy_threshold   = 5
     interval            = 10
@@ -496,7 +452,7 @@ resource "aws_vpc_endpoint_service" "east" {
 }
 resource "aws_vpc_endpoint" "west" {
   for_each          = local.sites.west.azs
-  vpc_id            = aws_vpc.west.id
+  vpc_id            = module.vpc_west.vpc_id
   service_name      = aws_vpc_endpoint_service.west.service_name
   vpc_endpoint_type = "GatewayLoadBalancer"
   subnet_ids        = [aws_subnet.gwlbe_west[each.key].id]
@@ -504,7 +460,7 @@ resource "aws_vpc_endpoint" "west" {
 resource "aws_vpc_endpoint" "east" {
   provider          = aws.east
   for_each          = local.sites.east.azs
-  vpc_id            = aws_vpc.east.id
+  vpc_id            = module.vpc_east.vpc_id
   service_name      = aws_vpc_endpoint_service.east.service_name
   vpc_endpoint_type = "GatewayLoadBalancer"
   subnet_ids        = [aws_subnet.gwlbe_east[each.key].id]
@@ -679,7 +635,7 @@ resource "aws_route" "gwlbe_to_remote_east" {
 
 resource "aws_security_group" "target_west" {
   name   = "${var.name}-west-target"
-  vpc_id = aws_vpc.west.id
+  vpc_id = module.vpc_west.vpc_id
   ingress {
     from_port   = 6081
     to_port     = 6081
@@ -703,7 +659,7 @@ resource "aws_security_group" "target_west" {
 resource "aws_security_group" "target_east" {
   provider = aws.east
   name     = "${var.name}-east-target"
-  vpc_id   = aws_vpc.east.id
+  vpc_id   = module.vpc_east.vpc_id
   ingress {
     from_port   = 6081
     to_port     = 6081
@@ -726,7 +682,7 @@ resource "aws_security_group" "target_east" {
 }
 resource "aws_security_group" "transport_west" {
   name   = "${var.name}-west-transport"
-  vpc_id = aws_vpc.west.id
+  vpc_id = module.vpc_west.vpc_id
   dynamic "ingress" {
     for_each = toset(local.sites.west.local_site_cidrs)
     content {
@@ -748,7 +704,7 @@ resource "aws_security_group" "transport_west" {
 resource "aws_security_group" "transport_east" {
   provider = aws.east
   name     = "${var.name}-east-transport"
-  vpc_id   = aws_vpc.east.id
+  vpc_id   = module.vpc_east.vpc_id
   dynamic "ingress" {
     for_each = toset(local.sites.east.local_site_cidrs)
     content {
@@ -770,7 +726,7 @@ resource "aws_security_group" "transport_east" {
 resource "aws_security_group" "workload_west" {
   for_each = local.workload_roles.west
   name     = "${var.name}-west-${each.key}"
-  vpc_id   = aws_vpc.west.id
+  vpc_id   = module.vpc_west.vpc_id
   dynamic "ingress" {
     for_each = local.workload_probe_ingress
     content {
@@ -793,7 +749,7 @@ resource "aws_security_group" "workload_east" {
   provider = aws.east
   for_each = local.workload_roles.east
   name     = "${var.name}-east-${each.key}"
-  vpc_id   = aws_vpc.east.id
+  vpc_id   = module.vpc_east.vpc_id
   dynamic "ingress" {
     for_each = local.workload_probe_ingress
     content {
@@ -838,7 +794,7 @@ locals {
 }
 
 resource "aws_instance" "envelope_target_west" {
-  for_each                    = local.sites.west.target_az_keys
+  for_each                    = var.deployment_phase == "targets" ? local.sites.west.target_az_keys : toset([])
   ami                         = var.west_ami_id
   instance_type               = var.instance_type
   subnet_id                   = aws_subnet.target_west[each.key].id
@@ -873,7 +829,7 @@ resource "aws_instance" "envelope_target_west" {
 }
 resource "aws_instance" "envelope_target_east" {
   provider                    = aws.east
-  for_each                    = local.sites.east.target_az_keys
+  for_each                    = var.deployment_phase == "targets" ? local.sites.east.target_az_keys : toset([])
   ami                         = var.east_ami_id
   instance_type               = var.instance_type
   subnet_id                   = aws_subnet.target_east[each.key].id
@@ -1045,17 +1001,28 @@ locals {
 }
 resource "aws_cloudwatch_log_group" "flow_west" {
   name              = "/aws/vpc-flow-logs/${var.name}/west"
-  retention_in_days = 7
+  retention_in_days = var.cloudwatch_log_retention_in_days
   tags              = merge(local.common_tags, { Name = "${var.name}-west-flow-logs", Site = "west", Role = "flow-logs" })
 }
 resource "aws_cloudwatch_log_group" "flow_east" {
   provider          = aws.east
   name              = "/aws/vpc-flow-logs/${var.name}/east"
-  retention_in_days = 7
+  retention_in_days = var.cloudwatch_log_retention_in_days
   tags              = merge(local.common_tags, { Name = "${var.name}-east-flow-logs", Site = "east", Role = "flow-logs" })
 }
+resource "aws_cloudwatch_log_group" "application_west" {
+  name              = "/envelope/${var.name}/west/application"
+  retention_in_days = var.cloudwatch_log_retention_in_days
+  tags              = merge(local.common_tags, { Name = "${var.name}-west-application-logs", Site = "west", Role = "application-logs" })
+}
+resource "aws_cloudwatch_log_group" "application_east" {
+  provider          = aws.east
+  name              = "/envelope/${var.name}/east/application"
+  retention_in_days = var.cloudwatch_log_retention_in_days
+  tags              = merge(local.common_tags, { Name = "${var.name}-east-application-logs", Site = "east", Role = "application-logs" })
+}
 resource "aws_flow_log" "west" {
-  vpc_id                   = aws_vpc.west.id
+  vpc_id                   = module.vpc_west.vpc_id
   traffic_type             = "ALL"
   log_destination_type     = "cloud-watch-logs"
   log_destination          = aws_cloudwatch_log_group.flow_west.arn
@@ -1067,7 +1034,7 @@ resource "aws_flow_log" "west" {
 }
 resource "aws_flow_log" "east" {
   provider                 = aws.east
-  vpc_id                   = aws_vpc.east.id
+  vpc_id                   = module.vpc_east.vpc_id
   traffic_type             = "ALL"
   log_destination_type     = "cloud-watch-logs"
   log_destination          = aws_cloudwatch_log_group.flow_east.arn
@@ -1079,7 +1046,34 @@ resource "aws_flow_log" "east" {
 }
 
 output "vpc_ids" {
-  value = { west = aws_vpc.west.id, east = aws_vpc.east.id }
+  value = { west = module.vpc_west.vpc_id, east = module.vpc_east.vpc_id }
+}
+output "network_foundation" {
+  description = "Module-owned common VPC primitives; inspection-specific route domains remain explicit in this root."
+  value = {
+    west = {
+      vpc_id                    = module.vpc_west.vpc_id
+      internet_gateway_id       = module.vpc_west.igw_id
+      nat_gateway_id            = module.vpc_west.natgw_ids[0]
+      management_subnet_id      = module.vpc_west.public_subnets[0]
+      management_route_table_id = module.vpc_west.public_route_table_ids[0]
+    }
+    east = {
+      vpc_id                    = module.vpc_east.vpc_id
+      internet_gateway_id       = module.vpc_east.igw_id
+      nat_gateway_id            = module.vpc_east.natgw_ids[0]
+      management_subnet_id      = module.vpc_east.public_subnets[0]
+      management_route_table_id = module.vpc_east.public_route_table_ids[0]
+    }
+  }
+}
+output "deployment_phase" {
+  description = "The reviewed rollout phase and whether inspected data-plane traffic is expected to work."
+  value = {
+    phase                          = var.deployment_phase
+    inspected_data_plane_available = var.deployment_phase == "targets"
+    expected_inspected_path        = var.deployment_phase == "targets" ? "available after target health checks pass" : "unavailable: target groups are intentionally empty and no direct-route fallback exists"
+  }
 }
 output "gwlb_target_group_arns" {
   value = { west = aws_lb_target_group.west.arn, east = aws_lb_target_group.east.arn }
@@ -1237,14 +1231,14 @@ output "production_controller_topology_seed" {
     deployment_id  = var.name
     sites = {
       west = {
-        vpc_id                        = aws_vpc.west.id
+        vpc_id                        = module.vpc_west.vpc_id
         region                        = var.west_region
         local_prefixes                = sort(local.sites.west.local_site_cidrs)
         local_main_rule_priority_base = local.transport_router_contracts.west.policy_rule_priority_base
         tailscale_route_rule_priority = 5270
       }
       east = {
-        vpc_id                        = aws_vpc.east.id
+        vpc_id                        = module.vpc_east.vpc_id
         region                        = var.east_region
         local_prefixes                = sort(local.sites.east.local_site_cidrs)
         local_main_rule_priority_base = local.transport_router_contracts.east.policy_rule_priority_base
@@ -1258,7 +1252,7 @@ output "production_controller_topology_seed" {
         site_id           = "west"
         instance_id       = aws_instance.transport_router_west[key].id
         eni_id            = aws_instance.transport_router_west[key].primary_network_interface_id
-        vpc_id            = aws_vpc.west.id
+        vpc_id            = module.vpc_west.vpc_id
         subnet_id         = aws_subnet.transport_west[key].id
         availability_zone = local.sites.west.azs[key]
         region            = var.west_region
@@ -1269,7 +1263,7 @@ output "production_controller_topology_seed" {
         site_id           = "east"
         instance_id       = aws_instance.transport_router_east[key].id
         eni_id            = aws_instance.transport_router_east[key].primary_network_interface_id
-        vpc_id            = aws_vpc.east.id
+        vpc_id            = module.vpc_east.vpc_id
         subnet_id         = aws_subnet.transport_east[key].id
         availability_zone = local.sites.east.azs[key]
         region            = var.east_region
@@ -1309,11 +1303,11 @@ output "cost_profile" {
       target_instances       = { west = length(aws_instance.envelope_target_west), east = length(aws_instance.envelope_target_east) }
       transport_routers      = { west = length(aws_instance.transport_router_west), east = length(aws_instance.transport_router_east) }
       workload_instances     = length(aws_instance.workload_west) + length(aws_instance.workload_east)
-      nat_gateways           = length(aws_nat_gateway.west[*]) + length(aws_nat_gateway.east[*])
-      elastic_ips            = length(aws_eip.nat_west[*]) + length(aws_eip.nat_east[*])
+      nat_gateways           = length(module.vpc_west.natgw_ids) + length(module.vpc_east.natgw_ids)
+      elastic_ips            = length(module.vpc_west.nat_public_ips) + length(module.vpc_east.nat_public_ips)
       gateway_load_balancers = length(aws_lb.west[*]) + length(aws_lb.east[*])
       vpc_flow_logs          = length(aws_flow_log.west[*]) + length(aws_flow_log.east[*])
-      cloudwatch_log_groups  = length(aws_cloudwatch_log_group.flow_west[*]) + length(aws_cloudwatch_log_group.flow_east[*])
+      cloudwatch_log_groups  = length(aws_cloudwatch_log_group.flow_west[*]) + length(aws_cloudwatch_log_group.flow_east[*]) + length(aws_cloudwatch_log_group.application_west[*]) + length(aws_cloudwatch_log_group.application_east[*])
       flow_log_iam_roles     = length(aws_iam_role.flow_logs[*])
       iam_roles = {
         target    = length(aws_iam_role.runtime_west[*]) + length(aws_iam_role.runtime_east[*])

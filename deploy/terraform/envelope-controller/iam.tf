@@ -112,6 +112,18 @@ locals {
             StringEquals = { "aws:RequestedRegion" = sort(tolist(local.topology_site_regions)) }
           }
         },
+        {
+          Sid      = "WriteApplicationLogs"
+          Effect   = "Allow"
+          Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+          Resource = ["arn:${data.aws_partition.current.partition}:logs:${var.aws_region}:${var.aws_account_id}:log-group:${aws_cloudwatch_log_group.application.name}:*"]
+        },
+        {
+          Sid      = "DescribeApplicationLogGroupsAndStreams"
+          Effect   = "Allow"
+          Action   = ["logs:DescribeLogGroups", "logs:DescribeLogStreams"]
+          Resource = ["*"]
+        },
       ],
       [
         for secret_name in ["tsnet", "admin"] : {

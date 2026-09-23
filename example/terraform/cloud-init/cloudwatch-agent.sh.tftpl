@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+dnf install -y amazon-cloudwatch-agent
+install -d -o root -g root -m 0755 /opt/aws/amazon-cloudwatch-agent/etc
+cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CLOUDWATCH_CONFIG'
+${config_json}
+CLOUDWATCH_CONFIG
+
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 -s \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json

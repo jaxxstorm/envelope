@@ -45,6 +45,42 @@ locals {
     site     = "east"
     run_name = var.name
   }))
+  cloudwatch_agent_bootstrap = {
+    west = templatefile("${path.module}/cloud-init/cloudwatch-agent.sh.tftpl", {
+      config_json = jsonencode({
+        agent = { region = var.west_region }
+        logs = {
+          logs_collected = {
+            files = {
+              collect_list = [
+                { file_path = "/var/log/envelope-target/envelope.log", log_group_name = aws_cloudwatch_log_group.application_west.name, log_stream_name = "{instance_id}/envelope-target" },
+                { file_path = "/var/log/envelope-router/transport-router.log", log_group_name = aws_cloudwatch_log_group.application_west.name, log_stream_name = "{instance_id}/transport-router" },
+                { file_path = "/var/log/envelope-router/tailscaled.log", log_group_name = aws_cloudwatch_log_group.application_west.name, log_stream_name = "{instance_id}/tailscaled" },
+                { file_path = "/var/log/envelope-router/router-attestor.log", log_group_name = aws_cloudwatch_log_group.application_west.name, log_stream_name = "{instance_id}/router-attestor" },
+              ]
+            }
+          }
+        }
+      })
+    })
+    east = templatefile("${path.module}/cloud-init/cloudwatch-agent.sh.tftpl", {
+      config_json = jsonencode({
+        agent = { region = var.east_region }
+        logs = {
+          logs_collected = {
+            files = {
+              collect_list = [
+                { file_path = "/var/log/envelope-target/envelope.log", log_group_name = aws_cloudwatch_log_group.application_east.name, log_stream_name = "{instance_id}/envelope-target" },
+                { file_path = "/var/log/envelope-router/transport-router.log", log_group_name = aws_cloudwatch_log_group.application_east.name, log_stream_name = "{instance_id}/transport-router" },
+                { file_path = "/var/log/envelope-router/tailscaled.log", log_group_name = aws_cloudwatch_log_group.application_east.name, log_stream_name = "{instance_id}/tailscaled" },
+                { file_path = "/var/log/envelope-router/router-attestor.log", log_group_name = aws_cloudwatch_log_group.application_east.name, log_stream_name = "{instance_id}/router-attestor" },
+              ]
+            }
+          }
+        }
+      })
+    })
+  }
   transport_policy_rule_priority_base = 100
   transport_router_contracts = {
     for site, topology in local.sites : site => {
@@ -215,6 +251,11 @@ data "cloudinit_config" "target_west" {
     content_type = "text/x-shellscript"
     content      = local.west_target_bootstrap
   }
+  part {
+    filename     = "95-cloudwatch-agent.sh"
+    content_type = "text/x-shellscript"
+    content      = local.cloudwatch_agent_bootstrap.west
+  }
 }
 data "cloudinit_config" "target_east" {
   gzip          = true
@@ -229,6 +270,11 @@ data "cloudinit_config" "target_east" {
     filename     = "90-envelope-packet-return.sh"
     content_type = "text/x-shellscript"
     content      = local.east_target_bootstrap
+  }
+  part {
+    filename     = "95-cloudwatch-agent.sh"
+    content_type = "text/x-shellscript"
+    content      = local.cloudwatch_agent_bootstrap.east
   }
 }
 module "tailscale_transport_west" {
@@ -256,6 +302,8 @@ module "tailscale_transport_west" {
     { filename = "30-activate-transport-router.sh", content_type = "text/x-shellscript", content = local.transport_router_activation },
     ], var.router_attestor_bootstrap == null ? [] : [
     { filename = "40-router-attestor.sh", content_type = "text/x-shellscript", content = local.attestor_bootstrap_scripts["west-${each.key}"] },
+    ], [
+    { filename = "95-cloudwatch-agent.sh", content_type = "text/x-shellscript", content = local.cloudwatch_agent_bootstrap.west },
   ])
 }
 module "tailscale_transport_east" {
@@ -283,5 +331,7 @@ module "tailscale_transport_east" {
     { filename = "30-activate-transport-router.sh", content_type = "text/x-shellscript", content = local.transport_router_activation },
     ], var.router_attestor_bootstrap == null ? [] : [
     { filename = "40-router-attestor.sh", content_type = "text/x-shellscript", content = local.attestor_bootstrap_scripts["east-${each.key}"] },
+    ], [
+    { filename = "95-cloudwatch-agent.sh", content_type = "text/x-shellscript", content = local.cloudwatch_agent_bootstrap.east },
   ])
 }

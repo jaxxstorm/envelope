@@ -29,6 +29,8 @@ RuntimeDirectory=envelope-controller
 RuntimeDirectoryMode=0700
 StateDirectory=envelope-controller
 StateDirectoryMode=0700
+LogsDirectory=envelope-controller
+LogsDirectoryMode=0750
 ReadWritePaths=/run/envelope-controller /var/lib/envelope-controller
 ReadOnlyPaths=/etc/envelope
 UMask=0077
@@ -62,8 +64,8 @@ SystemCallErrorNumber=EPERM
 SystemCallFilter=@system-service
 KeyringMode=private
 
-StandardOutput=journal
-StandardError=journal
+StandardOutput=append:/var/log/envelope-controller/controller.log
+StandardError=append:/var/log/envelope-controller/controller.log
 
 [Install]
 WantedBy=multi-user.target

@@ -13,6 +13,8 @@ locals {
       Statement = [
         { Effect = "Allow", Action = ["s3:GetObject"], Resource = [local.artifact_object_arn] },
         { Effect = "Allow", Action = local.ssm_core_actions, Resource = ["*"] },
+        { Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents"], Resource = ["arn:aws:logs:${var.west_region}:${data.aws_caller_identity.current.account_id}:log-group:${aws_cloudwatch_log_group.application_west.name}:*"] },
+        { Effect = "Allow", Action = ["logs:DescribeLogGroups", "logs:DescribeLogStreams"], Resource = ["*"] },
       ]
     })
     east = jsonencode({
@@ -20,6 +22,8 @@ locals {
       Statement = [
         { Effect = "Allow", Action = ["s3:GetObject"], Resource = [local.artifact_object_arn] },
         { Effect = "Allow", Action = local.ssm_core_actions, Resource = ["*"] },
+        { Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents"], Resource = ["arn:aws:logs:${var.east_region}:${data.aws_caller_identity.current.account_id}:log-group:${aws_cloudwatch_log_group.application_east.name}:*"] },
+        { Effect = "Allow", Action = ["logs:DescribeLogGroups", "logs:DescribeLogStreams"], Resource = ["*"] },
       ]
     })
   }
@@ -47,6 +51,8 @@ locals {
           }
         },
         { Effect = "Allow", Action = local.ssm_core_actions, Resource = ["*"] },
+        { Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents"], Resource = ["arn:aws:logs:${var.west_region}:${data.aws_caller_identity.current.account_id}:log-group:${aws_cloudwatch_log_group.application_west.name}:*"] },
+        { Effect = "Allow", Action = ["logs:DescribeLogGroups", "logs:DescribeLogStreams"], Resource = ["*"] },
       ]
     })
     east = jsonencode({
@@ -66,6 +72,8 @@ locals {
           }
         },
         { Effect = "Allow", Action = local.ssm_core_actions, Resource = ["*"] },
+        { Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents"], Resource = ["arn:aws:logs:${var.east_region}:${data.aws_caller_identity.current.account_id}:log-group:${aws_cloudwatch_log_group.application_east.name}:*"] },
+        { Effect = "Allow", Action = ["logs:DescribeLogGroups", "logs:DescribeLogStreams"], Resource = ["*"] },
       ]
     })
   }

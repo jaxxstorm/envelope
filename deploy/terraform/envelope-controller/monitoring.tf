@@ -1,3 +1,13 @@
+resource "aws_cloudwatch_log_group" "application" {
+  name              = "/envelope/${var.name}/controller/application"
+  retention_in_days = var.cloudwatch_log_retention_in_days
+
+  tags = merge(local.common_tags, {
+    Name = "${var.name}-controller-application-logs"
+    Role = "controller-application-logs"
+  })
+}
+
 resource "aws_cloudwatch_metric_alarm" "instance_status" {
   for_each = aws_instance.controller
 

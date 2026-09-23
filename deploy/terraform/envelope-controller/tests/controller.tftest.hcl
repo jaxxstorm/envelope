@@ -1174,6 +1174,19 @@ run "standalone_controller_contract" {
     )
     error_message = "instance, DynamoDB, and fail-closed external-ready alarms must be present."
   }
+  assert {
+    condition = (
+      aws_cloudwatch_log_group.application.retention_in_days == var.cloudwatch_log_retention_in_days &&
+      output.application_log_group.name == "/envelope/${var.name}/controller/application" &&
+      alltrue([
+        for statements in values(local.controller_policy_statements) :
+        length([for statement in statements : statement if statement.Sid == "WriteApplicationLogs" && statement.Action == ["logs:CreateLogStream", "logs:PutLogEvents"]]) == 1 &&
+        length([for statement in statements : statement if statement.Sid == "DescribeApplicationLogGroupsAndStreams" && statement.Action == ["logs:DescribeLogGroups", "logs:DescribeLogStreams"]]) == 1
+      ]) &&
+      alltrue([for instance in values(aws_instance.controller) : strcontains(instance.user_data, "amazon-cloudwatch-agent")])
+    )
+    error_message = "every controller must ship its application log to the retained deployment log group with only stream-delivery permissions."
+  }
 }
 
 run "active_controller_contract" {

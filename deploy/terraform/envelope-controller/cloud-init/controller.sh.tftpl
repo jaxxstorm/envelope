@@ -28,10 +28,11 @@ readonly topology_tool_version="$(decode '${topology_tool_version_b64}')"
 readonly controller_id="$(decode '${controller_id_b64}')"
 readonly state_base_dir="$(decode '${state_base_dir_b64}')"
 readonly topology_parameter="$(decode '${topology_parameter_b64}')"
+readonly cloudwatch_log_group="$(decode '${cloudwatch_log_group_b64}')"
 readonly tsnet_parameter="$(decode '${tsnet_parameter_name_b64}')"
 readonly admin_parameter="$(decode '${admin_parameter_name_b64}')"
 
-for command in /usr/bin/aws /usr/bin/base64 /usr/bin/curl /usr/bin/mount /usr/bin/mountpoint /usr/bin/sha256sum /usr/bin/systemctl /usr/sbin/blkid /usr/sbin/mkfs.ext4; do
+for command in /usr/bin/aws /usr/bin/base64 /usr/bin/curl /usr/bin/dnf /usr/bin/mount /usr/bin/mountpoint /usr/bin/sha256sum /usr/bin/systemctl /usr/sbin/blkid /usr/sbin/mkfs.ext4; do
   [[ -x "$command" ]] || { printf 'required controller bootstrap command is missing: %s\n' "$command" >&2; exit 1; }
 done
 
@@ -74,6 +75,9 @@ fi
 if ! /usr/bin/id envelope-controller >/dev/null 2>&1; then
   /usr/sbin/useradd --system --gid envelope-controller --home-dir /var/lib/envelope-controller --shell /usr/sbin/nologin envelope-controller
 fi
+/usr/bin/install -d -o envelope-controller -g envelope-controller -m 0750 /var/log/envelope-controller
+/usr/bin/touch /var/log/envelope-controller/controller.log
+/usr/bin/chown envelope-controller:envelope-controller /var/log/envelope-controller/controller.log
 
 /usr/bin/install -d -o root -g root -m 0755 /etc/envelope /usr/local/lib/envelope-controller
 
@@ -211,6 +215,15 @@ ${systemd_unit_b64}
 UNIT_BASE64
 /usr/bin/chown root:root /etc/systemd/system/envelope-controller.service
 /usr/bin/chmod 0644 /etc/systemd/system/envelope-controller.service
+
+/usr/bin/dnf install -y amazon-cloudwatch-agent
+/usr/bin/install -d -o root -g root -m 0755 /opt/aws/amazon-cloudwatch-agent/etc
+cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CLOUDWATCH_CONFIG
+{"agent":{"region":"$topology_region"},"logs":{"logs_collected":{"files":{"collect_list":[{"file_path":"/var/log/envelope-controller/controller.log","log_group_name":"$cloudwatch_log_group","log_stream_name":"{instance_id}/controller"}]}}}}
+CLOUDWATCH_CONFIG
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 -s \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
 
 /usr/bin/systemctl daemon-reload
 /usr/bin/systemctl enable --now envelope-controller.service

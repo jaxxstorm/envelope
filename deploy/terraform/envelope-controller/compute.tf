@@ -36,6 +36,7 @@ resource "aws_instance" "controller" {
     artifact_sha256            = var.artifact.sha256
     artifact_version_b64       = base64encode(var.artifact.version_id)
     controller_id_b64          = base64encode(each.key)
+    cloudwatch_log_group_b64   = base64encode(aws_cloudwatch_log_group.application.name)
     deployment_mode            = var.deployment_mode
     log_level                  = var.log_level
     metrics_port               = var.metrics_port

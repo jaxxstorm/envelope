@@ -95,6 +95,7 @@ mock_provider "aws" {
 
 variables {
   name                       = "envelope-plan"
+  deployment_phase           = "targets"
   expires_at                 = "2030-01-01T00:00:00Z"
   west_region                = "us-west-2"
   east_region                = "us-east-1"
@@ -175,12 +176,55 @@ variables {
   }
 }
 
+run "infrastructure_phase_creates_routes_and_endpoints_without_targets" {
+  command = plan
+
+  variables {
+    deployment_phase = "infrastructure"
+  }
+
+  assert {
+    condition = (
+      output.deployment_phase.phase == "infrastructure" &&
+      output.deployment_phase.inspected_data_plane_available == false &&
+      strcontains(output.deployment_phase.expected_inspected_path, "intentionally empty") &&
+      length(aws_vpc_endpoint.west) == 2 &&
+      length(aws_vpc_endpoint.east) == 2 &&
+      length(aws_route.workload_to_remote_west) == 4 &&
+      length(aws_route.workload_to_remote_east) == 4 &&
+      length(aws_route.transport_to_local_west) == 4 &&
+      length(aws_route.transport_to_local_east) == 4 &&
+      length(aws_route.gwlbe_to_remote_west) == 4 &&
+      length(aws_route.gwlbe_to_remote_east) == 4 &&
+      length(aws_instance.envelope_target_west) == 0 &&
+      length(aws_instance.envelope_target_east) == 0 &&
+      length(aws_lb_target_group_attachment.west) == 0 &&
+      length(aws_lb_target_group_attachment.east) == 0 &&
+      length(aws_instance.transport_router_west) == 2 &&
+      length(aws_instance.transport_router_east) == 2
+    )
+    error_message = "Infrastructure must retain every inspected route domain, endpoint, router, and controller input while intentionally leaving GWLB target groups empty without a direct-route fallback."
+  }
+}
+
 run "symmetric_two_az_paths" {
   command = plan
 
   assert {
     condition     = length(aws_vpc_endpoint.west) == 2 && length(aws_vpc_endpoint.east) == 2 && length(aws_instance.envelope_target_west) == 2 && length(aws_instance.envelope_target_east) == 2 && length(aws_instance.transport_router_west) == 2 && length(aws_instance.transport_router_east) == 2
     error_message = "every enabled AZ must have a GWLBE, target, and AZ-spread transport router."
+  }
+  assert {
+    condition = (
+      output.deployment_phase.phase == "targets" &&
+      output.deployment_phase.inspected_data_plane_available == true &&
+      length(aws_lb_target_group_attachment.west) == 2 &&
+      length(aws_lb_target_group_attachment.east) == 2 &&
+      alltrue([for target in values(aws_instance.envelope_target_west) : target.subnet_id == aws_subnet.target_west[target.tags.ZoneKey].id]) &&
+      alltrue([for target in values(aws_instance.envelope_target_east) : target.subnet_id == aws_subnet.target_east[target.tags.ZoneKey].id]) &&
+      !strcontains(file("${path.module}/topology.tf"), "aws_ecs_")
+    )
+    error_message = "The targets phase must add only EC2 targets and their registrations; it must not replace targets, routers, or the controller with ECS resources."
   }
   assert {
     condition     = length(aws_instance.workload_west) == 2 && length(aws_instance.workload_east) == 2 && toset(keys(aws_instance.workload_west)) == toset(["initiator", "responder"]) && toset(keys(aws_instance.workload_east)) == toset(["initiator", "responder"])
@@ -250,6 +294,22 @@ run "symmetric_two_az_paths" {
       ]
     }
     error_message = "flow-log IAM must be plan-time-known and limited to the two exact regional stream namespaces."
+  }
+  assert {
+    condition = (
+      aws_cloudwatch_log_group.application_west.retention_in_days == var.cloudwatch_log_retention_in_days &&
+      aws_cloudwatch_log_group.application_east.retention_in_days == var.cloudwatch_log_retention_in_days &&
+      alltrue([
+        for policy in [aws_iam_role_policy.runtime_west.policy, aws_iam_role_policy.runtime_east.policy, aws_iam_role_policy.transport_west.policy, aws_iam_role_policy.transport_east.policy] :
+        contains(flatten([for statement in jsondecode(policy).Statement : statement.Action]), "logs:CreateLogStream") &&
+        contains(flatten([for statement in jsondecode(policy).Statement : statement.Action]), "logs:PutLogEvents")
+      ]) &&
+      strcontains(local.cloudwatch_agent_bootstrap.west, "/var/log/envelope-target/envelope.log") &&
+      strcontains(local.cloudwatch_agent_bootstrap.west, "/var/log/envelope-router/transport-router.log") &&
+      strcontains(local.cloudwatch_agent_bootstrap.west, "/var/log/envelope-router/tailscaled.log") &&
+      strcontains(local.cloudwatch_agent_bootstrap.east, "/var/log/envelope-router/router-attestor.log")
+    )
+    error_message = "targets and transport routers must ship their application logs only to their site's retained CloudWatch log group."
   }
   assert {
     condition = alltrue([
@@ -557,6 +617,16 @@ run "reject_unsupported_topology_version" {
   }
 
   expect_failures = [var.symmetric_topology]
+}
+
+run "reject_invalid_deployment_phase" {
+  command = plan
+
+  variables {
+    deployment_phase = "target"
+  }
+
+  expect_failures = [var.deployment_phase]
 }
 
 run "reject_incomplete_target_fleet" {

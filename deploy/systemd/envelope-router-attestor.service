@@ -37,6 +37,10 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@mount @reboot @swap @module @raw-io @privileged
+LogsDirectory=envelope-router
+LogsDirectoryMode=0750
+StandardOutput=append:/var/log/envelope-router/router-attestor.log
+StandardError=append:/var/log/envelope-router/router-attestor.log
 # Exact private ingress is enforced by the router security group. AWS Describe
 # APIs require HTTPS egress; IMDS uses the fixed link-local endpoint.
 

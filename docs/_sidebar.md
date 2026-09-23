@@ -1,15 +1,25 @@
 - [Start Here](README.md)
-- [Build and Try It](getting-started.md)
+- [Architecture](architecture.md)
+- [Components](components.md)
+- [Deployment Guide](deployment.md)
+- [Getting Started](getting-started.md)
+- [Operations](operations.md)
+- [Troubleshooting](troubleshooting.md)
+- [Best Practices](best-practices.md)
+
+## Component Reference
+
+- [Production Controller](production-controller.md)
+- [Application Resilience](application-resilience.md)
 - [Terraform Example](terraform-example.md)
 
-## Production Control Plane
+## Developer E2E Documentation
 
-- [Controller Architecture and Operations](production-controller.md)
-- [Application Resilience](application-resilience.md)
+- [E2E Acceptance](developer/e2e-acceptance.md)
+- [Controller E2E Acceptance](developer/controller-e2e-acceptance.md)
+- [AWS Appliance Runbook](developer/aws-appliance-runbook.md)
+- [AWS Two-Region E2E Runbook](developer/aws-two-region-e2e-runbook.md)
 
-## Reference
+## Repository
 
 - [Technical README](../README.md)
-- [AWS Appliance Runbook](aws-appliance-runbook.md)
-- [Two-Region E2E Runbook](aws-two-region-e2e-runbook.md)
-- [Packet-Turnaround Benchmarks](packet-turnaround-benchmarks.md)

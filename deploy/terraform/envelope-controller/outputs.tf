@@ -185,3 +185,11 @@ output "alarm_arns" {
     controller_ready       = { for id, alarm in aws_cloudwatch_metric_alarm.controller_ready : id => alarm.arn }
   }
 }
+
+output "application_log_group" {
+  description = "CloudWatch Logs group receiving controller application logs."
+  value = {
+    arn  = aws_cloudwatch_log_group.application.arn
+    name = aws_cloudwatch_log_group.application.name
+  }
+}

@@ -1,0 +1,31 @@
+## 1. Module-Backed Network Foundation
+
+- [x] 1.1 Add `terraform-aws-modules/vpc/aws` at exactly v6.7.2 for west and east, with explicit reviewed AZ, CIDR, DNS, IGW, NAT, and provider-alias inputs; update `.terraform.lock.hcl`. Verify clean `terraform init` selects the pinned module and locked checksums. Spec: `example-terraform-staged-deployment` / Pinned VPC module topology.
+- [x] 1.2 Refactor the existing topology to consume VPC module outputs while retaining explicit workload, transport-router, GWLBE, GWLB, target, and management route tables, associations, endpoint routes, and controller-bound GWLBE route identities. Verify a two-site plan retains each route domain and exact association. Spec: `example-terraform-staged-deployment` / Pinned VPC module topology.
+- [x] 1.3 Remove superseded hand-authored VPC/common-subnet resources only after their consumers use module outputs; preserve explicit AZ inputs and do not introduce dynamic AZ discovery. Verify no plan references replaced resources and all existing topology assertions remain meaningful. Spec: `aws-appliance-deployment` / Reproducible Terraform inputs.
+
+## 2. Staged EC2 Target Rollout
+
+- [x] 2.1 Add and validate an explicit `deployment_phase` input with only `infrastructure` and `targets` values; expose phase and expected data-plane availability in non-secret outputs. Verify invalid values fail plan validation. Spec: `example-terraform-staged-deployment` / Reviewed staged target rollout.
+- [x] 2.2 Gate only Envelope target EC2 instances and GWLB target-group attachments on the `targets` phase. Keep GWLBs, listeners, target groups, endpoint services, GWLBE endpoints, all required workload/transport routes, EC2 routers, and production-v3 controller topology inputs in both phases. Verify the infrastructure plan contains zero target instances and zero attachments. Spec: `example-terraform-staged-deployment` / Reviewed staged target rollout.
+- [x] 2.3 Add phase-specific Terraform tests proving the infrastructure phase creates every endpoint and route domain but leaves target groups empty and reports expected inspected-path failure without a direct-route fallback. Spec: `example-terraform-staged-deployment` / Infrastructure data plane is unavailable; `symmetric-gwlb-ha-topology` / Symmetric inter-site GWLB traversal.
+- [x] 2.4 Add phase-specific Terraform tests proving a reviewed normal `targets` plan creates and registers the configured EC2 target fleet while preserving the existing VPC, endpoint, EC2 router, and controller topology resources. Assert no ECS service, task definition, or container replacement is introduced. Spec: `example-terraform-staged-deployment` / Reviewed staged target rollout.
+- [x] 2.5 Preserve the exact GWLB health-check contract and target packet-turnaround configuration through the phase transition. Verify target registration waits on the existing `/healthz`, UDP/6081, and reviewed health timing contract. Spec: `aws-appliance-deployment` / Packet-turnaround target readiness and drain.
+
+## 3. Router And Controller Preservation
+
+- [x] 3.1 Keep transport routers as EC2 instances with disabled source/destination checks, existing no-NAT forwarding, exact production-v3 overlapping route advertisements, and controller-eligible ENIs. Verify existing router and route-domain test assertions pass in both phases. Spec: `tailscale-host-routing` / Bidirectional no-NAT transport-router readiness.
+- [x] 3.2 Preserve production-v3 controller topology seed, immutable GWLBE route-table association identities, and controller-owned route reconciliation; do not add route-mutation authority to targets or routers. Verify phase tests retain the complete router/domain seed. Spec: `production-failover-controller` / Strict immutable topology authority; `symmetric-gwlb-ha-topology` / Autonomous production route alignment.
+- [x] 3.3 Retain `modules/tailscale-cloudinit` as the transport-router module and update its provenance to name upstream `tailscale/terraform-cloudinit-tailscale` v0.0.12 and both missing controls. Verify rendered router cloud-init still uses the pinned package URL/checksum and pre-setup gate before credential resolution and `tailscale up`. Spec: `example-terraform-staged-deployment` / Retained verified Tailscale cloud-init module.
+
+## 4. Operator Documentation
+
+- [x] 4.1 Add or update user-facing appliance documentation describing Envelope's packet-scoped EC2 target role, GWLB/GWLBE path, dedicated EC2 router role, standalone production-v3 controller role, unsupported ECS/TUN/target-Tailscale designs, and expected infrastructure-phase traffic failure. Verify all navigation links resolve. Spec: `docsify-onboarding` / Newcomer architecture explanation.
+- [x] 4.2 Document an exact Tailscale policy template derived from `tailscale_tag` and the configured west/east workload CIDRs: one tag-owner entry, two CIDR-limited directional ACL rules, and per-prefix `autoApprovers.routes` entries bound only to that tag. Document reusable preauthorized tagged bootstrap keys and regional encrypted SSM storage. Verify the example contains no wildcard, supernet, target enrollment, or unapproved route-activation substitute. Spec: `docsify-onboarding` / Appliance and Tailnet operator configuration.
+- [x] 4.3 Document the vendored cloud-init module rationale and link its provenance/checksum records. Verify the guide explicitly names v0.0.12 and explains the missing checksum-pinned installer and pre-setup gate. Spec: `docsify-onboarding` / Vendored cloud-init rationale.
+
+## 5. Verification
+
+- [ ] 5.1 Run `terraform fmt -check`, `terraform init`, `terraform validate`, and the example Terraform test suite for both deployment phases; review plans to confirm pinned VPC module use, empty infrastructure target groups, target-phase EC2 registrations, and unchanged controller/router model.
+- [x] 5.2 Run the documentation link/check suite and validate the exact Tailnet policy template against the configured topology before any live AWS creation. Spec: `docsify-onboarding` / Appliance and Tailnet operator configuration.
+- [x] 5.3 Run `openspec validate --all --strict --no-interactive` and `git diff --check`; record the reviewed plans and test results with the implementation evidence.

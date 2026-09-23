@@ -28,6 +28,16 @@ for binary in /usr/bin/flock /usr/bin/jq /usr/bin/mktemp /usr/bin/mv /usr/bin/py
 done
 
 install -d -m 0755 /etc/envelope /usr/local/sbin /var/lib/envelope
+install -d -m 0750 /var/log/envelope-router /etc/systemd/system/tailscaled.service.d
+touch /var/log/envelope-router/transport-router.log /var/log/envelope-router/tailscaled.log /var/log/envelope-router/router-attestor.log
+cat >/etc/systemd/system/tailscaled.service.d/envelope-logging.conf <<'TAILSCALED_LOGGING'
+[Service]
+LogsDirectory=envelope-router
+LogsDirectoryMode=0750
+StandardOutput=append:/var/log/envelope-router/tailscaled.log
+StandardError=append:/var/log/envelope-router/tailscaled.log
+TAILSCALED_LOGGING
+systemctl daemon-reload
 cat >/etc/envelope/transport-router-readiness-expectations.json <<'READINESS_EXPECTATIONS'
 ${readiness_expectations_json}
 READINESS_EXPECTATIONS
@@ -905,6 +915,8 @@ ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectSystem=strict
 ReadWritePaths=/run/envelope-transport-router-network /var/lib/envelope
+StandardOutput=append:/var/log/envelope-router/transport-router.log
+StandardError=append:/var/log/envelope-router/transport-router.log
 
 [Install]
 WantedBy=tailscaled.service

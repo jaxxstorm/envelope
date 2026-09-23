@@ -130,6 +130,7 @@ if ! getent group envelope >/dev/null; then groupadd --system envelope; fi
 if ! getent passwd envelope >/dev/null; then
   useradd --system --gid envelope --home-dir /nonexistent --shell /sbin/nologin envelope
 fi
+install -d -o envelope -g envelope -m 0750 /var/log/envelope-target
 
 cat >/etc/systemd/system/envelope.service <<'ENVELOPE_UNIT'
 [Unit]
@@ -167,8 +168,10 @@ RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 UMask=0077
-StandardOutput=journal
-StandardError=journal
+LogsDirectory=envelope-target
+LogsDirectoryMode=0750
+StandardOutput=append:/var/log/envelope-target/envelope.log
+StandardError=append:/var/log/envelope-target/envelope.log
 
 [Install]
 WantedBy=multi-user.target
